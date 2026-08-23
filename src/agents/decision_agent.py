@@ -140,6 +140,14 @@ SYSTEM = """\
   horizon=day 만 허용한다(스윙/장투로 올리지 마라). pool=swing(또는 없음)은 Athena 유니버스
   이므로 신규는 swing/position + 신선한 bullish 도시에.
 
+점예측(p_target_before_stop — BUY + 도시레 target·invalidation 있을 때):
+- dossier.target 이 dossier.invalidation 보다 먼저(가격 경로상) 닿을 주관적 확률 (0~1).
+  conviction 과 다르다 — conviction 은 코드가 덮어쓰는 매매 확신이고, 이 필드는 **도시레
+  경로만**의 확률이다. 0.5=동전, 0.7=목표가 선도달 쪽 유리, 0.3=손절이 먼저 올 가능성 높음.
+- target/invalidation 이 없거나 side 가 HOLD/SELL 이면 비워라(null). conviction 숫자를
+  복사하지 마라 — 둘은 다른 질문이다.
+- horizon 이 길수록 불확실성이 커지면 p 를 낮춰라(과신 금지).
+
 최근 공시(recent_disclosures — 있으면 최우선 점검):
 - 공시 워처가 잡은 최근 중대 공시다(유상증자·실적·공급계약·소송 등). 보유/진입대기 종목의
   공시(route=wake)는 이번 각성의 이유일 가능성이 높다 — 그 공시가 해당 종목의 thesis 를

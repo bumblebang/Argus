@@ -184,16 +184,31 @@ def run_cycle(*, context_json: str, decision_agent, validation_agent, broker, ri
         decision_prompt=dec_prompt,
         validation_prompt=val_prompt,
     )
+    archive_meta = _archive_context(context_json, cycle_ts, journal_path, manager)
     _journal(journal_path, decision, validation, executed, conv_audit=conv_audit,
-             cycle_ts_iso=cycle_ts_iso, manager=manager)
+             cycle_ts_iso=cycle_ts_iso, manager=manager, archive_meta=archive_meta)
     log.info("사이클 완료: 집행시도 %d건 epoch=%s", len(executed), manager.get("epoch"))
     return CycleResult(decision, validation, executed,
                        cycle_ts=cycle_ts, cycle_ts_iso=cycle_ts_iso, manager=manager)
 
 
+def _archive_context(context_json: str, cycle_ts: float, journal_path: str | Path,
+                     manager: dict | None) -> dict | None:
+    """입력 컨텍스트를 gzip 아카이브. 실패해도 사이클은 계속."""
+    try:
+        from ..eval.archive import persist_context
+        return persist_context(
+            context_json, cycle_ts=cycle_ts, journal_path=journal_path,
+            manager=manager)
+    except Exception as e:
+        log.warning("컨텍스트 아카이브 실패(사이클 계속): %s", e)
+        return None
+
+
 def _journal(path: str | Path, decision: DecisionOutput, validation: ValidationOutput,
              executed: list[dict], conv_audit: dict | None = None,
-             cycle_ts_iso: str | None = None, manager: dict | None = None) -> None:
+             cycle_ts_iso: str | None = None, manager: dict | None = None,
+             archive_meta: dict | None = None) -> None:
     rec = {
         "ts": cycle_ts_iso or datetime.now(timezone.utc).isoformat(),
         "market_view": decision.market_view,
@@ -205,6 +220,10 @@ def _journal(path: str | Path, decision: DecisionOutput, validation: ValidationO
         rec["conviction_code"] = conv_audit
     if manager:
         rec["manager"] = manager
+    if archive_meta:
+        for k in ("context_ref", "context_sha256", "context_bytes"):
+            if k in archive_meta:
+                rec[k] = archive_meta[k]
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
     with p.open("a", encoding="utf-8") as f:

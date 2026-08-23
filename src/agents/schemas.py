@@ -30,6 +30,11 @@ class Proposal(BaseModel):
     # 비우면 코드가 기본 배정(config.universe 매핑)으로 폴백. 범위 밖 값은 하드 가드가 클램프.
     strategy: str | None = Field(default=None, description="전략 템플릿명(strategies 카탈로그 중 택1)")
     params: dict[str, float] | None = Field(default=None, description="선택 전략의 파라미터(범위 내)")
+    # P2 점예측: 도시레 target 이 invalidation 전에 먼저 도달할 확률 (0~1).
+    # conviction 과 다르다 — conviction 은 코드가 덮어쓰는 매매 확신, 이건 경로 확률.
+    p_target_before_stop: float | None = Field(
+        default=None, ge=0.0, le=1.0,
+        description="BUY+도시레 target/invalidation 있을 때만. HOLD/SELL·레벨 없으면 null")
 
 
 class DecisionOutput(BaseModel):
