@@ -34,6 +34,16 @@ trailing:
     risk_on: 1.6
   horizons: [swing, position]
 
+# 공통 청산 바닥 — 전략 decide() 와 무관. day 는 watch.session_end_exit_min 이 담당.
+exit_policy:
+  enabled: true
+  time_stop:
+    enabled: true
+    by_horizon:
+      swing: { max_days: 20 }
+      position: { max_days: 120 }
+    exclude_strategy: ["value"]
+
 watch:
   watch_interval_sec: 1
   idle_interval_sec: 60

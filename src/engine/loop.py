@@ -31,6 +31,7 @@ from ..market_hours import current_session, is_tradable, near_session_end, marke
 from .gateway import TossGateway
 from .store import Store
 from . import triggers as T
+from .exit_policy import ExitPolicyConfig, time_stop_trigger
 from .wake_request import consume_brain_wake
 
 log = get_logger("engine.loop")
@@ -135,6 +136,13 @@ class WatchConfig:
     # 트레일링 스톱(목표가 도달 시 전량 청산 대신 이익 태우기). 최상위 trailing 블록에서 읽는다.
     # 기본={}=비활성(기존 동작: 목표가 전량 청산). 정규화형: {enabled, base_pct, regime_mult, horizons}.
     trailing: dict = field(default_factory=dict)
+    # 공통 청산 바닥(v1: time_stop). 최상위 exit_policy 블록.
+    exit_policy: "ExitPolicyConfig | None" = None
+
+    @staticmethod
+    def _parse_exit_policy(raw: dict) -> "ExitPolicyConfig":
+        from .exit_policy import parse_exit_policy
+        return parse_exit_policy(raw)
 
     @staticmethod
     def _parse_session_map(block: Any,
@@ -218,6 +226,7 @@ class WatchConfig:
             wake_request_path=str(w.get("wake_request_path", d.wake_request_path) or ""),
             # 트레일링은 watch 블록이 아니라 최상위 trailing 블록에서 읽는다(trading_sessions 와 동일).
             trailing=cls._parse_trailing(raw),
+            exit_policy=cls._parse_exit_policy(raw),
         )
 
 
@@ -328,7 +337,7 @@ class TickResult:
 
 
 # 코드(빠른손)가 즉시 처리하는 청산 트리거 — 뇌를 거치지 않는다.
-_EXIT_KINDS = {"stop_hit", "target_hit"}
+_EXIT_KINDS = {"stop_hit", "target_hit", "time_stop"}
 
 
 class WatchLoop:
@@ -686,6 +695,11 @@ class WatchLoop:
 
                 trigs: list[T.Trigger] = []
                 if sym in positions:
+                    ep = self.cfg.exit_policy
+                    if ep and ep.enabled:
+                        ts = time_stop_trigger(positions[sym], cfg=ep, now=now_ts)
+                        if ts:
+                            trigs.append(ts)
                     # 트레일링: 목표가 도달 시 전량 청산 대신 손절가를 끌어올려(래칫) 이익을
                     # 태운다. 청산 트리거 평가 '전에' stop_price 를 갱신해야 같은 틱의
                     # position_triggers 가 그 트레일링 스톱으로 stop_hit 을 낸다. 트레일 대상은

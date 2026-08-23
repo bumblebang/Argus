@@ -89,6 +89,39 @@ def test_stop_hit_routes_to_code_exit_not_wake(tmp_path, monkeypatch):
     assert "trigger" in logged                    # wake/precision 은 없음
 
 
+def test_time_stop_routes_to_code_exit(tmp_path, monkeypatch):
+    import time as _time
+    from src.engine.exit_policy import ExitPolicyConfig
+
+    _only_kr_open(monkeypatch)
+    store = Store(tmp_path / "t.db")
+    now = _time.time()
+    gw = FakeGateway({"005930": 70000})
+    pos = {
+        "symbol": "005930", "market": "KR", "qty": 10,
+        "avg_price": 70000, "stop_price": 60000, "target_price": None,
+        "opened_at": now - 25 * 86400,
+        "meta": '{"horizon": "swing"}',
+        "strategy": "rsi_reversion",
+    }
+    exits = []
+    ep = ExitPolicyConfig(
+        enabled=True,
+        max_days={"swing": 20, "position": 120},
+        exclude_strategies=frozenset({"value"}),
+    )
+    loop = WatchLoop(
+        gw, store,
+        lambda: {"KR": {"positions": [pos], "candidates": []}},
+        executor=lambda sym, m, p, t: exits.append(t.kind) or True,
+        config=WatchConfig(exit_policy=ep),
+    )
+    res = loop.run_once()
+    assert "time_stop" in {t.kind for t in res.triggers}
+    assert exits == ["time_stop"] and res.exits == ["005930"]
+    assert res.woke is False
+
+
 def test_vol_spike_wakes_brain(tmp_path, monkeypatch):
     _only_kr_open(monkeypatch)
     store = Store(tmp_path / "t.db")
