@@ -1,0 +1,327 @@
+# 자격증명은 여기 두지 말고 .env 에 둔다.
+# 이 파일을 config.yaml 로 복사한 뒤 자본·한도를 본인 계좌에 맞춘다.
+# 기본은 페이퍼. 라이브는 docs/SETUP_LIVE.md.
+
+run:
+  dry_run: true
+  poll_interval_sec: 60
+  request_spacing_sec: 0.3
+  timezone: "Asia/Seoul"
+  trade_markets: ["KR", "US"]
+
+# 실주문은 3중: broker.mode==live AND dry_run==false AND .env DRY_RUN=false.
+# 그리고 watch 데몬이 live_client 를 주입한 프로세스만 실주문 가능(배치 스크립트는 페이퍼).
+broker:
+  mode: "paper"          # paper | live
+  account_seq: 1         # doctor 가 조회한 계좌 seq 로 맞출 것
+  live_markets: ["KR"]   # 실주문 허용 시장. US 는 시세만.
+  limit_slippage_pct: 0.01
+  reconcile_poll_attempts: 5
+  reconcile_poll_sec: 0.4
+  reconcile_sec: 300
+  max_spread_pct_extended: 0.02
+
+trading_sessions:
+  KR: [regular, premarket, aftermarket]
+  US: [regular, premarket, aftermarket]
+
+trailing:
+  enabled: true
+  base_pct: 0.05
+  regime_mult:
+    risk_off: 0.6
+    neutral: 1.0
+    risk_on: 1.6
+  horizons: [swing, position]
+
+watch:
+  watch_interval_sec: 1
+  idle_interval_sec: 60
+  candle_ttl_sec: 8
+  precision_per_tick: 3
+  strategy_per_tick: 3
+  entry_per_tick: 3
+  vol_window: 12
+  vol_spike_pct: 0.02
+  stop_buffer_pct: 0.005
+  stale_quote_sec: 600
+  brain_backend: "cli"       # cli | live | dry
+  brain_interval_sec: 3600   # 프리 08:00부터 1시간. Athena 훅 + extra 08:00
+  brain_cooldown_sec: 300
+  circuit_fail_threshold: 2
+  # 미장 정기각성은 기본 끔. 재개 시 US: [regular] + Athena US 창(DST).
+  brain_sessions:
+    KR: [premarket, regular]
+    US: []
+  extra_wakes:
+    KR: ["08:00", "15:30"]
+  wake_request_path: "data/brain_wake_request.json"
+  session_end_exit_min: 5
+  dashboard: true
+  dashboard_port: 8787
+  market_state_refresh: true
+  market_state_refresh_sec: 300
+  account_snapshot_sec: 300
+
+alerts:
+  ntfy_topic: ""             # .env NTFY_TOPIC 이 우선
+
+risk:
+  # 본인 운용 금액으로 바꿀 것 (KR 원, US 달러)
+  capital:
+    KR: 1000000
+    US: 0
+  max_position_pct: 0.20
+  max_positions: 5
+  daily_loss_limit_pct: 0.05
+  allow_fractional: false
+  allow_min_lot: true
+  min_lot_qty: 1.0
+  max_gross_exposure: 0.90
+  max_sector_pct: 0.40
+  max_drawdown_pct: 0.10
+  exposure_base: "equity"
+  max_order_notional:
+    KR: 200000               # 소액. 고단가 1주는 allow_min_lot 이 연다
+    US: 0
+  kill_switch_file: "data/HALT"
+  # KRX 경보 종목 BUY 하드스킵 (build_market_state 가 갱신)
+  blocked_symbols_file: "data/krx_blocked_symbols.json"
+
+paper:
+  cash:
+    KR: 1000000              # 페이퍼 시작 현금. 라이브에선 실계좌 미러로 덮임
+    US: 0
+  fee_rate:
+    KR: 0.00015
+    US: 0.001
+  slippage_bps:
+    KR: 5
+    US: 5
+  sell_tax_rate:
+    KR: 0.0015
+    US: 0.0
+
+market_state:
+  regime_symbols:
+    KR: ["069500", "229200"]
+    US: ["SPY", "QQQ"]
+  regime_symbols_yahoo:
+    KR: ["^KS11", "^KQ11"]
+    US: ["^GSPC", "^IXIC"]
+  breadth_min_n: 10
+  fear_greed:
+    enabled: true
+    ttl_sec: 1800
+    kr_proxy: true
+    kr_index: "^KS11"
+    kr_drawdown_lookback: 20
+    kr_drawdown_max_age_hours: 6
+    history: true
+    history_path: "data/fear_history.json"
+    # KRX Open API(KRX_API_KEY) — VKOSPI·풋콜을 fear_kr.inputs 에만 붙임(점수 가중치 불변)
+    krx_enrich: true
+    krx_cache_path: "data/krx_fear_cache.json"
+    krx_ttl_sec: 21600
+  request_spacing_sec: 0.6
+  sec_user_agent: "Argus your-email@example.com"
+  fundamentals_max: 10
+  sector_symbols:
+    US:
+      Technology: "XLK"
+      Financials: "XLF"
+      Energy: "XLE"
+      HealthCare: "XLV"
+      Discretionary: "XLY"
+      Staples: "XLP"
+      Industrials: "XLI"
+      Utilities: "XLU"
+      Materials: "XLB"
+      Communication: "XLC"
+    KR:
+      반도체: "091160"
+      은행: "091170"
+      자동차: "091180"
+      증권: "102970"
+      헬스케어: "266420"
+      2차전지: "305720"
+  news_feeds:
+    한국경제: "https://www.hankyung.com/feed/finance"
+    연합뉴스: "https://www.yna.co.kr/rss/economy.xml"
+    매일경제: "https://www.mk.co.kr/rss/30000001/"
+    investing: "https://kr.investing.com/rss/news_25.rss"
+  sentiment_symbols:
+    vix: "^VIX"
+  markets_symbols:
+    KOSPI: "^KS11"
+    KOSDAQ: "^KQ11"
+    SP500: "^GSPC"
+    NASDAQ: "^IXIC"
+    Gold: "GC=F"
+    WTI: "CL=F"
+    BTC: "BTC-USD"
+    USDKRW: "KRW=X"
+
+agents:
+  model: "claude-opus-4-8"
+  min_conviction: 0.6
+  brain_min_conviction: 0
+  conviction_code: true
+  require_dossier: true
+  entry_zone_guard: true
+  entry_zone_tolerance_pct: 0.005
+  conviction_sizing: true
+  min_lot_conviction: 0.6
+  lessons: true
+  max_tokens: 8000
+  thinking: true
+  claude_command: "claude"
+  claude_model: "opus"
+  claude_val_model: "opus"
+  claude_fallback_model: "sonnet"
+  claude_timeout: 600
+  cursor_bridge:
+    enabled: false
+    inbox_dir: "data/llm_inbox"
+    timeout_sec: 240
+    poll_sec: 1.0
+    require_armed: true
+    armed_max_age_sec: 90
+  val_model: "claude-opus-4-8"
+
+watcher:
+  enabled: true
+  dart_poll_sec_active: 10
+  dart_poll_sec_idle: 60
+  active_after_close_hours: 2
+  earnings_consensus: true
+  imminent_after_close_hours: 4
+  earnings_result: true
+  earnings_poll_sec: 600
+  earnings_idle_poll_sec: 3600
+
+athena:
+  model: "sonnet"
+  max_per_run: 30
+  ttl_hours: 60
+  timeout: 240
+  windows:
+    KR:
+      - { start: "05:30", stop: "07:30" }   # 종료 직후 athena_done → 뇌 1회
+
+screener:
+  enabled: true
+  universe_max_age_hours: 192
+  history_range: "6mo"
+  candle_interval: "1d"
+  lookback: 60
+  exclude_warnings: true
+  min_price: { KR: 2000, US: 5 }
+  max_price: { KR: 1000000, US: 2000 }
+  min_avg_turnover: { KR: 5000000000, US: 50000000 }
+  gems:
+    enabled: true
+    count_per_market: { KR: 5, US: 3 }
+    pool: 150
+    min_avg_turnover: { KR: 1000000000, US: 20000000 }
+    drawdown_range: [-0.60, -0.25]
+    knife_20d_min: -0.10
+    box_momentum_max: 0.10
+    min_trades: 3
+  picks:
+    volatility_breakout: { count: 4, rank_by: "volatility" }
+    ma_crossover:        { count: 4, rank_by: "momentum" }
+    rsi_reversion:       { count: 4, rank_by: "liquidity" }
+  rolling:
+    enabled: true
+    movers_enabled: false
+    interval_min: 60
+    movers_per_scan: 3
+    mover_max_per_market: 6
+    core_weekdays: [0]
+    core_preopen_min: { KR: 90, US: 330 }
+    picks_scale: { KR: 1.0, US: 1.5 }
+
+day_pool:
+  enabled: true
+  markets: ["KR"]
+  count: 50
+  type: "MARKET_TRADING_AMOUNT"
+  duration_live: "realtime"
+  duration_fallback: "1d"
+  strategy: "volatility_breakout"
+
+universe:
+  KR:
+    - { symbol: "005930", name: "삼성전자",    strategy: "volatility_breakout", sector: "반도체" }
+    - { symbol: "000660", name: "SK하이닉스",  strategy: "ma_crossover",        sector: "반도체" }
+    - { symbol: "035720", name: "카카오",      strategy: "rsi_reversion",       sector: "인터넷" }
+  US:
+    - { symbol: "AAPL",   name: "Apple",       strategy: "volatility_breakout", sector: "하드웨어" }
+    - { symbol: "MSFT",   name: "Microsoft",   strategy: "ma_crossover",        sector: "소프트웨어" }
+    - { symbol: "NVDA",   name: "Nvidia",      strategy: "rsi_reversion",       sector: "반도체" }
+
+strategies:
+  volatility_breakout:
+    candle_interval: "1d"
+    k: 0.5
+    target_profit_pct: 0.03
+    stop_loss_pct: 0.02
+    exit_at_session_end: true
+  ma_crossover:
+    candle_interval: "1d"
+    short: 5
+    long: 20
+  rsi_reversion:
+    candle_interval: "1d"
+    period: 14
+    oversold: 30
+    overbought: 70
+
+value_scan:
+  enabled: true
+  markets: ["KR"]
+  pool: 600
+  pool_us: 400
+  min_avg_turnover:
+    KR: 500000000
+    US: 3000000
+  max_per_run: 15               # 평일 2회(여·닫) ×15 ≈ 30콜/일
+  ttl_hours: 400
+  refresh_hours: 20
+  refresh_slots: 2              # 보유 우선 재검증
+  weekend_refresh: true
+  weekend_max_per_run: 16       # 토 10:00 1회 지도 재감정. 일 없음
+  news_per_symbol: 3
+  model: "sonnet"
+  timeout: 240
+
+value_trade:
+  enabled: true
+  sleeve_pct: 0.60
+  brain_reserve_pct: 0.30
+  max_per_run: 2
+  max_positions: 3
+  min_dossier_conviction: 0.4
+  dossier_ttl_hours: 400
+  hard_stop_pct: 0.20
+  time_stop_days: 120
+  tranche_min_days: 7
+  markets: ["KR"]
+  model: "fable"
+  timeout: 600
+  windows: { KR: "10:00" }
+
+# 기본 기동 경로가 아님. 켜려면 docs 를 보고 enabled 를 true 로.
+public_page:
+  enabled: false
+  out: "public/index.html"
+  brief_model: "sonnet"
+  brief_timeout: 180
+  brief_ttl_hours: 20
+  publish:
+    enabled: false
+    repo_dir: ""
+    remote: ""
+    branch: "main"
+    single_commit: true

@@ -1,0 +1,143 @@
+{
+  "version": 1,
+  "endpoint": "https://data.krx.co.kr/comm/bldAttendant/getJsonData.cmd",
+  "auth": "loginProc.cmd + KRX_USER/KRX_PASS (2026-02+ LOGOUT without login)",
+  "notes": [
+    "2025-03-04+ KRX+NXT 합산 제공 화면 있음 — Naver와 숫자 어긋날 수 있음",
+    "전종목 폴링 금지: 일자 1회 스냅샷 + spacing≥0.25s",
+    "유료 호가/체결(ms)은 Data Marketplace 분배 — 이 카탈로그 범위 밖"
+  ],
+  "entries": [
+    {
+      "id": "short_종합",
+      "bld": "dbms/MDC/STAT/srt/MDCSTAT30001",
+      "slot": "positioning",
+      "priority": "P0",
+      "asof": "T+0 regular ~15:40; full day ~18:10",
+      "params": ["isuCd(ISIN)", "strtDd", "endDd"],
+      "note": "isuSrtCd 불가 — ISIN(KR7…) 필수. 잔고는 30501 우선"
+    },
+    {
+      "id": "short_거래_전종목",
+      "bld": "dbms/MDC/STAT/srt/MDCSTAT30101",
+      "slot": "positioning",
+      "priority": "P0",
+      "asof": "T+0 ~15:40 / ~18:10",
+      "params": ["trdDd", "mktId", "inqCond"]
+    },
+    {
+      "id": "short_잔고_전종목",
+      "bld": "dbms/MDC/STAT/srt/MDCSTAT30501",
+      "slot": "positioning",
+      "priority": "P0",
+      "asof": "T+2 report lag (잔고)",
+      "params": ["trdDd", "mktTpCd"]
+    },
+    {
+      "id": "short_투자자별",
+      "bld": "dbms/MDC/STAT/srt/MDCSTAT30301",
+      "slot": "short_market",
+      "priority": "P0",
+      "asof": "T+0 ~15:40 / ~18:10",
+      "params": ["strtDd", "endDd", "inqCondTpCd", "mktTpCd"]
+    },
+    {
+      "id": "investor_market_daily",
+      "bld": "dbms/MDC/STAT/standard/MDCSTAT02202",
+      "slot": "flows_market",
+      "priority": "P1",
+      "asof": "T+0 ~15:45 interim; ~18:00 final",
+      "params": ["strtDd", "endDd", "mktId", "trdVolVal", "askBid"]
+    },
+    {
+      "id": "investor_ticker_daily",
+      "bld": "dbms/MDC/STAT/standard/MDCSTAT02302",
+      "slot": "flows",
+      "priority": "P1",
+      "asof": "T+0 ~18:00 final",
+      "params": ["strtDd", "endDd", "isuCd", "trdVolVal", "askBid"]
+    },
+    {
+      "id": "investor_net_top",
+      "bld": "dbms/MDC/STAT/standard/MDCSTAT02401",
+      "slot": "flows",
+      "priority": "P1",
+      "asof": "T+0 ~15:45 / ~18:00",
+      "params": ["strtDd", "endDd", "mktId", "invstTpCd"]
+    },
+    {
+      "id": "program_trading",
+      "bld": "dbms/MDC/STAT/standard/MDCSTAT02601",
+      "slot": "program_flows",
+      "priority": "P1",
+      "asof": "T+0 ~18:00",
+      "params": ["strtDd", "endDd", "mktId"],
+      "note": "ITM_TP_NM=차익/비차익/전체 NETBID_TRDVAL. 구 02501=블록거래로 변경됨"
+    },
+    {
+      "id": "foreign_exhaustion_all",
+      "bld": "dbms/MDC/STAT/standard/MDCSTAT03701",
+      "slot": "foreign_exhaustion",
+      "priority": "P1b",
+      "asof": "D-1/D-2 확정(장개시 기준)",
+      "params": ["trdDd", "mktId", "isuLmtRto", "searchType"]
+    },
+    {
+      "id": "market_alert_주의",
+      "bld": "dbms/MDC/STAT/issue/MDCSTAT21501",
+      "slot": "warnings",
+      "priority": "P1b",
+      "asof": "intraday list",
+      "params": ["mktId", "trdDd"]
+    },
+    {
+      "id": "market_alert_경고",
+      "bld": "dbms/MDC/STAT/issue/MDCSTAT21201",
+      "slot": "warnings",
+      "priority": "P1b",
+      "asof": "intraday list",
+      "params": ["mktId", "trdDd"]
+    },
+    {
+      "id": "vkospi",
+      "bld": "dbms/MDC/STAT/standard/MDCSTAT01201",
+      "slot": "sentiment.fear_kr",
+      "priority": "P2",
+      "asof": "T+0 index",
+      "params": ["indTpCd", "idxIndCd", "strtDd", "endDd"],
+      "note": "코스피200 변동성지수 idxIndCd=300"
+    },
+    {
+      "id": "ohlcv_all",
+      "bld": "dbms/MDC/STAT/standard/MDCSTAT01501",
+      "slot": "regime",
+      "priority": "P2",
+      "asof": "T+0 EOD",
+      "params": ["mktId", "trdDd"]
+    },
+    {
+      "id": "index_constituents",
+      "bld": "dbms/MDC/STAT/standard/MDCSTAT00601",
+      "slot": "index_constituents",
+      "priority": "P2",
+      "asof": "rebalance dates",
+      "params": ["trdDd", "idxIndCd", "indTpCd"]
+    },
+    {
+      "id": "fundamental_all",
+      "bld": "dbms/MDC/STAT/standard/MDCSTAT03501",
+      "slot": "quant_shadow",
+      "priority": "P2",
+      "asof": "T+0 EOD",
+      "params": ["mktId", "trdDd", "searchType"]
+    },
+    {
+      "id": "etf_ohlcv",
+      "bld": "dbms/MDC/STAT/standard/MDCSTAT04301",
+      "slot": "optional",
+      "priority": "P2",
+      "asof": "T+0 EOD",
+      "params": ["trdDd"]
+    }
+  ]
+}

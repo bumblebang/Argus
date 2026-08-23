@@ -1,0 +1,17 @@
+Argus Source-Available License
+
+Copyright (c) 2026 Argus contributors
+
+Permission is granted to use, copy, and modify this software for any purpose,
+including running it against your own brokerage account, subject to the
+following conditions:
+
+1. THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND. The authors
+   are not liable for trading losses, API bans, missed orders, or any other
+   damages arising from use of this software.
+2. This is not investment advice and not a solicitation to trade.
+3. You are solely responsible for API keys, IP allowlists, order limits, and
+   compliance with your broker's terms.
+4. Redistribution of substantial portions must retain this notice.
+
+Live trading can lose real money. Default configuration is paper (no live orders).

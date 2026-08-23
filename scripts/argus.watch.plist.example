@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>local.argus.watch</string>
+  <key>WorkingDirectory</key>
+  <string>/REPLACE/WITH/ABS/PATH/TO/argus</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/usr/bin/caffeinate</string>
+    <string>-s</string>
+    <string>/REPLACE/WITH/ABS/PATH/TO/argus/.venv/bin/python</string>
+    <string>scripts/watch.py</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>/REPLACE/WITH/ABS/PATH/TO/argus/logs/watch.launchd.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>/REPLACE/WITH/ABS/PATH/TO/argus/logs/watch.launchd.err.log</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PYTHONIOENCODING</key>
+    <string>utf-8</string>
+  </dict>
+</dict>
+</plist>

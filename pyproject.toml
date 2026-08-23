@@ -1,0 +1,20 @@
+[project]
+name = "argus"
+version = "0.1.0"
+description = "Autonomous investing agent: research, judgment, gates, orders (Toss Open API)"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { file = "LICENSE" }
+
+dependencies = [
+    "requests>=2.32",
+    "python-dotenv>=1.0",
+    "PyYAML>=6.0",
+    "pandas>=2.2",
+    "tzdata>=2024.1",
+    "anthropic>=0.69",
+    "pydantic>=2.7",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]

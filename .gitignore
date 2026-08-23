@@ -1,0 +1,60 @@
+# secrets
+.env
+*.key
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+
+# 운영자 로컬 — 실계좌 모드·경로·운영일지. 공개 저장소에는 example만 올린다.
+config.yaml
+CONTEXT.md
+CONTEXT.local.md
+_chk_*.py
+
+# 퀀트 리서치 워크트리·산출물(절대경로·운영 메모가 섞임)
+research/
+data/quant_review/
+
+# runtime data (생성물). 후보군(base_universe_*.txt)과 KRX bld 카탈로그는 추적함.
+# 이 폴더엔 실계좌 흔적이 들어 있다 — bot.db(포지션·체결·결정 전문), 원장, 토큰 캐시.
+data/*.json
+!data/krx_bld_catalog.json
+data/*.jsonl*
+data/.token.json
+data/*.log
+data/*.db
+data/*.db-wal
+data/*.db-shm
+data/*.corrupt-*
+data/*.paper-era-*
+data/watch.*
+data/research.csv
+data/universe.yaml
+data/day_pool.yaml
+data/history/
+data/krx_cache/
+data/llm_inbox/
+logs/
+*.log
+
+# 공개 페이지 생성물 — 발행은 별도 저장소로 나간다
+public/
+
+# 로컬 다이어그램 — README 미사용
+argus_loop_final.png
+
+# os / editor / build
+.DS_Store
+Thumbs.db
+.idea/
+*.egg-info/
+dist/
+build/
+.coverage
+htmlcov/
+data/HALT
+

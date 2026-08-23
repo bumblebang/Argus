@@ -1,0 +1,179 @@
+"""에이전트 1사이클: 결정 -> 검증 -> 하드 게이트 -> 페이퍼 집행 + 결정 저널.
+
+흐름:
+  결정 에이전트가 제안 -> 검증 에이전트가 독립 검토(거부권) -> 승인된 것만
+  주문으로 변환 -> broker.execute()가 하드 리스크 게이트로 최종 검증 후 페이퍼 집행.
+모든 단계의 근거(thesis/verdict)를 data/decisions.jsonl에 남긴다.
+"""
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+
+from .schemas import DecisionOutput, ValidationOutput
+from .conviction import apply_buy_conviction, size_weight, min_lot_adjust
+from ..logging_setup import get_logger
+from ..risk_gate import Order
+
+log = get_logger("agents.cycle")
+
+
+@dataclass
+class CycleResult:
+    decision: DecisionOutput
+    validation: ValidationOutput
+    executed: list[dict]    # 집행/시도 결과 [{symbol, action, status, reason}]
+
+
+def run_cycle(*, context_json: str, decision_agent, validation_agent, broker, risk,
+              price_lookup: dict[str, float],
+              journal_path: str | Path = "data/decisions.jsonl",
+              arm_fn=None, dossier_fn=None, zone_fn=None,
+              entry_zone_tolerance_pct: float = 0.005,
+              conviction_sizing: bool = False,
+              min_lot_conviction: float | None = None,
+              apply_code_conviction: bool = False,
+              dossier_brief_fn=None,
+              features_by_sym: dict | None = None) -> CycleResult:
+    """결정→검증→집행. 데이트레(horizon='day') BUY 는 즉시 체결 대신 arm_fn 으로 라우팅.
+
+    arm_fn(proposal, price)->bool 이 주어지면 day BUY 는 진입대기(armed)로 등록하고
+    진입 타이밍은 감시 루프(코드)가 잡는다. swing/position 은 기존대로 즉시 진입.
+
+    dossier_fn(symbol)->bool 이 주어지면 **도시에 우선 원칙**: 스윙/장투 BUY 는 신선한
+    bullish 도시에가 있어야 집행(없으면 status='no_dossier' 차단). 데이트레(armed)는
+    예외 — 빠른 기회는 전략 신호 경로가 담당한다. conviction_sizing=True 면 확신도가
+    사이징에 반영된다(weight × (0.5+0.5×conviction) — 확신 낮으면 절반).
+
+    min_lot_conviction 이 주어지면(예: 0.6) 그 확신도 이상 BUY 는 목표비중이 1주도
+    못 살 때 최소 1주로 올린다(고단가 floor=0 구멍). RiskGate.allow_min_lot 과 짝.
+
+    zone_fn(symbol)->dict|None 이 주어지면 **갭 진입 가드**(스윙/장투 BUY 한정): 현재가가
+    도시에 진입존(entry_low~entry_high) 안이면 기존대로 즉시 시장가, 존 위(갭상승)면 시장가
+    취소 후 arm_fn 으로 존 재진입 대기 등록(status='gap_armed'), 존 아래·무효화가 위면
+    존 회복 대기(gap_armed), 무효화가 하회면 진입 거부(gap_rejected). zone 정보가 없으면
+    (도시에 없음/레벨 결손/가드 꺼짐) 기존 동작 그대로(하위호환). arm_fn 은 zone 을 함께
+    넘겨(arm_fn(p, price, zone=levels)) 감시 루프가 존 기준으로 진입/해제하게 한다.
+
+    apply_code_conviction=True 면 BUY 확신도를 코드 루브릭으로 덮어쓴 뒤 검증에 넘긴다
+    (LLM 자가채점은 사이징에 쓰지 않음). dossier_brief_fn(symbol)->dict 와
+    features_by_sym 이 가감 입력. 연속량은 부호×강도로 W_* 한도 안에 접고,
+    희석·법적 공시·실적 미스·적자만 계단 감점한다.
+    """
+    decision = decision_agent.decide(context_json)
+    conv_audit: dict = {}
+    if apply_code_conviction:
+        conv_audit = apply_buy_conviction(
+            decision, price_lookup, dossier_brief_fn,
+            zone_tol=entry_zone_tolerance_pct,
+            features_by_sym=features_by_sym)
+        log.info("확신도 코드 %s", conv_audit)
+    validation = validation_agent.review(context_json, decision)
+    verdict_by_sym = {v.symbol: v for v in validation.verdicts}
+
+    executed: list[dict] = []
+    for p in decision.proposals:
+        if p.side == "HOLD":
+            continue
+        v = verdict_by_sym.get(p.symbol)
+        if v is None or not v.approved:
+            executed.append({"symbol": p.symbol, "action": p.side, "status": "vetoed",
+                             "reason": v.reason if v else "검증 결과 없음"})
+            continue
+        price = price_lookup.get(p.symbol)
+        if not price or price <= 0:
+            executed.append({"symbol": p.symbol, "action": p.side, "status": "no_price",
+                             "reason": "가격 미확보"})
+            continue
+
+        # 데이트레 BUY: 코드 자율 진입(armed). 뇌는 종목/전략/파라미터만 배정.
+        if p.side == "BUY" and arm_fn and (p.horizon or "").lower() == "day":
+            armed = bool(arm_fn(p, price))
+            executed.append({"symbol": p.symbol, "action": "BUY",
+                             "status": "armed" if armed else "arm_skipped",
+                             "reason": p.thesis[:80]})
+            continue
+
+        # 도시에 우선 원칙: 스윙/장투 신규매수는 신선 bullish 도시에 필수(코드 하드가드).
+        if (p.side == "BUY" and dossier_fn
+                and (p.horizon or "swing").lower() != "day" and not dossier_fn(p.symbol)):
+            executed.append({"symbol": p.symbol, "action": "BUY", "status": "no_dossier",
+                             "reason": "신선한 bullish 도시에 없음 — 스윙/장투 신규매수 차단"})
+            continue
+
+        # 갭 진입 가드(스윙/장투 BUY): 진입은 오직 진입존 안에서만. 갭상승/존이탈은 시장가
+        # 추격 대신 존 재진입 대기(arm)로 라우팅하고, thesis 깨진 자리(무효화가 하회)는 거부.
+        levels = (zone_fn(p.symbol) if (zone_fn and p.side == "BUY"
+                                        and (p.horizon or "swing").lower() != "day") else None)
+        if levels:
+            lo, hi = levels["entry_low"], levels["entry_high"]
+            inval = levels["invalidation"]
+            hi_tol = hi * (1 + entry_zone_tolerance_pct)
+            if lo <= price <= hi_tol:
+                pass                              # 존 안 → 기존대로 즉시 시장가 진입
+            elif price > hi_tol:                  # 존 위(갭상승) → 존 재진입 대기
+                armed = bool(arm_fn(p, price, zone=levels)) if arm_fn else False
+                executed.append({"symbol": p.symbol, "action": "BUY",
+                                 "status": "gap_armed" if armed else "arm_skipped",
+                                 "reason": f"갭 위 — 존 재진입 대기 (p {price:g} > high {hi:g})"})
+                continue
+            elif inval <= price < lo:             # 존 아래·무효화가 위 → 존 회복 대기
+                armed = bool(arm_fn(p, price, zone=levels)) if arm_fn else False
+                executed.append({"symbol": p.symbol, "action": "BUY",
+                                 "status": "gap_armed" if armed else "arm_skipped",
+                                 "reason": f"존 아래 — 회복 대기 (p {price:g} < low {lo:g})"})
+                continue
+            else:                                 # 무효화가 하회 → 이미 thesis 깨짐, 진입 거부
+                executed.append({"symbol": p.symbol, "action": "BUY", "status": "gap_rejected",
+                                 "reason": f"무효화가 하회 — 진입 거부 "
+                                           f"(p {price:g} < inval {inval:g})"})
+                continue
+
+        if p.side == "BUY":
+            weight = size_weight(p.target_weight, p.conviction,
+                                 enabled=conviction_sizing)
+            cap = float(getattr(risk, "capital", {}).get(p.market, 0) or 0)
+            weight, min_qty = min_lot_adjust(
+                weight, price=price, capital=cap, conviction=p.conviction,
+                min_lot_conviction=min_lot_conviction)
+            if min_qty > 0 and cap > 0:
+                p.target_weight = min(
+                    1.0, max(float(p.target_weight), price / cap))
+            qty = risk.size_buy(p.market, price, weight, min_qty=min_qty)
+        else:  # SELL: 보유 수량 전량
+            qty = broker.position(p.symbol).qty
+        # broker.execute 내부에서 하드 게이트가 최종 검증(한도·자금·킬스위치)
+        ok = broker.execute(Order(p.symbol, p.market, p.side, qty, price),
+                            reason=f"[agent] {p.thesis[:60]}")
+        if ok:
+            exec_reason = p.thesis[:80]
+        else:
+            # RiskGate/매수가드 한글 사유 — thesis 를 넣으면 포스트모템이 막힌 이유를 못 봄
+            exec_reason = (getattr(broker, "last_reject_reason", None)
+                           or "리스크게이트 거부")
+        executed.append({"symbol": p.symbol, "action": p.side,
+                         "status": "filled" if ok else "gate_rejected",
+                         "reason": exec_reason})
+
+    _journal(journal_path, decision, validation, executed, conv_audit=conv_audit)
+    log.info("사이클 완료: 집행시도 %d건", len(executed))
+    return CycleResult(decision, validation, executed)
+
+
+def _journal(path: str | Path, decision: DecisionOutput, validation: ValidationOutput,
+             executed: list[dict], conv_audit: dict | None = None) -> None:
+    rec = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "market_view": decision.market_view,
+        "proposals": [p.model_dump() for p in decision.proposals],
+        "verdicts": [v.model_dump() for v in validation.verdicts],
+        "executed": executed,
+    }
+    if conv_audit:
+        rec["conviction_code"] = conv_audit
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    with p.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(rec, ensure_ascii=False) + "\n")

@@ -1,0 +1,14 @@
+[Unit]
+Description=Argus watch daemon
+After=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/REPLACE/WITH/ABS/PATH/TO/argus
+ExecStart=/REPLACE/WITH/ABS/PATH/TO/argus/.venv/bin/python scripts/watch.py
+Restart=on-failure
+RestartSec=60
+Environment=PYTHONIOENCODING=utf-8
+
+[Install]
+WantedBy=default.target

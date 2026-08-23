@@ -1,0 +1,28 @@
+# 매크로 이벤트 정본(큐레이티드). Finnhub /calendar/economic 은 무료티어 403
+# 이라 이 파일이 SSOT. 연말·연초에 다음 해 일정을 갱신한다.
+#
+# id: focus 렌즈 id (fomc / bok_mpc / cpi_us / cpi_kr / nfp)
+# date: 발표일(YYYY-MM-DD). FOMC 는 회의 둘째 날(성명 발표일).
+# market: US | KR
+# label: 표시명
+
+events:
+  # ── FOMC 2026 (Fed 발표, 성명일=둘째 날) ──
+  - {id: fomc, label: FOMC, date: "2026-01-28", market: US}
+  - {id: fomc, label: FOMC, date: "2026-03-18", market: US}
+  - {id: fomc, label: FOMC, date: "2026-04-29", market: US}
+  - {id: fomc, label: FOMC, date: "2026-06-17", market: US}
+  - {id: fomc, label: FOMC, date: "2026-07-29", market: US}
+  - {id: fomc, label: FOMC, date: "2026-09-16", market: US}
+  - {id: fomc, label: FOMC, date: "2026-10-28", market: US}
+  - {id: fomc, label: FOMC, date: "2026-12-09", market: US}
+
+  # ── 한국은행 금통위 통화정책방향 2026 ──
+  - {id: bok_mpc, label: 금통위, date: "2026-01-15", market: KR}
+  - {id: bok_mpc, label: 금통위, date: "2026-02-26", market: KR}
+  - {id: bok_mpc, label: 금통위, date: "2026-04-10", market: KR}
+  - {id: bok_mpc, label: 금통위, date: "2026-05-28", market: KR}
+  - {id: bok_mpc, label: 금통위, date: "2026-07-16", market: KR}
+  - {id: bok_mpc, label: 금통위, date: "2026-08-27", market: KR}
+  - {id: bok_mpc, label: 금통위, date: "2026-10-22", market: KR}
+  - {id: bok_mpc, label: 금통위, date: "2026-11-26", market: KR}
