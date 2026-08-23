@@ -95,7 +95,7 @@ def test_live_success_records_real_fill(tmp_path):
                          order_detail=_filled(1, 70050, commission="10.5"))
     b = _live_broker(tmp_path, client, store=store)
     ok = b.execute(Order("005930", "KR", "BUY", 1, 70000.0), "test")
-    assert ok is True
+    assert ok
     assert len(client.calls) == 1
     assert client.calls[0]["order_type"] == "LIMIT"        # 시장가 아님
     assert client.calls[0]["price"] == 70000.0             # 마켓터블 리밋가(최우선 매도호가)
@@ -115,7 +115,7 @@ def test_live_partial_fill_records_partial(tmp_path):
                          order_detail=_filled(2, 70000, status="PARTIAL_FILLED"))
     b = _live_broker(tmp_path, client, store=store)
     ok = b.execute(Order("005930", "KR", "BUY", 5, 70000.0), "test")   # 5주 주문, 2주 체결
-    assert ok is True
+    assert ok
     assert b.account.position("005930").qty == 2                        # 체결분만
     p = json.loads(store.recent_events("live_order", 0)[0]["payload"])
     assert p["qty"] == 2 and p["status"] == "PARTIAL_FILLED"
@@ -128,7 +128,7 @@ def test_live_pending_no_fill(tmp_path):
                          order_detail=_filled(0, None, status="PENDING"))
     b = _live_broker(tmp_path, client, store=store)
     ok = b.execute(Order("005930", "KR", "BUY", 1, 70000.0), "test")
-    assert ok is False
+    assert not ok
     assert b.account.position("005930").qty == 0                        # 원장 무변
     assert b.account.journal == []
     assert len(store.recent_events("live_order_pending", 0)) == 1
@@ -159,7 +159,7 @@ def test_live_sell_clamped_to_sellable(tmp_path):
     b = _live_broker(tmp_path, client, store=store,
                      positions={"005930": (10, 60000.0, "KR")})   # 원장엔 10주
     ok = b.execute(Order("005930", "KR", "SELL", 10, 70000.0), "test")  # 10주 매도 시도
-    assert ok is True
+    assert ok
     assert client.calls[0]["qty"] == 3                             # 실 매도가능 3주로 클램프
     assert client.calls[0]["side"] == "SELL"
 
@@ -172,7 +172,7 @@ def test_live_sell_sellable_zero_skips(tmp_path):
     b = _live_broker(tmp_path, client, store=store,
                      positions={"005930": (10, 60000.0, "KR")})
     ok = b.execute(Order("005930", "KR", "SELL", 10, 70000.0), "test")
-    assert ok is False
+    assert not ok
     assert len(client.calls) == 0                                  # 실주문 미발사
     assert len(store.recent_events("sell_skipped", 0)) == 1
 
@@ -183,7 +183,7 @@ def test_live_exception_no_fill_error_event(tmp_path):
     client = _MockClient(exc=RuntimeError("HTTP 400 rejected"))
     b = _live_broker(tmp_path, client, store=store)
     ok = b.execute(Order("005930", "KR", "BUY", 1, 70000.0), "test")
-    assert ok is False
+    assert not ok
     assert len(client.calls) == 1                       # 전송은 시도됨
     assert b.account.position("005930").qty == 0        # 체결 안 남음
     assert b.account.journal == []                       # 원장 무변화
@@ -197,7 +197,7 @@ def test_live_missing_order_id_fails(tmp_path):
     client = _MockClient(resp={"clientOrderId": "x"})   # orderId 없음
     b = _live_broker(tmp_path, client, store=store)
     ok = b.execute(Order("005930", "KR", "BUY", 1, 70000.0), "test")
-    assert ok is False
+    assert not ok
     assert b.account.position("005930").qty == 0
     assert b.account.journal == []
     assert len(store.recent_events("live_order_error", 0)) == 1
@@ -213,7 +213,7 @@ def test_live_market_outside_live_markets_blocked(tmp_path):
                      notional={"KR": 500_000, "US": 500_000},
                      live_markets=["KR"])
     ok = b.execute(Order("AAPL", "US", "BUY", 1, 100.0), "test")
-    assert ok is False
+    assert not ok
     assert len(client.calls) == 0                       # 실주문 미발사
     assert b.account.position("AAPL").qty == 0          # 원장에도 안 남음
 
@@ -266,5 +266,5 @@ def test_live_kill_switch_blocks_order(tmp_path):
     b = Broker(account=acct, gate=gate, client=client, mode="live",
                account_seq=1, live_markets=["KR"])
     ok = b.execute(Order("005930", "KR", "BUY", 1, 70000.0), "test")
-    assert ok is False
+    assert not ok
     assert len(client.calls) == 0                       # 게이트가 먼저 막아 미발사

@@ -36,7 +36,7 @@ def test_guard_blocks_buy_no_fill_and_event(tmp_path):
     b = _paper_broker(tmp_path, store=store,
                       tradable_fn=lambda s, m: (False, "부적격유형: ETF"))
     ok = b.execute(Order("069500", "KR", "BUY", 1, 30000.0), "test")
-    assert ok is False
+    assert not ok
     assert b.account.position("069500").qty == 0        # 미체결
     assert b.account.journal == []                       # 원장 무변화
     assert b.last_reject_reason == "부적격유형: ETF"
@@ -49,7 +49,7 @@ def test_guard_blocks_buy_no_fill_and_event(tmp_path):
 def test_guard_allows_buy_when_ok(tmp_path):
     b = _paper_broker(tmp_path, tradable_fn=lambda s, m: (True, ""))
     ok = b.execute(Order("005930", "KR", "BUY", 1, 70000.0), "test")
-    assert ok is True
+    assert ok
     assert b.account.position("005930").qty == 1        # 체결됨
 
 
@@ -66,7 +66,7 @@ def test_guard_does_not_block_sell(tmp_path):
     b.execute(Order("005930", "KR", "BUY", 2, 70000.0), "seed")   # 보유 2주
     b.tradable_fn = guard                                          # 이제 부적격으로
     ok = b.execute(Order("005930", "KR", "SELL", 1, 71000.0), "exit")
-    assert ok is True
+    assert ok
     assert b.account.position("005930").qty == 1                  # 1주 청산됨
     assert calls == []                                            # SELL 은 가드 미호출
 
@@ -74,7 +74,7 @@ def test_guard_does_not_block_sell(tmp_path):
 def test_guard_none_backward_compat(tmp_path):
     b = _paper_broker(tmp_path, tradable_fn=None)
     ok = b.execute(Order("005930", "KR", "BUY", 1, 70000.0), "test")
-    assert ok is True
+    assert ok
     assert b.account.position("005930").qty == 1
 
 
@@ -84,5 +84,5 @@ def test_guard_exception_fail_open(tmp_path):
 
     b = _paper_broker(tmp_path, tradable_fn=boom)
     ok = b.execute(Order("005930", "KR", "BUY", 1, 70000.0), "test")
-    assert ok is True                                             # fail-open → 체결
+    assert ok                                             # fail-open → 체결
     assert b.account.position("005930").qty == 1
