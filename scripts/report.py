@@ -38,11 +38,12 @@ def main() -> int:
     # 미실현손익 평가용 현재가
     price_lookup: dict[str, float] = {}
     if args.live:
-        from src.toss_client import TossClient, TossAPIError
-        client = TossClient(cfg.creds)
+        from src.engine.gateway import TossGateway
+        from src.toss_client import TossAPIError
+        gateway = TossGateway.from_config(cfg)
         syms = [s for s, p in acct.positions.items() if p.is_open]
         try:
-            for row in client.get_prices(syms) if syms else []:
+            for row in gateway.get_prices(syms):
                 price_lookup[row["symbol"]] = float(row["lastPrice"])
         except TossAPIError as e:
             log.warning("현재가 조회 실패, 평균단가로 평가: %s", e)

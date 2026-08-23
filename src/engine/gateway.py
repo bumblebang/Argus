@@ -78,15 +78,15 @@ class TossGateway:
     # ── 정밀층: 종목별 캔들/호가 (비싸다, 선별 호출 + TTL 캐시) ───────
     def candles(self, symbol: str, interval: str = "1m", count: int = 200) -> list[dict]:
         key = (symbol, interval, count)
-        if self.candle_ttl_sec > 0:
-            hit = self._candle_cache.get(key)
-            if hit and (time.time() - hit[0]) < self.candle_ttl_sec:
-                return hit[1]
         with self._lock:
+            if self.candle_ttl_sec > 0:
+                hit = self._candle_cache.get(key)
+                if hit and (time.time() - hit[0]) < self.candle_ttl_sec:
+                    return hit[1]
             data = self.client.get_candles(symbol, interval=interval, count=count)
-        if self.candle_ttl_sec > 0:
-            self._candle_cache[key] = (time.time(), data)
-        return data
+            if self.candle_ttl_sec > 0:
+                self._candle_cache[key] = (time.time(), data)
+            return data
 
     def get_rankings(self, **kw: Any) -> dict:
         """주식 랭킹(MARKET_TRADING_AMOUNT 등). 단일 게이트웨이 락 경유."""
@@ -125,3 +125,33 @@ class TossGateway:
     def get_buying_power(self, account_seq: int | str, market: str) -> dict:
         with self._lock:
             return self.client.get_buying_power(account_seq, market)
+
+    def fetch_account_snapshot(self, account_seq, markets=("KR",)) -> dict:
+        """account_refresher 전용 — gateway 락 경유."""
+        from ..datasources.account_snapshot import fetch_account_snapshot
+        with self._lock:
+            return fetch_account_snapshot(self.client, account_seq, markets=markets)
+
+    def refresh_market_sessions(self, markets=("KR", "US")) -> dict:
+        from ..datasources.market_calendar import refresh_sessions
+        with self._lock:
+            return refresh_sessions(self.client, markets)
+
+    def check_tradable(self, sym: str, mkt: str, *, info_cache, warn_cache) -> tuple[bool, str]:
+        from ..datasources.stock_info import check_tradable
+        with self._lock:
+            return check_tradable(sym, mkt, client=self.client,
+                                  info_cache=info_cache, warn_cache=warn_cache)
+
+    def get_accounts(self) -> list:
+        """doctor 등 일회성 스크립트용 — rate limiter·락 경유."""
+        with self._lock:
+            return self.client.get_accounts() or []
+
+    def get_prices(self, symbols: list[str]) -> list[dict]:
+        """report 등 일회성 스크립트용 — rate limiter·락 경유."""
+        syms = [s for s in symbols if s]
+        if not syms:
+            return []
+        with self._lock:
+            return self.client.get_prices(syms)

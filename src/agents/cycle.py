@@ -21,6 +21,15 @@ from ..risk_gate import Order
 log = get_logger("agents.cycle")
 
 
+def _already_held(broker, store, symbol: str) -> bool:
+    """broker 원장 또는 store open 행 — 피라미딩 차단(allow_add=False 일 때)."""
+    if broker.position(symbol).qty > 0:
+        return True
+    if store is not None:
+        return any(r["symbol"] == symbol for r in store.get_open_positions())
+    return False
+
+
 @dataclass
 class CycleResult:
     decision: DecisionOutput
@@ -40,7 +49,9 @@ def run_cycle(*, context_json: str, decision_agent, validation_agent, broker, ri
               min_lot_conviction: float | None = None,
               apply_code_conviction: bool = False,
               dossier_brief_fn=None,
-              features_by_sym: dict | None = None) -> CycleResult:
+              features_by_sym: dict | None = None,
+              store=None,
+              allow_add: bool = False) -> CycleResult:
     """결정→검증→집행. 데이트레(horizon='day') BUY 는 즉시 체결 대신 arm_fn 으로 라우팅.
 
     arm_fn(proposal, price)->bool 이 주어지면 day BUY 는 진입대기(armed)로 등록하고
@@ -135,6 +146,11 @@ def run_cycle(*, context_json: str, decision_agent, validation_agent, broker, ri
                                            f"(p {price:g} < inval {inval:g})"})
                 continue
 
+        if p.side == "BUY" and not allow_add and _already_held(broker, store, p.symbol):
+            executed.append({"symbol": p.symbol, "action": "BUY", "status": "already_held",
+                             "reason": "already holds position"})
+            continue
+
         if p.side == "BUY":
             weight = size_weight(p.target_weight, p.conviction,
                                  enabled=conviction_sizing)
@@ -148,9 +164,11 @@ def run_cycle(*, context_json: str, decision_agent, validation_agent, broker, ri
             qty = risk.size_buy(p.market, price, weight, min_qty=min_qty)
         else:  # SELL: 보유 수량 전량
             qty = broker.position(p.symbol).qty
-        # broker.execute 내부에서 하드 게이트가 최종 검증(한도·자금·킬스위치)
-        res = broker.execute(Order(p.symbol, p.market, p.side, qty, price),
-                                  reason=f"[agent] {p.thesis[:60]}")
+        exit_reason = "brain" if p.side == "SELL" else None
+        res = broker.execute(
+            Order(p.symbol, p.market, p.side, qty, price),
+            reason=f"[agent] {p.thesis[:60]}",
+            store=store, exit_reason=exit_reason)
         if res.partial:
             st = "partial"
         elif res.ok:
@@ -164,7 +182,9 @@ def run_cycle(*, context_json: str, decision_agent, validation_agent, broker, ri
                            or getattr(broker, "last_reject_reason", None)
                            or "리스크게이트 거부")
         executed.append({"symbol": p.symbol, "action": p.side,
-                         "status": st, "reason": exec_reason})
+                         "status": st, "reason": exec_reason,
+                         "avg_price": res.avg_price,
+                         "filled_qty": res.filled_qty if res.ok else 0.0})
 
     cycle_ts = time.time()
     cycle_ts_iso = datetime.fromtimestamp(cycle_ts, tz=timezone.utc).isoformat()

@@ -653,7 +653,8 @@ class CycleRunner:
                         min_lot_conviction=float(mlc) if mlc is not None else None,
                         apply_code_conviction=bool(agents_cfg.get("conviction_code", True)),
                         dossier_brief_fn=(self._dossier_brief if self.store else None),
-                        features_by_sym=feat_map)
+                        features_by_sym=feat_map,
+                        store=self.store)
         self._record(res)
         if self.store:
             from ..shadow_ledger import book_blocked, book_soft_pending
@@ -679,7 +680,7 @@ class CycleRunner:
         sym = proposal.symbol
         held = {r["symbol"] for r in self.store.get_open_positions()}
         pending = {r["symbol"] for r in self.store.get_armed()}
-        if sym in held or sym in pending:
+        if sym in held or sym in pending or self.broker.position(sym).qty > 0:
             return False
         horizon = proposal.horizon or "day"
         strat, params = resolve_strategy(self.cfg, sym, proposal)   # 뇌 선택 우선(클램프)
@@ -713,33 +714,67 @@ class CycleRunner:
         return True
 
     def sync_store_positions(self, res: CycleResult) -> None:
-        """페이퍼 계좌 ↔ store.positions 정합화(멱등).
-
-        새로 생긴 보유 → open_position(전략/thesis/손절/목표 포함, 감시 루프가 읽어 트리거).
-        평탄해진 보유 → close_position. 이게 있어야 데몬의 손절/익절 트리거가 실보유에 걸린다.
-        """
+        """페이퍼 계좌 ↔ store.positions 정합화(멱등). broker 락 안에서 실행."""
         if not self.store:
             return
+        self.broker.run_locked(lambda acct: self._sync_store_positions_locked(res, acct))
+
+    def _sync_store_positions_locked(self, res: CycleResult, acct) -> None:
+        """execute+mirror 후 orphan 승격·안전망 청산·메타 보강."""
+        from ..store_sync import is_orphan_store_row, sync_open_qty, _row_get
+
         prop_by_sym = {p.symbol: p for p in res.decision.proposals}
+        fill_by_sym = {
+            e["symbol"]: e for e in res.executed
+            if e.get("status") in ("filled", "partial")
+            and e.get("action") in ("BUY", "SELL")
+        }
         open_rows = {r["symbol"]: r for r in self.store.get_open_positions()}
-        acct = self.broker.account
-        for sym, pos in list(acct.positions.items()):   # 스냅샷(재대사 스레드와 경합 방지)
+        for sym, pos in list(acct.positions.items()):
             if not pos.is_open:
                 continue
-            if sym in open_rows:                      # 기존 보유: 수량/평단 갱신만
+            if sym in open_rows:
                 row = open_rows[sym]
-                if (abs(row["qty"] - pos.qty) > 1e-9
-                        or abs(row["avg_price"] - pos.avg_price) > 1e-9):
-                    self.store.update_position(row["id"], qty=pos.qty, avg_price=pos.avg_price)
+                if is_orphan_store_row(row):
+                    market = acct.symbol_market.get(sym, "KR")
+                    prop = prop_by_sym.get(sym)
+                    horizon = getattr(prop, "horizon", "swing") or "swing"
+                    strat, params = resolve_strategy(self.cfg, sym, prop)
+                    stop, target = entry_stop_target(pos.avg_price, horizon, params)
+                    d = self._dossier_brief(sym)
+                    if d and d.get("invalidation"):
+                        stop = d["invalidation"]
+                    if d and d.get("target"):
+                        target = d["target"]
+                    meta = {"horizon": horizon, "params": params,
+                            "entry_regime": self._regime_now.get(market),
+                            "dossier_id": (d["id"] if d else None),
+                            "conviction": getattr(prop, "conviction", None) if prop else None,
+                            "manager_epoch": (res.manager or {}).get("epoch") if res else None}
+                    from ..thesis_watch import default_spec_from_dossier
+                    meta["thesis_invalidation"] = default_spec_from_dossier(d, horizon)
+                    item = self._universe_item(sym)
+                    if item and item.get("source"):
+                        meta["source"] = item["source"]
+                    self.store.update_position(
+                        row["id"], qty=pos.qty, avg_price=pos.avg_price,
+                        strategy=strat, thesis=(prop.thesis if prop else _row_get(row, "thesis")),
+                        target_price=target, stop_price=stop, meta=meta)
+                elif (abs(float(row["qty"] or 0) - pos.qty) > 1e-9
+                      or abs(float(row["avg_price"] or 0) - pos.avg_price) > 1e-9):
+                    fe = fill_by_sym.get(sym) or {}
+                    sync_open_qty(
+                        self.store, row, sym, pos.qty, pos.avg_price, acct,
+                        exit_price=fe.get("avg_price") if fe.get("action") == "SELL" else None,
+                        reason="brain")
+                else:
+                    self.store.disarm_symbol(sym)
                 continue
             market = acct.symbol_market.get(sym, "KR")
             prop = prop_by_sym.get(sym)
             horizon = getattr(prop, "horizon", "swing") or "swing"
-            # 전략·파라미터는 뇌 선택 우선(없으면 config 폴백, 하드가드 클램프). 코드 전략
-            # 실행기(진입/청산)와 손절/목표가 모두 이 전략 기준으로 동작한다.
             strat, params = resolve_strategy(self.cfg, sym, prop)
             stop, target = entry_stop_target(pos.avg_price, horizon, params)
-            # 도시에가 있으면 무효화가/목표가를 손절/목표로(리서치 근거 레벨 > %기본값).
             d = self._dossier_brief(sym)
             if d and d.get("invalidation"):
                 stop = d["invalidation"]
@@ -750,25 +785,29 @@ class CycleRunner:
                     "dossier_id": (d["id"] if d else None),
                     "conviction": getattr(prop, "conviction", None) if prop else None,
                     "manager_epoch": (res.manager or {}).get("epoch") if res else None}
-            # thesis 무효화 시드(price+time). 뇌/Athena가 덮어쓸 수 있음.
             from ..thesis_watch import default_spec_from_dossier
             meta["thesis_invalidation"] = default_spec_from_dossier(d, horizon)
-            item = self._universe_item(sym)      # 성과귀속용 source 태그(gem 등, 있을 때만)
+            item = self._universe_item(sym)
             if item and item.get("source"):
                 meta["source"] = item["source"]
             self.store.open_position(
                 sym, market, pos.qty, pos.avg_price, strategy=strat,
                 thesis=(prop.thesis if prop else None),
                 target_price=target, stop_price=stop, meta=meta)
+            self.store.disarm_symbol(sym)
             from ..shadow_ledger import cancel_shadow_on_fill
             cancel_shadow_on_fill(self.store, sym)
-        for sym, row in open_rows.items():            # 계좌에서 사라진 보유 → 청산처리
+        for sym, row in open_rows.items():
             p = acct.positions.get(sym)
             if p is None or not p.is_open:
-                # 청산 체결가는 계좌 저널의 마지막 SELL 에서(성과귀속). 없으면 NULL.
-                exit_px = next((f.price for f in reversed(acct.journal)
-                                if f.symbol == sym and f.side == "SELL"), None)
-                self.store.close_position(row["id"], exit_price=exit_px, reason="brain")
+                fe = fill_by_sym.get(sym) or {}
+                exit_px = (fe.get("avg_price") if fe.get("action") == "SELL" else None
+                           or next((f.price for f in reversed(acct.journal)
+                                    if f.symbol == sym and f.side == "SELL"), None))
+                fee = next((f.fee for f in reversed(acct.journal)
+                            if f.symbol == sym and f.side == "SELL"), 0.0)
+                self.store.close_position(row["id"], exit_price=exit_px, reason="brain",
+                                          fee=fee)
 
     def _record(self, res: CycleResult) -> None:
         if not self.store:

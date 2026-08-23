@@ -82,6 +82,8 @@ class Broker:
         # 뇌 워커(진입)와 감시 루프(코드 청산)가 동시에 execute 할 수 있어 직렬화.
         # 주기 재대사(reconcile)도 이 락을 잡아 gate.check/체결과 원자적으로 계좌를 병합한다.
         self._lock = threading.Lock()
+        # 라이브: place_order~apply_fill 사이 동일 종목 중복 주문 차단.
+        self._inflight: set[str] = set()
         # 직전 execute 가 거부된 사유(한글). 성공 시 "". 저널/이벤트가 thesis 대신 기록.
         self.last_reject_reason: str = ""
         self.last_result: ExecuteResult | None = None
@@ -98,9 +100,93 @@ class Broker:
     def realized_pnl(self) -> dict:
         return self.account.realized_pnl
 
-    def execute(self, order: Order, reason: str) -> ExecuteResult:
+    def execute(self, order: Order, reason: str, *,
+                store=None,
+                armed_id: int | None = None,
+                plan_fn=None,
+                exit_reason: str | None = None) -> ExecuteResult:
+        """주문 집행. store 가 주어지면 apply_fill 과 mirror 를 **같은 락 구간**에서 처리."""
+        mirror_st = store if store is not None else None
+        base_kw = {"order_qty": float(order.qty), "limit_price": float(order.price)}
+
         with self._lock:
-            return self._execute_locked(order, reason)
+            if self._reject_inflight(order, base_kw):
+                return self.last_result
+
+        if self.mode == "live":
+            if not self._prepare_live_order(order):
+                with self._lock:
+                    if not self.last_reject_reason:
+                        self.last_reject_reason = "라이브 주문 준비 실패"
+                    self.last_result = ExecuteResult.rejected(
+                        self.last_reject_reason, **base_kw)
+                return self.last_result
+
+        with self._lock:
+            prep = self._begin_execute_locked(order, reason, base_kw)
+        if prep is None:
+            return self.last_result
+
+        sym = order.symbol
+        if prep["kind"] == "paper":
+            try:
+                with self._lock:
+                    res = self._finish_paper(order, reason, prep["base_kw"])
+                    self._mirror_after_fill(mirror_st, order, res, armed_id, plan_fn, exit_reason)
+                    return res
+            finally:
+                with self._lock:
+                    self._inflight.discard(sym)
+
+        try:
+            filled_qty, avg_px, fee, status = self._reconcile_order(prep["order_id"])
+            with self._lock:
+                res = self._finish_live(
+                    order, reason, prep["order_id"], prep["base_kw"],
+                    filled_qty, avg_px, fee, status,
+                    qty_before=prep.get("qty_before"))
+                self._mirror_after_fill(mirror_st, order, res, armed_id, plan_fn, exit_reason)
+                return res
+        finally:
+            with self._lock:
+                self._inflight.discard(sym)
+
+    def execute_with_mirror(
+        self, order: Order, reason: str, *,
+        store=None,
+        armed_id: int | None = None,
+        plan_fn=None,
+        exit_reason: str | None = None,
+    ) -> ExecuteResult:
+        """execute(..., store=...) 와 동일 — 하위호환 별칭."""
+        return self.execute(order, reason, store=store, armed_id=armed_id,
+                            plan_fn=plan_fn, exit_reason=exit_reason)
+
+    def _mirror_after_fill(self, store, order: Order, res: ExecuteResult,
+                           armed_id, plan_fn, exit_reason) -> None:
+        if store is None or not res.ok:
+            return
+        from .store_fill import mirror_symbol_to_store
+        mirror_symbol_to_store(
+            store, self, order.symbol, fill=res,
+            armed_id=armed_id, plan_fn=plan_fn, exit_reason=exit_reason)
+
+    def set_marks(self, price_of: dict[str, float]) -> None:
+        """실시간 평가가 갱신 — gate.check 와 reconcile 이 같은 marks 를 보도록 락 안에서."""
+        with self._lock:
+            self.account.set_marks(price_of)
+
+    def run_locked(self, fn: Callable[[PaperAccount], Any]) -> Any:
+        """account 읽기/동기화를 broker 락 안에서 실행(reconcile/sync 공용)."""
+        with self._lock:
+            return fn(self.account)
+
+    def sync_from_live(self, gateway, store=None, *, markets=("KR", "US")) -> dict:
+        """기동 동기화 — API fetch(락 밖) + apply( run_locked ). sync_from_live 직접 호출 금지."""
+        from .broker_sync import apply_sync_from_live, fetch_live_account_data
+        data = fetch_live_account_data(gateway, self.account_seq, markets=markets)
+        return self.run_locked(
+            lambda acct: apply_sync_from_live(acct, store, data, markets=markets))
 
     def reconcile(self, reconcile_fn: Callable[[PaperAccount], Any]) -> Any:
         """주기 재대사를 broker 락 안에서 실행 — gate.check/체결과 원자적으로 원장을 병합.
@@ -108,24 +194,47 @@ class Broker:
         reconcile_fn(account) 이 실계좌(holdings/buying-power)를 account.cash/positions 에
         병합한다(봇 관리 포지션의 thesis/손절은 보존, 고아는 채택). 락 밖에서 계좌를
         갈아끼우면 진행 중인 gate._invested 순회와 경합하므로 반드시 이 경로로만 병합한다.
+
+        in-flight 주문(체결 폴링 중)이 있으면 apply 를 연기한다 — live holdings 가 이미
+        체결을 반영한 뒤 _finish_live 가 apply_fill 을 중복 적용하는 레이스 방지.
         """
         with self._lock:
+            if self._inflight:
+                syms = sorted(self._inflight)
+                log.debug("재대사 연기 — in-flight %s", syms)
+                return {"deferred": True, "inflight": syms}
             return reconcile_fn(self.account)
 
-    def _execute_locked(self, order: Order, reason: str) -> ExecuteResult:
+    def _ledger_already_has_fill(self, order: Order, filled_qty: float,
+                                 qty_before: float | None) -> bool:
+        """주기 재대사가 live holdings 로 이미 체결을 반영했는지(이중 apply_fill 방지)."""
+        if qty_before is None:
+            return False
+        pos = self.account.position(order.symbol)
+        eps = 1e-9
+        if order.side == "BUY":
+            expected = qty_before + filled_qty
+            return abs(pos.qty - expected) < eps and abs(pos.qty - qty_before) > eps
+        sell_qty = min(filled_qty, qty_before)
+        expected = max(0.0, qty_before - sell_qty)
+        return abs(pos.qty - expected) < eps and sell_qty > eps
+
+    def _reject_inflight(self, order: Order, base_kw: dict) -> bool:
+        """in-flight 거부. True 이면 last_result 설정됨."""
+        if order.symbol not in self._inflight:
+            return False
+        self.last_reject_reason = "동일 종목 주문 처리 중(in-flight)"
+        log.info("[거부] %s %s — in-flight", order.side, order.symbol)
+        self.last_result = ExecuteResult.rejected(self.last_reject_reason, **base_kw)
+        return True
+
+    def _begin_execute_locked(self, order: Order, reason: str,
+                              base_kw: dict) -> dict | None:
+        """락 안: 게이트·주문 접수까지. 라이브 prep(I/O)은 execute()에서 락 밖 선행."""
         self.last_reject_reason = ""
         self.last_result = None
-        base_kw = {"order_qty": float(order.qty), "limit_price": float(order.price)}
-        # 라이브: 게이트 '이전에' 실체결 조건을 반영한다 — SELL 은 실 매도가능 수량으로
-        # 클램프, 주문가는 호가북 마켓터블 리밋가로 갱신. 그래야 하드 게이트(notional·비중·
-        # 매도수량)가 명목 견적가가 아닌 실체결 상한/실보유를 검증한다.
-        if self.mode == "live":
-            if not self._prepare_live_order(order):
-                if not self.last_reject_reason:
-                    self.last_reject_reason = "라이브 주문 준비 실패"
-                self.last_result = ExecuteResult.rejected(
-                    self.last_reject_reason, **base_kw)
-                return self.last_result
+        if self._reject_inflight(order, base_kw):
+            return None
 
         decision = self.gate.check(order, self.account)
         if not decision.approved:
@@ -134,10 +243,8 @@ class Broker:
                      order.side, order.symbol, order.qty, order.price, decision.reason)
             self.last_result = ExecuteResult.rejected(
                 self.last_reject_reason, **base_kw)
-            return self.last_result
+            return None
 
-        # 매수 안전가드(BUY 한정): 부적격 종목이면 게이트 통과 후에도 최종 차단한다. SELL 은
-        # 가드하지 않는다(위험 종목이어도 청산=위험축소는 허용). 판정 예외는 fail-open(매수 허용).
         if order.side == "BUY" and self.tradable_fn is not None:
             try:
                 ok, block_reason = self.tradable_fn(order.symbol, order.market)
@@ -150,20 +257,79 @@ class Broker:
                 self._emit("buy_blocked", order, {"symbol": order.symbol, "reason": block_reason})
                 self.last_result = ExecuteResult.rejected(
                     self.last_reject_reason, **base_kw)
-                return self.last_result
+                return None
 
-        if self.mode == "live":
-            self.last_result = self._execute_live(order, reason)
-            return self.last_result
+        qty_before = float(self.account.position(order.symbol).qty)
+        if self.mode != "live":
+            self._inflight.add(order.symbol)
+            return {"kind": "paper", "base_kw": base_kw, "qty_before": qty_before}
 
+        order_id = self._place_live_order(order, reason)
+        if order_id is None:
+            return None
+        self._inflight.add(order.symbol)  # place 직후(락 안) — 중복 주문 race 차단
+        return {"kind": "live", "order_id": order_id, "base_kw": base_kw,
+                "qty_before": qty_before}
+
+    def _finish_paper(self, order: Order, reason: str, base_kw: dict) -> ExecuteResult:
         fill = self.account.fill(order.symbol, order.market, order.side,
                                  order.qty, order.price, reason)
         log.info("[PAPER] %s %s x%s @ %.2f (fee %.2f) - %s",
                  fill.side, fill.symbol, fill.qty, fill.price, fill.fee, reason)
         self.last_result = ExecuteResult.from_fill(
             fill_qty=fill.qty, fill_price=fill.price, fee=fill.fee,
-            status="FILLED", **base_kw)
+            status="FILLED", side=order.side, **base_kw)
         return self.last_result
+
+    def _finish_live(self, order: Order, reason: str, order_id: str, base_kw: dict,
+                     filled_qty: float, avg_px: float | None, fee: float,
+                     status: str, *, qty_before: float | None = None) -> ExecuteResult:
+        if filled_qty > 0 and avg_px and avg_px > 0:
+            if self._ledger_already_has_fill(order, filled_qty, qty_before):
+                log.info("[LIVE] 체결 id=%s — 원장 이미 반영(재대사), apply_fill 스킵",
+                         order_id)
+            else:
+                fill = self.account.apply_fill(order.symbol, order.market, order.side,
+                                               filled_qty, avg_px, fee, reason)
+                log.info("[LIVE] 체결 id=%s status=%s — %s %s x%s @ %.2f (fee %.2f) - %s",
+                         order_id, status, fill.side, fill.symbol, fill.qty, fill.price,
+                         fill.fee, reason)
+            self._emit("live_order", order,
+                       {"symbol": order.symbol, "side": order.side, "qty": filled_qty,
+                        "price": avg_px, "fee": fee, "order_id": order_id,
+                        "status": status, "limit_price": order.price})
+            self.last_result = ExecuteResult.from_fill(
+                fill_qty=filled_qty, fill_price=avg_px, fee=fee,
+                order_qty=order.qty, limit_price=order.price,
+                status=status, order_id=order_id, side=order.side)
+            return self.last_result
+
+        kind = "live_order_pending" if status in _PENDING else "live_order_error"
+        log.warning("[LIVE] 미체결 id=%s status=%s — 원장 무변(주기 재대사가 반영): %s %s x%s",
+                    order_id, status, order.side, order.symbol, order.qty)
+        self._emit(kind, order,
+                   {"symbol": order.symbol, "side": order.side, "qty": order.qty,
+                    "order_id": order_id, "status": status, "reason": reason})
+        self.last_result = ExecuteResult.rejected(
+            f"미체결({status})", order_qty=order.qty, limit_price=order.price)
+        return self.last_result
+
+    def _execute_locked(self, order: Order, reason: str) -> ExecuteResult:
+        """하위호환 — execute() 가 _begin_execute_locked/_finish_* 로 분리됨."""
+        base_kw = {"order_qty": float(order.qty), "limit_price": float(order.price)}
+        if self.mode == "live" and not self._prepare_live_order(order):
+            if not self.last_reject_reason:
+                self.last_reject_reason = "라이브 주문 준비 실패"
+            self.last_result = ExecuteResult.rejected(self.last_reject_reason, **base_kw)
+            return self.last_result
+        prep = self._begin_execute_locked(order, reason, base_kw)
+        if prep is None:
+            return self.last_result
+        if prep["kind"] == "paper":
+            return self._finish_paper(order, reason, prep["base_kw"])
+        filled_qty, avg_px, fee, status = self._reconcile_order(prep["order_id"])
+        return self._finish_live(order, reason, prep["order_id"], prep["base_kw"],
+                                 filled_qty, avg_px, fee, status)
 
     def _prepare_live_order(self, order: Order) -> bool:
         """라이브 주문을 게이트 이전에 실조건으로 보정. 진행 가능하면 True.
@@ -302,13 +468,9 @@ class Broker:
                 break
         return picked
 
-    def _execute_live(self, order: Order, reason: str) -> ExecuteResult:
-        """라이브 실주문 집행. _prepare_live_order + 게이트 통과 후 호출된다(지정가).
-
-        주문 접수 후 get_order 로 체결을 대사해 **실체결 수량·평균가·수수료·세금**으로만
-        원장을 기록한다 — 거부/미체결(orderId 없음·펜딩)은 원장에 남지 않고, 부분체결은
-        체결분만 기록한다(잔량은 주기 재대사가 반영). 이로써 원장이 실계좌를 정확히 미러한다.
-        """
+    def _place_live_order(self, order: Order, reason: str) -> str | None:
+        """라이브 주문 접수만(락 안). orderId 또는 None(실패 시 last_result 설정)."""
+        base_kw = {"order_qty": float(order.qty), "limit_price": float(order.price)}
         try:
             resp = self.client.place_order(
                 account_seq=self.account_seq, symbol=order.symbol, side=order.side,
@@ -317,8 +479,9 @@ class Broker:
             log.error("[LIVE] 주문 전송 실패 — %s %s x%s @ %.2f: %s",
                       order.side, order.symbol, order.qty, order.price, e)
             self._emit("live_order_error", order, {"error": str(e), "reason": reason})
-            return ExecuteResult.rejected("주문 전송 실패", order_qty=order.qty,
-                                          limit_price=order.price)
+            self.last_result = ExecuteResult.rejected(
+                "주문 전송 실패", **base_kw)
+            return None
 
         order_id = self._order_id(resp)
         if order_id is None:
@@ -326,34 +489,9 @@ class Broker:
             self._emit("live_order_error", order,
                        {"error": "응답에 orderId 없음", "resp": str(resp)[:300],
                         "reason": reason})
-            return ExecuteResult.rejected("orderId 없음", order_qty=order.qty,
-                                          limit_price=order.price)
-
-        filled_qty, avg_px, fee, status = self._reconcile_order(order_id)
-        if filled_qty > 0 and avg_px and avg_px > 0:
-            fill = self.account.apply_fill(order.symbol, order.market, order.side,
-                                           filled_qty, avg_px, fee, reason)
-            log.info("[LIVE] 체결 id=%s status=%s — %s %s x%s @ %.2f (fee %.2f) - %s",
-                     order_id, status, fill.side, fill.symbol, fill.qty, fill.price,
-                     fill.fee, reason)
-            self._emit("live_order", order,
-                       {"symbol": order.symbol, "side": order.side, "qty": filled_qty,
-                        "price": avg_px, "fee": fee, "order_id": order_id,
-                        "status": status, "limit_price": order.price})
-            return ExecuteResult.from_fill(
-                fill_qty=filled_qty, fill_price=avg_px, fee=fee,
-                order_qty=order.qty, limit_price=order.price,
-                status=status, order_id=order_id)
-
-        # 미체결(펜딩/거부/취소) — 원장 무변. 펜딩은 주기 재대사가 이후 체결을 반영한다.
-        kind = "live_order_pending" if status in _PENDING else "live_order_error"
-        log.warning("[LIVE] 미체결 id=%s status=%s — 원장 무변(주기 재대사가 반영): %s %s x%s",
-                    order_id, status, order.side, order.symbol, order.qty)
-        self._emit(kind, order,
-                   {"symbol": order.symbol, "side": order.side, "qty": order.qty,
-                    "order_id": order_id, "status": status, "reason": reason})
-        return ExecuteResult.rejected(
-            f"미체결({status})", order_qty=order.qty, limit_price=order.price)
+            self.last_result = ExecuteResult.rejected("orderId 없음", **base_kw)
+            return None
+        return order_id
 
     def _reconcile_order(self, order_id: str) -> tuple[float, float | None, float, str]:
         """주문을 폴링해 (체결수량, 평균체결가, 수수료+세금, status).

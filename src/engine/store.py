@@ -153,9 +153,35 @@ class Store:
         """기존 DB 에 새 컬럼 추가(멱등). CREATE IF NOT EXISTS 는 기존 테이블을 못 바꾼다."""
         cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(positions)")}
         for name, ddl in (("exit_price", "exit_price REAL"), ("pnl", "pnl REAL"),
-                          ("exit_reason", "exit_reason TEXT")):
+                          ("exit_reason", "exit_reason TEXT"),
+                          ("parent_id", "parent_id INTEGER")):
             if name not in cols:
                 self.conn.execute(f"ALTER TABLE positions ADD COLUMN {ddl}")
+        self._dedupe_open_positions()
+        self.conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_positions_one_open_per_symbol "
+            "ON positions(symbol) WHERE state='open'")
+
+    def _dedupe_open_positions(self) -> None:
+        """symbol 당 open 2행 이상이면 최신 id만 남기고 나머지는 closed 처리."""
+        dupes = self.conn.execute(
+            "SELECT symbol FROM positions WHERE state='open' "
+            "GROUP BY symbol HAVING COUNT(*) > 1").fetchall()
+        if not dupes:
+            return
+        now = time.time()
+        for row in dupes:
+            sym = row["symbol"]
+            ids = [int(r["id"]) for r in self.conn.execute(
+                "SELECT id FROM positions WHERE symbol=? AND state='open' ORDER BY id",
+                (sym,)).fetchall()]
+            keep = ids[-1]
+            for rid in ids[:-1]:
+                self.conn.execute(
+                    "UPDATE positions SET state='closed', closed_at=?, updated_at=?,"
+                    " exit_reason=? WHERE id=?",
+                    (now, now, "dedupe:duplicate_open", rid))
+        self.conn.commit()
 
     def close(self) -> None:
         with self._lock:
@@ -184,6 +210,19 @@ class Store:
             self.conn.commit()
         return len(params)
 
+    def nearest_snapshot_price(self, symbol: str, ts: float, *,
+                               window_sec: float = 3600) -> float | None:
+        """ts 근처 snapshots 가격 — shadow_ledger 등 Store._lock 경유 조회용."""
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT price FROM snapshots WHERE symbol=? AND ts BETWEEN ? AND ? "
+                "ORDER BY ABS(ts-?) LIMIT 1",
+                (symbol, ts - window_sec, ts + window_sec, ts),
+            ).fetchone()
+            if row and row[0]:
+                return float(row[0])
+        return None
+
     def record_decision(self, symbol: str | None, action: str | None,
                         conviction: float | None = None, thesis: str | None = None,
                         verdict: str | None = None, payload: dict | None = None,
@@ -198,13 +237,27 @@ class Store:
                       strategy: str | None = None, thesis: str | None = None,
                       target_price: float | None = None, stop_price: float | None = None,
                       meta: dict | None = None) -> int:
+        """open 포지션 등록. 동일 symbol open 행이 있으면 qty/avg 갱신(중복 open 방지)."""
         now = time.time()
-        return self._insert(
-            "INSERT INTO positions(symbol, market, strategy, state, qty, avg_price, thesis,"
-            " target_price, stop_price, opened_at, updated_at, meta)"
-            " VALUES(?,?,?,'open',?,?,?,?,?,?,?,?)",
-            (symbol, market, strategy, qty, avg_price, thesis,
-             target_price, stop_price, now, now, _dumps(meta)))
+        with self._lock:
+            dup = self.conn.execute(
+                "SELECT id FROM positions WHERE symbol=? AND state='open'", (symbol,)
+            ).fetchone()
+            if dup:
+                pid = int(dup["id"])
+                self.conn.execute(
+                    "UPDATE positions SET qty=?, avg_price=?, updated_at=? WHERE id=?",
+                    (qty, avg_price, now, pid))
+                self.conn.commit()
+                return pid
+            cur = self.conn.execute(
+                "INSERT INTO positions(symbol, market, strategy, state, qty, avg_price, thesis,"
+                " target_price, stop_price, opened_at, updated_at, meta)"
+                " VALUES(?,?,?,'open',?,?,?,?,?,?,?,?)",
+                (symbol, market, strategy, qty, avg_price, thesis,
+                 target_price, stop_price, now, now, _dumps(meta)))
+            self.conn.commit()
+            return int(cur.lastrowid)
 
     def get_open_positions(self) -> list[sqlite3.Row]:
         """실보유 포지션만(armed 진입대기 제외). 감시 루프의 손절/익절·전략청산 대상."""
@@ -247,6 +300,17 @@ class Store:
         if meta is not None:
             sets.append("meta=?"); vals.append(_dumps(meta))
         with self._lock:
+            sym_row = self.conn.execute(
+                "SELECT symbol FROM positions WHERE id=?", (pos_id,)).fetchone()
+            if sym_row:
+                sym = sym_row["symbol"]
+                for row in self.conn.execute(
+                        "SELECT id FROM positions WHERE symbol=? AND state='open' AND id!=?",
+                        (sym, pos_id)).fetchall():
+                    self.conn.execute(
+                        "UPDATE positions SET state='closed', closed_at=?, updated_at=?,"
+                        " exit_reason=? WHERE id=?",
+                        (now, now, "dedupe:promote_merge", int(row["id"])))
             self.conn.execute(f"UPDATE positions SET {', '.join(sets)} WHERE id=?",
                               (*vals, pos_id))
             self.conn.commit()
@@ -261,25 +325,84 @@ class Store:
             self.conn.execute(f"UPDATE positions SET {cols} WHERE id=?", (*vals, pos_id))
             self.conn.commit()
 
-    def close_position(self, pos_id: int, *, exit_price: float | None = None,
-                       reason: str | None = None) -> None:
-        """청산 처리 + 성과귀속 기록. exit_price 가 있으면 pnl=(exit-avg)×qty 를 확정한다.
+    def disarm_symbol(self, symbol: str, *, exclude_id: int | None = None,
+                      reason: str = "disarm:already_held") -> int:
+        """보유 중인 종목의 stale armed 행을 해제(피라미딩 누수 방지). promote 대상은 exclude."""
+        now = time.time()
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT id FROM positions WHERE symbol=? AND state='armed'",
+                (symbol,)).fetchall()
+            n = 0
+            for row in rows:
+                rid = int(row["id"])
+                if exclude_id is not None and rid == int(exclude_id):
+                    continue
+                self.conn.execute(
+                    "UPDATE positions SET state='closed', closed_at=?, updated_at=?,"
+                    " exit_reason=? WHERE id=?",
+                    (now, now, reason, rid))
+                n += 1
+            if n:
+                self.conn.commit()
+            return n
 
-        pnl 은 수수료 제외(원장 손익은 페이퍼 계좌가 정확) — 귀속 통계엔 충분하다.
-        exit_price 없이 닫으면(armed 해제 등) pnl 은 NULL 로 남아 통계에서 제외된다.
+    def record_partial_exit(self, pos_id: int, sell_qty: float, exit_price: float,
+                            *, reason: str | None = None, fee: float = 0.0) -> None:
+        """부분 매도 귀속 — 매도 slice 를 closed 행으로 기록하고 open qty 를 줄인다."""
+        now = time.time()
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM positions WHERE id=?", (pos_id,)).fetchone()
+            if not row or row["state"] != "open":
+                return
+            old_qty = float(row["qty"] or 0)
+            avg = float(row["avg_price"] or 0)
+            sell_qty = min(float(sell_qty), old_qty)
+            if sell_qty <= 1e-9 or not avg:
+                return
+            pnl = (float(exit_price) - avg) * sell_qty - float(fee or 0)
+            new_qty = old_qty - sell_qty
+            self.conn.execute(
+                "INSERT INTO positions(symbol, market, strategy, state, qty, avg_price, thesis,"
+                " target_price, stop_price, opened_at, updated_at, closed_at, exit_price, pnl,"
+                " exit_reason, meta, parent_id)"
+                " VALUES(?,?,?,'closed',?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (row["symbol"], row["market"], row["strategy"], sell_qty, avg,
+                 row["thesis"], row["target_price"], row["stop_price"],
+                 row["opened_at"], now, now, exit_price, pnl,
+                 reason or "partial_exit", row["meta"], pos_id))
+            if new_qty <= 1e-9:
+                self.conn.execute(
+                    "UPDATE positions SET state='closed', qty=0, closed_at=?, updated_at=?,"
+                    " exit_reason=?, parent_id=? WHERE id=?",
+                    (now, now, reason or "partial_exit", pos_id, pos_id))
+            else:
+                self.conn.execute(
+                    "UPDATE positions SET qty=?, updated_at=? WHERE id=?",
+                    (new_qty, now, pos_id))
+            self.conn.commit()
+
+    def close_position(self, pos_id: int, *, exit_price: float | None = None,
+                       reason: str | None = None, fee: float = 0.0) -> None:
+        """청산 처리 + 성과귀속 기록. exit_price 가 있으면 pnl=(exit-avg)×qty-fee 를 확정.
+
+        pnl 은 account.realized_pnl(수수료 포함)과 맞춘다. exit_price 없이 닫으면 pnl NULL.
         """
         now = time.time()
         with self._lock:
             pnl = None
+            parent_id = pos_id
             if exit_price is not None:
                 row = self.conn.execute(
                     "SELECT qty, avg_price FROM positions WHERE id=?", (pos_id,)).fetchone()
                 if row and row["qty"] and row["avg_price"]:
-                    pnl = (float(exit_price) - float(row["avg_price"])) * float(row["qty"])
+                    pnl = ((float(exit_price) - float(row["avg_price"])) * float(row["qty"])
+                           - float(fee or 0))
             self.conn.execute(
                 "UPDATE positions SET state='closed', closed_at=?, updated_at=?,"
-                " exit_price=?, pnl=?, exit_reason=? WHERE id=?",
-                (now, now, exit_price, pnl, reason, pos_id))
+                " exit_price=?, pnl=?, exit_reason=?, parent_id=? WHERE id=?",
+                (now, now, exit_price, pnl, reason, parent_id, pos_id))
             self.conn.commit()
 
     def get_closed_positions(self, since: float | None = None,

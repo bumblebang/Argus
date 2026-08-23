@@ -19,7 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.config import load_config
 from src.logging_setup import setup_logging, get_logger
-from src.toss_client import TossClient
+from src.engine.gateway import TossGateway
 from src.agents.pipeline import (CycleRunner, select_backend, build_live_llm,
                                  synth_candles, dry_llm_factory)
 
@@ -56,8 +56,8 @@ def main() -> int:
         live_llm = build_live_llm(cfg, use_cli=use_cli, subscription=subscription,
                                   api_key=api_key)
         llm_factory = lambda cands: live_llm
-        client = TossClient(cfg.creds)
-        fetch_raw = lambda s, m: client.get_candles(s, "1d", 30)
+        gateway = TossGateway.from_config(cfg)
+        fetch_raw = lambda s, m: gateway.candles(s, "1d", 30)
 
     runner = CycleRunner(cfg, llm_factory=llm_factory, fetch_candles=fetch_raw)
 

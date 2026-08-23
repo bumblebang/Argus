@@ -14,7 +14,7 @@ import json
 import time
 
 from ..logging_setup import get_logger
-from ..store_fill import fill_event_payload, mirror_symbol_to_store
+from ..store_fill import fill_event_payload
 from ..risk_gate import Order
 from ..runner import candles_to_df, patch_live_price
 from ..strategies import build_strategy, REGISTRY
@@ -78,15 +78,14 @@ class ExitExecutor:
             return False
         kind = getattr(trigger, "kind", "exit")
         sell_qty = pos.qty
-        res = self.broker.execute(Order(symbol, market, "SELL", sell_qty, price),
-                                  reason=f"[exit] {kind}")
+        res = self.broker.execute_with_mirror(
+            Order(symbol, market, "SELL", sell_qty, price),
+            reason=f"[exit] {kind}", store=self.store, exit_reason=kind)
         if not res:
             why = res.reject_reason or getattr(self.broker, "last_reject_reason", None) or "gate_rejected"
             self.store.log_event("error", symbol,
                                  {"where": "exit", "kind": kind, "reason": why})
             return False
-        mirror_symbol_to_store(self.store, self.broker, symbol,
-                               fill=res, exit_reason=kind)
         acct = self.broker.position(symbol)
         self.store.log_event("exit", symbol, fill_event_payload(
             res, kind=kind, price=res.avg_price or price, qty=sell_qty,
@@ -128,6 +127,9 @@ class EntryExecutor:
             return self._evaluate_zone(armed, market, price, meta, zone)
 
         sym = armed.get("symbol")
+        if sym and (any(r["symbol"] == sym for r in self.store.get_open_positions())
+                    or self.broker.position(sym).qty > 0):
+            return {"action": "skip", "executed": False, "reason": "already_held"}
         name = armed.get("strategy")
         if not name or name not in REGISTRY:
             return {"action": "skip", "executed": False, "reason": "전략 미배정"}
@@ -148,16 +150,16 @@ class EntryExecutor:
         if qty <= 0:
             return {"action": "buy", "executed": False, "reason": "사이징 0"}
 
-        res = self.broker.execute(Order(sym, market, "BUY", qty, price),
-                                  reason=f"[entry:{name}] {sig.reason}")
+        res = self.broker.execute_with_mirror(
+            Order(sym, market, "BUY", qty, price),
+            reason=f"[entry:{name}] {sig.reason}",
+            store=self.store, armed_id=armed["id"], plan_fn=self.plan_fn)
         if not res:
             why = res.reject_reason or getattr(self.broker, "last_reject_reason", None) or "gate_rejected"
             self.store.log_event("error", sym, {"where": "entry", "reason": why})
             return {"action": "buy", "executed": False, "reason": why}
 
         from ..shadow_ledger import cancel_shadow_on_fill
-        mirror_symbol_to_store(self.store, self.broker, sym, fill=res,
-                               armed_id=armed["id"], plan_fn=self.plan_fn)
         cancel_shadow_on_fill(self.store, sym)
         acct = self.broker.position(sym)
         self.store.log_event("entry", sym, fill_event_payload(
@@ -175,6 +177,9 @@ class EntryExecutor:
         불필요하고, gateway.candles 호출은 CHART 예산을 쓰므로 여기선 호출하지 않는다.
         """
         sym = armed.get("symbol")
+        if sym and (any(r["symbol"] == sym for r in self.store.get_open_positions())
+                    or self.broker.position(sym).qty > 0):
+            return {"action": "skip", "executed": False, "reason": "already_held"}
         if not price or price <= 0:
             return {"action": "hold", "executed": False, "reason": "가격 미확보(존 모드)"}
 
@@ -194,16 +199,16 @@ class EntryExecutor:
             qty = self.risk.size_buy(market, price, weight, min_qty=min_qty)
             if qty <= 0:
                 return {"action": "buy", "executed": False, "reason": "사이징 0"}
-            res = self.broker.execute(Order(sym, market, "BUY", qty, price),
-                                      reason="[entry:zone] 존 진입")
+            res = self.broker.execute_with_mirror(
+                Order(sym, market, "BUY", qty, price),
+                reason="[entry:zone] 존 진입",
+                store=self.store, armed_id=armed["id"],
+                plan_fn=lambda p, h, params: (zone["invalidation"], zone.get("target")))
             if not res:
                 why = res.reject_reason or getattr(self.broker, "last_reject_reason", None) or "gate_rejected"
                 self.store.log_event("error", sym, {"where": "entry", "reason": why})
                 return {"action": "buy", "executed": False, "reason": why}
             from ..shadow_ledger import cancel_shadow_on_fill
-            mirror_symbol_to_store(
-                self.store, self.broker, sym, fill=res, armed_id=armed["id"],
-                plan_fn=lambda p, h, params: (zone["invalidation"], zone.get("target")))
             cancel_shadow_on_fill(self.store, sym)
             acct = self.broker.position(sym)
             self.store.log_event("entry", sym, fill_event_payload(

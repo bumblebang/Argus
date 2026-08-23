@@ -15,7 +15,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from src.config import load_config
 from src.logging_setup import setup_logging, get_logger
-from src.toss_client import TossClient, TossAPIError
+from src.engine.gateway import TossGateway
+from src.toss_client import TossAPIError
 
 from doctor import mask_acct
 
@@ -29,7 +30,8 @@ def main() -> int:
         log.error("CLIENT_ID/SECRET 누락 — .env 를 채우세요.")
         return 1
 
-    client = TossClient(cfg.creds)
+    gateway = TossGateway.from_config(cfg)
+    client = gateway.client
     try:
         client._ensure_token()
         log.info("토큰 OK")
@@ -39,7 +41,7 @@ def main() -> int:
 
     seq = cfg.creds.account_no or None
     try:
-        accts = client.get_accounts() or []
+        accts = gateway.get_accounts() or []
         bits = [f"seq={a.get('accountSeq')} no={mask_acct(a.get('accountNo'))}"
                 for a in accts[:4]]
         log.info("계좌 %d건 (%s)", len(accts), ", ".join(bits) or "없음")
@@ -49,23 +51,26 @@ def main() -> int:
         log.warning("계좌 조회 실패: %s", e)
 
     try:
-        px = client.get_prices("005930")
+        px = gateway.get_prices(["005930"])
         last = None
-        if isinstance(px, dict):
-            last = px.get("last") or px.get("close") or px.get("tradePrice")
+        if px:
+            r0 = px[0] if isinstance(px, list) else px
+            if isinstance(r0, dict):
+                last = r0.get("lastPrice") or r0.get("last") or r0.get("close")
         log.info("시세 005930 %s", last if last is not None else "OK")
     except TossAPIError as e:
         log.warning("시세 실패: %s", e)
 
     if seq:
         try:
-            holds = client.get_holdings(seq) or []
-            n = len(holds) if isinstance(holds, list) else 1
+            holds = gateway.get_holdings(seq) or {}
+            items = holds.get("items") if isinstance(holds, dict) else holds
+            n = len(items) if isinstance(items, list) else 1
             log.info("보유 조회 OK (%s종목) — 잔고 금액은 출력하지 않음", n)
         except TossAPIError as e:
             log.warning("보유 조회 실패: %s", e)
         try:
-            client.get_buying_power(seq, "KR")
+            gateway.get_buying_power(seq, "KR")
             log.info("매수여력 조회 OK — 금액은 출력하지 않음")
         except TossAPIError as e:
             log.warning("매수여력 조회 실패: %s", e)

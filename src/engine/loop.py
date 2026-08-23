@@ -766,7 +766,7 @@ class WatchLoop:
                     continue
                 if sym in positions:                 # 보유분 → 전략기반 청산 대상
                     managed.append((market, sym, positions[sym]))
-                if sym in armed:                     # 진입대기 → 전략기반 진입 대상
+                if sym in armed and sym not in positions:  # 진입대기(미보유만)
                     # 프리·애프터에서도 day/swing/position 진입. 데이트레 오버나잇은
                     # 오늘 마지막 허용 세션 종료 N분 전(_session_end_flatten)이 막는다.
                     armed_list.append((market, sym, armed[sym]))

@@ -4,8 +4,8 @@ store 의 청산 완료 포지션(pnl 확정)과 결정 저널을 읽어, 전략
 최근 거래 결과를 집계한다. 이 출력이 뇌 컨텍스트(track_record)에 주입되어
 뇌가 "내 과거 판단이 실제로 어땠는지"를 보고 다음 판단을 조정할 수 있게 한다.
 
-전부 읽기전용·순수 집계 — 매매 경로에 영향 없음. pnl 은 수수료 제외 원장이므로
-정밀 회계가 아니라 '전략/종목이 통하는가'의 신호로 쓴다.
+전부 읽기전용·순수 집계 — 매매 경로에 영향 없음. pnl 은 mirror 경로에서
+수수료를 반영해 account.realized_pnl 과 맞춘다.
 """
 from __future__ import annotations
 
@@ -22,29 +22,38 @@ _DAY = 86400.0
 MIN_SAMPLE = 5
 
 
-def _ret_pct(row) -> float | None:
-    """거래 수익률(%) = pnl / 원가. 원가 0 이면 None."""
-    cost = (row["avg_price"] or 0) * (row["qty"] or 0)
+def _trade_group_id(row) -> int:
+    """부분매도 slice 는 parent_id 로 한 거래로 묶는다."""
+    pid = row["parent_id"] if "parent_id" in row.keys() else None
+    return int(pid) if pid is not None else int(row["id"])
+
+
+def _ret_pct_from_pnl(pnl: float, cost: float) -> float | None:
     if not cost:
         return None
-    return round(row["pnl"] / cost * 100, 2)
+    return round(pnl / cost * 100, 2)
 
 
 def strategy_stats(store, since_days: float | None = 90) -> list[dict]:
-    """전략×시장별 청산 거래 통계(거래수·승률·평균수익률·누적손익). 최신 성과 우선.
-
-    since_days 이내 청산만 집계(None=전체). 표본 적은 전략도 내보내되 trades 로 판단.
-    """
+    """전략×시장별 청산 거래 통계. 부분매도 slice 는 parent_id 로 1거래로 집계."""
     since = (time.time() - since_days * _DAY) if since_days else None
-    agg: dict[tuple, dict] = {}
+    trades: dict[tuple, dict] = {}
     for row in store.get_closed_positions(since=since):
-        key = (row["strategy"] or "?", row["market"] or "?")
+        gid = _trade_group_id(row)
+        tkey = (gid, row["strategy"] or "?", row["market"] or "?")
+        t = trades.setdefault(tkey, {"strategy": tkey[1], "market": tkey[2],
+                                     "pnl": 0.0, "cost": 0.0})
+        t["pnl"] += row["pnl"]
+        t["cost"] += (row["avg_price"] or 0) * (row["qty"] or 0)
+    agg: dict[tuple, dict] = {}
+    for t in trades.values():
+        key = (t["strategy"], t["market"])
         s = agg.setdefault(key, {"strategy": key[0], "market": key[1], "trades": 0,
                                  "wins": 0, "total_pnl": 0.0, "_rets": []})
         s["trades"] += 1
-        s["wins"] += 1 if row["pnl"] > 0 else 0
-        s["total_pnl"] += row["pnl"]
-        r = _ret_pct(row)
+        s["wins"] += 1 if t["pnl"] > 0 else 0
+        s["total_pnl"] += t["pnl"]
+        r = _ret_pct_from_pnl(t["pnl"], t["cost"])
         if r is not None:
             s["_rets"].append(r)
     out = []
@@ -60,16 +69,35 @@ def strategy_stats(store, since_days: float | None = 90) -> list[dict]:
 
 
 def recent_trades(store, limit: int = 10) -> list[dict]:
-    """최근 청산 거래 — 종목/전략/수익률/보유일/청산사유. 뇌가 개별 판단을 복기할 재료."""
+    """최근 청산 거래 — 부분 slice 는 parent_id 로 묶어 1건으로 표시."""
+    groups: dict[int, dict] = {}
+    order: list[int] = []
+    for row in store.get_closed_positions(limit=limit * 4):
+        gid = _trade_group_id(row)
+        if gid not in groups:
+            groups[gid] = {
+                "symbol": row["symbol"], "market": row["market"],
+                "strategy": row["strategy"], "pnl": 0.0, "_cost": 0.0,
+                "opened_at": row["opened_at"], "closed_at": row["closed_at"],
+                "exit_reason": row["exit_reason"],
+            }
+            order.append(gid)
+        g = groups[gid]
+        g["pnl"] += row["pnl"]
+        g["_cost"] += (row["avg_price"] or 0) * (row["qty"] or 0)
+        g["closed_at"] = max(g["closed_at"] or 0, row["closed_at"] or 0)
     out = []
-    for row in store.get_closed_positions(limit=limit):
-        held = ((row["closed_at"] or 0) - (row["opened_at"] or 0)) / _DAY
+    for gid in order[:limit]:
+        g = groups[gid]
+        cost = g.pop("_cost")
+        held = ((g["closed_at"] or 0) - (g["opened_at"] or 0)) / _DAY
         out.append({
-            "symbol": row["symbol"], "market": row["market"],
-            "strategy": row["strategy"], "ret_pct": _ret_pct(row),
-            "pnl": round(row["pnl"], 2), "held_days": round(held, 1),
-            "exit_reason": row["exit_reason"],
-            "closed": datetime.fromtimestamp(row["closed_at"] or 0,
+            "symbol": g["symbol"], "market": g["market"],
+            "strategy": g["strategy"],
+            "ret_pct": _ret_pct_from_pnl(g["pnl"], cost),
+            "pnl": round(g["pnl"], 2), "held_days": round(held, 1),
+            "exit_reason": g["exit_reason"],
+            "closed": datetime.fromtimestamp(g["closed_at"] or 0,
                                              tz=timezone.utc).date().isoformat(),
         })
     return out
@@ -94,23 +122,28 @@ def decision_stats(store, since_days: float = 30) -> dict:
 
 
 def dossier_ab(store, since_days: float | None = 90) -> dict:
-    """도시에 기반 거래 vs 아닌 거래의 성과 비교 — Athena 의 알파 기여를 숫자로.
-
-    positions.meta.dossier_id 유무로 버킷을 나눈다(진입 시 태그됨).
-    """
+    """도시에 기반 거래 vs 아닌 거래의 성과 비교 — Athena 의 알파 기여를 숫자로."""
     import json as _json
     since = (time.time() - since_days * _DAY) if since_days else None
-    buckets = {"with_dossier": {"trades": 0, "wins": 0, "_rets": []},
-               "without_dossier": {"trades": 0, "wins": 0, "_rets": []}}
+    groups: dict[int, dict] = {}
     for row in store.get_closed_positions(since=since):
+        gid = _trade_group_id(row)
+        g = groups.setdefault(gid, {"pnl": 0.0, "cost": 0.0, "has_dossier": False})
+        g["pnl"] += row["pnl"]
+        g["cost"] += (row["avg_price"] or 0) * (row["qty"] or 0)
         try:
             meta = _json.loads(row["meta"]) if row["meta"] else {}
         except (ValueError, TypeError):
             meta = {}
-        b = buckets["with_dossier" if meta.get("dossier_id") else "without_dossier"]
+        if meta.get("dossier_id"):
+            g["has_dossier"] = True
+    buckets = {"with_dossier": {"trades": 0, "wins": 0, "_rets": []},
+               "without_dossier": {"trades": 0, "wins": 0, "_rets": []}}
+    for g in groups.values():
+        b = buckets["with_dossier" if g["has_dossier"] else "without_dossier"]
         b["trades"] += 1
-        b["wins"] += 1 if row["pnl"] > 0 else 0
-        r = _ret_pct(row)
+        b["wins"] += 1 if g["pnl"] > 0 else 0
+        r = _ret_pct_from_pnl(g["pnl"], g["cost"])
         if r is not None:
             b["_rets"].append(r)
     out = {}
@@ -152,8 +185,8 @@ def track_record(store, *, stats_days: float = 90, trades_limit: int = 10,
         from .calibration import conviction_calibration
         from .shadow_ledger import shadow_stats
         out = {
-            "note": (f"라이브 성과 귀속. trades<{MIN_SAMPLE}(small_sample) 인 통계는 "
-                     "과신하지 말 것."),
+            "note": (f"라이브 성과 귀속(pnl=수수료 반영). trades<{MIN_SAMPLE}(small_sample) "
+                     "인 통계는 과신하지 말 것."),
             "strategy_stats": strategy_stats(store, since_days=stats_days),
             "recent_trades": recent_trades(store, limit=trades_limit),
             "decision_stats": decision_stats(store, since_days=decisions_days),
