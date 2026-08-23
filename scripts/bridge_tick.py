@@ -1,15 +1,14 @@
 #!/usr/bin/env python3
-"""Argus cursor-bridge tick — heartbeat + optional zero-LLM auto reply.
+"""Argus cursor-bridge tick - heartbeat + optional zero-LLM auto reply.
 
 Modes (token-cheap by default):
   (default)     refresh heartbeat; print request status (no response write)
   --auto        heartbeat + if request.json, write frugal HOLD/reject response
   --heartbeat-only
-  --heartbeat-loop [sec]   daemon: heartbeat forever every N sec (default 60)
-                           no agent / no LLM — keeps bridge armed
+  --serve [sec]            one terminal: heartbeat + --auto every N sec (default 60)
+  --heartbeat-loop [sec]   heartbeat only every N sec (default 60); use --serve instead
 
-Agent should NOT wake every minute. Prefer --heartbeat-loop in background
-and --auto on demand (or a rare watcher). See .cursor/skills/argus-bridge.
+See .cursor/skills/argus-bridge.
 """
 from __future__ import annotations
 
@@ -63,7 +62,7 @@ def _auto_decision(req_id: str) -> dict:
     return {
         "id": req_id,
         "result": {
-            "market_view": "[CURSOR_FALLBACK] frugal auto — hold (quota bridge)",
+            "market_view": "[CURSOR_FALLBACK] frugal auto - hold (quota bridge)",
             "proposals": [],
         },
     }
@@ -135,14 +134,28 @@ def run_once(*, auto: bool, heartbeat_only: bool) -> int:
     return 0
 
 
+def _serve_loop(sec: int) -> None:
+    sec = max(15, int(sec))
+    print(f"serve every {sec}s (heartbeat+auto) → {INBOX}", flush=True)
+    while True:
+        run_once(auto=True, heartbeat_only=False)
+        time.sleep(sec)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--auto", action="store_true",
                     help="Write frugal HOLD/reject response without LLM")
     ap.add_argument("--heartbeat-only", action="store_true")
+    ap.add_argument("--serve", nargs="?", const=60, type=int, metavar="SEC",
+                    help="Loop heartbeat+auto every SEC seconds (default 60)")
     ap.add_argument("--heartbeat-loop", nargs="?", const=60, type=int, metavar="SEC",
-                    help="Loop heartbeat forever every SEC seconds (default 60)")
+                    help="Loop heartbeat only every SEC seconds (default 60)")
     args = ap.parse_args()
+
+    if args.serve is not None:
+        _serve_loop(args.serve)
+        return 0
 
     if args.heartbeat_loop is not None:
         sec = max(15, int(args.heartbeat_loop))

@@ -115,16 +115,29 @@ class TossClient:
             if self._load_cached():  # 디스크 캐시 재사용 (재발급 폭주 방지)
                 return self._token
             _, path = EP["token"]
-            resp = self.session.post(
-                self.creds.base_url + path,
-                data={"grant_type": "client_credentials",
-                      "client_id": self.creds.client_id,
-                      "client_secret": self.creds.client_secret},
-                timeout=self.timeout,
-            )
-            if resp.status_code != 200:
-                raise TossAPIError(resp.status_code, resp.text)
-            data = resp.json()
+            data = None
+            for attempt in range(4):
+                self._acquire("token")
+                resp = self.session.post(
+                    self.creds.base_url + path,
+                    data={"grant_type": "client_credentials",
+                          "client_id": self.creds.client_id,
+                          "client_secret": self.creds.client_secret},
+                    timeout=self.timeout,
+                )
+                if resp.status_code == 429:
+                    retry_after = resp.headers.get("Retry-After")
+                    base = float(retry_after) if retry_after else 2 ** attempt
+                    wait = base + random.uniform(0, 0.5)
+                    log.warning("429 token rate limit -> %.1fs 후 재시도", wait)
+                    time.sleep(wait)
+                    continue
+                if resp.status_code != 200:
+                    raise TossAPIError(resp.status_code, resp.text)
+                data = resp.json()
+                break
+            else:
+                raise TossAPIError(429, "token rate limit 재시도 초과")
             self._token = data["access_token"]
             self._token_exp = time.time() + int(data.get("expires_in", 3600))
             self._token_issued_at = time.time()
@@ -159,16 +172,19 @@ class TossClient:
         return h
 
     # ── 공용 요청 (ApiResponse.result 언랩) ───────────────
+    def _acquire(self, key: str) -> None:
+        if self.rate_limiter is not None:
+            self.rate_limiter.acquire(EP_GROUP.get(key, ""))
+
     def _request(self, key: str, *, params: dict | None = None, json: dict | None = None,
                  account_seq: int | str | None = None, path_params: dict | None = None) -> Any:
         method, path = EP[key]
-        if self.rate_limiter is not None:
-            self.rate_limiter.acquire(EP_GROUP.get(key, ""))
         if path_params:
             path = path.format(**path_params)
         url = self.creds.base_url + path
         token_retried = False
         for attempt in range(4):
+            self._acquire(key)                  # 재시도마다 토큰 소비(429 폭주 방지)
             resp = self.session.request(method, url, params=params, json=json,
                                         headers=self._headers(account_seq), timeout=self.timeout)
             if resp.status_code == 401 and "invalid-token" in resp.text:

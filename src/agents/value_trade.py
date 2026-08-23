@@ -654,7 +654,9 @@ class ValueRunner:
             broker=self.broker, risk=self.risk, price_lookup=price_lookup,
             journal_path=self.journal_path,
             arm_fn=None, dossier_fn=None, zone_fn=None, conviction_sizing=True,
-            min_lot_conviction=float(mlc) if mlc is not None else None)
+            min_lot_conviction=float(mlc) if mlc is not None else None,
+            store=self.store,
+            allow_add=True)
 
         if self.store:
             from ..shadow_ledger import book_blocked, book_soft_pending
@@ -665,9 +667,10 @@ class ValueRunner:
 
         res["proposed"] = sum(1 for p in cyc.decision.proposals if p.side == "BUY")
         res["vetoed"] = sum(1 for e in cyc.executed if e.get("status") == "vetoed")
-        res["filled"] = sum(1 for e in cyc.executed if e.get("status") == "filled")
+        res["filled"] = sum(
+            1 for e in cyc.executed if e.get("status") in ("filled", "partial"))
 
-        # 6) 체결 BUY 를 store 에 즉시 미러링(멱등) — 뇌 사이클 미러링과 충돌 방지.
+        # 6) 체결 BUY value 메타 보강 — run_cycle(store=) mirror 가 1차, 여기는 value 전용 필드.
         self._mirror_fills(market, cfg_v, cyc, gated)
         return res
 
@@ -739,12 +742,12 @@ class ValueRunner:
         open_rows = {r["symbol"]: r for r in self.store.get_open_positions()}
         done: set[str] = set()
         for e in cyc.executed:
-            if e.get("status") != "filled" or e.get("action") != "BUY":
+            if e.get("status") not in ("filled", "partial") or e.get("action") != "BUY":
                 continue
             sym = e["symbol"]
             if sym in done:                      # 멱등 — 이번 사이클에서 이미 반영
                 continue
-            pos = self.broker.account.position(sym)
+            pos = self.broker.position(sym)
             if not pos.is_open:
                 continue
             done.add(sym)
@@ -752,9 +755,36 @@ class ValueRunner:
             cand = by_sym.get(sym, {})
             prop = prop_by_sym.get(sym)
             stop = round(entry * (1 - cfg_v["hard_stop_pct"]), 2) if entry else None
-            row = open_rows.get(sym)
-            if row is not None:                  # 이미 미러링된 포지션
-                self._mirror_tranche(row, sym, cand, pos, stop)
+            row = open_rows.get(sym) or next(
+                (r for r in self.store.get_open_positions() if r["symbol"] == sym), None)
+            if row is not None:
+                meta = _row_meta(row)
+                if (cand.get("_tranche") and meta.get("source") == "value"
+                        and isinstance(meta.get("tranches"), list)):
+                    self._mirror_tranche(row, sym, cand, pos, stop)
+                    continue
+                if meta.get("source") == "value":
+                    continue
+                # run_cycle(store=) mirror 가 fill_mirror 행을 만들었으면 value 메타로 승격.
+                log.info("[value] promote fill_mirror → value meta sym=%s id=%s", sym, row["id"])
+                fpl = fair_price_low(cand)
+                fph = fair_price_high(cand)
+                promote_meta = {"source": "value", "horizon": "position",
+                        "entry_thesis": (prop.thesis if prop else cand.get("thesis")),
+                        "fair_low": fpl, "fair_high": fph,
+                        "scan_ts": cand.get("ts"),
+                        "tranches": list(cfg_v["tranches"]), "tranche_idx": 1,
+                        "last_tranche_at": self.now_fn()}
+                self.store.update_position(
+                    int(row["id"]), qty=pos.qty, avg_price=entry, strategy="value",
+                    thesis=(prop.thesis if prop else cand.get("thesis")),
+                    target_price=fpl, stop_price=stop, meta=promote_meta)
+                self.store.disarm_symbol(sym)
+                from ..shadow_ledger import cancel_shadow_on_fill
+                cancel_shadow_on_fill(self.store, sym)
+                self.store.log_event("value_entry", sym,
+                                     {"entry": entry, "stop": stop, "target": fpl,
+                                      "qty": pos.qty})
                 continue
             fpl = fair_price_low(cand)
             fph = fair_price_high(cand)
@@ -769,6 +799,7 @@ class ValueRunner:
                 sym, market, pos.qty, entry, strategy="value",
                 thesis=(prop.thesis if prop else cand.get("thesis")),
                 target_price=fpl, stop_price=stop, meta=meta)
+            self.store.disarm_symbol(sym)
             from ..shadow_ledger import cancel_shadow_on_fill
             cancel_shadow_on_fill(self.store, sym)
             self.store.log_event("value_entry", sym,

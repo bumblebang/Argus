@@ -59,7 +59,8 @@ from src.agents.pipeline import (CycleRunner, select_backend, build_live_llm,
                                  entry_stop_target)
 from src.agents.llm import ClaudeCLIClient
 from src.agents.value_trade import ValueRunner, value_trade_cfg
-from src.broker_sync import sync_from_live, reconcile_from_live, should_sync
+from src.broker_sync import (apply_reconcile_from_live,
+                             fetch_live_account_data, should_sync)
 
 log = get_logger("watch")
 
@@ -270,22 +271,17 @@ def _check_calendar_coverage(markets, store=None) -> list:
     return missing
 
 
-def _start_session_refresher(client, markets, interval_sec: float = 1800,
+def _start_session_refresher(gateway, markets, interval_sec: float = 1800,
                              store=None) -> threading.Event:
-    """시장 세션표(프리/정규/애프터)를 주기적으로 재갱신하는 가벼운 데몬 스레드.
-
-    refresh_sessions 가 '오늘(KST) 이미 받았으면 스킵'하므로 자주 불러도 네트워크는
-    하루 1회뿐이고, 날짜가 바뀌면(새 거래일) 다음 주기에 자동 재취득한다. 실패는 무시
-    (current_session 이 is_open 으로 폴백). 반환한 Event.set() 으로 정지."""
+    """시장 세션표(프리/정규/애프터)를 주기적으로 재갱신하는 가벼운 데몬 스레드."""
     stop = threading.Event()
 
     def loop():
         while not stop.wait(interval_sec):
             try:
-                refresh_sessions(client, markets)
+                gateway.refresh_market_sessions(markets)
             except Exception as e:
                 log.warning("세션표 주기 갱신 오류(무시): %s", e)
-            # 연도 롤오버 감지 — 장기 상주 데몬이 해를 넘겨도 캘린더 미갱신을 알아채게.
             _check_calendar_coverage(markets, store)
 
     threading.Thread(target=loop, name="session_refresher", daemon=True).start()
@@ -311,7 +307,8 @@ def _start_account_refresher(gateway, cfg) -> threading.Event | None:
 
     def _once():
         try:
-            save_snapshot(fetch_account_snapshot(client, account_seq, markets=markets))
+            from src.datasources.account_snapshot import save_snapshot
+            save_snapshot(gateway.fetch_account_snapshot(account_seq, markets=markets))
         except Exception as e:
             log.warning("자산 스냅샷 조회 오류(무시, 마지막 캐시 유지): %s", e)
 
@@ -340,12 +337,16 @@ def _start_reconcile_timer(broker, gateway, store, cfg, markets) -> threading.Ev
 
     def _once():
         try:
-            res = broker.reconcile(lambda acct: reconcile_from_live(
-                gateway, seq, acct, store, markets=tuple(markets)))
+            data = fetch_live_account_data(gateway, seq, markets=tuple(markets))
+            res = broker.reconcile(
+                lambda acct: apply_reconcile_from_live(
+                    acct, store, data, markets=tuple(markets)))
             if res.get("adopted") or res.get("closed") or res.get("error"):
                 store.log_event("reconcile", None, res)
         except Exception as e:
             log.warning("주기 재대사 오류(무시): %s", e)
+
+    _once()
 
     def loop():
         while not stop.wait(sec):
@@ -531,8 +532,7 @@ def main() -> int:
     # 단 데몬은 계속(다음 사이클에 뇌가 어긋난 상태로 판단하지 않도록 로그로 크게 알린다).
     if should_sync(broker):
         try:
-            _sync = sync_from_live(gateway.client, broker.account_seq, broker.account,
-                                   store, markets=tuple(markets))
+            _sync = broker.sync_from_live(gateway, store, markets=tuple(markets))
             log.info("실계좌 동기화 완료 — 현금=%s, 보유=%d종목", _sync["cash"], _sync["synced"])
             store.log_event("live_sync", None, _sync)
         except Exception as e:
@@ -541,12 +541,12 @@ def main() -> int:
     # 매수 안전가드 배선: 부적격 종목(관리/거래정지/상폐예정/ETF·ETN 등) 매수를 차단한다.
     # gateway.client(단일 토큰) 로만 조회. 키 없음/dry 면 주입 안 함(가드 비활성, 페이퍼 순수).
     # 캐시 dict 는 프로세스 내 공유(로드/세이브). 조회 실패는 fail-open(check_tradable 내부).
-    _guard_client = None if args.dry else getattr(gateway, "client", None)
-    if _guard_client is not None:
+    _guard_gw = None if args.dry else gateway
+    if _guard_gw is not None and getattr(_guard_gw, "client", None) is not None:
         _info_cache = load_info_cache()
         _warn_cache = load_warn_cache()
-        broker.tradable_fn = lambda sym, mkt: check_tradable(
-            sym, mkt, client=_guard_client, info_cache=_info_cache, warn_cache=_warn_cache)
+        broker.tradable_fn = lambda sym, mkt: _guard_gw.check_tradable(
+            sym, mkt, info_cache=_info_cache, warn_cache=_warn_cache)
         log.info("매수가드=on(warnings/stockinfo) — 부적격 종목 매수 차단 활성")
         # 합성 매도세 면제(국내 ETF/ETN) — 같은 StockInfo 캐시를 재사용(네트워크 추가 없음).
         # 라이브는 체결 대사에서 실세금을 받으므로 이 경로를 타지 않는다(페이퍼 비용모델용).
@@ -582,7 +582,7 @@ def main() -> int:
                      markets=markets, config=watch_config,
                      on_wake=(brain.wake if brain else None), executor=executor,
                      strategy_runner=strategy_runner, entry_executor=entry_executor,
-                     on_prices=broker.account.set_marks,   # 미실현 손익을 게이트가 보게
+                     on_prices=broker.set_marks,   # 미실현 손익을 게이트가 보게(락 안)
                      heartbeat_path=heartbeat)
     loop_ref.append(loop)                    # 뇌의 illiquid_fn 이 이제 루프를 볼 수 있다
 
@@ -684,13 +684,12 @@ def main() -> int:
     # 시장 세션표(프리/정규/애프터) 하루 1회 갱신 — 대시보드 current_session 이 이 캐시로
     # 세션 배지를 그린다. gateway.client(단일 토큰)로만 호출. 실패해도 데몬은 계속(is_open 폴백).
     session_stop = None
-    _sess_client = getattr(gateway, "client", None)
-    if _sess_client is not None:
+    if getattr(gateway, "client", None) is not None:
         try:
-            refresh_sessions(_sess_client, tuple(markets))
+            gateway.refresh_market_sessions(tuple(markets))
         except Exception as e:
             log.warning("세션표 초기 갱신 실패(무시, is_open 폴백): %s", e)
-        session_stop = _start_session_refresher(_sess_client, tuple(markets), store=store)
+        session_stop = _start_session_refresher(gateway, tuple(markets), store=store)
         log.info("세션표 갱신기 기동 — 하루 1회(주기 폴링, 오늘 받았으면 스킵), markets=%s", markets)
     # 휴장일 캘린더 커버리지 점검(기동 1회) — 연 1회 손갱신을 놓치면 휴장에도 매매를 시도한다.
     _check_calendar_coverage(markets, store)

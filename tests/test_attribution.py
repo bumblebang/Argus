@@ -15,6 +15,48 @@ import dashboard as dash  # noqa: E402
 
 
 # ── store: 청산 시 손익 확정 기록 ──────────────────────────────────
+def test_partial_exit_attribution_in_track_record(tmp_path):
+    """부분매도+잔량청산 시 track_record 합계가 맞다."""
+    from src.attribution import track_record
+    store = Store(tmp_path / "t.db")
+    pid = store.open_position("005930", "KR", 10, 70000, strategy="rsi_reversion")
+    store.record_partial_exit(pid, 3, 71000, reason="partial")
+    store.close_position(pid, exit_price=69000, reason="final")
+    closed = store.get_closed_positions()
+    assert len(closed) == 2
+    total = sum(r["pnl"] for r in closed)
+    assert total == (71000 - 70000) * 3 + (69000 - 70000) * 7
+    tr = track_record(store)
+    rsi = [s for s in tr["strategy_stats"] if s["strategy"] == "rsi_reversion"][0]
+    assert rsi["trades"] == 1
+    assert rsi["total_pnl"] == total
+
+
+def test_close_position_records_pnl_with_fee(tmp_path):
+    store = Store(tmp_path / "t.db")
+    pid = store.open_position("005930", "KR", 10, 1000, strategy="rsi_reversion")
+    store.close_position(pid, exit_price=1100, reason="target_hit", fee=15.0)
+    row = store.get_closed_positions()[0]
+    assert row["pnl"] == (1100 - 1000) * 10 - 15.0
+
+
+def test_open_position_merges_duplicate_open(tmp_path):
+    store = Store(tmp_path / "t.db")
+    a = store.open_position("005930", "KR", 5, 1000)
+    b = store.open_position("005930", "KR", 8, 1100)
+    assert a == b
+    assert len(store.get_open_positions()) == 1
+    assert store.get_open_positions()[0]["qty"] == 8
+
+
+def test_nearest_snapshot_price_under_lock(tmp_path):
+    store = Store(tmp_path / "t.db")
+    ts = 1_700_000_000.0
+    store.record_snapshot("005930", price=50000, ts=ts)
+    assert store.nearest_snapshot_price("005930", ts + 100) == 50000
+    assert store.nearest_snapshot_price("005930", ts + 99999) is None
+
+
 def test_close_position_records_pnl(tmp_path):
     store = Store(tmp_path / "t.db")
     pid = store.open_position("005930", "KR", 10, 1000, strategy="rsi_reversion")

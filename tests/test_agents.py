@@ -200,6 +200,40 @@ def test_cycle_day_buy_routes_to_arm(tmp_path):
     assert broker.position("005930").qty == 0          # 즉시 체결 안 함
 
 
+def test_cycle_already_held_when_broker_has_position(tmp_path):
+    """brain cycle: broker 보유 중이면 BUY → already_held."""
+    from src.engine.store import Store
+    broker = _broker(tmp_path)
+    store = Store(tmp_path / "bot.db")
+    broker.account.fill("005930", "KR", "BUY", 3, 1000)
+    llm = MockLLM(_responder(_decision_buy(0.8), approve=True))
+    res = run_cycle(context_json="{}", decision_agent=DecisionAgent(llm),
+                    validation_agent=ValidationAgent(llm, min_conviction=0.6),
+                    broker=broker, risk=RiskManager(capital={"KR": 1_000_000}, max_position_pct=0.2),
+                    price_lookup={"005930": 1000}, journal_path=tmp_path / "d.jsonl",
+                    store=store)
+    assert res.executed[0]["status"] == "already_held"
+    assert broker.position("005930").qty == 3
+    store.close()
+
+
+def test_cycle_already_held_when_store_open_only(tmp_path):
+    """brain cycle: store open / broker flat desync → BUY 차단."""
+    from src.engine.store import Store
+    broker = _broker(tmp_path)
+    store = Store(tmp_path / "bot.db")
+    store.open_position("005930", "KR", 2, 1000, thesis="desync ghost")
+    llm = MockLLM(_responder(_decision_buy(0.8), approve=True))
+    res = run_cycle(context_json="{}", decision_agent=DecisionAgent(llm),
+                    validation_agent=ValidationAgent(llm, min_conviction=0.6),
+                    broker=broker, risk=RiskManager(capital={"KR": 1_000_000}, max_position_pct=0.2),
+                    price_lookup={"005930": 1000}, journal_path=tmp_path / "d.jsonl",
+                    store=store)
+    assert res.executed[0]["status"] == "already_held"
+    assert broker.position("005930").qty == 0
+    store.close()
+
+
 def _decision_sell(conviction=0.3):
     return DecisionOutput(market_view="risk_off", proposals=[Proposal(
         symbol="005930", market="KR", side="SELL", conviction=conviction,

@@ -95,6 +95,22 @@ def test_build_symbol_lessons_max_per_symbol_cut():
     assert len(out["AAA"]["recent"]) == 2                # recent 만 컷
 
 
+def test_build_symbol_lessons_groups_partial_slices():
+    """부분매도 slice(parent_id)는 1거래로 집계."""
+    r1 = _row("AAA", 5, 100.0, 25.0, "partial", "rsi", "t", _BASE - 5 * _DAY, _BASE - 4 * _DAY)
+    r2 = _row("AAA", 5, 100.0, 25.0, "target_hit", "rsi", "t", _BASE - 5 * _DAY, _BASE)
+    r1["id"] = 1
+    r1["parent_id"] = 10
+    r2["id"] = 2
+    r2["parent_id"] = 10
+    store = _FakeStore([r1, r2])
+    out = build_symbol_lessons(store, ["AAA"])
+    assert out["AAA"]["n"] == 1
+    assert out["AAA"]["wins"] == 1
+    assert out["AAA"]["avg_pnl_pct"] == 5.0
+    assert len(out["AAA"]["recent"]) == 1
+
+
 def test_build_symbol_lessons_empty_symbols():
     assert build_symbol_lessons(_FakeStore(_sample_rows()), []) == {}
 

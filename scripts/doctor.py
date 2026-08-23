@@ -40,12 +40,12 @@ def mask_acct(no) -> str:
 def probe_toss(cfg) -> tuple[bool, str]:
     """토스 계좌 1회 조회. 실패해도 예외를 밖으로 안 던진다."""
     try:
-        from src.toss_client import TossClient
-        accts = TossClient(cfg.creds).get_accounts() or []
+        from src.engine.gateway import TossGateway
+        accts = TossGateway.from_config(cfg).get_accounts()
     except Exception as e:
         return False, f"조회 실패: {type(e).__name__}"
     if not accts:
-        return False, "계좌 0건 — 허용 IP·앱 위임 확인"
+        return False, "계좌 0건 - 허용 IP·앱 위임 확인"
     bits = [f"seq={a.get('accountSeq')} no={mask_acct(a.get('accountNo'))}"
             for a in accts[:4]]
     return True, f"{len(accts)}건 ({', '.join(bits)})"
@@ -66,7 +66,7 @@ def check_tz() -> bool:
         _ok("tz", "Asia/Seoul")
         return True
     except ZoneInfoNotFoundError:
-        _bad("tz", "Asia/Seoul 없음 — pip install tzdata")
+        _bad("tz", "Asia/Seoul 없음 - pip install tzdata")
         return False
 
 
@@ -86,6 +86,11 @@ def check_claude(cmd: str) -> None:
 
 
 def main() -> int:
+    if hasattr(sys.stdout, "reconfigure"):
+        try:
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
     from dotenv import load_dotenv
     load_dotenv(ROOT / ".env")
     print("Argus doctor")
@@ -93,7 +98,7 @@ def main() -> int:
 
     cfg_path = ROOT / "config.yaml"
     if not cfg_path.exists():
-        _bad("config", "config.yaml 없음 — python scripts/bootstrap.py")
+        _bad("config", "config.yaml 없음 - python scripts/bootstrap.py")
         return 1
 
     from src.config import load_config
@@ -104,7 +109,7 @@ def main() -> int:
     dry = bool(cfg.dry_run)
     pyv = sys.version.split()[0]
     if sys.version_info < (3, 11):
-        _bad("python", f"{pyv} — 3.11+ 필요")
+        _bad("python", f"{pyv} - 3.11+ 필요")
         blocked = True
     else:
         _ok("python", pyv)
@@ -131,19 +136,19 @@ def main() -> int:
             _bad("toss keys", "라이브인데 TOSS_CLIENT_ID/SECRET 없음")
             blocked = True
         else:
-            _warn("toss keys", "없음 — 시세·감시는 토스 키가 필요")
+            _warn("toss keys", "없음 - 시세·감시는 토스 키가 필요")
 
     if _filled("TOSS_ACCOUNT_NO"):
         _ok("account", mask_acct(os.getenv("TOSS_ACCOUNT_NO")))
     else:
-        _warn("account", "TOSS_ACCOUNT_NO 비움 — 라이브 시 첫 계좌 자동조회")
+        _warn("account", "TOSS_ACCOUNT_NO 비움 - 라이브 시 첫 계좌 자동조회")
 
     if _filled("ANTHROPIC_API_KEY"):
         _ok("brain", "ANTHROPIC_API_KEY")
     elif shutil.which("claude") or Path(cmd).is_file():
         _ok("brain", "claude CLI")
     else:
-        _warn("brain", "CLI/키 없음 — watch --dry 로만 배선 확인")
+        _warn("brain", "CLI/키 없음 - watch --dry 로만 배선 확인")
 
     optional = [
         ("DART_API_KEY", "국내 공시"),
@@ -157,7 +162,7 @@ def main() -> int:
         if _filled(key):
             _ok(key, why)
         else:
-            _warn(key, f"없음 — {why} 배선 비활성")
+            _warn(key, f"없음 - {why} 배선 비활성")
 
     if _filled("KRX_API_KEY"):
         try:
@@ -176,16 +181,16 @@ def main() -> int:
     if ip:
         _ok("public ip", f"{ip}  (토스 Open API 허용 IP에 이 주소를 넣는다)")
     else:
-        _warn("public ip", "조회 실패 — 토스 콘솔에 이 머신 공인 IP를 직접 등록")
+        _warn("public ip", "조회 실패 - 토스 콘솔에 이 머신 공인 IP를 직접 등록")
 
     want_live = mode == "live" and not dry
     if want_live:
         if blocked:
             _bad("live", "라이브 준비 안 됨")
         else:
-            print("  LIVE 가능 — docs/SETUP_LIVE.md 체크리스트를 통과한 뒤에만 watch 상주")
+            print("  LIVE 가능 - docs/SETUP_LIVE.md 체크리스트를 통과한 뒤에만 watch 상주")
     else:
-        print("  PAPER — python scripts/watch.py --dry --ticks 1  로 스모크")
+        print("  PAPER - python scripts/watch.py --dry --ticks 1 로 스모크")
 
     return 1 if blocked else 0
 

@@ -91,13 +91,9 @@ def _entry_price_at(data_dir: Path, store, symbol: str, ts: float,
         if entry is not None:
             return float(entry), "history"
     if store is not None:
-        row = store.conn.execute(
-            "SELECT price FROM snapshots WHERE symbol=? AND ts BETWEEN ? AND ? "
-            "ORDER BY ABS(ts-?) LIMIT 1",
-            (symbol, ts - 3600, ts + 3600, ts),
-        ).fetchone()
-        if row and row[0]:
-            return float(row[0]), "snapshot"
+        px = store.nearest_snapshot_price(symbol, ts, window_sec=3600)
+        if px is not None:
+            return px, "snapshot"
     return None, ""
 
 
@@ -380,12 +376,7 @@ def exit_close_on_calendar(series: list[tuple[datetime, float]],
 
 def snap_forward(store, symbol: str, ts0: float, days: float) -> float | None:
     target = ts0 + days * 86400
-    row = store.conn.execute(
-        "SELECT price FROM snapshots WHERE symbol=? AND ts BETWEEN ? AND ? "
-        "ORDER BY ABS(ts-?) LIMIT 1",
-        (symbol, target - 7200, target + 86400 * 2, target),
-    ).fetchone()
-    return float(row[0]) if row else None
+    return store.nearest_snapshot_price(symbol, target, window_sec=86400 * 2 + 7200)
 
 
 def score_open_shadows(store, *, now: float | None = None,
@@ -495,11 +486,17 @@ def shadow_stats(store, since_days: float = 90,
         by_sleeve.setdefault(r.get("sleeve") or "?", []).append(r)
 
     vetoed_agg = _agg_rows([r for r in rows if r.get("block_status") == "vetoed"])
-    filled_actual: list[float] = []
+    from .attribution import _trade_group_id
+    trade_groups: dict[int, dict] = {}
     for row in store.get_closed_positions(since=since):
-        cost = (row["avg_price"] or 0) * (row["qty"] or 0)
-        if cost:
-            filled_actual.append(row["pnl"] / cost * 100)
+        gid = _trade_group_id(row)
+        g = trade_groups.setdefault(gid, {"pnl": 0.0, "cost": 0.0})
+        g["pnl"] += float(row["pnl"] or 0)
+        g["cost"] += (row["avg_price"] or 0) * (row["qty"] or 0)
+    filled_actual: list[float] = []
+    for g in trade_groups.values():
+        if g["cost"]:
+            filled_actual.append(g["pnl"] / g["cost"] * 100)
 
     filled_avg = (round(sum(filled_actual) / len(filled_actual), 3)
                   if filled_actual else None)

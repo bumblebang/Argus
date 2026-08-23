@@ -122,13 +122,56 @@ def _static_us(cfg) -> list[dict]:
     return _static_universe(cfg).get("US", [])
 
 
+_SECTOR_MAP_PATH = ROOT / "config" / "sector_map.yaml"
+_UNIVERSE_PATH = ROOT / "data" / "universe.yaml"
+_ETF_NAME_MARKERS = ("TIGER", "KODEX", "ETF", "SPDR", "ISHARES", "INVESCO")
+
+
+def _infer_sector(item: dict) -> str | None:
+    name = str(item.get("name") or "").upper()
+    if any(m in name for m in _ETF_NAME_MARKERS):
+        return "ETF"
+    return None
+
+
+def _sector_lookup(cfg) -> dict[str, str]:
+    """symbol→sector: config 정적 + sector_map.yaml + 기존 universe.yaml."""
+    out: dict[str, str] = {}
+    for lst in _static_universe(cfg).values():
+        for it in lst or []:
+            sym, sec = it.get("symbol"), it.get("sector")
+            if sym and sec:
+                out[str(sym)] = str(sec)
+    if _SECTOR_MAP_PATH.is_file():
+        try:
+            extra = yaml.safe_load(_SECTOR_MAP_PATH.read_text(encoding="utf-8")) or {}
+            for lst in extra.values():
+                if not isinstance(lst, dict):
+                    continue
+                for sym, sec in lst.items():
+                    if sym and sec:
+                        out[str(sym)] = str(sec)
+        except (OSError, ValueError) as e:
+            log.warning("sector_map.yaml 로드 실패(무시): %s", e)
+    if _UNIVERSE_PATH.is_file():
+        try:
+            live = yaml.safe_load(_UNIVERSE_PATH.read_text(encoding="utf-8")) or {}
+            for lst in live.values():
+                for it in lst or []:
+                    sym, sec = it.get("symbol"), it.get("sector")
+                    if sym and sec:
+                        out[str(sym)] = str(sec)
+        except (OSError, ValueError):
+            pass
+    return out
+
+
 def _annotate_sectors(cfg, items: list[dict]) -> None:
-    """정적 universe 에 sector 가 지정된 종목은 동적 선정에도 sector 를 전파(in-place)."""
-    static_sec = {it["symbol"]: it["sector"]
-                  for lst in _static_universe(cfg).values() for it in (lst or [])
-                  if it.get("symbol") and it.get("sector")}
+    """동적 선정 종목에 sector 전파(in-place)."""
+    lookup = _sector_lookup(cfg)
     for it in items:
-        sec = it.get("sector") or static_sec.get(it["symbol"])
+        sym = str(it.get("symbol") or "")
+        sec = it.get("sector") or lookup.get(sym) or _infer_sector(it)
         if sec:
             it["sector"] = sec
 

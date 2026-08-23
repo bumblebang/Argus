@@ -147,7 +147,8 @@ class TradingBot:
         # 종가 청산: 변동성 돌파 전략의 보유분은 장 마감 직전 청산
         if (pos.is_open and strat.params.get("exit_at_session_end")
                 and market_hours.near_session_end(market)):
-            self.broker.execute(Order(symbol, market, "SELL", pos.qty, price), "종가 청산")
+            self.broker.execute(Order(symbol, market, "SELL", pos.qty, price), "종가 청산",
+                                store=self.broker.store)
             return
 
         if signal.action == Action.HOLD:
@@ -157,9 +158,11 @@ class TradingBot:
         # 신호 -> 주문. 한도/여력/킬스위치 검증은 모두 broker 내부의 하드 게이트가 수행.
         if signal.action == Action.BUY:
             qty = self.risk.size_buy(market, price, signal.target_weight)
-            self.broker.execute(Order(symbol, market, "BUY", qty, price), signal.reason)
+            self.broker.execute(Order(symbol, market, "BUY", qty, price), signal.reason,
+                                store=self.broker.store)
         elif signal.action == Action.SELL and pos.is_open:
-            self.broker.execute(Order(symbol, market, "SELL", pos.qty, price), signal.reason)
+            self.broker.execute(Order(symbol, market, "SELL", pos.qty, price), signal.reason,
+                                store=self.broker.store)
 
     def run_forever(self) -> None:
         interval = int(self.cfg.run.get("poll_interval_sec", 60))

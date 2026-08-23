@@ -15,6 +15,7 @@ class ExecuteResult:
     status: str = ""
     order_id: str | None = None
     reject_reason: str = ""
+    side: str = ""                          # BUY / SELL — mirror·귀속이 account race 없이 판별
 
     def __bool__(self) -> bool:
         return self.ok
@@ -32,7 +33,8 @@ class ExecuteResult:
     @classmethod
     def from_fill(cls, *, fill_qty: float, fill_price: float, fee: float,
                   order_qty: float, limit_price: float | None,
-                  status: str = "FILLED", order_id: str | None = None) -> ExecuteResult:
+                  status: str = "FILLED", order_id: str | None = None,
+                  side: str = "") -> ExecuteResult:
         return cls(
             ok=fill_qty > 0,
             filled_qty=float(fill_qty),
@@ -42,4 +44,5 @@ class ExecuteResult:
             limit_price=limit_price,
             status=status,
             order_id=order_id,
+            side=side,
         )

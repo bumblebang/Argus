@@ -254,3 +254,56 @@ def test_reconcile_holdings_failure_keeps_positions(tmp_path):
     assert "005930" in acct.positions
     assert acct.cash["KR"] == 732463
     assert "error" in res
+
+
+def test_reconcile_partial_qty_drop_records_pnl(tmp_path):
+    """재대사로 qty 감소 시 partial exit 귀속(track_record)."""
+    from src.paper_account import Fill
+    store = Store(tmp_path / "bot.db")
+    acct = _acct(tmp_path)
+    acct.positions["005930"] = Position(symbol="005930", qty=1, avg_price=267500)
+    acct.symbol_market["005930"] = "KR"
+    acct.journal.append(Fill(ts="2026-01-01T00:00:00Z", symbol="005930", market="KR",
+                               side="SELL", qty=1, price=270000, fee=0, reason="test"))
+    row_id = store.open_position("005930", "KR", 2, 267500, thesis="tracked")
+    partial = _SAMSUNG.copy()
+    partial["quantity"] = "1"
+    client = _MockClient(holdings={"items": [partial]},
+                         buying_power={"KR": {"cashBuyingPower": "732463"}})
+    res = reconcile_from_live(client, 1, acct, store, markets=("KR",))
+    row = store.get_open_positions()[0]
+    assert row["qty"] == 1
+    closed = store.conn.execute(
+        "SELECT qty, exit_price, pnl FROM positions "
+        "WHERE state='closed' AND exit_reason='reconcile'"
+    ).fetchone()
+    assert closed["qty"] == 1
+    assert closed["exit_price"] == 270000
+    assert closed["pnl"] == 2500.0
+    from src.attribution import track_record
+    tr = track_record(store)
+    assert tr.get("strategy_stats") or tr.get("total_trades", 0) >= 0
+    assert res["updated"] == ["005930"]
+    store.close()
+
+
+def test_reconcile_adopt_cancels_shadow(tmp_path):
+    """고아 채택 시 해당 종목 pending shadow 취소."""
+    from src.shadow_ledger import book_row
+    store = Store(tmp_path / "bot.db")
+    acct = _acct(tmp_path)
+    book_row(
+        store, cycle_ts=1.0, cycle_ts_iso="2026-01-01T00:00:00+09:00",
+        sleeve="brain", symbol="005930", market="KR",
+        block_status="armed", block_reason="test", verifier_reason=None,
+        concerns=[], conviction=0.7, horizon="swing", target_weight=0.1,
+        thesis="shadow", strategy=None, proposal=None, entry_price=270000,
+        state="pending",
+    )
+    assert len(store.get_pending_shadow_positions()) == 1
+    client = _MockClient(holdings={"items": [_SAMSUNG]},
+                         buying_power={"KR": {"cashBuyingPower": "732463"}})
+    reconcile_from_live(client, 1, acct, store, markets=("KR",))
+    assert store.get_pending_shadow_positions() == []
+    assert len(store.get_open_positions()) == 1
+    store.close()

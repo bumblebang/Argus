@@ -32,7 +32,7 @@ from src.datasources import (SourceContext, TossInfoSource, BreadthSource,
                              IndexConstituentsSource)
 from src.datasources.fear_greed import summary_line as fear_summary
 from src.screener import load_candidates
-from src.toss_client import TossClient
+from src.engine.gateway import TossGateway
 
 DATA_DIR = Path(__file__).resolve().parent.parent / "data"
 
@@ -63,7 +63,8 @@ def main() -> int:
             if len(symbols_by_market[market]) < 5:
                 symbols_by_market[market].append(symbol)
 
-    client = None if args.dry else TossClient(cfg.creds)
+    gateway = None if args.dry else TossGateway.from_config(cfg)
+    client = None if gateway is None else gateway.client
     ctx = SourceContext(client=client, symbols_by_market=symbols_by_market, dry=args.dry,
                         spacing_sec=float(ms_cfg.get("request_spacing_sec", 0.6)))
 

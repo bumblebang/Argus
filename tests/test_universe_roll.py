@@ -459,3 +459,21 @@ def test_static_universe_without_operator_config(monkeypatch, tmp_path):
     monkeypatch.setattr(UR, "default_config_path", lambda: tmp_path / "missing.yaml")
     static = UR._static_universe(None)
     assert any(it.get("symbol") == "005930" for it in (static.get("KR") or []))
+
+
+def test_annotate_sectors_from_map_and_etf_name(tmp_path, monkeypatch):
+    """sector_map + ETF 이름 휴리스틱으로 동적 종목 sector 전파."""
+    map_path = tmp_path / "sector_map.yaml"
+    map_path.write_text('KR:\n  "999999": "테스트"\n', encoding="utf-8")
+    monkeypatch.setattr(UR, "_SECTOR_MAP_PATH", map_path)
+    monkeypatch.setattr(UR, "_UNIVERSE_PATH", tmp_path / "missing_universe.yaml")
+
+    items = [
+        {"symbol": "999999", "name": "맵종목"},
+        {"symbol": "888888", "name": "TIGER 반도체"},
+        {"symbol": "005930", "sector": "반도체"},
+    ]
+    UR._annotate_sectors(None, items)
+    assert items[0]["sector"] == "테스트"
+    assert items[1]["sector"] == "ETF"
+    assert items[2]["sector"] == "반도체"
