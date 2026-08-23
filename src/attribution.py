@@ -122,18 +122,54 @@ def dossier_ab(store, since_days: float | None = 90) -> dict:
     return out
 
 
+def manager_epochs(store, since_days: float = 90) -> dict:
+    """결정 payload.manager.epoch 별 건수 — 폴백은 별도 키."""
+    import json as _json
+    since = time.time() - since_days * _DAY
+    with store._lock:
+        rows = store.conn.execute(
+            "SELECT payload FROM decisions WHERE ts >= ?", (since,)).fetchall()
+    epochs: dict[str, int] = {}
+    fallback_n = 0
+    for r in rows:
+        try:
+            pay = _json.loads(r["payload"]) if r["payload"] else {}
+        except (ValueError, TypeError):
+            continue
+        mgr = pay.get("manager") or {}
+        ep = mgr.get("epoch") or "unknown"
+        epochs[ep] = epochs.get(ep, 0) + 1
+        if (mgr.get("decision") or {}).get("used_fallback"):
+            fallback_n += 1
+    return {"by_epoch": dict(sorted(epochs.items(), key=lambda x: -x[1])),
+            "fallback_n": fallback_n, "n": sum(epochs.values())}
+
+
 def track_record(store, *, stats_days: float = 90, trades_limit: int = 10,
                  decisions_days: float = 30) -> dict:
     """뇌 컨텍스트에 주입할 트랙레코드 묶음. store 실패 시 빈 dict(사이클은 계속)."""
     try:
-        return {
+        from .calibration import conviction_calibration
+        from .shadow_ledger import shadow_stats
+        out = {
             "note": (f"라이브 성과 귀속. trades<{MIN_SAMPLE}(small_sample) 인 통계는 "
                      "과신하지 말 것."),
             "strategy_stats": strategy_stats(store, since_days=stats_days),
             "recent_trades": recent_trades(store, limit=trades_limit),
             "decision_stats": decision_stats(store, since_days=decisions_days),
             "dossier_ab": dossier_ab(store, since_days=stats_days),
+            "manager_epochs": manager_epochs(store, since_days=decisions_days),
+            "conviction_calibration": conviction_calibration(
+                store, since_days=stats_days),
         }
+        sh = shadow_stats(store, since_days=stats_days)
+        n_scored = (sh.get("overall") or {}).get("n_scored") or 0
+        log.info("그림자 장부 scored=%s open=%s",
+                 n_scored, (sh.get("overall") or {}).get("n_open"))
+        # 뇌 주입은 표본 20건 이상일 때만 (thin-sample 가드)
+        if n_scored >= 20:
+            out["shadow_stats"] = sh
+        return out
     except Exception as e:                     # 귀속 실패가 사이클을 죽이면 안 된다.
         log.warning("track_record 집계 실패(빈 값으로 진행): %s", e)
         return {}

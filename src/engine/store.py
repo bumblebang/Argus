@@ -94,6 +94,38 @@ CREATE TABLE IF NOT EXISTS decisions (
     payload    TEXT                         -- 원본 제안/검증 (JSON)
 );
 CREATE INDEX IF NOT EXISTS idx_decisions_ts ON decisions(ts);
+
+CREATE TABLE IF NOT EXISTS shadow_positions (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    cycle_ts        REAL NOT NULL,
+    cycle_ts_iso    TEXT,
+    sleeve          TEXT NOT NULL,
+    symbol          TEXT NOT NULL,
+    market          TEXT NOT NULL,
+    block_status    TEXT NOT NULL,
+    block_bucket    TEXT,
+    block_reason    TEXT,
+    verifier_reason TEXT,
+    concerns        TEXT,
+    conviction      REAL,
+    horizon         TEXT,
+    target_weight   REAL,
+    thesis          TEXT,
+    strategy        TEXT,
+    proposal_json   TEXT,
+    entry_price     REAL NOT NULL,
+    entry_ts        REAL NOT NULL,
+    state           TEXT NOT NULL DEFAULT 'open',
+    exit_price      REAL,
+    exit_ts         REAL,
+    exit_reason     TEXT,
+    ret_pct         REAL,
+    scored_at       REAL,
+    meta            TEXT,
+    UNIQUE(cycle_ts, symbol, sleeve)
+);
+CREATE INDEX IF NOT EXISTS idx_shadow_state ON shadow_positions(state);
+CREATE INDEX IF NOT EXISTS idx_shadow_bucket ON shadow_positions(block_bucket);
 """
 
 
@@ -328,6 +360,110 @@ class Store:
             return self.conn.execute(
                 "SELECT action, verdict, COUNT(*) n FROM decisions WHERE ts >= ?"
                 " GROUP BY action, verdict", (since,)).fetchall()
+
+    # ── 그림자 장부 (반사실 페이퍼) ─────────────────────────
+    def insert_shadow_position(self, **fields: Any) -> int | None:
+        """차단된 BUY 제안을 그림자 페이퍼로 등록. (cycle_ts,symbol,sleeve) 중복 시 None."""
+        cols = [k for k in fields if fields[k] is not None]
+        if not cols:
+            return None
+        ph = ", ".join("?" * len(cols))
+        names = ", ".join(cols)
+        vals = [_dumps(fields[k]) if k in ("concerns", "proposal_json", "meta")
+                else fields[k] for k in cols]
+        try:
+            with self._lock:
+                cur = self.conn.execute(
+                    f"INSERT INTO shadow_positions ({names}) VALUES ({ph})", vals)
+                self.conn.commit()
+                return int(cur.lastrowid)
+        except sqlite3.IntegrityError:
+            return None
+
+    def get_open_shadow_positions(self) -> list[sqlite3.Row]:
+        with self._lock:
+            return self.conn.execute(
+                "SELECT * FROM shadow_positions WHERE state='open' ORDER BY entry_ts"
+            ).fetchall()
+
+    def get_pending_shadow_positions(self) -> list[sqlite3.Row]:
+        with self._lock:
+            return self.conn.execute(
+                "SELECT * FROM shadow_positions WHERE state='pending' ORDER BY entry_ts"
+            ).fetchall()
+
+    def get_scorable_shadow_positions(self) -> list[sqlite3.Row]:
+        """open + pending — 채점 대상."""
+        with self._lock:
+            return self.conn.execute(
+                "SELECT * FROM shadow_positions WHERE state IN ('open','pending')"
+                " ORDER BY entry_ts"
+            ).fetchall()
+
+    def cancel_shadow_positions(self, symbol: str,
+                                  after_ts: float | None = None) -> int:
+        now = time.time()
+        sql = ("UPDATE shadow_positions SET state='cancelled',"
+               " exit_reason='filled_actual', scored_at=? WHERE symbol=?"
+               " AND state IN ('pending','open')")
+        params: list[Any] = [now, symbol]
+        if after_ts is not None:
+            sql += " AND entry_ts >= ?"
+            params.append(after_ts)
+        with self._lock:
+            cur = self.conn.execute(sql, params)
+            self.conn.commit()
+            return cur.rowcount
+
+    def is_symbol_armed(self, symbol: str) -> bool:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT 1 FROM positions WHERE symbol=? AND state='armed' LIMIT 1",
+                (symbol,)).fetchone()
+            return row is not None
+
+    def has_open_since(self, symbol: str, since_ts: float) -> bool:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT 1 FROM positions WHERE symbol=? AND state='open'"
+                " AND opened_at >= ? LIMIT 1",
+                (symbol, since_ts)).fetchone()
+            return row is not None
+
+    def get_scored_shadow_positions(self, *, since: float | None = None,
+                                    limit: int | None = None) -> list[sqlite3.Row]:
+        sql = "SELECT * FROM shadow_positions WHERE state='scored'"
+        params: list[Any] = []
+        if since is not None:
+            sql += " AND scored_at >= ?"
+            params.append(since)
+        sql += " ORDER BY scored_at DESC"
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(limit)
+        with self._lock:
+            return self.conn.execute(sql, params).fetchall()
+
+    def score_shadow_position(self, shadow_id: int, *, exit_price: float,
+                              exit_ts: float, exit_reason: str,
+                              ret_pct: float) -> None:
+        now = time.time()
+        with self._lock:
+            self.conn.execute(
+                "UPDATE shadow_positions SET state='scored', exit_price=?, exit_ts=?,"
+                " exit_reason=?, ret_pct=?, scored_at=? WHERE id=?"
+                " AND state IN ('open','pending')",
+                (exit_price, exit_ts, exit_reason, ret_pct, now, shadow_id))
+            self.conn.commit()
+
+    def skip_shadow_position(self, shadow_id: int, reason: str) -> None:
+        now = time.time()
+        with self._lock:
+            self.conn.execute(
+                "UPDATE shadow_positions SET state='skipped', exit_reason=?, scored_at=?"
+                " WHERE id=? AND state IN ('open','pending')",
+                (reason, now, shadow_id))
+            self.conn.commit()
 
     # ── 내부 ──────────────────────────────────────────────
     def _insert(self, sql: str, params: tuple) -> int:

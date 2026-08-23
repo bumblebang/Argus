@@ -1,0 +1,21 @@
+@echo off
+chcp 65001 >nul
+REM Shadow ledger score + optional backfill on first run.
+REM Scheduled: ArgusShadowScore (weekdays 18:30 KST).
+REM Re-register: powershell -ExecutionPolicy Bypass -File scripts\register_shadow_score.ps1
+setlocal
+cd /d "%~dp0\.."
+if not exist logs mkdir logs
+set "PYTHONIOENCODING=utf-8"
+
+set "PY=%~dp0..\.venv\Scripts\python.exe"
+if not exist "%PY%" (
+    echo [run_shadow_score] venv python not found: %PY%>> logs\shadow_score.run.log
+    exit /b 1
+)
+
+echo.>> logs\shadow_score.run.log
+echo ===== run %date% %time% =====>> logs\shadow_score.run.log
+"%PY%" scripts\score_shadow_ledger.py >> logs\shadow_score.run.log 2>&1
+
+endlocal

@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -25,6 +26,9 @@ class CycleResult:
     decision: DecisionOutput
     validation: ValidationOutput
     executed: list[dict]    # 집행/시도 결과 [{symbol, action, status, reason}]
+    cycle_ts: float = 0.0           # 저널·그림자장부 dedup 키 (epoch)
+    cycle_ts_iso: str = ""          # decisions.jsonl ts 필드
+    manager: dict | None = None     # model/prompt_hash 매니저 정체성
 
 
 def run_cycle(*, context_json: str, decision_agent, validation_agent, broker, risk,
@@ -157,15 +161,36 @@ def run_cycle(*, context_json: str, decision_agent, validation_agent, broker, ri
                          "status": "filled" if ok else "gate_rejected",
                          "reason": exec_reason})
 
-    _journal(journal_path, decision, validation, executed, conv_audit=conv_audit)
-    log.info("사이클 완료: 집행시도 %d건", len(executed))
-    return CycleResult(decision, validation, executed)
+    cycle_ts = time.time()
+    cycle_ts_iso = datetime.fromtimestamp(cycle_ts, tz=timezone.utc).isoformat()
+    from .manager_id import manager_snapshot
+    dec_prompt = getattr(decision_agent, "SYSTEM", "") or ""
+    val_prompt = getattr(validation_agent, "SYSTEM", "") or ""
+    # 모듈에 모듈 상수로 있을 수 있음
+    if not dec_prompt:
+        from . import decision_agent as _da
+        dec_prompt = getattr(_da, "SYSTEM", "") or ""
+    if not val_prompt:
+        from . import validation_agent as _va
+        val_prompt = getattr(_va, "SYSTEM", "") or ""
+    manager = manager_snapshot(
+        decision_llm=getattr(decision_agent, "llm", None),
+        validation_llm=getattr(validation_agent, "llm", None),
+        decision_prompt=dec_prompt,
+        validation_prompt=val_prompt,
+    )
+    _journal(journal_path, decision, validation, executed, conv_audit=conv_audit,
+             cycle_ts_iso=cycle_ts_iso, manager=manager)
+    log.info("사이클 완료: 집행시도 %d건 epoch=%s", len(executed), manager.get("epoch"))
+    return CycleResult(decision, validation, executed,
+                       cycle_ts=cycle_ts, cycle_ts_iso=cycle_ts_iso, manager=manager)
 
 
 def _journal(path: str | Path, decision: DecisionOutput, validation: ValidationOutput,
-             executed: list[dict], conv_audit: dict | None = None) -> None:
+             executed: list[dict], conv_audit: dict | None = None,
+             cycle_ts_iso: str | None = None, manager: dict | None = None) -> None:
     rec = {
-        "ts": datetime.now(timezone.utc).isoformat(),
+        "ts": cycle_ts_iso or datetime.now(timezone.utc).isoformat(),
         "market_view": decision.market_view,
         "proposals": [p.model_dump() for p in decision.proposals],
         "verdicts": [v.model_dump() for v in validation.verdicts],
@@ -173,6 +198,8 @@ def _journal(path: str | Path, decision: DecisionOutput, validation: ValidationO
     }
     if conv_audit:
         rec["conviction_code"] = conv_audit
+    if manager:
+        rec["manager"] = manager
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
     with p.open("a", encoding="utf-8") as f:

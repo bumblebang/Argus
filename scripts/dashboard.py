@@ -1034,6 +1034,22 @@ def _gather() -> dict:
     data["value_cfg"] = _read_value_cfg()
     data["value_watchlist"] = _read_value_watchlist()
     data["value_decisions"] = _read_value_decisions()
+    # 측정층(그림자·캘리브레이션·매니저) — 실패해도 대시보드는 계속
+    try:
+        from src.engine.store import Store
+        from src.shadow_ledger import shadow_stats
+        from src.calibration import conviction_calibration
+        from src.attribution import manager_epochs
+        _st = Store(DB)
+        data["instrumentation"] = {
+            "shadow": shadow_stats(_st, since_days=90),
+            "calibration": conviction_calibration(_st, since_days=90),
+            "manager_epochs": manager_epochs(_st, since_days=30),
+            "recent_pending": [dict(r) for r in _st.get_pending_shadow_positions()[:8]],
+        }
+        _st.close()
+    except Exception:
+        data["instrumentation"] = None
     return data
 
 
@@ -2143,6 +2159,52 @@ def _closed_ret_pct(c: dict) -> float | None:
     return None
 
 
+def _fmt_manager_epoch(ep: str) -> dict:
+    """에포크 문자열 → 대시보드용 {label, prompt, badges}."""
+    s = str(ep or "?").strip()
+    badges: list[str] = []
+    if s.endswith(":fallback"):
+        s = s[:-9]
+        badges.append("폴백")
+    legacy = s.startswith("legacy@") or s == "unknown"
+    model, _, ph = s.partition("@")
+    ph = ph or "?"
+    short = f"{ph[:6]}…" if len(ph) > 8 else ph
+    if legacy:
+        return {"label": "레거시", "prompt": "도입 전 기록", "badges": badges or ["역채우기"]}
+    if model == "unknown" or not model:
+        return {"label": "미기록", "prompt": short, "badges": badges}
+    return {"label": model, "prompt": short, "badges": badges}
+
+
+def _sleeve_ko(sleeve: str | None) -> str:
+    m = {"brain": "뇌", "value": "밸류"}
+    return m.get(str(sleeve or "").lower(), sleeve or "–")
+
+
+def _shadow_status_ko(st: str | None) -> str:
+    m = {"armed": "진입대기", "gap_armed": "갭 진입대기",
+         "vetoed": "검증거부", "gate_rejected": "게이트", "gap_rejected": "갭거부",
+         "buy_blocked": "매수차단", "no_dossier": "무도시에"}
+    return m.get(str(st or ""), st or "–")
+
+
+def _sym_display(sym: str, names: dict, *, show_code: bool = False) -> str:
+    """종목명 우선. show_code=True 면 이름 아래 코드(작게)."""
+    sym = str(sym or "")
+    nm = names.get(sym) or sym
+    if show_code and nm != sym:
+        return (f"{escape(str(nm))}<br><span class=muted><small class=mono>"
+                f"{escape(sym)}</small></span>")
+    return escape(str(nm))
+
+
+def _epoch_badges_html(badges: list[str]) -> str:
+    if not badges:
+        return "–"
+    return " ".join(f"<span class=chip>{escape(b)}</span>" for b in badges)
+
+
 def _perf_html(d: dict) -> str:
     t = d.get("trades")
     names = d.get("names", {})
@@ -2245,6 +2307,96 @@ def _perf_html(d: dict) -> str:
         p.append("</div>")
     else:
         p.append("<div class=panel><span class=muted>청산 표본 없음.</span></div>")
+
+    # 측정층 — 그림자 · 캘리브레이션 · 매니저
+    inst = d.get("instrumentation") or {}
+    sh = inst.get("shadow") or {}
+    cal = inst.get("calibration") or {}
+    mgr = inst.get("manager_epochs") or {}
+    ov = sh.get("overall") or {}
+    p.append("<div class=sec>측정층</div>")
+    p.append("<div class=sub style='margin:-4px 0 10px'>"
+             "그림자 장부 · 확신도 캘리브레이션 · 매니저 세대</div>")
+    p.append("<div class=panel>")
+    n_sc = ov.get("n_scored") or 0
+    n_op = ov.get("n_open") or 0
+    n_pe = ov.get("n_pending") or 0
+    wr_sh = ov.get("win_rate")
+    wr_s = f"{wr_sh*100:.0f}%" if wr_sh is not None else "–"
+    avg_sh = ov.get("avg_ret_pct")
+    avg_s = f"{avg_sh:+.2f}%" if avg_sh is not None else "–"
+    avg_cls = "pos" if (avg_sh or 0) >= 0 else "neg"
+    cal_on = cal.get("calibrated")
+    ss = ov.get("small_sample")
+    ss_note = (f"<div class=sub style='margin:8px 0 0'>&#9888; 채점 {n_sc}건 — "
+               "표본 부족, 승격·뇌주입 금지</div>"
+               if ss or n_sc < 20 else "")
+    p.append(f"<div class=grid>"
+             f"<div class=card><div class=k>그림자 채점</div>"
+             f"<div class='v mono'>{n_sc}"
+             f"<small> 미채점 {n_op} · 대기 {n_pe}</small></div></div>"
+             f"<div class=card><div class=k>그림자 승률</div>"
+             f"<div class='v mono'>{wr_s}</div></div>"
+             f"<div class=card><div class=k>그림자 평균수익</div>"
+             f"<div class='v mono {avg_cls}'>{avg_s}</div></div>"
+             f"<div class=card><div class=k>확신 캘리브레이션</div>"
+             f"<div class='v'>{'적용' if cal_on else '대기'}"
+             f"<small class=mono> n={cal.get('n',0)}</small></div></div>"
+             f"<div class=card><div class=k>매니저 결정</div>"
+             f"<div class='v mono'>{mgr.get('n',0)}"
+             f"<small> 폴백 {mgr.get('fallback_n',0)}</small></div></div>"
+             f"</div>{ss_note}")
+    va = sh.get("verifier_value_add") or {}
+    if va.get("delta_pp") is not None:
+        dp = va["delta_pp"]
+        v_avg = va.get("vetoed_avg_ret_pct")
+        f_avg = va.get("filled_actual_avg_ret_pct")
+        v_s = f"{v_avg:+.2f}%" if v_avg is not None else "–"
+        f_s = f"{f_avg:+.2f}%" if f_avg is not None else "–"
+        p.append(f"<div class=sub>검증 부가가치 "
+                 f"<span class='mono {'pos' if dp >= 0 else 'neg'}'>{dp:+.2f}pp</span> "
+                 f"<span class=muted>(거부 가정 {v_s} vs 실체결 {f_s})</span></div>")
+    by_b = sh.get("by_bucket") or {}
+    if by_b:
+        p.append("<div class=sub>차단 사유별 그림자</div>"
+                 "<table><tr><th>사유</th><th>n</th><th>승률</th><th>평균수익</th></tr>")
+        for bk, agg in sorted(by_b.items(), key=lambda x: -(x[1].get("n") or 0)):
+            if not agg.get("n"):
+                continue
+            wr = agg.get("win_rate")
+            wr_b = f"{wr*100:.0f}%" if wr is not None else "–"
+            ar = agg.get("avg_ret_pct")
+            ar_b = f"{ar:+.2f}%" if ar is not None else "–"
+            ar_cls = "pos" if (ar or 0) >= 0 else "neg"
+            p.append(f"<tr><td>{escape(str(bk))}</td><td class=mono>{agg['n']}</td>"
+                     f"<td class=mono>{wr_b}</td>"
+                     f"<td class='mono {ar_cls}'>{ar_b}</td></tr>")
+        p.append("</table>")
+    by_ep = mgr.get("by_epoch") or {}
+    if by_ep:
+        p.append("<div class=sub>매니저 세대 <span class=muted>(최근 30일)</span></div>"
+                 "<table><tr><th>모델</th><th>프롬프트</th><th>태그</th><th>결정</th></tr>")
+        for ep, cnt in list(by_ep.items())[:6]:
+            fe = _fmt_manager_epoch(ep)
+            p.append(f"<tr><td><b>{escape(fe['label'])}</b></td>"
+                     f"<td class=mono>{escape(fe['prompt'])}</td>"
+                     f"<td>{_epoch_badges_html(fe['badges'])}</td>"
+                     f"<td class=mono>{cnt}</td></tr>")
+        p.append("</table>")
+    pending = inst.get("recent_pending") or []
+    if pending:
+        p.append("<div class=sub>대기 중 그림자 <span class=muted>(armed · 미체결)</span></div>"
+                 "<table><tr><th>종목</th><th>트랙</th><th>상태</th><th>진입가</th></tr>")
+        for r in pending:
+            sym = r.get("symbol") or ""
+            ep = r.get("entry_price")
+            ep_s = f"{ep:,.0f}" if isinstance(ep, (int, float)) else escape(str(ep or "–"))
+            p.append(f"<tr><td>{_sym_display(sym, names)}</td>"
+                     f"<td>{escape(_sleeve_ko(r.get('sleeve')))}</td>"
+                     f"<td>{escape(_shadow_status_ko(r.get('block_status')))}</td>"
+                     f"<td class=mono>{ep_s}</td></tr>")
+        p.append("</table>")
+    p.append("</div>")
 
     # 거래별 실현손익
     p.append("<div class=sec>실현손익 (거래별)</div><div class=panel>")

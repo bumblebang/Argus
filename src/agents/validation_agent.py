@@ -73,6 +73,8 @@ SYSTEM = """\
 
 
 class ValidationAgent:
+    SYSTEM = SYSTEM  # manager_id 해시용
+
     def __init__(self, llm, min_conviction: float = 0.6):
         self.llm = llm
         self.min_conviction = min_conviction
