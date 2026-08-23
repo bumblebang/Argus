@@ -452,3 +452,10 @@ def test_sort_core_by_turnover_reorders_without_dropping(monkeypatch, _redirect_
     monkeypatch.setattr("src.datasources.discovery._load_ranking_cache", cache)
     out = UR.sort_core_by_turnover("KR")
     assert [it["symbol"] for it in out["KR"]] == ["C", "A", "B"]  # 캐시 없는 B는 맨 뒤
+
+
+def test_static_universe_without_operator_config(monkeypatch, tmp_path):
+    """클론/CI 에는 config.yaml 이 없다. example 로 폴백해야 한다."""
+    monkeypatch.setattr(UR, "default_config_path", lambda: tmp_path / "missing.yaml")
+    static = UR._static_universe(None)
+    assert any(it.get("symbol") == "005930" for it in (static.get("KR") or []))

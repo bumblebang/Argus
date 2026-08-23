@@ -27,7 +27,7 @@ import numpy as np
 import pandas as pd
 import yaml
 
-from .config import ROOT
+from .config import ROOT, default_config_path
 from .logging_setup import get_logger
 from .screener import screen, compute_metrics, passes_filters
 from .gem_screen import gem_candidates
@@ -102,13 +102,23 @@ def _fetch_fn(cfg, dry: bool):
 
 # ── 정적(config) sector 전파 — screen 결과엔 sector 가 없으므로 아는 것만 싣는다 ──
 def _static_universe(cfg) -> dict:
-    """config.yaml 원본의 정적 universe 블록(동적 유니버스로 대체되기 전 원문)."""
-    raw = yaml.safe_load((ROOT / "config.yaml").read_text(encoding="utf-8")) or {}
+    """설정 파일의 정적 universe 블록(동적 유니버스로 대체되기 전 원문).
+
+    load_config 는 동적 universe.yaml 으로 raw['universe'] 를 덮어쓸 수 있어서
+    파일을 다시 읽는다. 경로는 ARGUS_CONFIG / pytest example / config.yaml.
+    """
+    path = default_config_path()
+    if not path.exists():
+        path = ROOT / "config.example.yaml"
+    try:
+        raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except OSError:
+        return {}
     return raw.get("universe") or {}
 
 
 def _static_us(cfg) -> list[dict]:
-    """US 정적 유니버스(config.yaml 원본). US 발굴/스크린 실패 시 폴백용."""
+    """US 정적 유니버스(설정 파일 원본). US 발굴/스크린 실패 시 폴백용."""
     return _static_universe(cfg).get("US", [])
 
 

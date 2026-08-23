@@ -19,9 +19,10 @@ _chk_*.py
 research/
 data/quant_review/
 
-# runtime data (생성물). 후보군(base_universe_*.txt)은 추적함.
+# runtime data (생성물). 후보군(base_universe_*.txt)과 KRX bld 카탈로그는 추적함.
 # 이 폴더엔 실계좌 흔적이 들어 있다 — bot.db(포지션·체결·결정 전문), 원장, 토큰 캐시.
 data/*.json
+!data/krx_bld_catalog.json
 data/*.jsonl*
 data/.token.json
 data/*.log

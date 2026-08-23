@@ -270,12 +270,12 @@ def test_watch_config_reads_new_blocks():
     assert bare.extra_wakes == {}
 
 
-def test_live_config_yaml_brain_budget_schedule():
-    """운영 config: KR 프리+정규 1h, 08:00/15:30 extra, Athena 07:30 훅."""
+def test_example_config_yaml_brain_budget_schedule():
+    """공개 example: KR 프리+정규 1h, 08:00/15:30 extra, Athena 07:30 훅."""
     import yaml
     from pathlib import Path
     raw = yaml.safe_load(
-        (Path(__file__).resolve().parents[1] / "config.yaml").read_text(encoding="utf-8"))
+        (Path(__file__).resolve().parents[1] / "config.example.yaml").read_text(encoding="utf-8"))
     cfg = WatchConfig.from_config(raw)
     assert cfg.brain_sessions["KR"] == ("premarket", "regular")
     assert cfg.brain_sessions["US"] == ()
