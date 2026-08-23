@@ -22,6 +22,11 @@ PROTECTED = frozenset({
     "conviction_weights", "validation_rules",
 })
 
+# 리플레이·널 Δ 는 실험 등록과 무관하게 승격 불가 (판단 단위 측정일 뿐).
+NO_PROMOTE = frozenset({
+    "replay_score", "null_manager", "context_replay", "consistency",
+})
+
 
 def _empty() -> dict:
     return {"version": 1, "experiments": []}
@@ -72,6 +77,8 @@ def can_promote(*, change: str, evidence_n: int, registry_path: Path | str = DEF
 
     그림자 장부 Δ만으로는 항상 False.
     """
+    if change in NO_PROMOTE or change.startswith("replay"):
+        return False, "리플레이/널 Δ 로는 승격 불가"
     if change in PROTECTED or change.startswith("main") or change.startswith("sleeve"):
         reg = load_registry(registry_path)
         if not experiment_id:

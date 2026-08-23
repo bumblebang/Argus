@@ -82,9 +82,12 @@ def test_proposal_strategy_fields_optional():
     p = Proposal(symbol="A", market="KR", side="BUY", conviction=0.7,
                  target_weight=0.2, thesis="t")
     assert p.strategy is None and p.params is None          # 하위호환: 없어도 됨
+    assert p.p_target_before_stop is None
     p2 = Proposal(symbol="A", market="KR", side="BUY", conviction=0.7, target_weight=0.2,
-                  thesis="t", strategy="rsi_reversion", params={"period": 10})
+                  thesis="t", strategy="rsi_reversion", params={"period": 10},
+                  p_target_before_stop=0.65)
     assert p2.strategy == "rsi_reversion" and p2.params == {"period": 10.0}
+    assert p2.p_target_before_stop == 0.65
 
 
 def test_약세_스틸맨_필드_선택적이고_저널에_남는다():

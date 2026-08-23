@@ -36,6 +36,7 @@ data/research.csv
 data/universe.yaml
 data/day_pool.yaml
 data/history/
+data/context_archive/
 data/krx_cache/
 data/llm_inbox/
 logs/
