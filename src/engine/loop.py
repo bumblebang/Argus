@@ -31,7 +31,7 @@ from ..market_hours import current_session, is_tradable, near_session_end, marke
 from .gateway import TossGateway
 from .store import Store
 from . import triggers as T
-from .exit_policy import ExitPolicyConfig, time_stop_trigger
+from .exit_policy import ExitPolicyConfig, time_stop_trigger, thesis_inval_trigger
 from .wake_request import consume_brain_wake
 
 log = get_logger("engine.loop")
@@ -248,6 +248,15 @@ def _read_regime(market_state_path: str | Path | None) -> dict:
             return {}
         ms = json.loads(p.read_text(encoding="utf-8"))
         return {m: (v or {}).get("label") for m, v in (ms.get("regime") or {}).items()}
+    except (OSError, ValueError):
+        return {}
+
+
+def _read_market_state(path: str | Path | None = None) -> dict:
+    """market_state.json 전체(수급 streak 등). 틱당 1회 읽기."""
+    p = Path(path) if path else ROOT / "data" / "market_state.json"
+    try:
+        return json.loads(p.read_text(encoding="utf-8")) if p.exists() else {}
     except (OSError, ValueError):
         return {}
 
@@ -613,6 +622,7 @@ class WatchLoop:
         sessions = {m: current_session(m, now_ts) for m in open_markets}
 
         wl = self.watchlist_fn()
+        ms_full = _read_market_state()
         cur_regime = wl.get("_regime", {})          # {market: label} — regime_flip 비교용
         imminent: list[tuple[str, str, list]] = []  # (market, symbol, triggers)
         managed: list[tuple[str, str, dict]] = []   # 보유분(전략청산 대상)
@@ -700,6 +710,13 @@ class WatchLoop:
                         ts = time_stop_trigger(positions[sym], cfg=ep, now=now_ts)
                         if ts:
                             trigs.append(ts)
+                    # thesis 무효화(price/flow/time) — flow_streak 은 market_state.flows
+                    from ..thesis_watch import flow_streak_from_market_state
+                    fstr = flow_streak_from_market_state(ms_full, sym)
+                    ti = thesis_inval_trigger(positions[sym], price=price, now=now_ts,
+                                              flow_streak=fstr)
+                    if ti:
+                        trigs.append(ti)
                     # 트레일링: 목표가 도달 시 전량 청산 대신 손절가를 끌어올려(래칫) 이익을
                     # 태운다. 청산 트리거 평가 '전에' stop_price 를 갱신해야 같은 틱의
                     # position_triggers 가 그 트레일링 스톱으로 stop_hit 을 낸다. 트레일 대상은

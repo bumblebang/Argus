@@ -113,3 +113,22 @@ def time_stop_trigger(pos: dict, *, cfg: ExitPolicyConfig,
         f"시간손절 보유 {held:.1f}일 >= {max_d}일 ({hz})",
         {"days_held": round(held, 2), "max_days": max_d, "horizon": hz},
     )
+
+
+def thesis_inval_trigger(pos: dict, *, price: float | None, now: float,
+                         flow_streak: int | None = None) -> T.Trigger | None:
+    """thesis 무효화(price/flow/time) — 코드 감사. hits 있으면 act 청산."""
+    from ..thesis_watch import audit_position
+    hits = audit_position(pos, price=price, now=now, flow_streak=flow_streak)
+    if not hits:
+        return None
+    sym = pos.get("symbol")
+    if not sym:
+        return None
+    kinds = ",".join(h.kind for h in hits)
+    detail = "; ".join(h.detail for h in hits)
+    return T.Trigger(
+        "thesis_invalidation", sym, "act",
+        f"thesis 무효화[{kinds}] {detail}",
+        {"kinds": [h.kind for h in hits], "details": [h.detail for h in hits]},
+    )

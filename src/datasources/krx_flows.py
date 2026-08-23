@@ -178,16 +178,26 @@ class KrxFlowsSource(DataSource):
                 inqTpCd="2", detailView="0",
                 share="1", money="1",
             )
+            parsed: list[dict] = []
             best = None
             best_d = ""
             for r in rows:
                 p = parse_ticker_investor_row(r)
                 if not p:
                     continue
+                parsed.append(p)
                 d = p.get("date") or ""
                 if d >= best_d:
                     best_d, best = d, p
             if best and best.get("foreign_net") is not None:
+                streak = 0
+                for p in sorted(parsed, key=lambda x: x.get("date") or "", reverse=True):
+                    fn = p.get("foreign_net")
+                    if fn is not None and int(fn) < 0:
+                        streak += 1
+                    else:
+                        break
+                best["foreign_net_streak"] = streak
                 out[sym] = best
         if not out:
             return {}

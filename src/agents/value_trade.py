@@ -656,6 +656,13 @@ class ValueRunner:
             arm_fn=None, dossier_fn=None, zone_fn=None, conviction_sizing=True,
             min_lot_conviction=float(mlc) if mlc is not None else None)
 
+        if self.store:
+            from ..shadow_ledger import book_blocked, book_soft_pending
+            book_blocked(self.store, cyc, price_lookup, sleeve="value",
+                         cfg=self.cfg.raw)
+            book_soft_pending(self.store, cyc, price_lookup, sleeve="value",
+                              cfg=self.cfg.raw)
+
         res["proposed"] = sum(1 for p in cyc.decision.proposals if p.side == "BUY")
         res["vetoed"] = sum(1 for e in cyc.executed if e.get("status") == "vetoed")
         res["filled"] = sum(1 for e in cyc.executed if e.get("status") == "filled")
@@ -762,6 +769,8 @@ class ValueRunner:
                 sym, market, pos.qty, entry, strategy="value",
                 thesis=(prop.thesis if prop else cand.get("thesis")),
                 target_price=fpl, stop_price=stop, meta=meta)
+            from ..shadow_ledger import cancel_shadow_on_fill
+            cancel_shadow_on_fill(self.store, sym)
             self.store.log_event("value_entry", sym,
                                  {"entry": entry, "stop": stop, "target": fpl,
                                   "qty": pos.qty})

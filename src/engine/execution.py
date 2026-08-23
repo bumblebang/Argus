@@ -160,6 +160,8 @@ class EntryExecutor:
             stop = target = None
         self.store.promote_armed(armed["id"], qty, price,
                                  target_price=target, stop_price=stop)
+        from ..shadow_ledger import cancel_shadow_on_fill
+        cancel_shadow_on_fill(self.store, sym)
         self.store.log_event("entry", sym,
                              {"strategy": name, "price": price, "qty": qty,
                               "reason": sig.reason})
@@ -203,6 +205,8 @@ class EntryExecutor:
             self.store.promote_armed(armed["id"], qty, price,
                                      target_price=zone.get("target"),
                                      stop_price=zone["invalidation"])
+            from ..shadow_ledger import cancel_shadow_on_fill
+            cancel_shadow_on_fill(self.store, sym)
             self.store.log_event("entry", sym,
                                  {"strategy": armed.get("strategy"), "price": price, "qty": qty,
                                   "reason": "존 진입"})

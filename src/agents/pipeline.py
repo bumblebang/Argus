@@ -630,6 +630,10 @@ class CycleRunner:
         mlc = agents_cfg.get("min_lot_conviction")
         if mlc is None and self.cfg.risk.get("allow_min_lot"):
             mlc = self.min_conv
+        conv_sz = bool(agents_cfg.get("conviction_sizing", True))
+        if conv_sz and self.store:
+            from ..calibration import sizing_enabled
+            conv_sz = sizing_enabled(self.store, configured=True)
         res = run_cycle(context_json=context, decision_agent=DecisionAgent(llm),
                         validation_agent=ValidationAgent(val_llm, min_conviction=self.brain_min_conv),
                         broker=self.broker, risk=self.risk, price_lookup=price_lookup,
@@ -645,12 +649,18 @@ class CycleRunner:
                                  else None),
                         entry_zone_tolerance_pct=float(
                             agents_cfg.get("entry_zone_tolerance_pct", 0.005)),
-                        conviction_sizing=bool(agents_cfg.get("conviction_sizing", True)),
+                        conviction_sizing=conv_sz,
                         min_lot_conviction=float(mlc) if mlc is not None else None,
                         apply_code_conviction=bool(agents_cfg.get("conviction_code", True)),
                         dossier_brief_fn=(self._dossier_brief if self.store else None),
                         features_by_sym=feat_map)
         self._record(res)
+        if self.store:
+            from ..shadow_ledger import book_blocked, book_soft_pending
+            book_blocked(self.store, res, price_lookup, sleeve="brain",
+                         cfg=self.cfg.raw)
+            book_soft_pending(self.store, res, price_lookup, sleeve="brain",
+                              cfg=self.cfg.raw)
         self.sync_store_positions(res)
         return res
 
@@ -737,7 +747,12 @@ class CycleRunner:
                 target = d["target"]
             meta = {"horizon": horizon, "params": params,
                     "entry_regime": self._regime_now.get(market),
-                    "dossier_id": (d["id"] if d else None)}   # A/B 귀속 태그
+                    "dossier_id": (d["id"] if d else None),
+                    "conviction": getattr(prop, "conviction", None) if prop else None,
+                    "manager_epoch": (res.manager or {}).get("epoch") if res else None}
+            # thesis 무효화 시드(price+time). 뇌/Athena가 덮어쓸 수 있음.
+            from ..thesis_watch import default_spec_from_dossier
+            meta["thesis_invalidation"] = default_spec_from_dossier(d, horizon)
             item = self._universe_item(sym)      # 성과귀속용 source 태그(gem 등, 있을 때만)
             if item and item.get("source"):
                 meta["source"] = item["source"]
@@ -745,6 +760,8 @@ class CycleRunner:
                 sym, market, pos.qty, pos.avg_price, strategy=strat,
                 thesis=(prop.thesis if prop else None),
                 target_price=target, stop_price=stop, meta=meta)
+            from ..shadow_ledger import cancel_shadow_on_fill
+            cancel_shadow_on_fill(self.store, sym)
         for sym, row in open_rows.items():            # 계좌에서 사라진 보유 → 청산처리
             p = acct.positions.get(sym)
             if p is None or not p.is_open:
@@ -764,6 +781,8 @@ class CycleRunner:
                 symbol=p.symbol, action=p.side, conviction=p.conviction,
                 thesis=p.thesis, verdict=("approved" if (v and v.approved) else "vetoed"),
                 payload={"target_weight": p.target_weight, "horizon": p.horizon,
-                         "dossier_id": (d["id"] if d else None)})   # 도시에 A/B 귀속
+                         "dossier_id": (d["id"] if d else None),
+                         "manager": res.manager})   # 매니저 에포크 귀속
         self.store.log_event("cycle", None, {"market_view": res.decision.market_view,
-                                             "executed": res.executed})
+                                             "executed": res.executed,
+                                             "manager": res.manager})

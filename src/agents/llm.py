@@ -88,8 +88,14 @@ class LLMClient:
         self.model = model
         self.max_tokens = max_tokens
         self.thinking = thinking
+        self.last_model: str | None = model
+        self.used_fallback: bool = False
+        self.last_source: str | None = "api"
 
     def structured(self, system: str, user: str, schema: Type[T]) -> T:
+        self.last_model = self.model
+        self.used_fallback = False
+        self.last_source = "api"
         sys_prompt = (system + "\n\n출력 형식: 아래 JSON 스키마에 정확히 맞는 JSON 객체 "
                       "하나만 출력하라. 코드블록·설명·머리말 없이 순수 JSON만.\n스키마:\n"
                       + json.dumps(schema.model_json_schema(), ensure_ascii=False))
@@ -427,6 +433,7 @@ class ClaudeCLIClient:
                  *,
                  require_bridge_armed: bool = True,
                  bridge_armed_max_age_sec: float = 90.0):
+        self._command_cfg = command
         self.command = resolve_claude_command(command)
         if self.command != command:
             log.info("claude 경로 해석: %s -> %s", command, self.command)
@@ -442,24 +449,43 @@ class ClaudeCLIClient:
         self.bridge_armed_max_age_sec = float(bridge_armed_max_age_sec)
         # 직전 structured() 가 쓴 백엔드 — BrainWorker 가 mode=bridge|ok 판정에 사용.
         self.last_source: str | None = None
+        self.last_model: str | None = model
+        self.used_fallback: bool = False
 
     def _invoke(self, prompt: str, model: str | None) -> str:
-        args = [self.command, *self.base_args]
-        if model:
-            args += ["--model", model]
-        args += self.extra_args
+        def _args(cmd: str) -> list[str]:
+            a = [cmd, *self.base_args]
+            if model:
+                a += ["--model", model]
+            a += self.extra_args
+            return a
+
         # Windows: pythonw(무콘솔) 데몬이 콘솔 앱(claude.exe)을 subprocess 로 부르면 매 호출마다
         # 콘솔 창이 깜빡인다 → CREATE_NO_WINDOW 로 숨긴다(무인 데몬 운영 시 창 튐 방지).
         _kw = {"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}
-        try:
-            proc = subprocess.run(args, input=prompt, capture_output=True, text=True,
-                                  timeout=self.timeout, cwd=self.cwd,
-                                  encoding="utf-8", errors="replace", **_kw)
-        except FileNotFoundError:
-            raise RuntimeError(f"`{self.command}` 실행 파일을 찾을 수 없습니다. "
-                               "claude CLI 가 PATH 에 있는지 확인하세요.")
-        except subprocess.TimeoutExpired:
-            raise ClaudeCLIError(f"claude CLI 응답 시간 초과({self.timeout}s)", rc="timeout")
+        command = self.command
+        for attempt in range(2):
+            try:
+                proc = subprocess.run(_args(command), input=prompt, capture_output=True, text=True,
+                                      timeout=self.timeout, cwd=self.cwd,
+                                      encoding="utf-8", errors="replace", **_kw)
+                break
+            except subprocess.TimeoutExpired:
+                raise ClaudeCLIError(f"claude CLI 응답 시간 초과({self.timeout}s)", rc="timeout")
+            except FileNotFoundError:
+                if attempt == 0:
+                    fresh = resolve_claude_command(self._command_cfg)
+                    if fresh == command:
+                        raise RuntimeError(
+                            f"`{command}` 실행 파일을 찾을 수 없습니다. "
+                            "claude CLI 가 PATH 에 있는지 확인하세요.")
+                    log.info("claude 경로 재탐색: %s -> %s", command, fresh)
+                    command = fresh
+                    self.command = fresh
+                    continue
+                raise RuntimeError(
+                    f"`{command}` 실행 파일을 찾을 수 없습니다. "
+                    "claude CLI 가 PATH 에 있는지 확인하세요.")
         if proc.returncode != 0:
             # 원인이 stderr 대신 stdout 으로 오는 경우가 많다(사용량 한도 등) → 둘 다 본다.
             detail = (proc.stderr or "").strip() or (proc.stdout or "").strip()
@@ -478,12 +504,18 @@ class ClaudeCLIClient:
 
     def _run(self, prompt: str) -> str:
         try:
-            return self._invoke(prompt, self.model)
+            out = self._invoke(prompt, self.model)
+            self.last_model = self.model
+            self.used_fallback = False
+            return out
         except ClaudeCLIError as e:
             if self.fallback_model and self.fallback_model != self.model:
                 log.warning("claude(%s) 실패 → 폴백 모델 %s 재시도: %s",
                             self.model or "default", self.fallback_model, e)
-                return self._invoke(prompt, self.fallback_model)
+                out = self._invoke(prompt, self.fallback_model)
+                self.last_model = self.fallback_model
+                self.used_fallback = True
+                return out
             raise
 
     def _bridge_inbox_dir(self) -> Path | None:
@@ -531,6 +563,9 @@ class ClaudeCLIClient:
                 log.warning("claude 한도 소진 → cursor_bridge 폴백: %s", e)
                 out = self.cursor_bridge.structured(system, user, schema)
                 self.last_source = "bridge"
+                # 브릿지 모델은 외부 — 폴백 집계에 넣되 last_model 은 bridge 로 표기
+                self.last_model = getattr(self.cursor_bridge, "model", None) or "cursor_bridge"
+                self.used_fallback = True
                 return out
             raise
 
@@ -538,10 +573,17 @@ class ClaudeCLIClient:
 class MockLLM:
     """테스트/드라이런용. responder(schema, system, user) -> schema 인스턴스."""
 
-    def __init__(self, responder: Callable[[Type[BaseModel], str, str], BaseModel]):
+    def __init__(self, responder: Callable[[Type[BaseModel], str, str], BaseModel],
+                 model: str = "mock"):
         self._responder = responder
+        self.model = model
+        self.last_model = model
+        self.used_fallback = False
+        self.last_source = "mock"
 
     def structured(self, system: str, user: str, schema: Type[T]) -> T:
+        self.last_model = self.model
+        self.used_fallback = False
         out = self._responder(schema, system, user)
         if not isinstance(out, schema):
             raise TypeError(f"MockLLM responder 가 {schema.__name__} 를 반환해야 합니다")

@@ -41,6 +41,13 @@ class FlowsSource(DataSource):
                 r = requests.get(NAVER_TREND.format(code=sym), headers=_UA, timeout=12)
                 rows = r.json()
                 if rows:
+                    streak = 0
+                    for d in rows:
+                        fn = _num(d.get("foreignerPureBuyQuant"))
+                        if fn is not None and fn < 0:
+                            streak += 1
+                        else:
+                            break
                     d = rows[0]
                     out[sym] = {
                         "date": d.get("bizdate"),
@@ -48,6 +55,7 @@ class FlowsSource(DataSource):
                         "inst_net": _num(d.get("organPureBuyQuant")),
                         "indiv_net": _num(d.get("individualPureBuyQuant")),
                         "foreign_hold_ratio": d.get("foreignerHoldRatio"),
+                        "foreign_net_streak": streak,
                     }
             except Exception as e:
                 log.warning("[%s] 수급 조회 실패: %s", sym, e)

@@ -230,6 +230,8 @@ SYSTEM = """\
 
 
 class DecisionAgent:
+    SYSTEM = SYSTEM  # manager_id 해시용 (모듈 상수 별칭)
+
     def __init__(self, llm):
         self.llm = llm
 
