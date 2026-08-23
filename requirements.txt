@@ -1,0 +1,7 @@
+requests>=2.32
+python-dotenv>=1.0
+PyYAML>=6.0
+pandas>=2.2
+tzdata>=2024.1
+anthropic>=0.69
+pydantic>=2.7

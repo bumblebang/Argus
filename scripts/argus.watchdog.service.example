@@ -1,0 +1,8 @@
+[Unit]
+Description=Argus watch heartbeat watchdog
+
+[Service]
+Type=oneshot
+WorkingDirectory=/REPLACE/WITH/ABS/PATH/TO/argus
+ExecStart=/REPLACE/WITH/ABS/PATH/TO/argus/.venv/bin/python scripts/watchdog.py
+Environment=PYTHONIOENCODING=utf-8

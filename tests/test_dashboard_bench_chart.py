@@ -1,0 +1,80 @@
+# -*- coding: utf-8 -*-
+"""메인 Argus vs 코스피 수익률 차트 단위 테스트."""
+from datetime import datetime, timedelta
+
+from scripts.dashboard import (
+    _bench_chart_html, _equity_vs_kospi, _kr_journal_fills, _ret_chart_svg, _parse_jts,
+)
+
+
+def test_parse_jts_aware():
+    dt = _parse_jts("2026-08-07T01:03:18.775107+00:00")
+    assert dt is not None
+    assert dt.tzinfo is None
+
+
+def test_kr_journal_fills_backfills_missing_buy():
+    paper = {
+        "start_cash": {"KR": 1_000_000},
+        "positions": {"005930": {"qty": 1.0, "avg_price": 267500.0}},
+        "journal": [{
+            "ts": "2026-08-07T01:03:18+00:00", "symbol": "257720", "market": "KR",
+            "side": "BUY", "qty": 3.0, "price": 39000.0, "fee": 0,
+        }],
+    }
+    store = [{"symbol": "005930", "market": "KR", "state": "open",
+              "qty": 1.0, "avg_price": 267500.0,
+              "opened_at": datetime(2026, 8, 8).timestamp()}]
+    fills = _kr_journal_fills(paper, store)
+    syms = {(f["side"], f["symbol"]) for f in fills}
+    assert ("BUY", "257720") in syms
+    assert ("BUY", "005930") in syms
+
+
+def test_equity_vs_kospi_builds_series(monkeypatch):
+    # 고정 일봉: 벤치·종목
+    base = datetime(2026, 8, 1)
+    days = [(base + timedelta(days=i)).strftime("%Y-%m-%d") for i in range(10)]
+
+    def fake_closes(symbol, market="KR"):
+        if symbol == "^KS11":
+            return {d: 3000 + i * 10 for i, d in enumerate(days)}
+        return {d: 100 + i for i, d in enumerate(days)}
+
+    monkeypatch.setattr("scripts.dashboard._hist_closes", fake_closes)
+    monkeypatch.setattr("scripts.dashboard._chart_cache", {})
+
+    paper = {
+        "start_cash": {"KR": 1_000_000},
+        "cash": {"KR": 900_000},
+        "positions": {"AAA": {"qty": 10.0, "avg_price": 100.0}},
+        "journal": [{
+            "ts": "2026-08-03T01:00:00+00:00", "symbol": "AAA", "market": "KR",
+            "side": "BUY", "qty": 10.0, "price": 100.0, "fee": 0,
+        }],
+    }
+    snap = {"ts": 1.0, "cash": {"KR": 900_000}, "market_value": {"KR": 1200.0}}
+    out = _equity_vs_kospi(paper, snap, store_rows=[], latest_px={"AAA": 120})
+    assert out is not None
+    assert len(out["dates"]) >= 2
+    assert len(out["port"]) == len(out["dates"])
+    assert "alpha_now" in out
+    svg = _ret_chart_svg(out)
+    assert "polyline" in svg
+    assert "bc-overlay" in svg
+    assert "Argus" not in svg  # svg itself is geometry only
+
+
+def test_bench_chart_html_has_hover_tooltip():
+    series = {
+        "dates": ["2026-08-01", "2026-08-02", "2026-08-03"],
+        "port": [0.0, 1.2, 2.5],
+        "bench": [0.0, 0.8, 1.0],
+        "port_now": 2.5, "bench_now": 1.0, "alpha_now": 1.5,
+        "since": "2026-08-01", "bench_name": "코스피",
+    }
+    html = _bench_chart_html({"bench_chart": series})
+    assert "bc-wrap" in html
+    assert "bc-tip" in html
+    assert "bc-data" in html
+    assert "2026-08-02" in html

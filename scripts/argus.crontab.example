@@ -1,0 +1,13 @@
+# Argus 장전 배치 예시 (crontab -e). 시각은 KST 기준.
+# 상주 데몬(watch.py)은 여기에 넣지 않는다 — systemd/launchd/작업스케줄러.
+
+SHELL=/bin/bash
+PATH=/usr/bin:/bin
+
+# 매일 05:30 Athena KR 창 시작 무렵
+# 30 5 * * 1-5 cd /REPLACE/WITH/ABS/PATH/TO/argus && .venv/bin/python scripts/athena.py >> logs/athena.cron.log 2>&1
+
+# 매일 08:20 국면
+# 20 8 * * 1-5 cd /REPLACE/WITH/ABS/PATH/TO/argus && .venv/bin/python scripts/build_market_state.py >> logs/market_state.cron.log 2>&1
+
+# 유니버스는 watch 데몬이 굴린다. screen.py 는 수동/디버그용 — 여기 넣지 않아도 된다.

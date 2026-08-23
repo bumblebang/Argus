@@ -1,0 +1,22 @@
+# 스크리닝 후보군 (US). 형식: 티커,이름  (# 은 주석)
+# 시작용 S&P 대형주. S&P500/원하는 종목으로 자유롭게 확장하세요.
+AAPL,Apple
+MSFT,Microsoft
+NVDA,Nvidia
+AMZN,Amazon
+GOOGL,Alphabet
+META,Meta
+TSLA,Tesla
+AVGO,Broadcom
+JPM,JPMorgan
+V,Visa
+UNH,UnitedHealth
+XOM,ExxonMobil
+JNJ,JohnsonJohnson
+WMT,Walmart
+MA,Mastercard
+PG,ProcterGamble
+HD,HomeDepot
+COST,Costco
+ORCL,Oracle
+AMD,AMD
