@@ -330,7 +330,7 @@ def test_시간외_넓은_스프레드_주문스킵(tmp_path, monkeypatch):
     client = _MockClient(orderbook=_book(69000, 71000))     # 스프레드 ≈ 2.86% > 2%
     b = _live_broker(tmp_path, client, store=store)
     ok = b.execute(Order("005930", "KR", "BUY", 1, 70000.0), "test")
-    assert ok is False
+    assert not ok
     assert client.calls == []                                # 실주문 미발사
     assert b.account.position("005930").qty == 0             # 원장 무변
     evs = store.recent_events("wide_spread_skip", 0)
@@ -346,7 +346,7 @@ def test_시간외_좁은_스프레드_통과(tmp_path, monkeypatch):
     client = _MockClient(orderbook=_book(69900, 70000))      # 스프레드 ≈ 0.14%
     b = _live_broker(tmp_path, client, store=store)
     ok = b.execute(Order("005930", "KR", "BUY", 1, 70000.0), "test")
-    assert ok is True
+    assert ok
     assert client.calls and client.calls[0]["price"] == 70000.0
     assert store.recent_events("wide_spread_skip", 0) == []
 
@@ -358,7 +358,7 @@ def test_정규장은_넓은_스프레드여도_통과(tmp_path, monkeypatch):
     client = _MockClient(orderbook=_book(69000, 71000))      # 시간외였다면 스킵될 폭
     b = _live_broker(tmp_path, client, store=store)
     ok = b.execute(Order("005930", "KR", "BUY", 1, 70000.0), "test")
-    assert ok is True
+    assert ok
     assert store.recent_events("wide_spread_skip", 0) == []
 
 
@@ -368,11 +368,11 @@ def test_호가북_결측이면_가드_미적용_통과(tmp_path, monkeypatch):
     store = Store(tmp_path / "t.db")
     # (a) 조회 예외
     b = _live_broker(tmp_path, _MockClient(raise_orderbook=True), store=store)
-    assert b.execute(Order("005930", "KR", "BUY", 1, 70000.0), "test") is True
+    assert b.execute(Order("005930", "KR", "BUY", 1, 70000.0), "test")
     # (b) 한쪽 호가만 존재(bids 없음) → 스프레드 계산 불가
     sub = tmp_path / "b2"
     sub.mkdir()
     client = _MockClient(orderbook={"asks": [{"price": "70000", "volume": "10"}], "bids": []})
     b2 = _live_broker(sub, client, store=store)
-    assert b2.execute(Order("005930", "KR", "BUY", 1, 70000.0), "test") is True
+    assert b2.execute(Order("005930", "KR", "BUY", 1, 70000.0), "test")
     assert store.recent_events("wide_spread_skip", 0) == []

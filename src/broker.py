@@ -6,10 +6,9 @@
                 남지 않게 한다(치명 버그 방지). live_markets 밖 시장은 실주문도 원장
                 기록도 하지 않는다(원장=실계좌 미러 원칙).
 
-알려진 한계: 라이브 체결가는 요청 시점 시세(order.price)로 원장에 기록한다. 실체결가
-동기화(계좌 조회 대사)는 후속 과제 — 소액 운용에서 수용한다.
-
-집행 경로는 단 하나: execute(order) -> gate.check() -> (승인 시) 체결.
+알려진 한계: 라이브 미체결 잔량은 주기 재대사(reconcile)가 반영한다.
+execute() 는 ExecuteResult 를 반환하고, executor 는 store_fill.mirror_symbol_to_store 로
+account→store 를 즉시 맞춘다(부분체결 포함).
 """
 from __future__ import annotations
 
@@ -17,6 +16,7 @@ import threading
 import time
 from typing import Any, Callable
 
+from .fill_result import ExecuteResult
 from .logging_setup import get_logger
 from .market_hours import current_session
 from .paper_account import PaperAccount
@@ -84,6 +84,7 @@ class Broker:
         self._lock = threading.Lock()
         # 직전 execute 가 거부된 사유(한글). 성공 시 "". 저널/이벤트가 thesis 대신 기록.
         self.last_reject_reason: str = ""
+        self.last_result: ExecuteResult | None = None
 
     # 게이트/러너가 참조하는 계좌 상태 위임
     def position(self, symbol: str) -> Position:
@@ -97,7 +98,7 @@ class Broker:
     def realized_pnl(self) -> dict:
         return self.account.realized_pnl
 
-    def execute(self, order: Order, reason: str) -> bool:
+    def execute(self, order: Order, reason: str) -> ExecuteResult:
         with self._lock:
             return self._execute_locked(order, reason)
 
@@ -111,8 +112,10 @@ class Broker:
         with self._lock:
             return reconcile_fn(self.account)
 
-    def _execute_locked(self, order: Order, reason: str) -> bool:
+    def _execute_locked(self, order: Order, reason: str) -> ExecuteResult:
         self.last_reject_reason = ""
+        self.last_result = None
+        base_kw = {"order_qty": float(order.qty), "limit_price": float(order.price)}
         # 라이브: 게이트 '이전에' 실체결 조건을 반영한다 — SELL 은 실 매도가능 수량으로
         # 클램프, 주문가는 호가북 마켓터블 리밋가로 갱신. 그래야 하드 게이트(notional·비중·
         # 매도수량)가 명목 견적가가 아닌 실체결 상한/실보유를 검증한다.
@@ -120,14 +123,18 @@ class Broker:
             if not self._prepare_live_order(order):
                 if not self.last_reject_reason:
                     self.last_reject_reason = "라이브 주문 준비 실패"
-                return False
+                self.last_result = ExecuteResult.rejected(
+                    self.last_reject_reason, **base_kw)
+                return self.last_result
 
         decision = self.gate.check(order, self.account)
         if not decision.approved:
             self.last_reject_reason = decision.reason or "리스크게이트 거부"
             log.info("[거부] %s %s x%s @ %.2f — %s",
                      order.side, order.symbol, order.qty, order.price, decision.reason)
-            return False
+            self.last_result = ExecuteResult.rejected(
+                self.last_reject_reason, **base_kw)
+            return self.last_result
 
         # 매수 안전가드(BUY 한정): 부적격 종목이면 게이트 통과 후에도 최종 차단한다. SELL 은
         # 가드하지 않는다(위험 종목이어도 청산=위험축소는 허용). 판정 예외는 fail-open(매수 허용).
@@ -141,16 +148,22 @@ class Broker:
                 self.last_reject_reason = block_reason or "매수가드 차단"
                 log.warning("[매수차단] %s %s — %s", order.side, order.symbol, block_reason)
                 self._emit("buy_blocked", order, {"symbol": order.symbol, "reason": block_reason})
-                return False
+                self.last_result = ExecuteResult.rejected(
+                    self.last_reject_reason, **base_kw)
+                return self.last_result
 
         if self.mode == "live":
-            return self._execute_live(order, reason)
+            self.last_result = self._execute_live(order, reason)
+            return self.last_result
 
         fill = self.account.fill(order.symbol, order.market, order.side,
                                  order.qty, order.price, reason)
         log.info("[PAPER] %s %s x%s @ %.2f (fee %.2f) - %s",
                  fill.side, fill.symbol, fill.qty, fill.price, fill.fee, reason)
-        return True
+        self.last_result = ExecuteResult.from_fill(
+            fill_qty=fill.qty, fill_price=fill.price, fee=fill.fee,
+            status="FILLED", **base_kw)
+        return self.last_result
 
     def _prepare_live_order(self, order: Order) -> bool:
         """라이브 주문을 게이트 이전에 실조건으로 보정. 진행 가능하면 True.
@@ -289,7 +302,7 @@ class Broker:
                 break
         return picked
 
-    def _execute_live(self, order: Order, reason: str) -> bool:
+    def _execute_live(self, order: Order, reason: str) -> ExecuteResult:
         """라이브 실주문 집행. _prepare_live_order + 게이트 통과 후 호출된다(지정가).
 
         주문 접수 후 get_order 로 체결을 대사해 **실체결 수량·평균가·수수료·세금**으로만
@@ -304,7 +317,8 @@ class Broker:
             log.error("[LIVE] 주문 전송 실패 — %s %s x%s @ %.2f: %s",
                       order.side, order.symbol, order.qty, order.price, e)
             self._emit("live_order_error", order, {"error": str(e), "reason": reason})
-            return False
+            return ExecuteResult.rejected("주문 전송 실패", order_qty=order.qty,
+                                          limit_price=order.price)
 
         order_id = self._order_id(resp)
         if order_id is None:
@@ -312,7 +326,8 @@ class Broker:
             self._emit("live_order_error", order,
                        {"error": "응답에 orderId 없음", "resp": str(resp)[:300],
                         "reason": reason})
-            return False
+            return ExecuteResult.rejected("orderId 없음", order_qty=order.qty,
+                                          limit_price=order.price)
 
         filled_qty, avg_px, fee, status = self._reconcile_order(order_id)
         if filled_qty > 0 and avg_px and avg_px > 0:
@@ -325,7 +340,10 @@ class Broker:
                        {"symbol": order.symbol, "side": order.side, "qty": filled_qty,
                         "price": avg_px, "fee": fee, "order_id": order_id,
                         "status": status, "limit_price": order.price})
-            return True
+            return ExecuteResult.from_fill(
+                fill_qty=filled_qty, fill_price=avg_px, fee=fee,
+                order_qty=order.qty, limit_price=order.price,
+                status=status, order_id=order_id)
 
         # 미체결(펜딩/거부/취소) — 원장 무변. 펜딩은 주기 재대사가 이후 체결을 반영한다.
         kind = "live_order_pending" if status in _PENDING else "live_order_error"
@@ -334,7 +352,8 @@ class Broker:
         self._emit(kind, order,
                    {"symbol": order.symbol, "side": order.side, "qty": order.qty,
                     "order_id": order_id, "status": status, "reason": reason})
-        return False
+        return ExecuteResult.rejected(
+            f"미체결({status})", order_qty=order.qty, limit_price=order.price)
 
     def _reconcile_order(self, order_id: str) -> tuple[float, float | None, float, str]:
         """주문을 폴링해 (체결수량, 평균체결가, 수수료+세금, status).

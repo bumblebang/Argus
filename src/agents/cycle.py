@@ -149,17 +149,22 @@ def run_cycle(*, context_json: str, decision_agent, validation_agent, broker, ri
         else:  # SELL: 보유 수량 전량
             qty = broker.position(p.symbol).qty
         # broker.execute 내부에서 하드 게이트가 최종 검증(한도·자금·킬스위치)
-        ok = broker.execute(Order(p.symbol, p.market, p.side, qty, price),
-                            reason=f"[agent] {p.thesis[:60]}")
-        if ok:
+        res = broker.execute(Order(p.symbol, p.market, p.side, qty, price),
+                                  reason=f"[agent] {p.thesis[:60]}")
+        if res.partial:
+            st = "partial"
+        elif res.ok:
+            st = "filled"
+        else:
+            st = "gate_rejected"
+        if st == "filled" or st == "partial":
             exec_reason = p.thesis[:80]
         else:
-            # RiskGate/매수가드 한글 사유 — thesis 를 넣으면 포스트모템이 막힌 이유를 못 봄
-            exec_reason = (getattr(broker, "last_reject_reason", None)
+            exec_reason = (res.reject_reason
+                           or getattr(broker, "last_reject_reason", None)
                            or "리스크게이트 거부")
         executed.append({"symbol": p.symbol, "action": p.side,
-                         "status": "filled" if ok else "gate_rejected",
-                         "reason": exec_reason})
+                         "status": st, "reason": exec_reason})
 
     cycle_ts = time.time()
     cycle_ts_iso = datetime.fromtimestamp(cycle_ts, tz=timezone.utc).isoformat()

@@ -14,6 +14,7 @@ import json
 import time
 
 from ..logging_setup import get_logger
+from ..store_fill import fill_event_payload, mirror_symbol_to_store
 from ..risk_gate import Order
 from ..runner import candles_to_df, patch_live_price
 from ..strategies import build_strategy, REGISTRY
@@ -76,20 +77,22 @@ class ExitExecutor:
         if pos.qty <= 0 or not price or price <= 0:
             return False
         kind = getattr(trigger, "kind", "exit")
-        ok = self.broker.execute(Order(symbol, market, "SELL", pos.qty, price),
-                                 reason=f"[exit] {kind}")
-        if not ok:
-            why = (getattr(self.broker, "last_reject_reason", None)
-                   or "gate_rejected")
+        sell_qty = pos.qty
+        res = self.broker.execute(Order(symbol, market, "SELL", sell_qty, price),
+                                  reason=f"[exit] {kind}")
+        if not res:
+            why = res.reject_reason or getattr(self.broker, "last_reject_reason", None) or "gate_rejected"
             self.store.log_event("error", symbol,
                                  {"where": "exit", "kind": kind, "reason": why})
             return False
-        for row in self.store.get_open_positions():
-            if row["symbol"] == symbol:
-                self.store.close_position(row["id"], exit_price=price, reason=kind)
-        self.store.log_event("exit", symbol,
-                             {"kind": kind, "price": price, "qty": pos.qty})
-        log.info("코드 청산 %s x%s @ %.2f (%s)", symbol, pos.qty, price, kind)
+        mirror_symbol_to_store(self.store, self.broker, symbol,
+                               fill=res, exit_reason=kind)
+        acct = self.broker.position(symbol)
+        self.store.log_event("exit", symbol, fill_event_payload(
+            res, kind=kind, price=res.avg_price or price, qty=sell_qty,
+            account_qty=acct.qty))
+        log.info("코드 청산 %s filled=%s acct=%s @ %.2f (%s)",
+                 symbol, res.filled_qty, acct.qty, res.avg_price or price, kind)
         return True
 
 
@@ -145,27 +148,23 @@ class EntryExecutor:
         if qty <= 0:
             return {"action": "buy", "executed": False, "reason": "사이징 0"}
 
-        ok = self.broker.execute(Order(sym, market, "BUY", qty, price),
-                                 reason=f"[entry:{name}] {sig.reason}")
-        if not ok:
-            why = (getattr(self.broker, "last_reject_reason", None)
-                   or "gate_rejected")
+        res = self.broker.execute(Order(sym, market, "BUY", qty, price),
+                                  reason=f"[entry:{name}] {sig.reason}")
+        if not res:
+            why = res.reject_reason or getattr(self.broker, "last_reject_reason", None) or "gate_rejected"
             self.store.log_event("error", sym, {"where": "entry", "reason": why})
             return {"action": "buy", "executed": False, "reason": why}
 
-        horizon = meta.get("horizon", "day")
-        if self.plan_fn:
-            stop, target = self.plan_fn(price, horizon, meta.get("params"))
-        else:
-            stop = target = None
-        self.store.promote_armed(armed["id"], qty, price,
-                                 target_price=target, stop_price=stop)
         from ..shadow_ledger import cancel_shadow_on_fill
+        mirror_symbol_to_store(self.store, self.broker, sym, fill=res,
+                               armed_id=armed["id"], plan_fn=self.plan_fn)
         cancel_shadow_on_fill(self.store, sym)
-        self.store.log_event("entry", sym,
-                             {"strategy": name, "price": price, "qty": qty,
-                              "reason": sig.reason})
-        log.info("코드 진입 %s x%s @ %.2f (%s: %s)", sym, qty, price, name, sig.reason)
+        acct = self.broker.position(sym)
+        self.store.log_event("entry", sym, fill_event_payload(
+            res, strategy=name, price=res.avg_price or price, qty=acct.qty,
+            reason=sig.reason))
+        log.info("코드 진입 %s filled=%s acct=%s @ %.2f (%s: %s)",
+                 sym, res.filled_qty, acct.qty, res.avg_price or price, name, sig.reason)
         return {"action": "buy", "executed": True, "reason": sig.reason}
 
     def _evaluate_zone(self, armed: dict, market: str, price: float | None,
@@ -195,22 +194,23 @@ class EntryExecutor:
             qty = self.risk.size_buy(market, price, weight, min_qty=min_qty)
             if qty <= 0:
                 return {"action": "buy", "executed": False, "reason": "사이징 0"}
-            ok = self.broker.execute(Order(sym, market, "BUY", qty, price),
-                                     reason="[entry:zone] 존 진입")
-            if not ok:
-                why = (getattr(self.broker, "last_reject_reason", None)
-                       or "gate_rejected")
+            res = self.broker.execute(Order(sym, market, "BUY", qty, price),
+                                      reason="[entry:zone] 존 진입")
+            if not res:
+                why = res.reject_reason or getattr(self.broker, "last_reject_reason", None) or "gate_rejected"
                 self.store.log_event("error", sym, {"where": "entry", "reason": why})
                 return {"action": "buy", "executed": False, "reason": why}
-            self.store.promote_armed(armed["id"], qty, price,
-                                     target_price=zone.get("target"),
-                                     stop_price=zone["invalidation"])
             from ..shadow_ledger import cancel_shadow_on_fill
+            mirror_symbol_to_store(
+                self.store, self.broker, sym, fill=res, armed_id=armed["id"],
+                plan_fn=lambda p, h, params: (zone["invalidation"], zone.get("target")))
             cancel_shadow_on_fill(self.store, sym)
-            self.store.log_event("entry", sym,
-                                 {"strategy": armed.get("strategy"), "price": price, "qty": qty,
-                                  "reason": "존 진입"})
-            log.info("코드 진입(존) %s x%s @ %.2f", sym, qty, price)
+            acct = self.broker.position(sym)
+            self.store.log_event("entry", sym, fill_event_payload(
+                res, strategy=armed.get("strategy"), price=res.avg_price or price,
+                qty=acct.qty, reason="존 진입"))
+            log.info("코드 진입(존) %s filled=%s acct=%s @ %.2f",
+                     sym, res.filled_qty, acct.qty, res.avg_price or price)
             return {"action": "buy", "executed": True, "reason": "존 진입"}
 
         return {"action": "hold", "executed": False, "reason": "존 밖 대기"}
