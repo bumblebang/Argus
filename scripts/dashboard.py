@@ -443,12 +443,8 @@ def _read_live_mode() -> bool:
 
 
 def _trade_stats(paper: dict | None, fx: float | None = None) -> dict | None:
-    """페이퍼 저널을 FIFO 로 매칭해 청산 라운드트립 승률/손익/수익률을 낸다.
-
-    거래별 net 은 계좌 realized_pnl 규약과 맞춘다: qty*(매도가-매수가) - 매도수수료
-    (매수수수료는 매수 시점 현금유출로 이미 반영됨). net>0 이면 승. 거래 수익률은
-    net/원가(qty*매수가). 총수익률(원금대비)은 fx 로 KRW 환산해 합산한다.
-    """
+    """페이퍼 저널 FIFO 매칭(레거시). 라이브에선 BUY 누락 시 0원 청산이 생겨
+    성과 탭은 `_store_trade_stats` 를 쓴다. 알파·테스트용으로 유지."""
     if not paper:
         return None
     market_of = paper.get("symbol_market", {})
@@ -490,6 +486,67 @@ def _trade_stats(paper: dict | None, fx: float | None = None) -> dict | None:
         "win_rate": (wins / n) if n else None,
         "realized_by_market": rbm, "start_cash": sc,
         "realized_krw": realized_krw, "seed_krw": seed_krw, "ret_total": ret_total, "fx": fx,
+    }
+
+
+def _store_trade_stats(closed_pos: list[dict] | None, *,
+                       paper: dict | None = None,
+                       open_positions: list[dict] | None = None,
+                       fx: float | None = None) -> dict:
+    """store 청산 포지션 기준 성과 — 거래별 실현손익·승률·합계.
+
+    paper 저널 FIFO 는 라이브에서 BUY 미기록 시 net=0 고아 SELL 이 생긴다.
+    원금대비 수익률만 start_cash(페이퍼 미러)를 쓴다.
+    """
+    closed_rows: list[dict] = []
+    realized_by_m: dict[str, float] = defaultdict(float)
+    for c in closed_pos or []:
+        try:
+            pnl = float(c["pnl"]) if c.get("pnl") is not None else None
+        except (TypeError, ValueError):
+            pnl = None
+        if pnl is None:
+            continue
+        try:
+            qty = float(c.get("qty") or 0)
+            avg = float(c.get("avg_price") or 0)
+        except (TypeError, ValueError):
+            qty, avg = 0.0, 0.0
+        cost = qty * avg
+        mk = str(c.get("market") or "KR")
+        realized_by_m[mk] += pnl
+        closed_rows.append({
+            "symbol": c.get("symbol"),
+            "market": mk,
+            "qty": qty,
+            "net": pnl,
+            "cost": cost,
+            "ts": c.get("closed_at"),
+            "ret_pct": (pnl / cost * 100) if cost > 0 else None,
+            "strategy": c.get("strategy"),
+            "exit_reason": c.get("exit_reason"),
+            "name": c.get("name"),
+        })
+    # 표시는 오래된→최신(테이블에서 reversed 로 최신 우선이던 기존과 맞춤)
+    closed_rows.sort(key=lambda r: float(r["ts"] or 0))
+    n = len(closed_rows)
+    wins = sum(1 for r in closed_rows if r["net"] > 0)
+    open_n = sum(1 for x in (open_positions or [])
+                 if x.get("state") == "open" and float(x.get("qty") or 0) > 0)
+    sc = (paper or {}).get("start_cash") or {}
+    realized_krw = seed_krw = ret_total = None
+    fx_v = float(fx) if fx else 1.0
+    realized_krw = sum(v * (fx_v if m == "US" else 1.0) for m, v in realized_by_m.items())
+    if sc:
+        seed_krw = sum(float(v or 0) * (fx_v if m == "US" else 1.0) for m, v in sc.items())
+        ret_total = (realized_krw / seed_krw * 100) if seed_krw else None
+    return {
+        "closed": closed_rows, "n": n, "wins": wins, "losses": n - wins,
+        "entries": n + open_n,
+        "win_rate": (wins / n) if n else None,
+        "realized_by_market": dict(realized_by_m), "start_cash": sc,
+        "realized_krw": realized_krw, "seed_krw": seed_krw, "ret_total": ret_total, "fx": fx,
+        "source": "store",
     }
 
 
@@ -1017,7 +1074,12 @@ def _gather() -> dict:
     sent = ms.get("sentiment")
     data["sentiment"] = sent if isinstance(sent, dict) else {}
     data["fear_history"] = _read_fear_history()
-    data["trades"] = _trade_stats(data.get("paper"), fx)
+    data["trades"] = _store_trade_stats(
+        data.get("closed_pos"),
+        paper=data.get("paper"),
+        open_positions=data.get("positions"),
+        fx=fx,
+    )
     data["names"] = _load_names()
     data["base_rates"] = _read_base_rates()
     data["snapshot"] = _read_snapshot()
@@ -2209,8 +2271,22 @@ def _perf_html(d: dict) -> str:
     t = d.get("trades")
     names = d.get("names", {})
     p = ['<div class="tabpage page-perf">']
-    if not t:
-        p.append("<div class=panel><span class=muted>페이퍼 계좌 데이터 없음.</span></div>")
+    if not t or (t.get("n", 0) == 0 and not t.get("closed")):
+        # store 기준: 청산 없어도 카드는 0으로 보여줄 수 있음
+        if not t:
+            p.append("<div class=panel><span class=muted>성과 데이터 없음.</span></div>")
+        else:
+            n = 0
+            p.append("<div class=grid>")
+            p.append("<div class=card><div class=k>승률</div><div class='v'>– "
+                     "<small>0승 0패</small></div></div>")
+            p.append(f"<div class=card><div class=k>진입거래</div><div class='v mono'>{t.get('entries',0)}</div></div>")
+            p.append("<div class=card><div class=k>청산거래</div><div class='v mono'>0</div></div>")
+            p.append("<div class=card><div class=k>실현손익 <small>₩환산</small></div>"
+                     "<div class='v mono'>0</div></div>")
+            p.append("<div class=card><div class=k>수익률 <small>원금대비</small></div>"
+                     "<div class='v mono'>–</div></div>")
+            p.append("</div>")
     else:
         n = t["n"]; wr = t["win_rate"]
         wr_s = f"{wr*100:.0f}%" if wr is not None else "–"
@@ -2398,7 +2474,7 @@ def _perf_html(d: dict) -> str:
         p.append("</table>")
     p.append("</div>")
 
-    # 거래별 실현손익
+    # 거래별 실현손익 (store 청산 — 전략별 성과와 동일 원천)
     p.append("<div class=sec>실현손익 (거래별)</div><div class=panel>")
     if t and t["closed"]:
         p.append("<table><tr><th>거래일자</th><th>시장</th><th>종목명</th><th>실현손익</th><th>수익률</th></tr>")

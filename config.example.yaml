@@ -91,9 +91,7 @@ risk:
   max_sector_pct: 0.40
   max_drawdown_pct: 0.10
   exposure_base: "equity"
-  max_order_notional:
-    KR: 200000               # 소액. 고단가 1주는 allow_min_lot 이 연다
-    US: 0
+  max_order_notional: {}     # BUY 절대캡. {}=비활성(현금·비중·총노출). 예: {KR: 500000}
   kill_switch_file: "data/HALT"
   # KRX 경보 종목 BUY 하드스킵 (build_market_state 가 갱신)
   blocked_symbols_file: "data/krx_blocked_symbols.json"
@@ -193,7 +191,7 @@ agents:
   cursor_bridge:
     enabled: false
     inbox_dir: "data/llm_inbox"
-    timeout_sec: 240
+    timeout_sec: 1200
     poll_sec: 1.0
     require_armed: true
     armed_max_age_sec: 90
