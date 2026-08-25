@@ -137,14 +137,16 @@ class RiskGate:
         min_lot = (self.allow_min_lot and order.side == "BUY"
                    and order.qty == self.min_lot_qty)
 
-        # 2) 주문당 최대 금액
-        cap_notional = self.max_order_notional.get(m)
-        if (not min_lot and cap_notional is not None
-                and order.notional > float(cap_notional)):
-            return GateDecision(False,
-                f"주문금액 초과 ({order.notional:,.0f} > {float(cap_notional):,.0f})")
-
         if order.side == "BUY":
+            # 2) 주문당 최대 금액 — 신규 매수 폭주 방지. SELL에는 미적용.
+            #    시장 키 없음·null·≤0 이면 비활성(현금·비중·총노출 게이트로 충분).
+            cap_notional = self.max_order_notional.get(m)
+            if (not min_lot and cap_notional is not None
+                    and float(cap_notional) > 0
+                    and order.notional > float(cap_notional)):
+                return GateDecision(False,
+                    f"주문금액 초과 ({order.notional:,.0f} > {float(cap_notional):,.0f})")
+
             if order.symbol in self.blocked_symbols:
                 return GateDecision(False, f"KRX 경보·관리 차단({order.symbol})")
 

@@ -215,6 +215,27 @@ def test_drawdown_breaker_sell_exempt(tmp_path):
     assert d.approved                                       # 위험 축소는 항상 허용
 
 
+def test_sell_exempt_from_max_order_notional(tmp_path):
+    """고단가 1주 청산이 BUY용 주문상한에 막히면 안 된다(삼전 25만 > 캡 20만 사례)."""
+    gate = _gate(tmp_path, max_order_notional={"KR": 200_000})
+    acct = _acct(tmp_path)
+    acct.fill("005930", "KR", "BUY", 1, 267_500)
+    d = gate.check(Order("005930", "KR", "SELL", 1, 253_000), acct)
+    assert d.approved
+    # 같은 금액의 BUY 는 여전히 거부
+    d_buy = gate.check(Order("000660", "KR", "BUY", 1, 253_000), acct)
+    assert not d_buy.approved and "주문금액 초과" in d_buy.reason
+
+
+def test_max_order_notional_disabled_when_empty_or_zero(tmp_path):
+    """{} / 0 이면 절대캡 비활성 — 비중·현금 게이트만."""
+    acct = _acct(tmp_path)
+    for caps in ({}, {"KR": 0}, {"KR": None}):
+        gate = _gate(tmp_path, max_order_notional=caps, max_position_pct=1.0)
+        d = gate.check(Order("005930", "KR", "BUY", 1, 253_000), acct)
+        assert d.approved, caps
+
+
 # ── 최소 1주 시범매수 (allow_min_lot) ────────────────────────────────
 def test_min_lot_exempts_order_notional_and_position_pct(tmp_path):
     """qty=1 이면 주문상한·종목비중을 넘어도 통과(현금만 되면)."""
