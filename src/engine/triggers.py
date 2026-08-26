@@ -11,10 +11,23 @@ urgency 3단계:
 """
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import Sequence
 
 URGENCY = {"info": 0, "watch": 1, "act": 2}
+
+
+def _level(value) -> float | None:
+    """비교 가능한 유한 양수 레벨만 통과. NaN 은 truthy 인데 모든 비교가 False 라
+    조용히 트리거를 죽인다(손절 무발화) — 여기서 None 으로 만든다."""
+    if value is None:
+        return None
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return None
+    return v if math.isfinite(v) and v > 0 else None
 
 
 @dataclass
@@ -44,9 +57,15 @@ def position_triggers(pos: dict, price: float | None,
     if not pos or price is None:
         return []
     sym = pos.get("symbol")
-    stop = pos.get("stop_price")
-    target = pos.get("target_price")
+    raw_stop = pos.get("stop_price")
+    stop = _level(raw_stop)
+    target = _level(pos.get("target_price"))
     out: list[Trigger] = []
+    if raw_stop is not None and stop is None:
+        # 손절가가 있는데 비교 불가(NaN/음수) — 이 포지션은 손절이 사실상 없다.
+        out.append(Trigger("stop_invalid", sym, "watch",
+                           f"손절가 비정상 {raw_stop!r} — 손절 트리거 불가",
+                           {"stop_raw": repr(raw_stop), "price": price}))
     if stop:
         if price <= stop:
             out.append(Trigger("stop_hit", sym, "act",
@@ -91,6 +110,7 @@ def limit_trigger(symbol: str, price: float | None, watch_level: float | None,
     direction='below' 면 price<=level(저가 매수 관심), 'above' 면 price>=level(돌파).
     M1 에선 관심가가 비어 있을 수 있어(아직 LLM 미배정) None 을 그냥 흘린다.
     """
+    watch_level = _level(watch_level)
     if price is None or not watch_level:
         return None
     hit = price <= watch_level if direction == "below" else price >= watch_level

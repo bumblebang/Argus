@@ -5,6 +5,7 @@ build_paper_core · select_backend · bridge/LLM 팩토리 · 전략·손절 헬
 from __future__ import annotations
 
 import json
+import math
 import time
 from pathlib import Path
 from typing import Callable
@@ -231,15 +232,38 @@ def resolve_strategy(cfg: AppConfig, symbol: str, proposal=None) -> tuple[str | 
     return name, base
 
 
+# entry_stop_target 이 읽는 비율의 최종 하드 바운드. strategies.base.COMMON_PARAMS 와
+# 같은 범위 — store meta 등 validate 를 안 거친 params 가 들어와도 여기서 잘린다.
+_PCT_BOUNDS = {"stop_loss_pct": (0.005, 0.30), "target_profit_pct": (0.005, 0.50)}
+
+
+def _plan_pct(params: dict | None, key: str, default: float) -> float:
+    """손절/익절 비율을 유한·범위 안으로 강제. 위반이면 보유기간 기본값."""
+    raw = (params or {}).get(key)
+    if raw is None:
+        return default
+    try:
+        v = float(raw)
+    except (TypeError, ValueError):
+        log.warning("%s 비정상값 %r → 기본 %s", key, raw, default)
+        return default
+    lo, hi = _PCT_BOUNDS[key]
+    if not math.isfinite(v) or not (lo <= v <= hi):
+        log.warning("%s 범위 밖 %r (허용 %s~%s) → 기본 %s", key, v, lo, hi, default)
+        return default
+    return v
+
+
 def entry_stop_target(entry_price: float, horizon: str,
                       params: dict | None) -> tuple[float | None, float | None]:
     """진입가·보유기간·전략 파라미터로 (손절가, 목표가) 산출.
 
     손절/익절%는 전략 params(stop_loss_pct/target_profit_pct), 없으면 보유기간 기본값.
+    비유한값·범위 밖은 기본값으로 되돌린다(NaN 손절가 = 손절 무발화).
     """
     d_stop, d_target = _HORIZON_DEFAULTS.get(horizon, _HORIZON_DEFAULTS["swing"])
-    stop_pct = float((params or {}).get("stop_loss_pct", d_stop))
-    target_pct = float((params or {}).get("target_profit_pct", d_target))
+    stop_pct = _plan_pct(params, "stop_loss_pct", d_stop)
+    target_pct = _plan_pct(params, "target_profit_pct", d_target)
     stop = round(entry_price * (1 - stop_pct), 2) if entry_price else None
     target = round(entry_price * (1 + target_pct), 2) if entry_price else None
     return stop, target

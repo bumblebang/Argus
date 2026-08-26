@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass
 from typing import Any
 
@@ -35,9 +36,14 @@ def parse_invalidation_spec(meta: dict | None) -> dict:
     out: dict = {}
     if raw.get("price") is not None:
         try:
-            out["price"] = float(raw["price"])
+            px = float(raw["price"])
         except (TypeError, ValueError):
-            pass
+            px = None
+        if px is None or not math.isfinite(px) or px <= 0:
+            # NaN 은 price < lim 이 항상 False 라 무효화가 조용히 죽는다.
+            log.warning("thesis 무효화 가격 비정상 %r — 무시", raw.get("price"))
+        else:
+            out["price"] = px
     fl = raw.get("flow")
     if isinstance(fl, dict):
         out["flow"] = {
@@ -56,6 +62,8 @@ def parse_invalidation_spec(meta: dict | None) -> dict:
 def check_price(price: float | None, spec: dict, symbol: str) -> InvalHit | None:
     lim = spec.get("price")
     if lim is None or price is None:
+        return None
+    if not math.isfinite(float(lim)) or not math.isfinite(float(price)):
         return None
     if price < lim:
         return InvalHit("price", symbol, f"가격 {price:g} < 무효화 {lim:g}")

@@ -5,9 +5,10 @@
 """
 from __future__ import annotations
 
+import math
 from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class Proposal(BaseModel):
@@ -38,6 +39,15 @@ class Proposal(BaseModel):
         default=None, ge=0.0, le=1.0,
         description="BUY+도시레 target/invalidation 있을 때만. HOLD/SELL·레벨 없으면 null")
 
+    @field_validator("params")
+    @classmethod
+    def _finite_params(cls, v: dict[str, float] | None) -> dict[str, float] | None:
+        """NaN/Inf 파라미터를 버린다 — pydantic 은 기본으로 허용하는데, NaN 은
+        min/max 비교가 모두 False 라 하류 클램프도 통과한다."""
+        if not v:
+            return v
+        return {k: x for k, x in v.items() if math.isfinite(x)}
+
 
 class DecisionOutput(BaseModel):
     market_view: str = Field(description="현재 시장 국면에 대한 종합 판단 한두 문장")
@@ -62,6 +72,14 @@ class DossierOutput(BaseModel):
     evidence: list[str] = Field(default_factory=list,
                                 description="증거 목록(재무추세/수급/기술적/베이스레이트/뉴스)")
     key_risks: list[str] = Field(default_factory=list, description="틀릴 수 있는 위험요인")
+
+    @field_validator("entry_low", "entry_high", "invalidation", "target")
+    @classmethod
+    def _finite_level(cls, v: float | None) -> float | None:
+        """비유한 레벨은 None. NaN 은 truthy 라 손절 덮어쓰기 경로로 새어 들어간다."""
+        if v is None or not math.isfinite(v):
+            return None
+        return v
 
 
 class ValueDossier(BaseModel):
