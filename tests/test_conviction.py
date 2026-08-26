@@ -153,9 +153,12 @@ def test_floor_and_cap():
 
 
 def test_size_weight_matches_cycle_formula():
-    assert size_weight(0.2, 0.6) == 0.2 * (0.5 + 0.5 * 0.6)
+    # base × (0.75 + 0.25×c)
+    assert size_weight(0.2, 0.6) == 0.2 * (0.75 + 0.25 * 0.6)
     assert size_weight(0.2, None) == 0.2
     assert size_weight(0.2, 0.6, enabled=False) == 0.2
+    assert size_weight(0.2, 1.0, cap=0.18) == 0.18
+    assert abs(size_weight(0.2, 0.0) - 0.15) < 1e-12  # floor only
 
 
 def test_min_lot_adjust_bumps_only_when_cut_clears():

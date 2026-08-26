@@ -93,8 +93,8 @@ def test_conviction_sizing_scales_qty(tmp_path):
     tmp2 = tmp_path / "conv"
     tmp2.mkdir()
     _, b_conv = _cycle(tmp2, _buy(conviction=0.8), conviction_sizing=True)
-    conv_qty = b_conv.account.position("005930").qty             # 0.2×0.9=0.18 → 180주
-    assert plain_qty == 200 and conv_qty == 180
+    conv_qty = b_conv.account.position("005930").qty             # 0.2×(0.75+0.25×0.8)=0.19 → 190주
+    assert plain_qty == 200 and conv_qty == 190
 
 
 # ── CycleRunner 도시에 헬퍼 + 무효화가 손절 + A/B 태그 ─────────────

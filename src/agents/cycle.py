@@ -17,6 +17,7 @@ from .schemas import DecisionOutput, ValidationOutput
 from .conviction import apply_buy_conviction, size_weight, min_lot_adjust
 from ..logging_setup import get_logger
 from ..risk_gate import Order
+from .. import paths as _paths
 
 log = get_logger("agents.cycle")
 
@@ -51,7 +52,9 @@ def run_cycle(*, context_json: str, decision_agent, validation_agent, broker, ri
               dossier_brief_fn=None,
               features_by_sym: dict | None = None,
               store=None,
-              allow_add: bool = False) -> CycleResult:
+              allow_add: bool = False,
+              tranche_weights: dict[str, float] | None = None,
+              budget_caps: dict[str, float] | None = None) -> CycleResult:
     """결정→검증→집행. 데이트레(horizon='day') BUY 는 즉시 체결 대신 arm_fn 으로 라우팅.
 
     arm_fn(proposal, price)->bool 이 주어지면 day BUY 는 진입대기(armed)로 등록하고
@@ -60,10 +63,13 @@ def run_cycle(*, context_json: str, decision_agent, validation_agent, broker, ri
     dossier_fn(symbol)->bool 이 주어지면 **도시에 우선 원칙**: 스윙/장투 BUY 는 신선한
     bullish 도시에가 있어야 집행(없으면 status='no_dossier' 차단). 데이트레(armed)는
     예외 — 빠른 기회는 전략 신호 경로가 담당한다. conviction_sizing=True 면 확신도가
-    사이징에 반영된다(weight × (0.5+0.5×conviction) — 확신 낮으면 절반).
+    사이징에 소폭 반영된다(base×(floor+span×c), config risk.*).
 
     min_lot_conviction 이 주어지면(예: 0.6) 그 확신도 이상 BUY 는 목표비중이 1주도
     못 살 때 최소 1주로 올린다(고단가 floor=0 구멍). RiskGate.allow_min_lot 과 짝.
+
+    tranche_weights: 심볼→회차 비중(밸류 분할). budget_caps: 심볼→명목 상한(슬리브 room).
+    LLM target_weight 는 사이징에 쓰지 않는다(저널용으로만 남을 수 있음).
 
     zone_fn(symbol)->dict|None 이 주어지면 **갭 진입 가드**(스윙/장투 BUY 한정): 현재가가
     도시에 진입존(entry_low~entry_high) 안이면 기존대로 즉시 시장가, 존 위(갭상승)면 시장가
@@ -77,6 +83,7 @@ def run_cycle(*, context_json: str, decision_agent, validation_agent, broker, ri
     features_by_sym 이 가감 입력. 연속량은 부호×강도로 W_* 한도 안에 접고,
     희석·법적 공시·실적 미스·적자만 계단 감점한다.
     """
+    journal_path = _paths.resolve("decisions", configured=journal_path)
     decision = decision_agent.decide(context_json)
     conv_audit: dict = {}
     if apply_code_conviction:
@@ -89,102 +96,159 @@ def run_cycle(*, context_json: str, decision_agent, validation_agent, broker, ri
     verdict_by_sym = {v.symbol: v for v in validation.verdicts}
 
     executed: list[dict] = []
-    for p in decision.proposals:
-        if p.side == "HOLD":
-            continue
-        v = verdict_by_sym.get(p.symbol)
-        if v is None or not v.approved:
-            executed.append({"symbol": p.symbol, "action": p.side, "status": "vetoed",
-                             "reason": v.reason if v else "검증 결과 없음"})
-            continue
-        price = price_lookup.get(p.symbol)
-        if not price or price <= 0:
-            executed.append({"symbol": p.symbol, "action": p.side, "status": "no_price",
-                             "reason": "가격 미확보"})
-            continue
+    try:
+        for p in decision.proposals:
+            if p.side == "HOLD":
+                continue
+            v = verdict_by_sym.get(p.symbol)
+            if v is None or not v.approved:
+                executed.append({"symbol": p.symbol, "action": p.side, "status": "vetoed",
+                                 "reason": v.reason if v else "검증 결과 없음"})
+                continue
+            price = price_lookup.get(p.symbol)
+            if not price or price <= 0:
+                executed.append({"symbol": p.symbol, "action": p.side, "status": "no_price",
+                                 "reason": "가격 미확보"})
+                continue
 
-        # 데이트레 BUY: 코드 자율 진입(armed). 뇌는 종목/전략/파라미터만 배정.
-        if p.side == "BUY" and arm_fn and (p.horizon or "").lower() == "day":
-            armed = bool(arm_fn(p, price))
-            executed.append({"symbol": p.symbol, "action": "BUY",
-                             "status": "armed" if armed else "arm_skipped",
-                             "reason": p.thesis[:80]})
-            continue
-
-        # 도시에 우선 원칙: 스윙/장투 신규매수는 신선 bullish 도시에 필수(코드 하드가드).
-        if (p.side == "BUY" and dossier_fn
-                and (p.horizon or "swing").lower() != "day" and not dossier_fn(p.symbol)):
-            executed.append({"symbol": p.symbol, "action": "BUY", "status": "no_dossier",
-                             "reason": "신선한 bullish 도시에 없음 — 스윙/장투 신규매수 차단"})
-            continue
-
-        # 갭 진입 가드(스윙/장투 BUY): 진입은 오직 진입존 안에서만. 갭상승/존이탈은 시장가
-        # 추격 대신 존 재진입 대기(arm)로 라우팅하고, thesis 깨진 자리(무효화가 하회)는 거부.
-        levels = (zone_fn(p.symbol) if (zone_fn and p.side == "BUY"
-                                        and (p.horizon or "swing").lower() != "day") else None)
-        if levels:
-            lo, hi = levels["entry_low"], levels["entry_high"]
-            inval = levels["invalidation"]
-            hi_tol = hi * (1 + entry_zone_tolerance_pct)
-            if lo <= price <= hi_tol:
-                pass                              # 존 안 → 기존대로 즉시 시장가 진입
-            elif price > hi_tol:                  # 존 위(갭상승) → 존 재진입 대기
-                armed = bool(arm_fn(p, price, zone=levels)) if arm_fn else False
+            # 데이트레 BUY: 코드 자율 진입(armed). 뇌는 종목/전략/파라미터만 배정.
+            if p.side == "BUY" and arm_fn and (p.horizon or "").lower() == "day":
+                armed = bool(arm_fn(p, price))
                 executed.append({"symbol": p.symbol, "action": "BUY",
-                                 "status": "gap_armed" if armed else "arm_skipped",
-                                 "reason": f"갭 위 — 존 재진입 대기 (p {price:g} > high {hi:g})"})
-                continue
-            elif inval <= price < lo:             # 존 아래·무효화가 위 → 존 회복 대기
-                armed = bool(arm_fn(p, price, zone=levels)) if arm_fn else False
-                executed.append({"symbol": p.symbol, "action": "BUY",
-                                 "status": "gap_armed" if armed else "arm_skipped",
-                                 "reason": f"존 아래 — 회복 대기 (p {price:g} < low {lo:g})"})
-                continue
-            else:                                 # 무효화가 하회 → 이미 thesis 깨짐, 진입 거부
-                executed.append({"symbol": p.symbol, "action": "BUY", "status": "gap_rejected",
-                                 "reason": f"무효화가 하회 — 진입 거부 "
-                                           f"(p {price:g} < inval {inval:g})"})
+                                 "status": "armed" if armed else "arm_skipped",
+                                 "reason": p.thesis[:80]})
                 continue
 
-        if p.side == "BUY" and not allow_add and _already_held(broker, store, p.symbol):
-            executed.append({"symbol": p.symbol, "action": "BUY", "status": "already_held",
-                             "reason": "already holds position"})
-            continue
+            # 도시에 우선 원칙: 스윙/장투 신규매수는 신선 bullish 도시에 필수(코드 하드가드).
+            if (p.side == "BUY" and dossier_fn
+                    and (p.horizon or "swing").lower() != "day" and not dossier_fn(p.symbol)):
+                executed.append({"symbol": p.symbol, "action": "BUY", "status": "no_dossier",
+                                 "reason": "신선한 bullish 도시에 없음 — 스윙/장투 신규매수 차단"})
+                continue
 
-        if p.side == "BUY":
-            weight = size_weight(p.target_weight, p.conviction,
-                                 enabled=conviction_sizing)
-            cap = float(getattr(risk, "capital", {}).get(p.market, 0) or 0)
-            weight, min_qty = min_lot_adjust(
-                weight, price=price, capital=cap, conviction=p.conviction,
-                min_lot_conviction=min_lot_conviction)
-            if min_qty > 0 and cap > 0:
-                p.target_weight = min(
-                    1.0, max(float(p.target_weight), price / cap))
-            qty = risk.size_buy(p.market, price, weight, min_qty=min_qty)
-        else:  # SELL: 보유 수량 전량
-            qty = broker.position(p.symbol).qty
-        exit_reason = "brain" if p.side == "SELL" else None
-        res = broker.execute(
-            Order(p.symbol, p.market, p.side, qty, price),
-            reason=f"[agent] {p.thesis[:60]}",
-            store=store, exit_reason=exit_reason)
-        if res.partial:
-            st = "partial"
-        elif res.ok:
-            st = "filled"
-        else:
-            st = "gate_rejected"
-        if st == "filled" or st == "partial":
-            exec_reason = p.thesis[:80]
-        else:
-            exec_reason = (res.reject_reason
-                           or getattr(broker, "last_reject_reason", None)
-                           or "리스크게이트 거부")
-        executed.append({"symbol": p.symbol, "action": p.side,
-                         "status": st, "reason": exec_reason,
-                         "avg_price": res.avg_price,
-                         "filled_qty": res.filled_qty if res.ok else 0.0})
+            # 갭 진입 가드(스윙/장투 BUY): 진입은 오직 진입존 안에서만. 갭상승/존이탈은 시장가
+            # 추격 대신 존 재진입 대기(arm)로 라우팅하고, thesis 깨진 자리(무효화가 하회)는 거부.
+            levels = (zone_fn(p.symbol) if (zone_fn and p.side == "BUY"
+                                            and (p.horizon or "swing").lower() != "day") else None)
+            if levels:
+                lo, hi = levels["entry_low"], levels["entry_high"]
+                inval = levels["invalidation"]
+                hi_tol = hi * (1 + entry_zone_tolerance_pct)
+                if lo <= price <= hi_tol:
+                    pass                              # 존 안 → 기존대로 즉시 시장가 진입
+                elif price > hi_tol:                  # 존 위(갭상승) → 존 재진입 대기
+                    armed = bool(arm_fn(p, price, zone=levels)) if arm_fn else False
+                    executed.append({"symbol": p.symbol, "action": "BUY",
+                                     "status": "gap_armed" if armed else "arm_skipped",
+                                     "reason": f"갭 위 — 존 재진입 대기 (p {price:g} > high {hi:g})"})
+                    continue
+                elif inval <= price < lo:             # 존 아래·무효화가 위 → 존 회복 대기
+                    armed = bool(arm_fn(p, price, zone=levels)) if arm_fn else False
+                    executed.append({"symbol": p.symbol, "action": "BUY",
+                                     "status": "gap_armed" if armed else "arm_skipped",
+                                     "reason": f"존 아래 — 회복 대기 (p {price:g} < low {lo:g})"})
+                    continue
+                else:                                 # 무효화가 하회 → 이미 thesis 깨짐, 진입 거부
+                    executed.append({"symbol": p.symbol, "action": "BUY", "status": "gap_rejected",
+                                     "reason": f"무효화가 하회 — 진입 거부 "
+                                               f"(p {price:g} < inval {inval:g})"})
+                    continue
+
+            if p.side == "BUY" and not allow_add and _already_held(broker, store, p.symbol):
+                executed.append({"symbol": p.symbol, "action": "BUY", "status": "already_held",
+                                 "reason": "already holds position"})
+                continue
+
+            if p.side == "BUY":
+                # 코드 기본비중(config) — LLM target_weight 무시. 확신도는 소폭 ±만.
+                def _rf(name: str, default: float) -> float:
+                    try:
+                        v = getattr(risk, name, None)
+                        return float(v) if v is not None else default
+                    except (TypeError, ValueError):
+                        return default
+
+                base_pct = _rf("base_position_pct", _rf("max_position_pct", 0.20))
+                floor = _rf("conviction_size_floor", 0.75)
+                span = _rf("conviction_size_span", 0.25)
+                hard_cap = _rf("max_position_pct", 0.25)
+                weight = size_weight(
+                    base_pct, p.conviction, enabled=conviction_sizing,
+                    floor=floor, span=span, cap=hard_cap)
+                tr_w = (tranche_weights or {}).get(p.symbol)
+                if tr_w is not None:
+                    try:
+                        weight = min(weight * float(tr_w), hard_cap)
+                    except (TypeError, ValueError):
+                        pass
+                try:
+                    equity = (risk.sizing_base_amount(broker, p.market)
+                              if hasattr(risk, "sizing_base_amount")
+                              else float(getattr(risk, "capital", {}).get(p.market, 0) or 0))
+                    equity = float(equity)
+                except (TypeError, ValueError):
+                    equity = 0.0
+                # 종목 잔여 한도 + 선택적 슬리브/예산 캡
+                pos = broker.position(p.symbol)
+                try:
+                    cur_notional = float(pos.qty) * float(price)
+                except (TypeError, ValueError):
+                    cur_notional = 0.0
+                headroom = max(0.0, equity * hard_cap - cur_notional)
+                caps: list[float] = [headroom]
+                extra = (budget_caps or {}).get(p.symbol)
+                if extra is not None:
+                    try:
+                        caps.append(float(extra))
+                    except (TypeError, ValueError):
+                        pass
+                notional_cap = min(caps) if caps else None
+                weight, min_qty = min_lot_adjust(
+                    weight, price=price, capital=equity, conviction=p.conviction,
+                    min_lot_conviction=min_lot_conviction)
+                # 저널용: 실제 쓴 비중을 target_weight 에 기록(LLM 값 덮어씀)
+                p.target_weight = float(weight)
+                if min_qty > 0 and equity > 0:
+                    p.target_weight = min(
+                        1.0, max(float(p.target_weight), price / equity))
+                qty = risk.size_buy(
+                    p.market, price, weight, min_qty=min_qty,
+                    base_equity=equity, notional_cap=notional_cap)
+            else:  # SELL: 보유 수량 전량
+                qty = broker.position(p.symbol).qty
+            exit_reason = "brain" if p.side == "SELL" else None
+            res = broker.execute(
+                Order(p.symbol, p.market, p.side, qty, price),
+                reason=f"[agent] {p.thesis[:60]}",
+                store=store, exit_reason=exit_reason)
+            if res.partial:
+                st = "partial"
+            elif res.ok:
+                st = "filled"
+            else:
+                st = "gate_rejected"
+            if st == "filled" or st == "partial":
+                exec_reason = p.thesis[:80]
+            else:
+                exec_reason = (res.reject_reason
+                               or getattr(broker, "last_reject_reason", None)
+                               or "리스크게이트 거부")
+            executed.append({"symbol": p.symbol, "action": p.side,
+                             "status": st, "reason": exec_reason,
+                             "avg_price": res.avg_price,
+                             "filled_qty": res.filled_qty if res.ok else 0.0})
+
+    except Exception:
+        # 부분 체결이 이미 paper 에 남았을 수 있음 — 저널만이라도 남기고 재전파.
+        log.exception("사이클 집행 중 예외 — 지금까지 %d건 저널 후 재전파", len(executed))
+        cycle_ts = time.time()
+        cycle_ts_iso = datetime.fromtimestamp(cycle_ts, tz=timezone.utc).isoformat()
+        try:
+            _journal(journal_path, decision, validation, executed, conv_audit=conv_audit,
+                     cycle_ts_iso=cycle_ts_iso, manager=None, archive_meta=None)
+        except Exception:
+            log.exception("예외 경로 저널 실패")
+        raise
 
     cycle_ts = time.time()
     cycle_ts_iso = datetime.fromtimestamp(cycle_ts, tz=timezone.utc).isoformat()

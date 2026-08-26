@@ -274,7 +274,7 @@ def test_clamp_leaves_smaller_weight_alone():
 
 def test_value_prompt_has_tranche_section():
     assert "분할 매수(candidates[].tranche" in VALUE_TRADE_SYSTEM
-    assert "코드가 강제로 클램프" in VALUE_TRADE_SYSTEM
+    assert "사이징에 쓰이지 않는다" in VALUE_TRADE_SYSTEM or "사이징에 미반영" in VALUE_TRADE_SYSTEM
 
 
 # ── 4) 러너: 추가 트랜치 체결 미러링 ──────────────────────────────

@@ -21,7 +21,7 @@ from ..config import AppConfig, ROOT
 from ..logging_setup import get_logger
 from ..strategies import REGISTRY, validate_params
 from ..paper_account import PaperAccount
-from ..risk import RiskManager
+from ..risk import RiskManager, risk_manager_from_cfg
 from ..risk_gate import RiskGate
 from ..broker import Broker
 from .features import assemble
@@ -132,9 +132,7 @@ def build_paper_core(cfg: AppConfig, *, live_client=None, account_seq=None,
             why = "dry 활성(.env DRY_RUN 또는 config run.dry_run == true)"
         log.info("broker=PAPER — %s (mode=%s, dry=%s, live_client=%s)",
                  why, mode, dry, "주입됨" if live_client is not None else "없음")
-    risk = RiskManager(capital=risk_cfg.get("capital", {}),
-                       max_position_pct=risk_cfg.get("max_position_pct", 0.2),
-                       allow_fractional=risk_cfg.get("allow_fractional", False))
+    risk = risk_manager_from_cfg(risk_cfg)
     return broker, risk
 
 
@@ -341,9 +339,7 @@ class CycleRunner:
             if risk is None:
                 risk = default_risk
         elif risk is None:
-            risk = RiskManager(capital=cfg.risk.get("capital", {}),
-                               max_position_pct=cfg.risk.get("max_position_pct", 0.2),
-                               allow_fractional=cfg.risk.get("allow_fractional", False))
+            risk = risk_manager_from_cfg(cfg.risk)
         self.broker = broker
         self.account = broker.account
         self.risk = risk
@@ -691,6 +687,14 @@ class CycleRunner:
             mlc = self.min_conv
         meta = {"horizon": horizon, "params": params,
                 "target_weight": proposal.target_weight,
+                "base_position_pct": float(getattr(
+                    self.risk, "base_position_pct", 0.20)),
+                "max_position_pct": float(getattr(
+                    self.risk, "max_position_pct", 0.25)),
+                "conviction_size_floor": float(getattr(
+                    self.risk, "conviction_size_floor", 0.75)),
+                "conviction_size_span": float(getattr(
+                    self.risk, "conviction_size_span", 0.25)),
                 "conviction": getattr(proposal, "conviction", None),
                 "conviction_sizing": bool(agents_cfg.get("conviction_sizing", True)),
                 "entry_regime": self._regime_now.get(proposal.market),

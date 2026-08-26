@@ -52,7 +52,7 @@ watch:
   strategy_per_tick: 3
   entry_per_tick: 3
   vol_window: 12
-  vol_spike_pct: 0.02
+  vol_spike_pct: 0.05
   stop_buffer_pct: 0.005
   stale_quote_sec: 600
   brain_backend: "cli"       # cli | live | dry
@@ -81,7 +81,12 @@ risk:
   capital:
     KR: 1000000
     US: 0
-  max_position_pct: 0.20
+  # 사이징: weight = base_position_pct × (floor + span × conviction)
+  sizing_base: "equity"      # equity=실자산(현금+평가) | capital=고정 capital
+  base_position_pct: 0.20    # 기본 목표 비중(총자산 대비)
+  max_position_pct: 0.25     # 한 종목 하드 상한
+  conviction_size_floor: 0.75
+  conviction_size_span: 0.25 # floor+span=1.0 이면 확신 1에서 base 전량
   max_positions: 5
   daily_loss_limit_pct: 0.05
   allow_fractional: false

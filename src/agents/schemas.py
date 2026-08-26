@@ -17,7 +17,9 @@ class Proposal(BaseModel):
     side: Literal["BUY", "SELL", "HOLD"]
     conviction: float = Field(ge=0.0, le=1.0, description="확신도 0~1")
     horizon: Literal["day", "swing", "position"] = "swing"
-    target_weight: float = Field(ge=0.0, le=1.0, description="배정 예산 중 사용 비중 0~1")
+    target_weight: float = Field(
+        ge=0.0, le=1.0,
+        description="스키마 호환용(사이징 미사용 — 코드가 base_position_pct 로 정함)")
     thesis: str = Field(description="이 판단의 핵심 근거 (시황·수급·재무·뉴스 종합)")
     key_risks: list[str] = Field(default_factory=list, description="이 판단이 틀릴 수 있는 위험요인")
     # 약세 스틸맨(BUY 필수) — key_risks 가 '위험 목록'이라면 이건 '내가 틀리는 하나의 완결된

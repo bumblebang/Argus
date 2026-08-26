@@ -36,34 +36,55 @@ def _meta_of(pos: dict) -> dict:
     return meta if isinstance(meta, dict) else {}
 
 
-def _entry_weight(meta: dict, sig_weight=None) -> float | None:
-    """armed meta 의 목표비중.
+def _entry_weight(meta: dict, sig_weight=None, risk=None) -> float | None:
+    """armed meta 의 목표비중 — 코드 base_position_pct(arm 시 스탬프) 우선.
 
-    스윙/장투 갭대기는 즉시 체결과 같은 conviction_sizing 식을 쓴다.
-    데이트레(day)는 사이클이 사이징 전에 arm 하므로 비중을 그대로 둔다.
-    옛 armed 행(conviction 키 없음)도 비중 그대로.
+    LLM/시그널 target_weight 는 사이징에 쓰지 않는다(구 armed 행 폴백만).
+    스윙/장투 갭대기는 즉시 체결과 같은 conviction_sizing 식.
+    데이트레(day)는 사이클이 사이징 전에 arm 하므로 확신 배율 없이 base 그대로.
     """
-    raw = sig_weight if sig_weight is not None else meta.get("target_weight")
-    if raw is None:
+    base = meta.get("base_position_pct")
+    if base is None and risk is not None:
+        base = getattr(risk, "base_position_pct", None)
+    if base is None:
+        base = sig_weight if sig_weight is not None else meta.get("target_weight")
+    if base is None:
         return None
     hz = str(meta.get("horizon") or "day").lower()
     enabled = bool(meta.get("conviction_sizing")) and hz != "day"
-    return size_weight(float(raw), meta.get("conviction"), enabled=enabled)
+    floor = float(meta.get(
+        "conviction_size_floor",
+        getattr(risk, "conviction_size_floor", 0.75) if risk else 0.75))
+    span = float(meta.get(
+        "conviction_size_span",
+        getattr(risk, "conviction_size_span", 0.25) if risk else 0.25))
+    cap = meta.get("max_position_pct")
+    if cap is None and risk is not None:
+        cap = getattr(risk, "max_position_pct", None)
+    return size_weight(float(base), meta.get("conviction"), enabled=enabled,
+                       floor=floor, span=span, cap=cap)
 
 
-def _entry_lot(meta: dict, market: str, price: float, risk, sig_weight=None
-               ) -> tuple[float | None, float]:
+def _entry_lot(meta: dict, market: str, price: float, risk, sig_weight=None,
+               *, equity: float | None = None) -> tuple[float | None, float]:
     """갭대기 스윙은 즉시 체결과 같은 min_lot. 데이트레·옛 행은 수량 하한 없음."""
-    weight = _entry_weight(meta, sig_weight)
+    weight = _entry_weight(meta, sig_weight, risk=risk)
     if weight is None:
         return None, 0.0
     hz = str(meta.get("horizon") or "day").lower()
-    cap = float(getattr(risk, "capital", {}).get(market, 0) or 0)
+    cap = float(equity) if equity is not None and float(equity) > 0 else float(
+        getattr(risk, "capital", {}).get(market, 0) or 0)
     return min_lot_adjust(
         weight, price=price, capital=cap,
         conviction=meta.get("conviction"),
         min_lot_conviction=meta.get("min_lot_conviction"),
         enabled=(hz != "day"))
+
+
+def _sizing_equity(risk, broker, market: str) -> float:
+    if hasattr(risk, "sizing_base_amount"):
+        return float(risk.sizing_base_amount(broker, market))
+    return float(getattr(risk, "capital", {}).get(market, 0) or 0)
 
 
 class ExitExecutor:
@@ -145,8 +166,13 @@ class EntryExecutor:
             return {"action": sig.action.value, "executed": False, "reason": sig.reason}
 
         price = float(df["close"].iloc[-1])
-        weight, min_qty = _entry_lot(meta, market, price, self.risk, sig.target_weight)
-        qty = self.risk.size_buy(market, price, weight, min_qty=min_qty)
+        equity = _sizing_equity(self.risk, self.broker, market)
+        weight, min_qty = _entry_lot(meta, market, price, self.risk, sig.target_weight,
+                                    equity=equity)
+        hard_cap = float(getattr(self.risk, "max_position_pct", 0.25) or 0.25)
+        headroom = max(0.0, equity * hard_cap)
+        qty = self.risk.size_buy(market, price, weight, min_qty=min_qty,
+                                 base_equity=equity, notional_cap=headroom)
         if qty <= 0:
             return {"action": "buy", "executed": False, "reason": "사이징 0"}
 
@@ -195,8 +221,12 @@ class EntryExecutor:
             return {"action": "disarm", "executed": False, "reason": "도시에 만료"}
 
         if zone["low"] <= price <= zone["high"]:
-            weight, min_qty = _entry_lot(meta, market, price, self.risk)
-            qty = self.risk.size_buy(market, price, weight, min_qty=min_qty)
+            equity = _sizing_equity(self.risk, self.broker, market)
+            weight, min_qty = _entry_lot(meta, market, price, self.risk, equity=equity)
+            hard_cap = float(getattr(self.risk, "max_position_pct", 0.25) or 0.25)
+            headroom = max(0.0, equity * hard_cap)
+            qty = self.risk.size_buy(market, price, weight, min_qty=min_qty,
+                                     base_equity=equity, notional_cap=headroom)
             if qty <= 0:
                 return {"action": "buy", "executed": False, "reason": "사이징 0"}
             res = self.broker.execute_with_mirror(
