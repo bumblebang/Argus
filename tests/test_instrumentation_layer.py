@@ -124,6 +124,38 @@ def test_eval_promote_protected(tmp_path):
     assert "관심 섀도" in shadow_only_label({"n": 3})
 
 
+def test_apply_kill_rules_structured_only(tmp_path):
+    from src.eval_protocol import apply_kill_rules
+    reg = tmp_path / "reg.json"
+    exp = register_experiment(
+        name="t", hypothesis="h", metric="shadow.avg_ret_pct",
+        kill_if="this string is NEVER eval'd; 1/0",
+        kill={"metric": "shadow.avg_ret_pct", "op": "<", "threshold": 0.0, "min_n": 10},
+        min_n=10, touches=["validation_rules"], path=reg)
+    # 표본 부족
+    apply_kill_rules(metrics={"shadow.avg_ret_pct": -5.0}, n=3, path=reg)
+    data = json.loads(reg.read_text(encoding="utf-8"))
+    assert data["experiments"][0]["status"] == "shadow_only"
+    # 조건 충족 → kill
+    apply_kill_rules(metrics={"shadow.avg_ret_pct": -5.0}, n=20, path=reg)
+    data = json.loads(reg.read_text(encoding="utf-8"))
+    assert data["experiments"][0]["status"] == "kill"
+    # kill 은 되돌리지 않음
+    apply_kill_rules(metrics={"shadow.avg_ret_pct": 9.0}, n=20, path=reg)
+    data = json.loads(reg.read_text(encoding="utf-8"))
+    assert data["experiments"][0]["status"] == "kill"
+    # 새 실험: 조건 미충족 → pass
+    exp2 = register_experiment(
+        name="ok", hypothesis="h", metric="shadow.avg_ret_pct",
+        kill={"metric": "shadow.avg_ret_pct", "op": "<", "threshold": 0.0, "min_n": 5},
+        path=reg)
+    apply_kill_rules(metrics={"shadow.avg_ret_pct": 1.5}, n=10, path=reg)
+    data = json.loads(reg.read_text(encoding="utf-8"))
+    by_id = {e["id"]: e for e in data["experiments"]}
+    assert by_id[exp2["id"]]["status"] == "pass"
+    assert by_id[exp["id"]]["status"] == "kill"
+
+
 def test_thesis_audit_price_and_time():
     now = time.time()
     pos = {

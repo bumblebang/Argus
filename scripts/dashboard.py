@@ -2704,8 +2704,10 @@ def _perf_html(d: dict) -> str:
     cal_on = cal.get("calibrated")
     ss = ov.get("small_sample")
     ss_note = (f"<div class=sub style='margin:8px 0 0'>&#9888; 채점 {n_sc}건 — "
-               "표본 부족, 승격·뇌주입 금지</div>"
-               if ss or n_sc < 20 else "")
+               "표본 부족. 이 숫자로 메인·슬리브를 바꾸지 마라</div>"
+               if ss or n_sc < 20 else
+               "<div class=sub style='margin:8px 0 0'>"
+               "측정 참고. 평가 프로토콜은 체크리스트 — 이 화면에서 승격하지 마라</div>")
     p.append(f"<div class=grid>"
              f"<div class=card><div class=k>그림자 채점</div>"
              f"<div class='v mono'>{n_sc}"

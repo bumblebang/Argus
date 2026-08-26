@@ -61,6 +61,16 @@ def main() -> None:
 
     stats = shadow_stats(store, cfg=cfg.raw)
     print(json.dumps(stats, ensure_ascii=False, indent=2))
+    ov = stats.get("overall") or {}
+    from src.eval_protocol import apply_kill_rules
+    apply_kill_rules(
+        metrics={
+            "shadow.avg_ret_pct": ov.get("avg_ret_pct"),
+            "shadow.win_rate": ov.get("win_rate"),
+            "shadow.avg_ret_pct__n": ov.get("n_scored"),
+        },
+        n=ov.get("n_scored"),
+    )
 
 
 if __name__ == "__main__":

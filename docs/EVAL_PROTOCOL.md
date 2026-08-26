@@ -9,7 +9,13 @@
    `conviction_weights`, `validation_rules`) 변경은 등록된 실험 id 없이 금지.
 2. 그림자 장부 Δ·OOS 블렌드 Δ만으로 승격 금지 (workspace thin-sample 규칙과 동일).
 3. `min_n` 미달 → `status=shadow_only` / "관심 섀도" 라벨만.
-4. kill 조건 충족 시 즉시 `kill` — 파라미터를 고쳐가며 재시도하지 않음 (새 실험 등록).
+4. **kill 은 구조화 필드만 집행한다.** `kill_if` 문자열은 사람용 메모이며
+   `eval` 하지 않는다. `apply_kill_rules(metrics, n)` 가 score 후 status 를
+   `kill` / `pass` / `shadow_only` 로 갱신한다. 이 함수를 안 돌리면 레지스트리는
+   **체크리스트**다 — 코드가 메인/게이트를 막아주리라 기대하지 마라.
+
+`can_promote` 는 리플레이/널 Δ 에 항상 False 이고, PROTECTED 변경 경로
+(`risk_gate` 적용·config 저장)에는 아직 배선되지 않았다. 자동 승격 CTA 는 없다.
 
 ## 결함 수정 예외 (defect fix)
 
@@ -37,19 +43,22 @@
 ## 등록 예시
 
 ```python
-from src.eval_protocol import register_experiment, can_promote
+from src.eval_protocol import register_experiment, can_promote, apply_kill_rules
 
 register_experiment(
     name="verifier_rule3_relax",
     hypothesis="rule3 완화 시 vetoed 반사실 ret가 악화되지 않는다",
-    metric="shadow.by_bucket['검증:규칙거부'].avg_ret_pct",
-    kill_if="avg_ret_pct < filled_actual - 2pp after n>=30",
+    metric="shadow.avg_ret_pct",
+    kill={"metric": "shadow.avg_ret_pct", "op": "<", "threshold": -2.0, "min_n": 30},
+    kill_if="메모: 평균수익 < -2% (n>=30) 이면 kill — 코드는 구조화 필드만 본다",
     min_n=30,
     touches=["validation_rules"],
 )
 ok, why = can_promote(change="validation_rules", evidence_n=12,
                       experiment_id="exp_...")
 # ok=False — 표본 부족
+apply_kill_rules(metrics={"shadow.avg_ret_pct": -3.0}, n=40)
+# status=kill
 ```
 
 ## 매니저 에포크
@@ -92,7 +101,8 @@ ok, why = can_promote(change="validation_rules", evidence_n=12,
 LLM 없이, 아카이브에 찍힌 후보·제약만 사용.
 
 - `null_cash`: 전부 HOLD.
-- `null_random_gated`: 재현 가능한 코드 게이트(도시레 유무, 진입존, max_positions)를 통과한 집합에서 `sha256(cycle_ts|symbol)` 순으로 당시 BUY 개수만큼 추출. 같은 시드면 재현.
+- `null_random_gated`: 재현 가능한 코드 게이트( **stance==bullish** 도시레, 진입존, max_positions)를 통과한 집합에서 `sha256(cycle_ts|symbol)` 순으로 당시 BUY 개수만큼 추출. 같은 시드면 재현.
+- `delta_vs_gated` 는 `delta_decomp.same_pool` / `gate_diff` 로 분해한다. 합산 Δ로 스킬을 주장하지 않는다.
 
 해석: LLM 정책수익 − 널 정책수익 = 게이트 통과 후 종목 선택의 상대엣지.
 **널 대비 없이 스킬을 주장하지 않는다.** 결론이 "널과 구분 안 됨"이면 그게 결과다.
