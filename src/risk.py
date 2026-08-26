@@ -1,6 +1,7 @@
 """포지션 사이징 및 리스크 한도.
 
-사이징 분모는 기본 실자산(equity). capital 은 일손실·DD·폴백·min_lot 한도용.
+사이징 분모는 기본 실자산(equity). capital 은 손실예산 폴백·US 차단·min_lot 한도용.
+(일손실·DD 분모는 게이트가 당일 시가 SoD equity 를 쓰고, 실패 시 capital 폴백.)
 종목 목표비중(base_position_pct)·상한(max_position_pct)·확신 배율 밴드는
 config risk.* 로 시점/운용자마다 바꾸면 된다.
 """
@@ -28,7 +29,7 @@ def risk_manager_from_cfg(risk_cfg: dict | None) -> "RiskManager":
 
 @dataclass
 class RiskManager:
-    capital: dict          # {"KR": 1000000, "US": 1000} — 손실예산·폴백
+    capital: dict          # {"KR": 1000000, "US": 1000} — 손실예산 폴백·US 차단
     max_position_pct: float = 0.25
     max_positions: int = 5
     daily_loss_limit_pct: float = 0.05
@@ -91,8 +92,11 @@ class RiskManager:
     def can_open_new(self, open_positions: int) -> bool:
         return open_positions < self.max_positions
 
-    def daily_loss_exceeded(self, market: str, realized_pnl: float) -> bool:
-        cap = self.capital_of(market)
-        if cap <= 0:
+    def daily_loss_exceeded(self, market: str, realized_pnl: float,
+                            *, budget_base: float | None = None) -> bool:
+        """일손실 한도. budget_base(SoD 등) 우선, 없으면 capital."""
+        base = (float(budget_base) if budget_base is not None and float(budget_base) > 0
+                else self.capital_of(market))
+        if base <= 0:
             return False
-        return realized_pnl <= -cap * self.daily_loss_limit_pct
+        return realized_pnl <= -base * self.daily_loss_limit_pct

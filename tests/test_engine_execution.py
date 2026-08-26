@@ -282,8 +282,36 @@ def test_reconcile_deferred_while_inflight(tmp_path):
 
     res = broker.reconcile(_apply)
     assert res.get("deferred") is True
+    assert res.get("reason") == "inflight"
     assert "005930" in res.get("inflight", [])
     assert applied["called"] is False
+
+
+def test_reconcile_deferred_on_stale_snapshot_gen(tmp_path):
+    """API 조회 중 주문이 시작·끝나면 inflight 가 비어도 stale snapshot apply 연기."""
+    broker = _broker(tmp_path, mode="live")
+    gen = broker.activity_generation()
+    with broker._lock:
+        broker._mark_inflight("005930")
+        broker._clear_inflight("005930")
+    assert broker.activity_generation() == gen + 2
+    assert not broker._inflight
+
+    applied = {"called": False}
+
+    def _apply(acct):
+        applied["called"] = True
+        return {"ok": True}
+
+    res = broker.reconcile(_apply, expect_gen=gen)
+    assert res.get("deferred") is True
+    assert res.get("reason") == "stale_snapshot"
+    assert applied["called"] is False
+
+    # gen 이 맞으면 apply 진행
+    res2 = broker.reconcile(_apply, expect_gen=broker.activity_generation())
+    assert res2 == {"ok": True}
+    assert applied["called"] is True
 
 
 def test_finish_live_skips_double_apply_after_reconcile(tmp_path):

@@ -84,6 +84,9 @@ class Broker:
         self._lock = threading.Lock()
         # 라이브: place_order~apply_fill 사이 동일 종목 중복 주문 차단.
         self._inflight: set[str] = set()
+        # 주문 시작·종료마다 증가. 재대사 API 조회(락 밖) 중 주문이 시작·끝나
+        # apply 시점 inflight 가 비어도, 조회 스냅샷이 낡은지 판별한다.
+        self._activity_gen: int = 0
         # 직전 execute 가 거부된 사유(한글). 성공 시 "". 저널/이벤트가 thesis 대신 기록.
         self.last_reject_reason: str = ""
         self.last_result: ExecuteResult | None = None
@@ -136,7 +139,7 @@ class Broker:
                     return res
             finally:
                 with self._lock:
-                    self._inflight.discard(sym)
+                    self._clear_inflight(sym)
 
         try:
             filled_qty, avg_px, fee, status = self._reconcile_order(prep["order_id"])
@@ -150,7 +153,7 @@ class Broker:
                 return res
         finally:
             with self._lock:
-                self._inflight.discard(sym)
+                self._clear_inflight(sym)
 
     def execute_with_mirror(
         self, order: Order, reason: str, *,
@@ -173,7 +176,10 @@ class Broker:
             armed_id=armed_id, plan_fn=plan_fn, exit_reason=exit_reason)
 
     def set_marks(self, price_of: dict[str, float]) -> None:
-        """실시간 평가가 갱신 — gate.check 와 reconcile 이 같은 marks 를 보도록 락 안에서."""
+        """실시간 평가가 갱신 — gate.check 와 reconcile 이 같은 marks 를 보도록 락 안에서.
+
+        account.set_marks 가 SoD equity 조기 스냅까지 수행(손실예산 분모).
+        """
         with self._lock:
             self.account.set_marks(price_of)
 
@@ -189,7 +195,25 @@ class Broker:
         return self.run_locked(
             lambda acct: apply_sync_from_live(acct, store, data, markets=markets))
 
-    def reconcile(self, reconcile_fn: Callable[[PaperAccount], Any]) -> Any:
+    def activity_generation(self) -> int:
+        """주문 활동 세대(락 안 스냅샷). 재대사 fetch 직전 캡처용."""
+        with self._lock:
+            return self._activity_gen
+
+    def _mark_inflight(self, symbol: str) -> None:
+        """락 안: in-flight 등록 + activity_gen 증가."""
+        self._inflight.add(symbol)
+        self._activity_gen += 1
+
+    def _clear_inflight(self, symbol: str) -> None:
+        """락 안: in-flight 해제. 실제로 빠져 나갔을 때만 gen 증가."""
+        if symbol not in self._inflight:
+            return
+        self._inflight.discard(symbol)
+        self._activity_gen += 1
+
+    def reconcile(self, reconcile_fn: Callable[[PaperAccount], Any],
+                  *, expect_gen: int | None = None) -> Any:
         """주기 재대사를 broker 락 안에서 실행 — gate.check/체결과 원자적으로 원장을 병합.
 
         reconcile_fn(account) 이 실계좌(holdings/buying-power)를 account.cash/positions 에
@@ -198,12 +222,20 @@ class Broker:
 
         in-flight 주문(체결 폴링 중)이 있으면 apply 를 연기한다 — live holdings 가 이미
         체결을 반영한 뒤 _finish_live 가 apply_fill 을 중복 적용하는 레이스 방지.
+
+        expect_gen 이 주어지면 fetch 직전 activity_generation() 과 같아야 한다. 조회
+        동안 주문이 시작·끝나 inflight 가드에 안 걸려도, 낡은 API 스냅샷 apply 를 막는다.
         """
         with self._lock:
             if self._inflight:
                 syms = sorted(self._inflight)
                 log.debug("재대사 연기 — in-flight %s", syms)
-                return {"deferred": True, "inflight": syms}
+                return {"deferred": True, "reason": "inflight", "inflight": syms}
+            if expect_gen is not None and expect_gen != self._activity_gen:
+                log.debug("재대사 연기 — stale snapshot expect_gen=%s now=%s",
+                          expect_gen, self._activity_gen)
+                return {"deferred": True, "reason": "stale_snapshot",
+                        "expect_gen": expect_gen, "activity_gen": self._activity_gen}
             return reconcile_fn(self.account)
 
     def _ledger_already_has_fill(self, order: Order, filled_qty: float,
@@ -262,13 +294,13 @@ class Broker:
 
         qty_before = float(self.account.position(order.symbol).qty)
         if self.mode != "live":
-            self._inflight.add(order.symbol)
+            self._mark_inflight(order.symbol)
             return {"kind": "paper", "base_kw": base_kw, "qty_before": qty_before}
 
         order_id = self._place_live_order(order, reason)
         if order_id is None:
             return None
-        self._inflight.add(order.symbol)  # place 직후(락 안) — 중복 주문 race 차단
+        self._mark_inflight(order.symbol)  # place 직후(락 안) — 중복 주문 race 차단
         return {"kind": "live", "order_id": order_id, "base_kw": base_kw,
                 "qty_before": qty_before}
 

@@ -176,6 +176,53 @@ def test_daily_loss_blocks_when_today_over_limit(tmp_path):
     assert not d.approved and "일 손실" in d.reason
 
 
+def test_daily_loss_scales_with_sod_equity(tmp_path):
+    """SoD 가 크면 같은 원 손실도 비율 한도 안에 들어 매수 허용."""
+    from src.market_hours import market_day
+    gate = _gate(tmp_path, max_order_notional={"KR": 10_000_000})
+    acct = _acct(tmp_path, cash={"KR": 100_000_000})
+    acct.realized_pnl_today["KR"] = -60_000                 # 고정 capital 5%면 차단이던 금액
+    acct._pnl_day["KR"] = market_day("KR")
+    assert gate.check(Order("005930", "KR", "BUY", 100, 100), acct).approved
+    acct.realized_pnl_today["KR"] = -5_500_000              # SoD 1억의 5.5%
+    d = gate.check(Order("005930", "KR", "BUY", 100, 100), acct)
+    assert not d.approved and "일 손실" in d.reason
+
+
+def test_sod_equity_persists_across_reload(tmp_path):
+    from src.market_hours import market_day
+    path = tmp_path / "acct.json"
+    acct = PaperAccount(cash={"KR": 1_000_000}, state_path=path)
+    day = market_day("KR")
+    acct._sod_day["KR"] = day
+    acct._sod_equity["KR"] = 100_000_000.0
+    acct._save()
+    reloaded = PaperAccount(cash={"KR": 1_000_000}, state_path=path)
+    assert reloaded.ensure_sod_equity("KR") == 100_000_000.0
+    # 장중 equity 가 줄어도 당일 SoD 유지
+    reloaded.cash["KR"] = 500_000
+    assert reloaded.ensure_sod_equity("KR") == 100_000_000.0
+
+
+def test_sod_day_rollover_resnaps(tmp_path):
+    acct = _acct(tmp_path, cash={"KR": 2_000_000})
+    acct._sod_day["KR"] = "2000-01-01"
+    acct._sod_equity["KR"] = 50_000.0
+    assert acct.ensure_sod_equity("KR") == 2_000_000.0
+
+
+def test_loss_budget_falls_back_to_capital_when_sod_zero(tmp_path):
+    """당일 SoD 가 0으로 고정되면 capital 폴백(기존 100만×5%)."""
+    from src.market_hours import market_day
+    gate, acct = _gate(tmp_path), _acct(tmp_path)
+    acct._sod_day["KR"] = market_day("KR")
+    acct._sod_equity["KR"] = 0.0
+    acct.realized_pnl_today["KR"] = -60_000
+    acct._pnl_day["KR"] = market_day("KR")
+    d = gate.check(Order("005930", "KR", "BUY", 100, 100), acct)
+    assert not d.approved and "일 손실" in d.reason
+
+
 # ── 드로다운 브레이커: 미실현 손실 포함 ────────────────────────────
 def test_drawdown_breaker_blocks_with_unrealized(tmp_path):
     gate = _gate(tmp_path, max_drawdown_pct=0.10, max_position_pct=1.0,

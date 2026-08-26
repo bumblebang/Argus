@@ -63,11 +63,11 @@ class RiskGate:
             log.warning("max_sector_pct=%s 설정됐지만 sector_map 이 비어 있음 — "
                         "섹터 집중도 검사가 사실상 비활성입니다(유니버스에 sector 누락?).",
                         self.max_sector_pct)
-        # 드로다운 브레이커(선택): 실현누적+미실현 손실이 자본×한도 초과 시 신규 매수 차단.
+        # 드로다운 브레이커(선택): 실현누적+미실현 손실이 SoD equity×한도 초과 시 신규 매수 차단.
         dd = limits.get("max_drawdown_pct")
         self.max_drawdown_pct = float(dd) if dd is not None else None
         # 노출 한도(종목비중·총익스포저·섹터)의 기준: "capital"(고정 자본) | "equity"(실자산).
-        # 손실 예산(일손실·드로다운)은 배정 자본 기준이 맞으므로 항상 capital 을 쓴다.
+        # 손실 예산(일손실·드로다운)은 당일 시가(SoD) equity, 없으면 capital 폴백.
         self.exposure_base = str(limits.get("exposure_base", "capital")).lower()
         # 최소 1주 시범매수: qty==min_lot_qty BUY 는 주문상한·종목비중 면제(현금·총익스포저·
         # 보유수·킬스위치는 유지). 고단가 종목이 목표비중 floor=0 으로 영구 탈락하는 구멍 보완.
@@ -86,6 +86,19 @@ class RiskGate:
 
     def _cap(self, market: str) -> float:
         return float(self.capital.get(market, 0.0))
+
+    def _loss_budget_base(self, account, market: str) -> float:
+        """일손실·DD 분모: 당일 시가(SoD) equity, 없으면 config capital 폴백."""
+        base = 0.0
+        if hasattr(account, "ensure_sod_equity"):
+            try:
+                base = float(account.ensure_sod_equity(market) or 0.0)
+            except Exception as e:
+                log.warning("SoD equity 산출 실패 — capital 폴백(%s): %s", market, e)
+                base = 0.0
+        if base <= 0:
+            base = self._cap(market)
+        return base
 
     def _exposure_base(self, account, market: str) -> float:
         """노출 한도의 기준 금액. exposure_base='equity' 면 현재 실자산(현금+보유평가).
@@ -152,23 +165,24 @@ class RiskGate:
                 return GateDecision(False, f"KRX 경보·관리 차단({order.symbol})")
 
             # 3) 일 손실 한도 도달 시 신규 매수 차단 — '오늘' 실현손익 기준(시장 타임존
-            #    날짜로 리셋). 누적 realized_pnl 을 쓰면 영구 차단이 돼버린다.
-            cap = self._cap(m)
+            #    날짜로 리셋). 분모=당일 시가(SoD) equity(없으면 capital). 누적 realized_pnl
+            #    을 쓰면 영구 차단이 돼버린다.
+            base = self._loss_budget_base(account, m)
             realized_today = (account.daily_realized_pnl(m)
                               if hasattr(account, "daily_realized_pnl")
                               else account.realized_pnl.get(m, 0.0))
-            if cap > 0 and realized_today <= -cap * self.daily_loss_limit_pct:
+            if base > 0 and realized_today <= -base * self.daily_loss_limit_pct:
                 return GateDecision(False,
                     f"일 손실 한도 도달 (오늘 실현손익 {realized_today:,.0f})")
 
             # 3b) 드로다운 브레이커: 미실현 손실 포함 총 드로다운이 한도 초과면 신규 매수
             #     차단(보유가 깊은 손실인데 위험을 더 쌓는 것을 막는다). 마크는 감시 루프가
             #     매 틱 갱신 — 마크 없으면 미실현 0(배치 등 비루프 경로는 기존과 동일).
-            if self.max_drawdown_pct is not None and cap > 0:
+            if self.max_drawdown_pct is not None and base > 0:
                 unreal = (account.unrealized_pnl(m)
                           if hasattr(account, "unrealized_pnl") else 0.0)
                 drawdown = account.realized_pnl.get(m, 0.0) + unreal
-                if drawdown <= -cap * self.max_drawdown_pct:
+                if drawdown <= -base * self.max_drawdown_pct:
                     return GateDecision(False,
                         f"드로다운 한도 도달 (실현누적+미실현 {drawdown:,.0f})")
 
