@@ -1,0 +1,125 @@
+{
+  "since_days": 90.0,
+  "calibration": {
+    "n": 1,
+    "calibrated": false,
+    "brier": 0.1225,
+    "by_bin": {
+      "0.00-0.40": {
+        "n": 1,
+        "hit_rate": 0.0,
+        "small_sample": true
+      },
+      "0.40-0.55": {
+        "n": 0,
+        "hit_rate": null,
+        "small_sample": null
+      },
+      "0.55-0.70": {
+        "n": 0,
+        "hit_rate": null,
+        "small_sample": null
+      },
+      "0.70-0.85": {
+        "n": 0,
+        "hit_rate": null,
+        "small_sample": null
+      },
+      "0.85-1.01": {
+        "n": 0,
+        "hit_rate": null,
+        "small_sample": null
+      }
+    }
+  },
+  "shadow": {
+    "overall": {
+      "n_open": 105,
+      "n_pending": 7,
+      "n_scored": 17,
+      "win_rate": 0.294,
+      "avg_ret_pct": 1.98,
+      "small_sample": false
+    },
+    "by_bucket": {
+      "armed": {
+        "n": 1,
+        "win_rate": 0.0,
+        "avg_ret_pct": 0.0,
+        "small_sample": true
+      },
+      "검증:LLM거부": {
+        "n": 1,
+        "win_rate": 0.0,
+        "avg_ret_pct": 0.0,
+        "small_sample": true
+      },
+      "검증:규칙거부": {
+        "n": 2,
+        "win_rate": 0.0,
+        "avg_ret_pct": 0.0,
+        "small_sample": true
+      },
+      "검증:확신도미달": {
+        "n": 13,
+        "win_rate": 0.385,
+        "avg_ret_pct": 2.589,
+        "small_sample": false
+      }
+    },
+    "verifier_value_add": {
+      "vetoed_avg_ret_pct": 2.104,
+      "filled_actual_avg_ret_pct": 9.981,
+      "delta_pp": 7.877
+    }
+  },
+  "strategy_stats": [
+    {
+      "strategy": "value",
+      "market": "KR",
+      "trades": 2,
+      "wins": 2,
+      "total_pnl": 37110.0,
+      "win_rate": 1.0,
+      "avg_ret_pct": 17.87,
+      "small_sample": true
+    },
+    {
+      "strategy": "rsi_reversion",
+      "market": "KR",
+      "trades": 1,
+      "wins": 0,
+      "total_pnl": -15500.0,
+      "win_rate": 0.0,
+      "avg_ret_pct": -5.79,
+      "small_sample": true
+    }
+  ],
+  "gate_postmortem": {
+    "present": true,
+    "asof": "2026-08-21T20:41:05.608477+09:00",
+    "actual_closed": {
+      "n": 3,
+      "wins": 2,
+      "win_rate": 0.667
+    },
+    "actual_rows_with_null_pnl": 1,
+    "counterfactual_overall": {
+      "d1": {
+        "n": 54,
+        "win_rate": 0.778,
+        "avg_ret_pct": 1.038
+      },
+      "d5": {
+        "n": 31,
+        "win_rate": 0.677,
+        "avg_ret_pct": 1.484
+      },
+      "d20": {
+        "n": 1,
+        "win_rate": 1.0,
+        "avg_ret_pct": 18.819
+      }
+    }
+  }
+}
