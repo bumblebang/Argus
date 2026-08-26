@@ -15,12 +15,14 @@ sys.path.insert(0, str(ROOT))
 from src.eval.archive import load_context, parse_context
 from src.eval.consistency import bucket_by_regime, consistency_report
 from src.logging_setup import setup_logging
+from src import paths as _paths
 
 
 def main() -> None:
     setup_logging()
     ap = argparse.ArgumentParser(description="Offline decision consistency")
-    ap.add_argument("--journal", type=Path, default=ROOT / "data" / "decisions.jsonl")
+    ap.add_argument("--journal", type=Path,
+                    default=_paths.resolve("decisions", configured="data/decisions.jsonl"))
     ap.add_argument("--n", type=int, default=5)
     ap.add_argument("--limit", type=int, default=10)
     ap.add_argument("--dry", action="store_true")

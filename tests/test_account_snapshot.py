@@ -1,4 +1,5 @@
 """실계좌 스냅샷 조회·정규화·캐시(account_snapshot) + 대시보드 자산 패널 렌더 스모크."""
+import json
 import sys
 import time
 from pathlib import Path
@@ -186,16 +187,81 @@ def test_asset_html_live_trades_render():
     snap = acc.fetch_account_snapshot(client, 1)
     trades = [
         {"ts": time.time(), "kind": "live_order", "symbol": "005930",
-         "payload": '{"side":"BUY","qty":1,"price":273500,"order_id":"OID123"}'},
+         "payload": json.dumps({
+             "side": "BUY", "qty": 1, "price": 273500, "order_id": "OID123",
+             "reason": "[entry:zone] 존 진입",
+         })},
+        {"ts": time.time(), "kind": "live_order", "symbol": "005930",
+         "payload": json.dumps({
+             "side": "SELL", "qty": 1, "price": 252000, "order_id": "OID999",
+             "reason": "[exit] stop_hit", "exit_reason": "stop_hit",
+         })},
         {"ts": time.time(), "kind": "buy_blocked", "symbol": "900110",
          "payload": '{"reason":"관리종목"}'},
         {"ts": time.time(), "kind": "live_order_error", "symbol": "005930",
-         "payload": '{"error":"응답에 orderId 없음"}'},
+         "payload": '{"side":"BUY","error":"응답에 orderId 없음"}'},
     ]
     html = dash._asset_html(_base_d(snap, live_trades=trades))
-    assert "체결" in html and "OID123" in html
+    assert "매수" in html and "273,500" in html
+    assert "매도" in html and "손절" in html and "252,000" in html
+    assert ">수량<" in html and ">체결가<" in html
+    assert "OID123" not in html and "OID999" not in html
     assert "매수차단" in html and "관리종목" in html
-    assert "전송실패" in html
+    assert "매수실패" in html
+    # 내용 칸에 수량·가격 문구가 섞이지 않음
+    assert "x1 @" not in html
+
+
+def test_summarize_trade_note_first_sentence():
+    long = (
+        "이번 각성의 트리거 종목이고 thesis가 가격·시간 양쪽으로 무효화됐다. "
+        "①가격: 현재 251,250원이 무효화가 254,125원을 하회했다. "
+        "②시간: 보유 40일로 시한을 넘겼다."
+    )
+    s = dash._summarize_trade_note(long)
+    assert "무효화됐다" in s
+    assert "①" not in s
+    assert len(s) < len(long)
+
+
+def test_asset_html_live_trades_timestop_enrichment():
+    """구 live_order 에 reason 없어도 closed_pos.exit_reason=time_stop 을 표시."""
+    client = _FakeClient({"KR": {"cashBuyingPower": "732463"}}, _HOLDINGS)
+    snap = acc.fetch_account_snapshot(client, 1)
+    ts = time.time()
+    trades = [
+        {"ts": ts, "kind": "live_order", "symbol": "005930",
+         "payload": json.dumps({
+             "side": "SELL", "qty": 1, "price": 252000, "order_id": "LONGID",
+         })},
+    ]
+    d = _base_d(snap, live_trades=trades)
+    d["closed_pos"] = [{
+        "symbol": "005930", "exit_reason": "time_stop",
+        "closed_at": ts + 0.5, "pnl": -15500,
+    }]
+    long_thesis = (
+        "이번 각성의 트리거 종목이고 thesis가 가격·시간 양쪽으로 무효화됐다. "
+        "①가격: 현재 251,250원이 무효화가 254,125원을 하회(평단 267,500). "
+        "②시간: 보유 40일로 시한 20일을 넘겼다."
+    )
+    d["trade_theses"] = [{
+        "ts": ts - 3600, "symbol": "005930", "action": "SELL",
+        "thesis": long_thesis,
+    }]
+    html = dash._asset_html(d)
+    assert "매도" in html
+    assert "시간손절" in html
+    assert "무효화됐다." in html
+    assert "class=tr-tip" in html
+    assert "class=tr-brief" in html
+    brief = html.split("class=tr-brief>", 1)[1].split("</span>", 1)[0]
+    assert "①" not in brief
+    assert brief.endswith("무효화됐다.")
+    tip = html.split("class=tr-tip>", 1)[1].split("</span>", 1)[0]
+    assert "①" in tip  # 전문은 툴팁
+    assert "LONGID" not in html
+    assert "x1 @" not in html
 
 
 def test_asset_html_no_holdings():

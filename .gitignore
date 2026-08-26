@@ -16,7 +16,9 @@ CONTEXT.local.md
 _chk_*.py
 
 # 퀀트 리서치 워크트리·산출물(절대경로·운영 메모가 섞임)
-research/
+# README 만 추적 — lab 스크립트/data 는 로컬 전용
+research/**
+!research/README.md
 data/quant_review/
 
 # runtime data (생성물). 후보군(base_universe_*.txt)과 KRX bld 카탈로그는 추적함.
@@ -39,6 +41,11 @@ data/history/
 data/context_archive/
 data/krx_cache/
 data/llm_inbox/
+# Phase 2 레이아웃 — nested 원장/인박스/백업(git add -A 사고 방지)
+data/state/
+data/inbox/
+data/ledgers/
+data/archive/
 logs/
 *.log
 

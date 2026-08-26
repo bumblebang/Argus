@@ -1,4 +1,5 @@
 """경보 판정 — 뇌 모드 전이 기반(슬라이딩 창 플리핑 제거)."""
+import json
 import sys
 from pathlib import Path
 
@@ -21,6 +22,22 @@ def test_heartbeat_missing():
 def test_heartbeat_stale():
     r = ac.evaluate(NOW, hb_age=400, market_open=False, brain_mode="ok")
     assert any("하트비트 끊김" in x for x in r)
+
+
+def test_heartbeat_path_prefers_state_layout(tmp_path, monkeypatch):
+    """레거시가 stale 여도 state/ 실파일을 본다(오탐 하트비트 끊김 방지)."""
+    import time as _t
+    root = tmp_path
+    legacy = root / "data" / "watch.heartbeat"
+    state = root / "data" / "state" / "watch.heartbeat"
+    legacy.parent.mkdir(parents=True)
+    state.parent.mkdir(parents=True)
+    now = _t.time()
+    legacy.write_text(json.dumps({"ts": now - 9999}), encoding="utf-8")
+    state.write_text(json.dumps({"ts": now - 5}), encoding="utf-8")
+    monkeypatch.setattr(ac._paths, "ROOT", root)
+    age = ac._read_heartbeat_age(now)
+    assert age is not None and age < 60
 
 
 def test_sliding_window_ignored():

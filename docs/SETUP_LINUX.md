@@ -7,8 +7,8 @@
 ```bash
 python3.12 -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
-python scripts/bootstrap.py
+pip install -e ".[dev]"
+argus bootstrap
 ```
 
 `config.yaml` 의 `claude_command` 는 `"claude"` (PATH).
@@ -38,4 +38,4 @@ Athena·market_state 는 crontab. `scripts/argus.crontab.example` 참고. 유니
 
 ## IP
 
-`python scripts/doctor.py` 의 public ip 를 토스 허용 목록에 넣는다.
+`argus doctor` 의 public ip 를 토스 허용 목록에 넣는다.

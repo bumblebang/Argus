@@ -2,6 +2,7 @@
 
 저널에는 포인터만 남긴다(context_ref / sha256 / bytes). 본문은
 `data/context_archive/{YYYY-MM-DD}/{cycle_ts}_{sha16}.json.gz`.
+저널이 ledgers/ 로 옮겨도 아카이브는 항상 data/context_archive 고정.
 쓰기가 실패해도 호출측이 사이클을 계속해야 한다.
 """
 from __future__ import annotations
@@ -13,11 +14,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from ..config import ROOT
 from ..logging_setup import get_logger
 
 log = get_logger("eval.archive")
 
 ARCHIVE_DIRNAME = "context_archive"
+_DATA = ROOT / "data"
 
 
 def sleeve_from_journal(journal_path: str | Path) -> str:
@@ -27,8 +30,18 @@ def sleeve_from_journal(journal_path: str | Path) -> str:
     return "brain"
 
 
-def archive_root(journal_path: str | Path) -> Path:
-    return Path(journal_path).resolve().parent / ARCHIVE_DIRNAME
+def archive_root(journal_path: str | Path | None = None) -> Path:
+    """repo data/ 아래 저널이면 data/context_archive, 테스트 tmp 는 저널 옆."""
+    if journal_path is None:
+        return _DATA / ARCHIVE_DIRNAME
+    jp = Path(journal_path).resolve()
+    try:
+        rel = jp.relative_to(ROOT.resolve())
+    except ValueError:
+        return jp.parent / ARCHIVE_DIRNAME
+    if rel.parts and rel.parts[0] == "data":
+        return _DATA / ARCHIVE_DIRNAME
+    return jp.parent / ARCHIVE_DIRNAME
 
 
 def persist_context(context_json: str, *, cycle_ts: float,
@@ -63,18 +76,24 @@ def persist_context(context_json: str, *, cycle_ts: float,
 
 
 def resolve_ref(journal_path: str | Path, context_ref: str) -> Path:
-    """저널 옆 data/ 기준으로 context_ref 를 연다."""
+    """data/context_archive 우선, 없으면 저널 부모(레거시/테스트)에서 탐색."""
     ref = Path(context_ref)
     if ref.is_absolute() and ref.exists():
         return ref
+    # 운영: 항상 data/ 기준
+    data_p = _DATA / context_ref
+    if data_p.exists():
+        return data_p
+    root = archive_root(journal_path)
+    name = Path(context_ref).name
+    day = Path(context_ref).parent.name
+    alt = root / day / name
+    if alt.exists():
+        return alt
     base = Path(journal_path).resolve().parent
     p = base / context_ref
     if p.exists():
         return p
-    # context_ref 가 context_archive/... 이고 archive_root 가 이미 그 폴더인 경우
-    name = Path(context_ref).name
-    day = Path(context_ref).parent.name
-    alt = archive_root(journal_path) / day / name
     return alt
 
 

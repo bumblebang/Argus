@@ -28,12 +28,14 @@ sys.path.insert(0, str(ROOT))
 from src.market_hours import is_open, current_session  # noqa: E402
 from src.engine.singleton import _pid_alive  # noqa: E402
 from src.agents.value_trade import compute_sleeve  # noqa: E402
+from src import paths as _paths  # noqa: E402
 
-DB = ROOT / "data" / "bot.db"
-HEARTBEAT = ROOT / "data" / "watch.heartbeat"
+# configured=레거시 문자열 유지 → G0 경로 계약 + dual-resolve(컷오버 후 state/)
+DB = _paths.resolve("db", configured="data/bot.db")
+HEARTBEAT = _paths.resolve("watch_hb", configured="data/watch.heartbeat")
 ALERT = ROOT / "data" / "ALERT.json"
-PAPER = ROOT / "data" / "paper_account.json"
-WATCHPID = ROOT / "data" / "watch.pid"
+PAPER = _paths.resolve("paper", configured="data/paper_account.json")
+WATCHPID = _paths.resolve("watch_pid", configured="data/watch.pid")
 MARKET_STATE = ROOT / "data" / "market_state.json"
 FEAR_HISTORY = ROOT / "data" / "fear_history.json"
 BASE_RATES = ROOT / "data" / "base_rates.json"
@@ -391,7 +393,10 @@ def _read_value_cfg() -> dict:
 
 
 def _read_value_watchlist(limit: int = 15) -> list[dict]:
-    """저평가 워치리스트 상위 N(확신도 내림차순). 파일 없거나 깨졌으면 빈 목록."""
+    """저평가 워치리스트 상위 N — 확신도 내림차순, 동점이면 스캔 시각(ts) 최신 우선.
+
+    파일 없거나 깨졌으면 빈 목록.
+    """
     try:
         wl = json.loads(VALUE_WATCHLIST.read_text(encoding="utf-8")) or {}
     except (OSError, ValueError):
@@ -400,7 +405,9 @@ def _read_value_watchlist(limit: int = 15) -> list[dict]:
         return []
     out = [{"symbol": s, **e} for s, e in wl.items()
            if isinstance(e, dict) and e.get("stance") == "undervalued"]
-    out.sort(key=lambda c: _conv(c.get("conviction")), reverse=True)
+    # 확신도 우선, 같으면 최근 스캔이 위로(7월 고확신 동점에 8월 분이 가려지지 않게).
+    out.sort(key=lambda c: (_conv(c.get("conviction")), _conv(c.get("ts"))),
+             reverse=True)
     return out[:limit]
 
 
@@ -515,10 +522,16 @@ def _store_trade_stats(closed_pos: list[dict] | None, *,
         cost = qty * avg
         mk = str(c.get("market") or "KR")
         realized_by_m[mk] += pnl
+        try:
+            exit_px = float(c["exit_price"]) if c.get("exit_price") is not None else None
+        except (TypeError, ValueError):
+            exit_px = None
         closed_rows.append({
             "symbol": c.get("symbol"),
             "market": mk,
             "qty": qty,
+            "avg_price": avg if avg > 0 else None,
+            "exit_price": exit_px,
             "net": pnl,
             "cost": cost,
             "ts": c.get("closed_at"),
@@ -994,7 +1007,7 @@ def _gather() -> dict:
     # 영속 뇌 모드(회로차단/브릿지) — health 이벤트보다 SSOT.
     try:
         from src.engine.brain_mode import load_mode
-        bm = load_mode(ROOT / "data" / "brain_mode.json")
+        bm = load_mode(_paths.resolve("brain_mode", configured="data/brain_mode.json"))
         data["brain_mode"] = bm.get("mode", "ok")
         data["brain_mode_state"] = bm
         base = health.get("brain") or {"consecutive_failures": 0, "last_ok_ts": 0}
@@ -1032,6 +1045,11 @@ def _gather() -> dict:
         "select ts,kind,symbol,payload from events where kind in "
         "('live_order','live_order_error','buy_blocked') and ts>=? "
         "order by ts desc limit 10", (kst_midnight,))]
+    # 오늘 봇 거래 근거 보강용(뇌 thesis — 구 이벤트에 reason 없을 때)
+    data["trade_theses"] = [dict(r) for r in cur.execute(
+        "select ts,symbol,action,thesis from decisions "
+        "where ts>=? and action in ('BUY','SELL') and thesis is not null "
+        "order by ts desc limit 40", (kst_midnight,))]
     # Athena 실행 로그(최근 5건)
     data["athena_runs"] = [dict(r) for r in cur.execute(
         "select ts,payload from events where kind='athena_done' order by ts desc limit 5")]
@@ -1045,11 +1063,18 @@ def _gather() -> dict:
         data["paper"] = json.loads(PAPER.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         data["paper"] = None
-    # 보유·진입대기·도씨에 종목 최신가(오늘 평가손익 + 리서치 존 위치)
+    # 보유·도씨에·밸류 워치리스트 최신가(평가손익·존 위치·저평가 표 현재가)
+    # 워치리스트는 파일 기반이라 여기서 한 번 읽어 심볼만 합치고, 본문은 아래에서 재사용.
+    try:
+        data["value_watchlist"] = _read_value_watchlist()
+    except Exception:
+        data["value_watchlist"] = []
     try:
         held_syms = [x["symbol"] for x in data["positions"]]
         dos_syms = [x["symbol"] for x in data["dossiers"] if x.get("symbol")]
-        data["pos_px"] = _latest_prices(cur, list(dict.fromkeys(held_syms + dos_syms)))
+        wl_syms = [x["symbol"] for x in data["value_watchlist"] if x.get("symbol")]
+        data["pos_px"] = _latest_prices(
+            cur, list(dict.fromkeys(held_syms + dos_syms + wl_syms)))
     except Exception:
         data["pos_px"] = {}
     try:                                     # 알파: 포트폴리오 평가수익률 vs 지수 B&H
@@ -1094,7 +1119,8 @@ def _gather() -> dict:
         data.pop("_open_for_chart", None)
     # 밸류 탭 재료(전부 read-only 파일 — 없으면 빈 값)
     data["value_cfg"] = _read_value_cfg()
-    data["value_watchlist"] = _read_value_watchlist()
+    if "value_watchlist" not in data:
+        data["value_watchlist"] = _read_value_watchlist()
     data["value_decisions"] = _read_value_decisions()
     # 측정층(그림자·캘리브레이션·매니저) — 실패해도 대시보드는 계속
     try:
@@ -1120,6 +1146,214 @@ def _safe_json(s) -> dict:
         return json.loads(s)
     except (ValueError, TypeError):
         return {}
+
+
+_EXIT_REASON_KO = {
+    "stop_hit": "손절",
+    "target_hit": "목표가 도달",
+    "session_end": "종가 청산",
+    "time_stop": "시간손절",
+    "brain": "뇌 판단",
+    "partial_exit": "부분 청산",
+    "exit": "청산",
+}
+
+
+def _reason_label(exit_reason: str | None, reason: str | None) -> str:
+    """exit_reason·broker reason 을 사람이 읽게. 둘 다 없으면 빈 문자열."""
+    er = (exit_reason or "").strip()
+    raw = (reason or "").strip()
+    if er:
+        label = _EXIT_REASON_KO.get(er, er)
+        if er.startswith("strategy:"):
+            label = f"전략신호 ({er.split(':', 1)[1]})"
+        # reason 이 exit 태그 이상이면 같이 붙임
+        if raw and raw not in (er, f"[exit] {er}") and not raw.startswith(f"[exit] {er}"):
+            extra = raw
+            if raw.startswith("[exit] "):
+                extra = raw[7:].strip()
+            if extra and extra != er:
+                return f"{label} — {extra}"
+        return label
+    if not raw:
+        return ""
+    # "[exit] stop_hit" / "[strategy:rsi] …" / "brain" 등
+    if raw.startswith("[exit] "):
+        kind = raw[7:].strip()
+        return _EXIT_REASON_KO.get(kind, kind)
+    if raw.startswith("[strategy:"):
+        return f"전략신호 — {raw}"
+    if raw.startswith("[entry"):
+        return f"진입 — {raw}"
+    return raw
+
+
+def _lookup_closed_exit(d: dict, symbol: str | None, ts: float) -> str:
+    """구 live_order 에 reason 없을 때 청산 원장 exit_reason 으로 보강."""
+    if not symbol or not ts:
+        return ""
+    best, best_dt = "", 1e18
+    for row in d.get("closed_pos") or []:
+        if str(row.get("symbol") or "") != str(symbol):
+            continue
+        closed = row.get("closed_at")
+        try:
+            ct = float(closed)
+        except (TypeError, ValueError):
+            continue
+        dt = abs(ct - float(ts))
+        if dt < best_dt and dt <= 600:  # 10분 이내
+            best_dt = dt
+            best = str(row.get("exit_reason") or "")
+    return best
+
+
+def _lookup_thesis(d: dict, symbol: str | None, side: str | None, ts: float,
+                   *, max_before_sec: float = 1800) -> str:
+    """뇌 판단 thesis — 체결 직전 같은 종목·방향 결정."""
+    if not symbol or not side or not ts:
+        return ""
+    want = "SELL" if str(side).upper() == "SELL" else "BUY"
+    best, best_dt = "", 1e18
+    for row in d.get("trade_theses") or []:
+        if str(row.get("symbol") or "") != str(symbol):
+            continue
+        if str(row.get("action") or "").upper() != want:
+            continue
+        try:
+            rt = float(row.get("ts") or 0)
+        except (TypeError, ValueError):
+            continue
+        # 판단이 체결보다 조금 앞선 경우가 정상
+        dt = float(ts) - rt
+        if dt < -60 or dt > float(max_before_sec):
+            continue
+        if abs(dt) < best_dt:
+            best_dt = abs(dt)
+            best = str(row.get("thesis") or "").strip()
+    return best
+
+
+def _live_trade_chip(kind: str, pl: dict) -> str:
+    side = str(pl.get("side") or "").upper()
+    if kind == "buy_blocked":
+        return "<span class=r-queue>매수차단</span>"
+    if kind == "live_order_error":
+        if side == "SELL":
+            return "<span class=veto>매도실패</span>"
+        if side == "BUY":
+            return "<span class=veto>매수실패</span>"
+        return "<span class=veto>전송실패</span>"
+    # live_order 체결
+    if side == "SELL":
+        return "<span class=side-sell>매도</span>"
+    if side == "BUY":
+        return "<span class=side-buy>매수</span>"
+    return "<span class=fill>체결</span>"
+
+
+def _live_trade_qty_price(kind: str, pl: dict) -> tuple[str, str]:
+    """(수량 HTML, 체결가 HTML). 비체결은 –."""
+    if kind != "live_order":
+        return "–", "–"
+    try:
+        px = float(pl.get("price") or 0)
+    except (TypeError, ValueError):
+        px = 0.0
+    dp = 0 if px >= 100 else 2
+    qty = pl.get("qty")
+    if qty is None:
+        return "–", "–"
+    return _fmt(qty, 0), _fmt(pl.get("price"), dp)
+
+
+def _live_trade_why_thesis(e: dict, pl: dict, d: dict) -> tuple[str, str]:
+    """(근거 라벨, thesis 전문)."""
+    kind = e.get("kind")
+    if kind == "live_order_error":
+        return _reason_label(pl.get("exit_reason"), pl.get("reason")), ""
+    if kind == "buy_blocked":
+        return str(pl.get("reason") or "").strip(), ""
+
+    side = str(pl.get("side") or "").upper()
+    exit_raw = str(pl.get("exit_reason") or "").strip()
+    why = _reason_label(exit_raw, pl.get("reason"))
+    if not why and side == "SELL":
+        exit_raw = _lookup_closed_exit(d, e.get("symbol"), e.get("ts"))
+        why = _reason_label(exit_raw, None)
+
+    thesis = ""
+    want_thesis = (not why) or why in ("뇌 판단", "brain", "시간손절") or exit_raw == "time_stop"
+    if want_thesis or (side in ("BUY", "SELL") and why):
+        # 시간손절은 체결이 각성보다 늦을 수 있어 창을 넓힘. 그 외도 설명은 있으면 붙임.
+        max_before = 6 * 3600 if (why == "시간손절" or exit_raw == "time_stop") else 1800
+        if why == "시간손절" or exit_raw == "time_stop" or why in ("뇌 판단", "brain") or not why:
+            thesis = _lookup_thesis(
+                d, e.get("symbol"), side, e.get("ts"), max_before_sec=max_before)
+    return why, thesis
+
+
+def _summarize_trade_note(text: str, *, max_len: int = 96) -> str:
+    """뇌 thesis 한두 문장으로 줄임. 문장 끝에서 자르고, 넘치면 …."""
+    s = " ".join((text or "").split())
+    if not s:
+        return ""
+    if len(s) <= max_len:
+        return s
+    # 첫 문장(또는 ① 앞)만 우선
+    cut_at = None
+    for i, ch in enumerate(s):
+        if i < 24:
+            continue
+        if ch in ".!?。":
+            cut_at = i + 1
+            break
+        if ch == "①":
+            cut_at = i
+            break
+    if cut_at and 24 <= cut_at <= max_len + 20:
+        out = s[:cut_at].rstrip(" ·,，")
+        return out if len(out) <= max_len + 8 else out[:max_len].rstrip() + "…"
+    # soft cut near max_len (공백/구두점 선호)
+    window = s[: max_len + 1]
+    for sep in (" ", "·", ",", "，", "—", "-"):
+        pos = window.rfind(sep)
+        if pos >= max_len // 2:
+            return s[:pos].rstrip(" ·,，—-") + "…"
+    return s[:max_len].rstrip() + "…"
+
+
+def _live_trade_detail(e: dict, pl: dict, d: dict) -> str:
+    """내용 칸 — 근거 뱃지 + 요약 설명(호버 시 전문)."""
+    kind = e.get("kind")
+    if kind == "live_order_error":
+        err = escape(str(pl.get("error") or "")[:120])
+        why, _ = _live_trade_why_thesis(e, pl, d)
+        bits = [f"<div class=tr-err>{err}</div>"]
+        if why:
+            bits.append(f"<span class=tr-why>{escape(why[:60])}</span>")
+        return "".join(bits)
+    if kind == "buy_blocked":
+        why, _ = _live_trade_why_thesis(e, pl, d)
+        return f"<span class=tr-why>{escape(why[:80] or '–')}</span>"
+
+    why, thesis = _live_trade_why_thesis(e, pl, d)
+    bits: list[str] = []
+    if why:
+        bits.append(f"<span class=tr-why>{escape(why[:80])}</span>")
+    if thesis:
+        brief = _summarize_trade_note(thesis)
+        # 네이티브 title 은 긴 한글에서 안 뜨는 경우가 많아 CSS 호버 툴팁 사용
+        tip = escape(" ".join(thesis.split()))
+        bits.append(
+            "<div class=tr-thesis>"
+            f"<span class=tr-brief>{escape(brief)}</span>"
+            f"<span class=tr-tip>{tip}</span>"
+            "</div>"
+        )
+    if not bits:
+        return "<span class=muted>–</span>"
+    return "".join(bits)
 
 
 # ───────────────────────── HTML 렌더 ─────────────────────────
@@ -1151,6 +1385,31 @@ th{color:#8b94a3;font-weight:500;font-size:11px;text-transform:uppercase;letter-
 td.mono,.mono{font-variant-numeric:tabular-nums;font-family:ui-monospace,Consolas,monospace;}
 .chip{padding:1px 8px;border-radius:20px;font-size:11px;font-weight:600;background:#1c2433;}
 .veto{color:#ff8c91;} .fill{color:#3ddc84;}
+.side-buy{display:inline-block;padding:2px 10px;border-radius:20px;font-size:11px;font-weight:600;background:#12341f;color:#3ddc84;white-space:nowrap;}
+.side-sell{display:inline-block;padding:2px 10px;border-radius:20px;font-size:11px;font-weight:600;background:#3a1013;color:#ff8c91;white-space:nowrap;}
+/* 오늘 봇 거래 표 — 짧은 칸 고정, 내용은 근거+설명 */
+table.trades{table-layout:fixed;width:100%;}
+table.trades th:nth-child(1),table.trades td:nth-child(1){width:68px;white-space:nowrap;}
+table.trades th:nth-child(2),table.trades td:nth-child(2){width:58px;white-space:nowrap;}
+table.trades th:nth-child(3),table.trades td:nth-child(3){width:88px;white-space:nowrap;}
+table.trades th:nth-child(4),table.trades td:nth-child(4){width:52px;white-space:nowrap;text-align:right;}
+table.trades th:nth-child(5),table.trades td:nth-child(5){width:88px;white-space:nowrap;text-align:right;}
+table.trades th:nth-child(6),table.trades td:nth-child(6){width:auto;}
+table.trades td{overflow:visible;vertical-align:top;}
+table.trades td.nm{font-weight:600;color:#e6e9ef;}
+table.trades td.num{font-variant-numeric:tabular-nums;font-family:ui-monospace,Consolas,monospace;color:#cdd4e0;}
+.tr-err{color:#ff8c91;font-size:12px;}
+.tr-why{display:inline-block;padding:2px 10px;border-radius:20px;font-size:11px;font-weight:600;background:#232a36;color:#ffcf6b;}
+.tr-thesis{position:relative;margin-top:8px;display:inline-block;max-width:100%;cursor:help;}
+.tr-brief{color:#9aa4b2;font-size:12px;line-height:1.6;border-bottom:1px dotted #5a6373;}
+.tr-tip{
+  display:none;position:absolute;left:0;top:calc(100% + 8px);z-index:80;
+  width:min(440px,70vw);max-height:260px;overflow:auto;
+  padding:10px 12px;border-radius:10px;border:1px solid #2a3548;
+  background:#0f1522;color:#cdd4e0;font-size:12px;line-height:1.55;
+  box-shadow:0 8px 24px rgba(0,0,0,.45);white-space:pre-wrap;word-break:keep-all;
+}
+.tr-thesis:hover .tr-tip{display:block;}
 .pos{color:#3ddc84;} .neg{color:#ff5c63;}
 .muted{color:#6b7280;}
 .foot{margin-top:26px;color:#5a6373;font-size:11px;text-align:center;}
@@ -1171,8 +1430,8 @@ td.mono,.mono{font-variant-numeric:tabular-nums;font-family:ui-monospace,Consola
 .b-live{padding:2px 10px;border-radius:20px;font-size:12px;font-weight:700;background:#3a1013;color:#ff8c91;border:1px solid #ff5c63;}
 .b-paper{padding:2px 10px;border-radius:20px;font-size:12px;font-weight:700;background:#12341f;color:#3ddc84;}
 .freshwarn{color:#ffb454;}
+.r-queue{display:inline-block;padding:2px 10px;border-radius:20px;font-size:11px;font-weight:600;background:#332a10;color:#ffcf6b;white-space:nowrap;}
 .r-wake{padding:1px 8px;border-radius:20px;font-size:11px;font-weight:600;background:#3a1013;color:#ff8c91;}
-.r-queue{padding:1px 8px;border-radius:20px;font-size:11px;font-weight:600;background:#332a10;color:#ffcf6b;}
 .vd-approved{padding:1px 8px;border-radius:20px;font-size:11px;font-weight:600;background:#12341f;color:#3ddc84;}
 .vd-vetoed{padding:1px 8px;border-radius:20px;font-size:11px;font-weight:600;background:#3a1013;color:#ff8c91;}
 .vd-other{padding:1px 8px;border-radius:20px;font-size:11px;font-weight:600;background:#232a36;color:#9aa4b2;}
@@ -1638,25 +1897,20 @@ def _asset_html(d: dict) -> str:
     trades = d.get("live_trades") or []
     p.append("<div class=sec>오늘 봇 거래 (라이브)</div><div class=panel>")
     if trades:
-        p.append("<table><tr><th>시각</th><th>구분</th><th>종목명</th><th>내용</th></tr>")
+        p.append("<table class=trades><tr>"
+                 "<th>시각</th><th>구분</th><th>종목</th>"
+                 "<th>수량</th><th>체결가</th><th>내용</th></tr>")
         for e in trades:
             pl = _safe_json(e.get("payload"))
-            kind = e.get("kind")
-            if kind == "live_order":
-                chip = "<span class=fill>체결</span>"
-                detail = (f"{escape(str(pl.get('side') or ''))} x{_fmt(pl.get('qty'),0)} "
-                          f"@ {_fmt(pl.get('price'),0)} · "
-                          f"id={escape(str(pl.get('order_id') or '–'))}")
-            elif kind == "live_order_error":
-                chip = "<span class=veto>전송실패</span>"
-                detail = escape(str(pl.get("error") or "")[:80])
-            else:  # buy_blocked
-                chip = "<span class=r-queue>매수차단</span>"
-                detail = escape(str(pl.get("reason") or "")[:80])
+            kind = e.get("kind") or ""
+            chip = _live_trade_chip(kind, pl)
+            qty_s, px_s = _live_trade_qty_price(kind, pl)
+            detail = _live_trade_detail(e, pl, d)
             nm = _name(e.get("symbol"), names) if e.get("symbol") else "–"
             p.append(f"<tr><td class=mono>{_hms(e['ts'])}</td><td>{chip}</td>"
-                     f"<td>{nm}</td>"
-                     f"<td class='muted mono' style='font-size:12px'>{detail}</td></tr>")
+                     f"<td class=nm>{nm}</td>"
+                     f"<td class=num>{qty_s}</td><td class=num>{px_s}</td>"
+                     f"<td>{detail}</td></tr>")
         p.append("</table>")
     else:
         p.append("<span class=muted>오늘 라이브 거래 없음.</span>")
@@ -2477,14 +2731,19 @@ def _perf_html(d: dict) -> str:
     # 거래별 실현손익 (store 청산 — 전략별 성과와 동일 원천)
     p.append("<div class=sec>실현손익 (거래별)</div><div class=panel>")
     if t and t["closed"]:
-        p.append("<table><tr><th>거래일자</th><th>시장</th><th>종목명</th><th>실현손익</th><th>수익률</th></tr>")
+        p.append("<table><tr><th>거래일자</th><th>시장</th><th>종목명</th>"
+                 "<th>매수가</th><th>매도가</th><th>실현손익</th><th>수익률</th></tr>")
         for c in reversed(t["closed"]):
             cls = "pos" if c["net"] > 0 else "neg"
             mk = c.get("market") or ""
+            dp = 0 if mk == "KR" else 2
+            buy_s = _fmt(c.get("avg_price"), dp) if c.get("avg_price") is not None else "–"
+            sell_s = _fmt(c.get("exit_price"), dp) if c.get("exit_price") is not None else "–"
             val = f"${c['net']:,.2f}" if mk == "US" else f"{c['net']:,.0f}"
             rp = ("%+.2f%%" % c["ret_pct"]) if c.get("ret_pct") is not None else "–"
             p.append(f"<tr><td class=mono>{_fmt_ts(c.get('ts'))}</td><td>{escape(mk)}</td>"
                      f"<td>{_pos_name(c, names)}</td>"
+                     f"<td class=mono>{buy_s}</td><td class=mono>{sell_s}</td>"
                      f"<td class='mono {cls}'>{val}</td><td class='mono {cls}'>{rp}</td></tr>")
         p.append("</table>")
     else:
@@ -2627,7 +2886,7 @@ def _value_html(d: dict) -> str:
     p.append("<div class=sec>저평가 워치리스트 (확신도 상위)</div><div class=panel>")
     if wl:
         p.append("<table><tr><th>종목명</th><th>시장</th><th>확신도</th>"
-                 "<th>적정가 밴드</th><th>스캔</th></tr>")
+                 "<th>적정가 밴드</th><th>현재가</th><th>스캔</th></tr>")
         for e in wl:
             mk = str(e.get("market") or "KR")
             dp = 0 if mk == "KR" else 2
@@ -2636,8 +2895,18 @@ def _value_html(d: dict) -> str:
                     else "–")
             conv = e.get("conviction")
             conv_s = f"{_conv(conv):.2f}" if conv is not None else "–"
+            # 스냅샷 시세 우선, 없으면 스캔 시점 metrics.price(밴드 산정 기준과 동일).
+            cur_px = px.get(e.get("symbol"))
+            if cur_px is None:
+                try:
+                    mp = (e.get("metrics") or {}).get("price")
+                    cur_px = float(mp) if mp is not None else None
+                except (TypeError, ValueError, AttributeError):
+                    cur_px = None
+            px_s = _fmt(cur_px, dp) if cur_px is not None else "–"
             p.append(f"<tr><td>{_name(e.get('symbol'), names)}</td><td>{escape(mk)}</td>"
                      f"<td class=mono>{conv_s}</td><td class=mono>{band}</td>"
+                     f"<td class=mono>{px_s}</td>"
                      f"<td class=mono>{_fmt_ts(e.get('ts'))}</td></tr>")
         p.append("</table>")
     else:

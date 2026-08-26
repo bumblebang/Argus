@@ -68,12 +68,12 @@ class BrainWorker:
 
     # 감시 루프가 호출(on_wake 콜백). 신호만 세팅하고 즉시 반환(논블로킹).
     def wake(self, reason: str = "", triggers: list | None = None) -> None:
+        """대기 중 wake 가 있으면 덮어쓰지 않고 reason/triggers 를 합친다(재료 유실 방지)."""
+        from ..agents.serve_policy import merge_wake_pending
+        serialized = _serialize_triggers(triggers)
         with self._lock:
-            self._pending = {
-                "reason": reason or "",
-                "n": len(triggers or []),
-                "triggers": _serialize_triggers(triggers),
-            }
+            self._pending = merge_wake_pending(
+                self._pending, reason or "", serialized)
         self._wake.set()
 
     def start(self) -> None:

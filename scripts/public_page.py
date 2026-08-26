@@ -47,6 +47,7 @@ from src import public_brief  # noqa: E402
 from src.leakguard import (  # noqa: E402,F401
     FOOTER_NOTE, LEAK_PATTERNS, assert_no_leak,
 )
+from src import paths as _paths  # noqa: E402
 from src.logging_setup import setup_logging, get_logger  # noqa: E402
 # 데이터를 들고 있지 않은 순수 렌더 헬퍼만 재사용한다(_gather 계열은 절대 쓰지 않는다).
 from scripts.dashboard import (  # noqa: E402
@@ -56,7 +57,7 @@ from scripts.dashboard import (  # noqa: E402
 
 log = get_logger("public_page")
 
-DB = ROOT / "data" / "bot.db"
+DB = _paths.resolve("db", configured="data/bot.db")
 MARKET_STATE = ROOT / "data" / "market_state.json"
 FEAR_HISTORY = ROOT / "data" / "fear_history.json"
 VALUE_WATCHLIST = ROOT / "data" / "value_watchlist.json"   # symbol→name 보충용(이름만 읽는다)

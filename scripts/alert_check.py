@@ -43,10 +43,11 @@ for _s in (sys.stdout, sys.stderr):
 
 from src.engine import brain_mode as bm  # noqa: E402
 from src.market_hours import is_open  # noqa: E402
+from src import paths as _paths  # noqa: E402
 
-DB = ROOT / "data" / "bot.db"
-HEARTBEAT = ROOT / "data" / "watch.heartbeat"
-BRAIN_MODE = ROOT / "data" / "brain_mode.json"
+DB = _paths.resolve("db", configured="data/bot.db")
+HEARTBEAT = _paths.resolve("watch_hb", configured="data/watch.heartbeat")
+BRAIN_MODE = _paths.resolve("brain_mode", configured="data/brain_mode.json")
 ALERT = ROOT / "data" / "ALERT.json"
 ALERTS_LOG = ROOT / "data" / "alerts.jsonl"
 _PUSH_STATE = ROOT / "data" / "alert_push_state.json"
@@ -293,4 +294,6 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    from src.cli.legacy import warn_legacy_script
+    warn_legacy_script("argus alert-check")
     raise SystemExit(main())

@@ -20,6 +20,7 @@ from src.engine.store import Store
 from src.logging_setup import setup_logging
 from src.shadow_ledger import (backfill_from_jsonl, score_open_shadows,
                                shadow_stats)
+from src import paths as _paths
 
 DATA = ROOT / "data"
 
@@ -32,15 +33,22 @@ def main() -> None:
                     help="replay decisions.jsonl (+ value) into shadow_positions")
     ap.add_argument("--limit", type=int, default=None,
                     help="backfill max journal lines per file")
-    ap.add_argument("--db", type=Path, default=DATA / "bot.db")
+    ap.add_argument("--db", type=Path,
+                    default=_paths.resolve("db", configured="data/bot.db"))
     args = ap.parse_args()
 
     cfg = load_config(ROOT / "config.yaml")
-    store = Store(args.db)
+    # Path 오버라이드도 resolve 경유(레거시 상대경로면 dual-find)
+    db = args.db
+    if str(db).replace("\\", "/") in ("data/bot.db", "data/state/bot.db"):
+        store = Store(_paths.resolve("db", configured=str(db)))
+    else:
+        store = Store(db)
 
     if args.backfill:
-        for path, sleeve in ((DATA / "decisions.jsonl", "brain"),
-                             (DATA / "value_decisions.jsonl", "value")):
+        brain_j = _paths.resolve("decisions", configured="data/decisions.jsonl")
+        value_j = DATA / "value_decisions.jsonl"  # MIGRATE 밖(루트 유지)
+        for path, sleeve in ((brain_j, "brain"), (value_j, "value")):
             if path.exists():
                 bf = backfill_from_jsonl(
                     store, path, sleeve=sleeve, data_dir=DATA,
@@ -56,4 +64,6 @@ def main() -> None:
 
 
 if __name__ == "__main__":
+    from src.cli.legacy import warn_legacy_script
+    warn_legacy_script("argus shadow-score")
     main()

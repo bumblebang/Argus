@@ -28,6 +28,7 @@ sys.path.insert(0, str(_SCRIPTS.parent))
 sys.path.insert(0, str(_SCRIPTS))   # 같은 폴더의 dashboard.py 임포트용(scripts 는 패키지 아님)
 
 from src.config import load_config
+from src import paths as _paths
 from src.day_pool import (day_pool_cfg, load_day_pool, merge_swing_and_day,
                           refresh_all_day_pools)
 from src.logging_setup import setup_logging, get_logger
@@ -154,14 +155,15 @@ def _build_brain(cfg, gateway, store, args, broker, risk, universe_fn=None,
         return runner.run(wake=wake)
 
     cooldown = float(wcfg.get("brain_cooldown_sec", 300))
-    # 뇌 모드/회로차단: data/brain_mode.json + Cursor bridge heartbeat 게이트.
+    # 뇌 모드/회로차단: brain_mode.json + Cursor bridge heartbeat 게이트.
     from src.agents.pipeline import DATA, build_cursor_bridge
     acfg = cfg.raw.get("agents", {})
     cb = (acfg.get("cursor_bridge") or {})
-    mode_path = DATA / "brain_mode.json"
+    mode_path = _paths.resolve("brain_mode", configured="data/brain_mode.json")
     bridge = build_cursor_bridge(cfg) if not dry else None
     inbox_dir = (bridge.inbox_dir if bridge is not None
-                 else (cb.get("inbox_dir") or str(DATA / "llm_inbox")))
+                 else str(_paths.resolve(
+                     "inbox", configured=cb.get("inbox_dir") or "data/llm_inbox")))
     source_fn = None
     if not dry:
         # llm 은 위 else 분기에서 생성된 ClaudeCLIClient(또는 API 클라이언트).
@@ -499,7 +501,7 @@ def main() -> int:
         return 1
 
     # 단일 인스턴스 락 — 오펀/중복 기동 시 토스 토큰 경합(→401)·claude 동시 스폰 경합 방지.
-    lock = SingleInstance(_SCRIPTS.parent / "data" / "watch.pid")
+    lock = SingleInstance(_paths.resolve("watch_pid", configured="data/watch.pid"))
     try:
         lock.acquire()
     except AlreadyRunning as e:
@@ -512,7 +514,9 @@ def main() -> int:
     store = Store(run_cfg.get("db_path", "data/bot.db"))
     gateway = TossGateway.from_config(cfg, store=store)
     markets = cfg.run.get("trade_markets", ["KR", "US"])
-    heartbeat = run_cfg.get("heartbeat_path", "data/watch.heartbeat")
+    heartbeat = str(_paths.resolve(
+        "watch_hb",
+        configured=run_cfg.get("heartbeat_path") or "data/watch.heartbeat"))
     # 런타임 유니버스 재독기: screen 이 data/universe.yaml 을 재생성하면(2회/일) 재기동 없이
     # 다음 markets() 호출부터 반영. 감시 루프(build_watchlist)와 뇌(CycleRunner)가 공유.
     provider = UniverseProvider(cfg)

@@ -48,7 +48,8 @@ def _live_check() -> int:
     watchlist = load_watchlist()
     # store 는 읽기만(보유/진입대기 제외 반영). data/bot.db 는 WAL 이라 동시 읽기 안전.
     db_path = cfg.raw.get("run", {}).get("db_path", "data/bot.db")
-    store = Store(db_path) if Path(db_path).exists() else None
+    from src import paths as _paths
+    store = Store(_paths.resolve("db", configured=db_path))
     cands = select_candidates(watchlist, store, cfg_v, now)
     print(f"[value live-check] watchlist={len(watchlist)} "
           f"selector 통과={len(cands)} (markets={cfg_v['markets']}, "
@@ -177,4 +178,6 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    from src.cli.legacy import warn_legacy_script
+    warn_legacy_script("argus value-trade")
     sys.exit(main())

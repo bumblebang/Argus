@@ -9,6 +9,7 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT))
 
 
 def main() -> int:
@@ -29,9 +30,11 @@ def main() -> int:
         shutil.copyfile(src, dst)
         copied.append(dst.name)
         print(f"생성: {dst.name}")
-    print("다음: .env 키를 채운 뒤  python scripts/doctor.py")
+    print("다음: .env 키를 채운 뒤  argus doctor  (또는 python scripts/doctor.py)")
     return 0
 
 
 if __name__ == "__main__":
+    from src.cli.legacy import warn_legacy_script
+    warn_legacy_script("argus bootstrap")
     sys.exit(main())

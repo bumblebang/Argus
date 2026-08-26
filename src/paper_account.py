@@ -14,6 +14,7 @@ from pathlib import Path
 
 from .logging_setup import get_logger
 from .market_hours import market_day
+from . import paths as _paths
 from .strategies.base import Position
 
 log = get_logger("paper")
@@ -44,7 +45,7 @@ class PaperAccount:
         # (symbol, market)->bool. True 면 합성 매도세를 면제(국내 ETF/ETN 등). None 이면
         # 항상 부과(기존 동작). 라이브는 실세금을 대사로 받으므로 이 경로를 타지 않는다.
         self.sell_tax_exempt_fn = sell_tax_exempt_fn
-        self.state_path = Path(state_path)
+        self.state_path = _paths.resolve("paper", configured=state_path)
         self.positions: dict[str, Position] = {}
         self.symbol_market: dict[str, str] = {}   # 종목 -> 시장(KR/US)
         self.realized_pnl: dict[str, float] = {}          # 누적(리포팅용)

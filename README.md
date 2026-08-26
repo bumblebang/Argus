@@ -8,6 +8,9 @@
 
 구조(돈의 경로·상주 vs 배치): [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
+CLI (Phase 3): repo에서 `pip install -e .` 후 `argus <cmd>`.
+레거시 `python scripts/….py` 도 동작한다(DeprecationWarning).
+
 ## 돌리려면 (여기까지면 기동)
 
 | 단계 | 무엇 |
@@ -25,13 +28,13 @@
 python -m venv .venv
 # Windows: .venv\Scripts\activate
 # macOS/Linux: source .venv/bin/activate
-pip install -r requirements.txt
+pip install -e ".[dev]"
 
-python scripts/bootstrap.py     # config.yaml · .env 가 없을 때만 생성
+argus bootstrap     # config.yaml · .env 가 없을 때만 생성
 # .env 에 TOSS_CLIENT_ID / SECRET 을 채운다 (시세용)
 
-python scripts/doctor.py
-python scripts/watch.py --dry --ticks 1
+argus doctor
+argus watch --dry --ticks 1
 ```
 
 대시보드: `http://127.0.0.1:8787` (watch 프로세스 안, 읽기전용).
@@ -45,24 +48,28 @@ python scripts/watch.py --dry --ticks 1
 상주: [Windows](docs/SETUP_WINDOWS.md) · [macOS](docs/SETUP_MAC.md) · [Linux](docs/SETUP_LINUX.md).
 키·페이퍼: [docs/SETUP.md](docs/SETUP.md). 뇌 인증: [AUTH.md](AUTH.md). 기여: [docs/CONTRIBUTING.md](docs/CONTRIBUTING.md).
 
-`python main.py` 는 안내만 하고 종료한다. 상주는 `scripts/watch.py`. 구 루프 지름길은 없다.
+`python main.py` 는 안내만 하고 종료한다. 상주는 `argus watch` (또는 레거시 `scripts/watch.py`).
 
 `.env` · `config.yaml` · `CONTEXT.md` · `data` 원장(json/db/토큰)은 gitignore다. 시드 유니버스·매크로 일정만 추적한다.
 
 ## 무엇이 도는가
 
+정본은 `argus <cmd>` (`pip install -e .`). 괄호는 레거시 stub.
+
 ```
-scripts/watch.py          상주: 시세 폴링 → 트리거 → 뇌 → 검증 → 하드게이트 → 주문
-scripts/athena.py         배치: 종목 딥리서치(도시에)
-scripts/screen.py         수동 CLI: 유니버스 재스크린 (상주는 watch 가 굴림)
-scripts/build_market_state.py  배치: 국면·매크로 파일
-scripts/doctor.py         점검: 키·설정·공인 IP
-scripts/agent_cycle.py    수동 1사이클 (기본 페이퍼, 실주문 없음)
+argus watch              상주: 시세 폴링 → 트리거 → 뇌 → 검증 → 하드게이트 → 주문
+argus athena             배치: 종목 딥리서치(도시에)
+argus value-scan         배치: 밸류 워치리스트 스캔
+argus market-state       배치: 국면·매크로 파일
+argus doctor             점검: 키·설정·공인 IP · --check-auth / --check-cli / --migrate-data
+argus agent-cycle        수동 1사이클 (기본 페이퍼, 실주문 없음)
+argus bridge             Cursor 뇌 폴백 (--serve 60)
+argus screen             수동 CLI: 유니버스 재스크린 (상주는 watch 가 굴림)
 ```
 
 판단(LLM)과 집행(돈)은 분리돼 있다. 모든 주문은 [`src/risk_gate.py`](src/risk_gate.py)를 통과한다.
-`data/HALT` 파일이 있으면 신규 주문을 막는다.
+`data/HALT`(또는 컷오버 후 `data/state/HALT`) 파일이 있으면 신규 주문을 막는다. 경로 계약: [docs/OPS_CUTOVER.md](docs/OPS_CUTOVER.md).
 
 데이터(`universe.yaml`, 히스토리, 도시에, `bot.db`)는 클론 직후 비어 있다. 각자 채운다.
 
-테스트: `pip install -r requirements-dev.txt && python -m pytest`
+테스트: `pip install -e ".[dev]" && python -m pytest`

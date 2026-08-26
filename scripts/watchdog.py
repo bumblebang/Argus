@@ -4,7 +4,8 @@ OS 스케줄러가 N분마다 호출한다. 2단 방어:
   - 크래시(프로세스 종료): 스케줄러 KeepAlive / restart-on-failure 가 1차로 잡음.
   - 멈춤(hang, heartbeat 갱신 중단): 이 워치독이 잡아 작업을 재기동.
 
-heartbeat 는 data/watch.heartbeat (WatchLoop._beat 가 매 틱 epoch 기록).
+heartbeat 는 paths.resolve("watch_hb") — 컷오버 후 data/state/watch.heartbeat
+(WatchLoop._beat 가 매 틱 epoch 기록).
 장중 5초/휴장 60초 주기로 갱신되므로 STALE_SEC=300(5분) 이면 오탐 없이 hang 감지.
 
 Windows: 작업 스케줄러 작업명 ArgusWatch (schtasks).
@@ -21,7 +22,7 @@ import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-HEARTBEAT = ROOT / "data" / "watch.heartbeat"
+HEARTBEAT = None  # main 에서 paths.resolve 로 설정
 LOG = ROOT / "logs" / "watchdog.log"
 TASK = "ArgusWatch"
 LAUNCHD_LABEL = "local.argus.watch"
@@ -39,9 +40,15 @@ def log(msg: str) -> None:
         print(msg)
 
 
+def _heartbeat_path() -> Path:
+    sys.path.insert(0, str(ROOT))
+    from src import paths as _paths
+    return _paths.resolve("watch_hb", configured="data/watch.heartbeat")
+
+
 def heartbeat_age() -> float | None:
     try:
-        d = json.loads(HEARTBEAT.read_text(encoding="utf-8"))
+        d = json.loads(_heartbeat_path().read_text(encoding="utf-8"))
         return time.time() - float(d.get("ts", 0))
     except (OSError, ValueError):
         return None
@@ -86,4 +93,6 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    from src.cli.legacy import warn_legacy_script
+    warn_legacy_script("argus watchdog")
     sys.exit(main())

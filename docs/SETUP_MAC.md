@@ -9,8 +9,8 @@ brew install python@3.12
 cd argus
 python3 -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
-python scripts/bootstrap.py
+pip install -e ".[dev]"
+argus bootstrap
 ```
 
 Claude Code를 설치한 뒤 터미널에서 `claude -p "ping"`. `config.yaml` 의 `claude_command` 는 `"claude"` (PATH).
@@ -49,4 +49,4 @@ Athena·market_state 는 crontab 또는 별도 LaunchAgent `StartCalendarInterva
 
 ## IP
 
-`python scripts/doctor.py` 의 public ip 를 토스 허용 목록에 넣는다. 공유기 DHCP면 주소가 바뀐다.
+`argus doctor` 의 public ip 를 토스 허용 목록에 넣는다. 공유기 DHCP면 주소가 바뀐다.

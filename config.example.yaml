@@ -65,7 +65,7 @@ watch:
     US: []
   extra_wakes:
     KR: ["08:00", "15:30"]
-  wake_request_path: "data/brain_wake_request.json"
+  wake_request_path: "data/state/brain_wake_request.json"
   session_end_exit_min: 5
   dashboard: true
   dashboard_port: 8787
@@ -97,7 +97,7 @@ risk:
   max_drawdown_pct: 0.10
   exposure_base: "equity"
   max_order_notional: {}     # BUY 절대캡. {}=비활성(현금·비중·총노출). 예: {KR: 500000}
-  kill_switch_file: "data/HALT"
+  kill_switch_file: "data/state/HALT"
   # KRX 경보 종목 BUY 하드스킵 (build_market_state 가 갱신)
   blocked_symbols_file: "data/krx_blocked_symbols.json"
 
@@ -186,6 +186,15 @@ agents:
   conviction_sizing: true
   min_lot_conviction: 0.6
   lessons: true
+  # 정기=전량 서빙, 이벤트=보유∪wake shortlist(+온디맨드 수급). 느린슬롯 전량 장중 갱신 없음.
+  serve:
+    enabled: true
+    focus_cap: 16
+    focus_pad: 0
+    ondemand_flows: true
+    ondemand_news: false
+    focus_headline_limit: 40
+    compact_json: true
   max_tokens: 8000
   thinking: true
   claude_command: "claude"
@@ -195,7 +204,7 @@ agents:
   claude_timeout: 600
   cursor_bridge:
     enabled: false
-    inbox_dir: "data/llm_inbox"
+    inbox_dir: "data/inbox"
     timeout_sec: 1200
     poll_sec: 1.0
     require_armed: true

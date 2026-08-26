@@ -1,22 +1,28 @@
 @echo off
 chcp 65001 >nul
-REM 장전/장후 배치 — 국면 파일 + 에이전트 1사이클 (페이퍼).
-REM 상주 데몬이 아니다. 상주는 scripts\watch.py (작업명 ArgusWatch).
+REM Pre/post session batch: market_state + agent_cycle dry.
+REM Not the always-on daemon (that is ArgusWatch / argus watch).
 setlocal
 cd /d "%~dp0\.."
 if not exist logs mkdir logs
 set "PYTHONIOENCODING=utf-8"
 
+set "ARGUS=%~dp0..\.venv\Scripts\argus.exe"
 set "PY=%~dp0..\.venv\Scripts\python.exe"
-if not exist "%PY%" (
-    echo [run_bot] venv python 없음: %PY%>> logs\bot.run.log
+if not exist "%ARGUS%" if not exist "%PY%" (
+    echo [run_bot] venv missing>> logs\bot.run.log
     exit /b 1
 )
 
 echo.>> logs\bot.run.log
 echo ===== run %date% %time% =====>> logs\bot.run.log
 
-"%PY%" scripts\build_market_state.py >> logs\bot.run.log 2>&1
-"%PY%" scripts\agent_cycle.py --cli >> logs\bot.run.log 2>&1
+if exist "%ARGUS%" (
+  "%ARGUS%" market-state >> logs\bot.run.log 2>&1
+  "%ARGUS%" agent-cycle --cli >> logs\bot.run.log 2>&1
+) else (
+  "%PY%" scripts\build_market_state.py >> logs\bot.run.log 2>&1
+  "%PY%" scripts\agent_cycle.py --cli >> logs\bot.run.log 2>&1
+)
 
 endlocal

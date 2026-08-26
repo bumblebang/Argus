@@ -66,12 +66,18 @@ def assemble(items: list[dict], market_state: dict,
         sym, market = it["symbol"], it.get("market", "KR")
         name = it.get("name", sym)
         bad, reason = is_buy_ineligible(sym, market, name)
-        if bad:
+        if bad and not it.get("force_include"):
             log.info("[%s] 후보 제외 %s (%s)", market, sym, reason)
             continue
         feat: dict = {"symbol": sym, "name": name, "market": market,
                       "fundamentals": funds.get(sym), "flows": flows.get(sym),
                       "news": [n for n in news if n.get("symbol") == sym][:5]}
+        if it.get("force_include"):
+            feat["force_include"] = True
+        if it.get("serve_stub"):
+            feat["serve_stub"] = True
+        if bad and it.get("force_include"):
+            feat["buy_ineligible"] = reason  # 뇌가 신규매수 금지를 알도록
         if it.get("pool"):
             feat["pool"] = it["pool"]
         if it.get("rank") is not None:

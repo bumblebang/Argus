@@ -26,15 +26,16 @@ from src.config import load_config, ROOT
 from src.logging_setup import setup_logging, get_logger
 from src.datasources.earnings import (fetch_kr_earnings, fetch_us_earnings,
                                       fetch_us_surprise_history)
+from src import paths as _paths
 
 OUT = ROOT / "data" / "earnings_calendar.json"
-ACCOUNT = ROOT / "data" / "paper_account.json"
 
 
 def _held_symbols(log) -> dict[str, str]:
     """보유 종목 {symbol: market}. 파일 없거나 깨졌으면 {} (유니버스만 대상)."""
+    account = _paths.resolve("paper", configured="data/paper_account.json")
     try:
-        acct = json.loads(ACCOUNT.read_text(encoding="utf-8"))
+        acct = json.loads(account.read_text(encoding="utf-8"))
     except (OSError, ValueError) as e:
         log.info("보유 계좌 로드 생략(유니버스만 대상): %s", e)
         return {}
@@ -120,4 +121,6 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    from src.cli.legacy import warn_legacy_script
+    warn_legacy_script("argus earnings-cal")
     sys.exit(main())

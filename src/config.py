@@ -106,6 +106,8 @@ def load_config(path: str | Path | None = None) -> AppConfig:
     path = Path(path) if path is not None else default_config_path()
     with open(path, "r", encoding="utf-8") as f:
         raw = yaml.safe_load(f) or {}
+    # Phase 1: watcher(구) ↔ disclosure/events(신) 호환 — 운영 yaml 즉시 rename 강제 금지.
+    raw = _normalize_watcher_keys(raw)
     # 동적 유니버스(스크리너 결과)가 있으면 정적 블록 대신 사용(없거나 낡으면 정적 폴백).
     # 테스트는 ARGUS_DISABLE_DYNAMIC_UNIVERSE=1 로 정적 유니버스 고정(production 파일 격리).
     if os.getenv("ARGUS_DISABLE_DYNAMIC_UNIVERSE") != "1":
@@ -115,3 +117,24 @@ def load_config(path: str | Path | None = None) -> AppConfig:
     env_dry = os.getenv("DRY_RUN", "true").lower() != "false"
     yaml_dry = bool(raw.get("run", {}).get("dry_run", True))
     return AppConfig(raw=raw, creds=creds, dry_run=env_dry or yaml_dry)
+
+
+def _normalize_watcher_keys(raw: dict) -> dict:
+    """disclosure/events 블록이 있으면 watcher 로 병합(구키 우선 유지).
+
+    코드는 계속 raw['watcher'] 를 읽는다. 신키만 있는 설정도 동작하게 한다.
+    """
+    if not isinstance(raw, dict):
+        return raw
+    legacy = raw.get("watcher")
+    if not isinstance(legacy, dict):
+        legacy = {}
+    merged = dict(legacy)
+    for alt in ("disclosure", "events"):
+        block = raw.get(alt)
+        if isinstance(block, dict):
+            for k, v in block.items():
+                merged.setdefault(k, v)
+    if merged:
+        raw["watcher"] = merged
+    return raw

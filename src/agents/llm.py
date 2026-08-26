@@ -31,6 +31,7 @@ from zoneinfo import ZoneInfo
 from pydantic import BaseModel
 
 from ..logging_setup import get_logger
+from .. import paths as _paths
 
 log = get_logger("agents.llm")
 
@@ -327,7 +328,7 @@ class FileInboxLLM:
                  *, sleep_fn: Callable[[float], None] = time.sleep,
                  now_fn: Callable[[], float] = time.time,
                  notify_fn: Callable[[str], None] | None = None):
-        self.inbox_dir = Path(inbox_dir)
+        self.inbox_dir = _paths.resolve("inbox", configured=inbox_dir)
         self.timeout_sec = float(timeout_sec)
         self.poll_sec = float(poll_sec)
         self._sleep = sleep_fn

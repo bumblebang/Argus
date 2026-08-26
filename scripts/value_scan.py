@@ -21,6 +21,7 @@ from src.logging_setup import setup_logging, get_logger
 from src.agents.llm import ClaudeCLIClient, MockLLM
 from src.agents.schemas import ValueDossier
 from src.value_scan import run_scan
+from src import paths as _paths
 
 log = get_logger("value_scan.cli")
 
@@ -29,7 +30,7 @@ def _held_symbols() -> set[str]:
     """원장의 열린 포지션 — 재검증 우선순위. 실패해도 스캔은 계속(빈 set)."""
     try:
         from src.engine.store import Store
-        store = Store(ROOT / "data" / "bot.db")
+        store = Store(_paths.resolve("db", configured="data/bot.db"))
         return {r["symbol"] for r in store.get_open_positions() if r["symbol"]}
     except Exception as e:
         log.warning("보유 심볼 로드 실패(재검증 우선순위 없이 진행): %s", e)
@@ -78,4 +79,6 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    from src.cli.legacy import warn_legacy_script
+    warn_legacy_script("argus value-scan")
     sys.exit(main())
