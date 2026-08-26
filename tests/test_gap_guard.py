@@ -340,8 +340,8 @@ def test_zone_mode_conviction_sizing_reduces_qty(tmp_path):
     ex = _ee(tmp_path, gw, store)
     r = ex.evaluate(dict(store.get_armed()[0]), "KR", price=1000.0)
     assert r["executed"] is True
-    # 0.2 × (0.5+0.5×0.56) × 1_000_000 / 1000 = 156 → floor
-    assert ex.broker.position("005930").qty == 156
+    # 0.2 × (0.75+0.25×0.56) × 1_000_000 / 1000 = 178 → floor
+    assert ex.broker.position("005930").qty == 178
 
 
 def test_zone_mode_legacy_meta_keeps_full_weight(tmp_path):

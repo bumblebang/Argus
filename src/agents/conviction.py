@@ -1,6 +1,7 @@
 """뇌 BUY 확신도 — 사이징용. 매수 봉인이 아니다.
 
-weight × (0.5 + 0.5 × conviction) 이라 0.22~0.82 가 목표비중의 61~91%.
+사이징: base_position_pct × (floor + span × conviction), 기본 floor=0.75·span=0.25
+→ 확신 0~1 에서 목표비중의 75~100%(소폭 ±). 배율·기본비중은 config risk.* 로 조정.
 
 설계:
 - 증거 *문장 개수*·LLM 자가채점·존 안 보너스는 쓰지 않는다.
@@ -69,14 +70,25 @@ def unit_intensity(x: float, scale: float) -> float:
     return math.tanh(x / scale)
 
 
-def size_weight(weight: float, conviction: float | None, *,
-                enabled: bool = True) -> float:
-    """사이징 비중. enabled 이고 conviction 이 있으면 weight×(0.5+0.5×c)."""
-    w = float(weight)
-    if not enabled or conviction is None:
-        return w
-    c = max(0.0, min(1.0, float(conviction)))
-    return w * (0.5 + 0.5 * c)
+def size_weight(base: float, conviction: float | None, *,
+                enabled: bool = True,
+                floor: float = 0.75, span: float = 0.25,
+                cap: float | None = None) -> float:
+    """사이징 비중. base×(floor+span×c). enabled 끄거나 c 없으면 base 그대로.
+
+    floor/span 은 config risk.conviction_size_* (시점·운용자별 조정).
+    cap(보통 max_position_pct)이 있으면 그 이하로 클램프.
+    """
+    w = float(base)
+    if enabled and conviction is not None:
+        c = max(0.0, min(1.0, float(conviction)))
+        w = w * (float(floor) + float(span) * c)
+    if cap is not None:
+        try:
+            w = min(w, float(cap))
+        except (TypeError, ValueError):
+            pass
+    return w
 
 
 def min_lot_adjust(weight: float, *, price: float, capital: float,

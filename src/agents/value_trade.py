@@ -352,15 +352,16 @@ VALUE_TRADE_SYSTEM = """\
   **첫 진입 대비 무엇이 나아졌는지**(촉매 진전·실적 확인) 또는 **안전마진이 더 커졌는지**
   (가격 하락으로 적정가 밴드까지 여력 확대)를 thesis 에 구체적으로 써라. 둘 다 대지 못하면
   그냥 물타기다 — 그럴 땐 HOLD 하라.
-- 비중은 신경 쓰지 마라. 회차 비중 상한은 **코드가 강제로 클램프**하므로 네가 얼마를 내든
-  이번 회차 몫을 넘길 수 없다. 너는 '지금 더 살 만한가'만 판단하면 된다.
+- 비중은 신경 쓰지 마라. **매수 수량은 코드가 총자산×기본비중(config)으로 정한다.**
+  target_weight 는 스키마 호환용이며 사이징에 쓰이지 않는다. 분할 회차 상한도 코드가
+  강제한다. 너는 '지금 더 살 만한가'만 판단하면 된다.
 
 출력 규칙:
 - 각 후보에 대해 side 는 BUY 또는 HOLD 만 낸다(SELL 금지 — 청산은 코드/후속이 담당).
 - BUY 에는 bear_case·bear_rebuttal 을 반드시 채워라(위 5번). HOLD 는 비워도 된다.
 - horizon 은 반드시 "position"(중장기).
 - strategy/params 는 지정하지 마라(전략 매매가 아닌 가치투자 진입이다).
-- target_weight 는 {max_position_pct} 이하로 제시하라(배정 예산 중 사용 비중).
+- target_weight 는 사이징에 미반영이니 형식만 맞추면 된다(예: 0 또는 {max_position_pct}).
 - conviction 은 보수적으로 매겨라 — 0.6 미만이면 검증 에이전트가 자동 거부한다. 확신이
   부족하면 억지 BUY 대신 HOLD 가 정답이다.
 - market_view 에 이번 판단의 밸류 슬리브 상태(예산/잔여)와 시장 국면 요약을 한두 문장으로.
@@ -476,7 +477,8 @@ class ValueRunner:
         self.now_fn = now_fn
         agents_cfg = cfg.raw.get("agents", {})
         self.min_conviction = float(agents_cfg.get("min_conviction", 0.6))
-        self.max_position_pct = float(cfg.risk.get("max_position_pct", 0.2))
+        self.max_position_pct = float(cfg.risk.get("max_position_pct", 0.25))
+        self.base_position_pct = float(cfg.risk.get("base_position_pct", 0.20))
 
     # ── 슬리브(중장기 자본 잠김 분리) ────────────────────────────
     def _value_positions(self) -> list:
@@ -656,7 +658,13 @@ class ValueRunner:
             arm_fn=None, dossier_fn=None, zone_fn=None, conviction_sizing=True,
             min_lot_conviction=float(mlc) if mlc is not None else None,
             store=self.store,
-            allow_add=True)
+            allow_add=True,
+            tranche_weights={
+                c["symbol"]: float(c["_tranche"]["weight"])
+                for c in gated if c.get("_tranche")
+            },
+            budget_caps={c["symbol"]: float(sleeve.get("room") or 0) for c in gated},
+        )
 
         if self.store:
             from ..shadow_ledger import book_blocked, book_soft_pending
