@@ -257,14 +257,20 @@ def test_reconcile_holdings_failure_keeps_positions(tmp_path):
 
 
 def test_reconcile_partial_qty_drop_records_pnl(tmp_path):
-    """재대사로 qty 감소 시 partial exit 귀속(track_record)."""
+    """재대사로 qty 감소 시 partial exit 귀속(track_record).
+
+    저널 매도는 코드 청산기가 방금 apply_fill 한 것 — 시간 창 안이어야 인정된다.
+    """
+    from datetime import datetime, timezone
+
     from src.paper_account import Fill
     store = Store(tmp_path / "bot.db")
     acct = _acct(tmp_path)
     acct.positions["005930"] = Position(symbol="005930", qty=1, avg_price=267500)
     acct.symbol_market["005930"] = "KR"
-    acct.journal.append(Fill(ts="2026-01-01T00:00:00Z", symbol="005930", market="KR",
-                               side="SELL", qty=1, price=270000, fee=0, reason="test"))
+    acct.journal.append(Fill(ts=datetime.now(timezone.utc).isoformat(),
+                             symbol="005930", market="KR",
+                             side="SELL", qty=1, price=270000, fee=0, reason="test"))
     row_id = store.open_position("005930", "KR", 2, 267500, thesis="tracked")
     partial = _SAMSUNG.copy()
     partial["quantity"] = "1"

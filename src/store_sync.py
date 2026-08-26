@@ -65,12 +65,20 @@ def sync_open_qty(
     account,
     *,
     exit_price: float | None = None,
+    allow_journal_fallback: bool = True,
     reason: str = "sync",
 ) -> None:
-    """open 행 qty 갱신. 감소 시 exit_price(또는 journal SELL)로 partial 귀속."""
+    """open 행 qty 갱신. 감소 시 exit_price(또는 journal SELL)로 partial 귀속.
+
+    allow_journal_fallback=False 면 exit_price 가 없을 때 저널을 뒤지지 않는다.
+    재대사 경로는 청산가 판정을 직접 하므로(귀속 실체결가 > 최근 매도가) 여기서
+    임의로 오래된 매도가를 끌어오면 pnl 이 조용히 틀린다.
+    """
     old_qty = float(row["qty"] or 0)
     if old_qty > new_qty + 1e-9:
-        px = exit_price or _last_sell_price(account, symbol)
+        px = exit_price
+        if px is None and allow_journal_fallback:
+            px = _last_sell_price(account, symbol)
         if px:
             sell_qty = min(old_qty - new_qty, old_qty)
             fee = _last_sell_fee(account, symbol)

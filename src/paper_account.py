@@ -212,6 +212,35 @@ class PaperAccount:
         self._save()
         return f
 
+    def record_exit_attribution(self, symbol: str, market: str, qty: float,
+                                exec_price: float, avg_price: float,
+                                fee: float = 0.0, reason: str = "") -> Fill | None:
+        """매도 실현손익·저널만 기입 — 현금/보유수량은 건드리지 않는다.
+
+        재대사가 실계좌 holdings/buying-power 로 cash·positions 를 덮은 **뒤** 호출된다.
+        수량과 현금은 이미 실계좌 값이므로 apply_fill 을 쓰면 이중 계상이다. 빠진
+        것은 그 매도의 손익 귀속뿐이다 — realized_pnl(누적·당일)과 저널.
+
+        avg_price 는 재대사 전 평균단가(덮이기 전 값)를 호출측이 넘긴다.
+        """
+        qty, exec_price = float(qty), float(exec_price)
+        if qty <= 0 or exec_price <= 0 or float(avg_price) <= 0:
+            return None
+        fee = float(fee or 0.0)
+        pnl = (exec_price - float(avg_price)) * qty - fee
+        self.realized_pnl[market] = self.realized_pnl.get(market, 0.0) + pnl
+        day = market_day(market)
+        if self._pnl_day.get(market) != day:
+            self._pnl_day[market] = day
+            self.realized_pnl_today[market] = 0.0
+        self.realized_pnl_today[market] = self.realized_pnl_today.get(market, 0.0) + pnl
+        f = Fill(ts=datetime.now(timezone.utc).isoformat(), symbol=symbol,
+                 market=market, side="SELL", qty=qty, price=exec_price, fee=fee,
+                 reason=reason or "reconcile_attribution")
+        self.journal.append(f)
+        self._save()
+        return f
+
     # ── 영속화 ───────────────────────────────────────────
     def _load(self) -> None:
         """저장된 원장 복원. 깨진 파일에 죽지 않는다.

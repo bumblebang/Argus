@@ -27,6 +27,9 @@ broker:
   working_order_ttl_sec: 60
   # 같은 종목에 미체결 주문이 살아 있으면 재발주 거부(매 틱 중복 발주 차단).
   block_on_working_order: true
+  # 종결된 체결분을 원장 귀속(실체결가 기입)까지 보관하는 시간(초). 재대사가 수량
+  # 감소를 못 보면 만료 회수하고 unattributed_fill 을 남긴다. 음수=무제한.
+  attribution_ttl_sec: 1800
 
 trading_sessions:
   KR: [regular, premarket, aftermarket]

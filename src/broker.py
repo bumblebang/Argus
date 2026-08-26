@@ -47,6 +47,15 @@ def _num(v: Any) -> float | None:
         return None
 
 
+def _parse_execution(info: dict | None) -> tuple[str, float, float | None, float]:
+    """주문 조회 응답 -> (status, 누적체결수량, 누적평균체결가, 누적 수수료+세금)."""
+    ex = (info or {}).get("execution") or {}
+    return (str((info or {}).get("status") or "UNKNOWN"),
+            _num(ex.get("filledQuantity")) or 0.0,
+            _num(ex.get("averageFilledPrice")),
+            (_num(ex.get("commission")) or 0.0) + (_num(ex.get("tax")) or 0.0))
+
+
 class Broker:
     def __init__(self, account: PaperAccount, gate: RiskGate,
                  client: TossClient | None = None, mode: str = "paper",
@@ -59,7 +68,8 @@ class Broker:
                  reconcile_poll_sec: float = 0.4,
                  reservation_ttl_sec: float = 300.0,
                  working_order_ttl_sec: float = 60.0,
-                 block_on_working_order: bool = True):
+                 block_on_working_order: bool = True,
+                 attribution_ttl_sec: float = 1800.0):
         self.account = account
         self.gate = gate
         self.client = client
@@ -96,6 +106,9 @@ class Broker:
         self.working_order_ttl_sec = float(working_order_ttl_sec)
         # 미체결 주문이 살아 있는 종목에 재발주를 막는다(매 틱 중복 발주 차단).
         self.block_on_working_order = bool(block_on_working_order)
+        # 종결됐지만 원장 귀속(J3)이 안 된 체결분을 얼마나 들고 있을지. 재대사가
+        # 수량 감소를 못 보면 영구히 남으므로 만료 회수(+경보). 음수면 무제한.
+        self.attribution_ttl_sec = float(attribution_ttl_sec)
         # 주문 시작·종료마다 증가. 재대사 API 조회(락 밖) 중 주문이 시작·끝나
         # apply 시점 inflight 가 비어도, 조회 스냅샷이 낡은지 판별한다.
         self._activity_gen: int = 0
@@ -262,7 +275,7 @@ class Broker:
         if self.store is None:
             return []
         try:
-            rows = self.store.get_working_orders()
+            rows = self.store.get_working_orders(settled=False)
         except Exception:
             return []
         out: list[Reservation] = []
@@ -323,19 +336,29 @@ class Broker:
 
     # ── 미체결 주문 레지스트리 (J2) ────────────────────────────
     def _register_working_order(self, order: Order, order_id: str, status: str,
-                                filled_qty: float, reason: str) -> None:
+                                filled_qty: float, reason: str, *,
+                                avg_px: float | None = None,
+                                fee: float = 0.0) -> None:
         """미체결/부분체결을 영속 레지스트리에 남긴다.
 
         토스 API 에 미체결 주문 **목록** 조회가 없다(order_get 단건뿐). 프로세스가
         죽으면 접수된 주문을 다시 찾을 방법이 이 표뿐이므로, 인메모리로는 안 된다.
+
+        filled_qty 는 이 시점 _finish_live 가 apply_fill 로 **이미 원장에 넣은**
+        수량이다. applied_* 로 함께 박아 두면 이후 추가 체결분만 정확히 귀속할 수
+        있다(J3) — 누적 평균가에서 반영분을 빼면 증분 실체결가가 나온다.
         """
         if self.store is None:
             return
+        applied_notional = float(filled_qty) * float(avg_px or 0.0)
         try:
             self.store.upsert_working_order(
                 order_id=order_id, symbol=order.symbol, market=order.market,
                 side=order.side, qty=float(order.qty), price=float(order.price),
-                status=status, filled_qty=float(filled_qty), reason=reason)
+                status=status, filled_qty=float(filled_qty), filled_avg=avg_px,
+                fee=float(fee), applied_qty=float(filled_qty),
+                applied_notional=applied_notional, applied_fee=float(fee),
+                reason=reason)
         except Exception as e:
             log.error("미체결 주문 기록 실패 — 고아 주문 위험 id=%s: %s", order_id, e)
 
@@ -361,10 +384,14 @@ class Broker:
     def sweep_working_orders(self) -> dict:
         """레지스트리 정산 — 기동 시 1회 + 주기 재대사마다.
 
-        상태를 재조회해 종결분은 지우고, TTL 초과 미체결은 취소한다. **원장은
+        상태를 재조회해 종결분을 정산하고, TTL 초과 미체결은 취소한다. **원장 수량은
         건드리지 않는다** — 체결 반영은 재대사(live holdings)가 단일 소유자이고,
         여기서 apply_fill 하면 이중 계상이 된다. 이 표는 (a) 재발주 차단,
-        (b) 고아 주문 회수, (c) J3 귀속용 실체결가 출처의 세 역할만 한다.
+        (b) 고아 주문 회수, (c) J3 귀속용 실체결가 출처의 세 역할을 한다.
+
+        (c) 때문에 원장 미반영 체결분이 남은 종결 주문은 삭제하지 않고 settled_at
+        만 찍는다. 재대사가 실체결가로 소비한 뒤 지운다. 소비되지 않은 채 오래
+        남으면 attribution_ttl 로 버리고 unattributed_fill 을 남긴다.
         """
         if self.store is None or self.client is None or self.account_seq is None:
             return {"skipped": True}
@@ -374,25 +401,31 @@ class Broker:
             log.warning("미체결 목록 조회 실패: %s", e)
             return {"error": str(e)}
         out = {"checked": 0, "settled": 0, "canceled": 0, "cancel_failed": 0,
-               "working": 0}
+               "working": 0, "awaiting_attribution": 0, "dropped": 0}
         now = time.time()
         for row in rows:
-            out["checked"] += 1
             oid = row["order_id"]
+            if row.get("settled_at"):
+                if self._expire_settled(row, now):
+                    out["dropped"] += 1
+                else:
+                    out["awaiting_attribution"] += 1
+                continue
+            out["checked"] += 1
             info = self._fetch_order(oid)
             if info is None:
                 out["working"] += 1
                 continue
-            status = str(info.get("status") or "UNKNOWN")
-            filled = _num((info.get("execution") or {}).get("filledQuantity")) or 0.0
-            self._store_call(self.store.update_working_order, oid,
-                             status=status, filled_qty=filled)
+            status, filled, avg, fee = _parse_execution(info)
+            self._store_call(self.store.update_working_order, oid, status=status,
+                             filled_qty=filled, filled_avg=avg, fee=fee)
             if status in _TERMINAL:
-                self._store_call(self.store.delete_working_order, oid)
                 out["settled"] += 1
+                if self._settle_or_drop(oid, row, filled, now):
+                    out["awaiting_attribution"] += 1
                 self._emit_symbol("working_order_settled", row["symbol"], {
                     "order_id": oid, "status": status, "filled_qty": filled,
-                    "qty": row["qty"], "side": row["side"]})
+                    "avg_price": avg, "qty": row["qty"], "side": row["side"]})
                 continue
             age = now - float(row["placed_at"] or now)
             if self.working_order_ttl_sec < 0 or age < self.working_order_ttl_sec:
@@ -404,6 +437,38 @@ class Broker:
                 out["cancel_failed"] += 1
                 out["working"] += 1
         return out
+
+    def _settle_or_drop(self, order_id: str, row: dict,
+                        filled: float, now: float) -> bool:
+        """종결 주문 처리. 원장 미반영 체결분이 남았으면 귀속 대기로 보존(True)."""
+        if filled - float(row.get("applied_qty") or 0.0) > 1e-9:
+            self._store_call(self.store.update_working_order, order_id,
+                             settled_at=now)
+            return True
+        self._store_call(self.store.delete_working_order, order_id)
+        return False
+
+    def _expire_settled(self, row: dict, now: float) -> bool:
+        """귀속 대기분 만료 회수. 버렸으면 True.
+
+        재대사가 수량 감소를 못 봤다는 뜻이다(직전 재대사가 이미 흡수, 또는 수동
+        개입). 추정으로 채우지 않고 버리되 조용히 지우지는 않는다 — 실체결가를
+        알았는데 원장에 못 넣었다는 기록이 남아야 리포트에서 구멍이 보인다.
+        """
+        if self.attribution_ttl_sec < 0:
+            return False
+        age = now - float(row.get("settled_at") or now)
+        if age < self.attribution_ttl_sec:
+            return False
+        self._store_call(self.store.delete_working_order, row["order_id"])
+        log.warning("[귀속 실패] %s %s 체결 %s @ %s — 재대사가 수량 감소를 못 봄(%.0f초)",
+                    row["side"], row["symbol"], row["filled_qty"],
+                    row.get("filled_avg"), age)
+        self._emit_symbol("unattributed_fill", row["symbol"], {
+            "order_id": row["order_id"], "side": row["side"],
+            "filled_qty": row["filled_qty"], "applied_qty": row.get("applied_qty"),
+            "avg_price": row.get("filled_avg"), "age_sec": round(age, 1)})
+        return True
 
     def _fetch_order(self, order_id: str) -> dict | None:
         try:
@@ -423,14 +488,14 @@ class Broker:
                               {"order_id": order_id, "error": str(e)})
             return False
         info = self._fetch_order(order_id) or {}
-        status = str(info.get("status") or "UNKNOWN")
-        filled = _num((info.get("execution") or {}).get("filledQuantity")) or 0.0
+        status, filled, avg, fee = _parse_execution(info)
+        self._store_call(self.store.update_working_order, order_id, status=status,
+                         filled_qty=filled, filled_avg=avg, fee=fee)
         if status not in _TERMINAL:
             log.warning("[LIVE] 취소 미확인 id=%s status=%s — working 유지", order_id, status)
-            self._store_call(self.store.update_working_order, order_id, status=status,
-                             filled_qty=filled)
             return False
-        self._store_call(self.store.delete_working_order, order_id)
+        # 취소 전 일부 체결됐으면 실체결가를 귀속에 넘겨야 한다 — 바로 지우지 않는다.
+        self._settle_or_drop(order_id, row, filled, time.time())
         log.info("[LIVE] 미체결 취소 확인 id=%s status=%s (체결 %s/%s)",
                  order_id, status, filled, row["qty"])
         self._emit_symbol("working_order_canceled", row["symbol"], {
@@ -538,7 +603,8 @@ class Broker:
             # 만료 시 취소한다. 지금까지는 성공 반환 후 잔량을 잊었다.
             if status in _PENDING and filled_qty < float(order.qty):
                 self._register_working_order(order, order_id, status,
-                                             filled_qty, reason)
+                                             filled_qty, reason,
+                                             avg_px=avg_px, fee=fee)
             self.last_result = ExecuteResult.from_fill(
                 fill_qty=filled_qty, fill_price=avg_px, fee=fee,
                 order_qty=order.qty, limit_price=order.price,

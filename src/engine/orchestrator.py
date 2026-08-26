@@ -359,7 +359,8 @@ def _start_reconcile_timer(broker, gateway, store, cfg, markets) -> threading.Ev
             # 재대사보다 먼저 — 종결된 미체결 주문을 지우고 만료분을 취소한 뒤
             # holdings 를 읽어야 방금 취소한 주문의 잔량이 스냅샷에 안 섞인다.
             sw = broker.sweep_working_orders()
-            if sw.get("canceled") or sw.get("cancel_failed") or sw.get("settled"):
+            if (sw.get("canceled") or sw.get("cancel_failed") or sw.get("settled")
+                    or sw.get("dropped")):
                 store.log_event("working_orders", None, sw)
         except Exception as e:
             log.warning("미체결 정산 오류(무시): %s", e)
@@ -371,7 +372,8 @@ def _start_reconcile_timer(broker, gateway, store, cfg, markets) -> threading.Ev
                 lambda acct: apply_reconcile_from_live(
                     acct, store, data, markets=tuple(markets)),
                 expect_gen=gen)
-            if res.get("adopted") or res.get("closed") or res.get("error"):
+            if (res.get("adopted") or res.get("closed") or res.get("error")
+                    or res.get("attributed")):
                 store.log_event("reconcile", None, res)
         except Exception as e:
             log.warning("주기 재대사 오류(무시): %s", e)
