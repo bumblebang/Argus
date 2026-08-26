@@ -111,15 +111,17 @@ def evaluate(now: float, hb_age: float | None, market_open: bool = True,
 
 def _read_heartbeat_age(now: float) -> float | None:
     try:
-        d = json.loads(HEARTBEAT.read_text(encoding="utf-8"))
+        # import 시 고정 경로 금지 — 컷오버 후 state/ 우선은 resolve 가 담당.
+        # (모듈 상수 HEARTBEAT 는 대시보드 등 표시용; 경보 판정은 매회 resolve)
+        hb = _paths.resolve("watch_hb", configured="data/watch.heartbeat")
+        d = json.loads(hb.read_text(encoding="utf-8"))
         return now - float(d.get("ts", 0))
     except (OSError, ValueError, TypeError):
         return None
 
 
 def _load_brain_mode() -> dict:
-    return bm.load_mode(BRAIN_MODE)
-
+    return bm.load_mode(_paths.resolve("brain_mode", configured="data/brain_mode.json"))
 
 def _auth_expired_recent(now: float, window: float = 3600.0) -> bool:
     """mode 파일 없을 때 DB 인증 에러 폴백. 세션 한도는 False."""
