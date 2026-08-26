@@ -95,9 +95,14 @@ class SingleInstance:
     컨텍스트 매니저(`with SingleInstance(path): ...`)로도 쓸 수 있다.
     """
 
-    def __init__(self, pidfile: str | os.PathLike):
+    def __init__(self, pidfile: str | os.PathLike,
+                 lockfile: str | os.PathLike | None = None):
         self.pidfile = Path(pidfile)
-        self.lockfile = self.pidfile.with_name(self.pidfile.name + ".lock")
+        # 락 경로를 pidfile 에서 파생시키면, pidfile 이 레이아웃 전환으로 이동하는
+        # 순간 락 파일도 같이 바뀌어 **서로 다른 락을 잡은 두 인스턴스**가 생긴다.
+        # 호출측이 고정 경로(paths.resolve("watch_lock"))를 넘길 수 있게 한다.
+        self.lockfile = (Path(lockfile) if lockfile is not None
+                         else self.pidfile.with_name(self.pidfile.name + ".lock"))
         self._fh = None
         self._acquired = False
 
@@ -109,6 +114,7 @@ class SingleInstance:
 
     def acquire(self) -> "SingleInstance":
         self.pidfile.parent.mkdir(parents=True, exist_ok=True)
+        self.lockfile.parent.mkdir(parents=True, exist_ok=True)
         fh = open(self.lockfile, "a+")
         try:
             _lock_nb(fh)

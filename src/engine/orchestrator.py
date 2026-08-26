@@ -514,7 +514,8 @@ def run_from_args(args) -> int:
         return 1
 
     # 단일 인스턴스 락 — 오펀/중복 기동 시 토스 토큰 경합(→401)·claude 동시 스폰 경합 방지.
-    lock = SingleInstance(_paths.resolve("watch_pid"))
+    lock = SingleInstance(_paths.resolve("watch_pid"),
+                          lockfile=_paths.resolve("watch_lock"))
     try:
         lock.acquire()
     except AlreadyRunning as e:

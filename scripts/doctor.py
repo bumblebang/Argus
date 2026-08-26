@@ -102,10 +102,44 @@ def check_ops_paths() -> None:
             tag = "other"
         exists = "exists" if got.exists() else "missing"
         _ok(f"path:{key}", f"{tag} {exists} → {got}")
+    lock = p.resolve("watch_lock")
+    _ok("path:watch_lock", f"fixed → {lock}")
+    legacy_lock = (ROOT / p.rel("watch_lock")).resolve()
+    if legacy_lock != lock and legacy_lock.exists():
+        _warn("path:watch_lock", f"레거시 락 잔재 — 쓰이지 않음, 삭제 가능: {legacy_lock}")
+
+
+def _migrate_blockers() -> list[str]:
+    """--apply 를 막아야 하는 조건. 컷오버는 파일 경로를 갈아엎으므로,
+    장중이거나 watch 가 살아 있으면 원장/DB 를 실행 중인 프로세스 밑에서 빼게 된다."""
+    blockers: list[str] = []
+    from src import market_hours, paths as p
+    from src.engine.singleton import AlreadyRunning, SingleInstance
+
+    open_now = [m for m in ("KR", "US") if market_hours.is_open(m)]
+    if open_now:
+        blockers.append(f"장중({', '.join(open_now)}) — 장 마감 후 재시도")
+
+    probe = SingleInstance(p.resolve("watch_pid"), lockfile=p.resolve("watch_lock"))
+    try:
+        probe.acquire()
+    except AlreadyRunning as e:
+        blockers.append(f"watch 실행 중(pid={e.pid}) — 먼저 중지")
+    except OSError as e:
+        blockers.append(f"락 확인 실패({e}) — 수동 확인")
+    else:
+        probe.release()
+    return blockers
 
 
 def run_migrate(*, apply: bool) -> int:
     from src.paths_migrate import apply_moves, format_plan
+    if apply:
+        blockers = _migrate_blockers()
+        if blockers:
+            for b in blockers:
+                _bad("migrate", b)
+            return 1
     rows = apply_moves(root=ROOT, dry_run=not apply)
     print(format_plan(rows))
     if any(r.get("action") == "conflict" or r.get("result") == "conflict"
