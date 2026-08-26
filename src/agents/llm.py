@@ -452,6 +452,10 @@ class ClaudeCLIClient:
         self.last_source: str | None = None
         self.last_model: str | None = model
         self.used_fallback: bool = False
+        # 한도 폴백 직전 메시지(예산 계기판). CLI 성공 시 비움.
+        self.last_quota_error: str | None = None
+        self.last_quota_reset_at: float | None = None
+        self.last_quota_kind: str | None = None
 
     def _invoke(self, prompt: str, model: str | None) -> str:
         def _args(cmd: str) -> list[str]:
@@ -537,6 +541,9 @@ class ClaudeCLIClient:
                     try:
                         result = schema.model_validate(data)
                         self.last_source = "cli"
+                        self.last_quota_error = None
+                        self.last_quota_reset_at = None
+                        self.last_quota_kind = None
                         return result
                     except Exception as e:
                         last = str(e)
@@ -545,9 +552,13 @@ class ClaudeCLIClient:
             raise ValueError(f"claude CLI 구조화 출력 실패: {last}")
         except ClaudeCLIError as e:
             if self.cursor_bridge is not None and is_usage_limit(e):
+                from ..ops_budget import classify_quota_kind
                 reset_at = parse_reset_at(str(e))
                 if reset_at is None:
                     reset_at = time.time() + _DEFAULT_QUOTA_COOLDOWN_SEC
+                self.last_quota_error = str(e)[:300]
+                self.last_quota_reset_at = reset_at
+                self.last_quota_kind = classify_quota_kind(str(e)) or "unknown"
                 inbox = self._bridge_inbox_dir()
                 armed = True
                 if self.require_bridge_armed:

@@ -1007,16 +1007,50 @@ def _gather() -> dict:
     # 영속 뇌 모드(회로차단/브릿지) — health 이벤트보다 SSOT.
     try:
         from src.engine.brain_mode import load_mode
+        from src.agents.llm import is_bridge_armed
+        from src.ops_playbook import actions_for
+        from src.ops_budget import budget_gauge
         bm = load_mode(_paths.resolve("brain_mode", configured="data/brain_mode.json"))
         data["brain_mode"] = bm.get("mode", "ok")
         data["brain_mode_state"] = bm
+        # 라이브 armed (mode 파일의 bridge_armed 스냅샷보다 heartbeat 실측 우선)
+        inbox_cfg = "data/llm_inbox"
+        max_age = 90.0
+        raw: dict = {}
+        try:
+            import yaml
+            raw = yaml.safe_load(CONFIG.read_text(encoding="utf-8")) or {}
+            cb = ((raw.get("agents") or {}).get("cursor_bridge") or {})
+            inbox_cfg = str(cb.get("inbox_dir") or inbox_cfg)
+            max_age = float(cb.get("armed_max_age_sec", 90) or 90)
+        except Exception:
+            raw = {}
+        inbox = _paths.resolve("inbox", configured=inbox_cfg)
+        armed_now = is_bridge_armed(inbox, max_age_sec=max_age)
+        data["bridge_armed"] = armed_now
         base = health.get("brain") or {"consecutive_failures": 0, "last_ok_ts": 0}
         health["brain"] = {**base, "mode": bm.get("mode"),
                            "reset_at": bm.get("reset_at"),
-                           "bridge_armed": bm.get("bridge_armed")}
+                           "bridge_armed": armed_now,
+                           "quota_kind": bm.get("quota_kind")}
         data["brain_health"] = health
+        data["budget"] = budget_gauge(
+            bm, consecutive_failures=base.get("consecutive_failures"), cfg=raw)
+        alert = data.get("alert") or {}
+        reasons = list(alert.get("reasons") or []) if alert.get("active") else []
+        if (bm.get("mode") == "bridge" and not armed_now
+                and not any("미무장" in r for r in reasons)):
+            reasons = reasons + [
+                "브릿지 모드인데 미무장 — bridge.heartbeat 만료/없음 → circuit 위험"]
+        data["ops_actions"] = actions_for(
+            reasons, brain_mode=str(bm.get("mode") or "ok"))
+        data["ops_reasons"] = reasons
     except Exception:
         data["brain_mode"] = "ok"
+        data["bridge_armed"] = None
+        data["ops_actions"] = []
+        data["ops_reasons"] = []
+        data["budget"] = None
     data["positions"] = [dict(r) for r in cur.execute(
         "select symbol,market,strategy,state,qty,avg_price,thesis,stop_price,target_price,"
         "opened_at,meta from positions where state not in ('closed') order by opened_at desc")]
@@ -1045,6 +1079,17 @@ def _gather() -> dict:
         "select ts,kind,symbol,payload from events where kind in "
         "('live_order','live_order_error','buy_blocked') and ts>=? "
         "order by ts desc limit 10", (kst_midnight,))]
+    # 지정가·재대사·프리/애프터 실측 (오늘 KST)
+    data["exec_events"] = [dict(r) for r in cur.execute(
+        "select ts,kind,symbol,payload from events where kind in "
+        "('live_order','live_order_pending','live_order_error',"
+        "'reconcile','wide_spread_skip','sell_skipped') and ts>=? "
+        "order by ts desc limit 400", (kst_midnight,))]
+    try:
+        from src.ops_exec import summarize_exec
+        data["exec_ops"] = summarize_exec(data["exec_events"], market="KR")
+    except Exception:
+        data["exec_ops"] = None
     # 오늘 봇 거래 근거 보강용(뇌 thesis — 구 이벤트에 reason 없을 때)
     data["trade_theses"] = [dict(r) for r in cur.execute(
         "select ts,symbol,action,thesis from decisions "
@@ -2939,6 +2984,149 @@ def _value_html(d: dict) -> str:
 
 # ───────────────────────── 탭5: 시스템 ─────────────────────────
 
+def _ops_card_html(d: dict) -> str:
+    """시스템 탭 상단 — mode / bridge armed / 예산 / 사유 / 다음 액션."""
+    mode = str(d.get("brain_mode") or "ok")
+    armed = d.get("bridge_armed")
+    if armed is True:
+        armed_s, armed_col = "armed", "#3ddc84"
+    elif armed is False:
+        armed_s, armed_col = "미무장", "#ff5c63"
+    else:
+        armed_s, armed_col = "–", "#9aa4b2"
+    mode_col = {
+        "ok": "#3ddc84", "bridge": "#ffb454",
+        "circuit_open": "#ff5c63", "auth_needed": "#ff5c63",
+    }.get(mode, "#9aa4b2")
+    reasons = list(d.get("ops_reasons") or [])
+    alert = d.get("alert") or {}
+    if not reasons and alert.get("active"):
+        reasons = list(alert.get("reasons") or [])
+    actions = list(d.get("ops_actions") or [])
+    if not actions and alert.get("actions"):
+        actions = list(alert.get("actions") or [])
+    budget = d.get("budget") or alert.get("budget") or {}
+    budget_line = escape(str(budget.get("line") or "—"))
+    sest = budget.get("session_est") or {}
+    pct = sest.get("pct")
+    if pct is not None:
+        pct_col = "#3ddc84" if pct < 70 else ("#ffb454" if pct < 90 else "#ff5c63")
+        pct_html = (f"<span class=mono style='color:{pct_col}'>"
+                    f"추정 {float(pct):.0f}%</span>"
+                    f" <span class=muted>({escape(_fmt_tok_ops(sest.get('used')))}"
+                    f" / {escape(_fmt_tok_ops(sest.get('cap')))}"
+                    f", 최근 {int((sest.get('window_sec') or 18000) // 3600)}h)</span>")
+    else:
+        pct_html = f"<span class=mono>{budget_line}</span>"
+    qk = budget.get("quota_label") or budget.get("quota_kind") or ""
+    cd = budget.get("countdown") or "—"
+    reason_html = ("<br>".join(escape(r) for r in reasons[:3])
+                   if reasons else '<span class=muted>경보 없음</span>')
+    action_html = ("<br>".join(escape(a) for a in actions[:2])
+                   if actions else '<span class=muted>—</span>')
+    return (
+        f"<div class=card style='grid-column:1/-1'>"
+        f"<div class=k>Ops</div>"
+        f"<div class=v style='font-size:14px;line-height:1.45'>"
+        f"뇌 <span class=mono style='color:{mode_col}'>{escape(mode)}</span>"
+        f" · 브릿지 <span class=mono style='color:{armed_col}'>{armed_s}</span>"
+        f"<div style='margin-top:8px'><span class=muted>예산</span><br>{pct_html}"
+        f"{(' · ' + escape(str(qk))) if qk else ''}"
+        f"{(' · 리셋까지 ' + escape(str(cd))) if budget.get('countdown') and mode != 'ok' else ''}"
+        f"<div class=muted style='font-size:11px;margin-top:4px'>"
+        f"{escape(str(budget.get('line') or ''))}</div>"
+        f"</div>"
+        f"<div style='margin-top:8px'><span class=muted>사유</span><br>{reason_html}</div>"
+        f"<div style='margin-top:8px'><span class=muted>다음</span><br>{action_html}</div>"
+        f"</div></div>"
+    )
+
+
+def _fmt_tok_ops(n) -> str:
+    try:
+        n = int(n or 0)
+    except (TypeError, ValueError):
+        return "?"
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.2f}M"
+    if n >= 1_000:
+        return f"{n / 1_000:.1f}K"
+    return str(n)
+
+
+def _exec_ops_html(d: dict, *, compact: bool = False) -> str:
+    """지정가·재대사·세션별 체결 실측 카드."""
+    ex = d.get("exec_ops")
+    if not ex:
+        return (
+            "<div class=card style='grid-column:1/-1'>"
+            "<div class=k>체결·재대사</div>"
+            "<div class=v muted>오늘 실측 없음(또는 집계 실패)</div></div>"
+        )
+    rh = ex.get("reconcile_health") or "none"
+    rh_col = {
+        "quiet": "#3ddc84", "drift": "#ffb454", "noisy": "#ff5c63", "none": "#9aa4b2",
+    }.get(rh, "#9aa4b2")
+    rh_lab = {
+        "quiet": "조용", "drift": "소폭 보정", "noisy": "잦은 채택/청산", "none": "기록 없음",
+    }.get(rh, rh)
+    by = ex.get("by_session") or {}
+    sess_html = " · ".join(
+        f"{ex.get('session_labels', {}).get(k, k)} {by.get(k, 0)}"
+        for k in ("premarket", "regular", "aftermarket")
+        if by.get(k)
+    ) or "세션별 체결 없음"
+    avg = ex.get("avg_slip_pct")
+    worst = ex.get("worst_slip_pct")
+    slip_s = "—"
+    if avg is not None:
+        slip_s = f"평균 {avg:+.2f}%"
+        if worst is not None:
+            slip_s += f" · 최악 {worst:+.2f}%"
+    recon = ex.get("reconcile") or {}
+    line = escape(str(ex.get("line") or ""))
+    body = (
+        f"<div class=v style='font-size:14px;line-height:1.45'>"
+        f"<span class=mono>{line}</span>"
+        f"<div style='margin-top:8px'><span class=muted>세션</span> {escape(sess_html)}</div>"
+        f"<div style='margin-top:4px'><span class=muted>지정가 슬립</span> "
+        f"<span class=mono>{escape(slip_s)}</span>"
+        f" <span class=muted>(+불리)</span></div>"
+        f"<div style='margin-top:4px'><span class=muted>재대사</span> "
+        f"<span style='color:{rh_col}'>{escape(rh_lab)}</span>"
+        f" <span class='muted mono'>"
+        f"{recon.get('n', 0)}회"
+        f" · 채택 {recon.get('adopted', 0)}"
+        f" · 청산 {recon.get('closed', 0)}"
+        f" · 갱신 {recon.get('updated', 0)}</span></div>"
+    )
+    if not compact:
+        prev = ex.get("fills_preview") or []
+        if prev:
+            body += ("<table style='margin-top:10px;font-size:12px'>"
+                     "<tr><th>시각</th><th>종목</th><th>세션</th>"
+                     "<th>지정</th><th>체결</th><th>슬립</th></tr>")
+            names = d.get("names") or {}
+            for f in prev[:6]:
+                sp = f.get("slip_pct")
+                sp_s = f"{sp:+.2f}%" if sp is not None else "—"
+                lim = f.get("limit"); fil = f.get("fill")
+                body += (
+                    f"<tr><td class=mono>{_hms(f.get('ts'))}</td>"
+                    f"<td>{_name(f.get('symbol'), names)}</td>"
+                    f"<td>{escape(str(ex.get('session_labels', {}).get(f.get('session'), f.get('session') or '–')))}</td>"
+                    f"<td class=mono>{lim if lim is not None else '–'}</td>"
+                    f"<td class=mono>{fil if fil is not None else '–'}</td>"
+                    f"<td class=mono>{sp_s}</td></tr>"
+                )
+            body += "</table>"
+    body += "</div>"
+    return (
+        f"<div class=card style='grid-column:1/-1'>"
+        f"<div class=k>체결·재대사 (오늘)</div>{body}</div>"
+    )
+
+
 def _system_html(d: dict) -> str:
     age = d["hb_age"]; hb = d["hb"] or {}
     pid = d.get("pid")
@@ -2946,6 +3134,8 @@ def _system_html(d: dict) -> str:
     dot = '<span class="dot ok"></span>' if alive else '<span class="dot bad"></span>'
     t = d.get("tally", {})
     p = ['<div class="tabpage page-system">', "<div class=grid>"]
+    p.append(_ops_card_html(d))
+    p.append(_exec_ops_html(d, compact=True))
     p.append(f"<div class=card><div class=k>워커 프로세스</div><div class=v>{dot}{'살아있음' if alive else '없음'} "
              f"<small>pid {pid if pid else '–'}</small></div></div>")
     p.append(f"<div class=card><div class=k>하트비트</div><div class='v mono'>{'%.0fs'%age if age is not None else '–'}</div></div>")

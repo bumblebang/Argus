@@ -32,6 +32,7 @@ def default_state(*, now: float | None = None) -> dict[str, Any]:
         "reset_at": None,
         "last_error": None,
         "bridge_armed": False,
+        "quota_kind": None,  # session|weekly|unknown — 예산 계기판
         "ts": ts,
     }
 
@@ -77,9 +78,14 @@ def is_bridge_timeout(err: BaseException | str) -> bool:
 def set_mode(path: str | Path | None, mode: str, *, reason: str = "",
              reset_at: float | None = None, last_error: str | None = None,
              bridge_armed: bool | None = None,
+             quota_kind: str | None = None,
+             clear_quota: bool = False,
              now: float | None = None,
              prev: dict[str, Any] | None = None) -> dict[str, Any]:
-    """모드 기록. 모드가 바뀌면 since 를 갱신. 반환=새 상태(+ changed bool 키는 별도)."""
+    """모드 기록. 모드가 바뀌면 since 를 갱신. 반환=새 상태(+ changed bool 키는 별도).
+
+    quota_kind: session|weekly|unknown. clear_quota=True 또는 mode=ok 복귀 시 한도 필드 비움.
+    """
     if mode not in MODES:
         raise ValueError(f"unknown brain mode: {mode}")
     ts = time.time() if now is None else float(now)
@@ -96,6 +102,12 @@ def set_mode(path: str | Path | None, mode: str, *, reason: str = "",
         nxt["last_error"] = last_error[:300]
     if bridge_armed is not None:
         nxt["bridge_armed"] = bool(bridge_armed)
+    if clear_quota or mode == "ok":
+        nxt["quota_kind"] = None
+        if mode == "ok":
+            nxt["reset_at"] = None
+    elif quota_kind in ("session", "weekly", "unknown"):
+        nxt["quota_kind"] = quota_kind
     nxt["ts"] = ts
     save_mode(path, nxt)
     nxt["_changed"] = changed

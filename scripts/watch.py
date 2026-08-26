@@ -165,12 +165,20 @@ def _build_brain(cfg, gateway, store, args, broker, risk, universe_fn=None,
                  else str(_paths.resolve(
                      "inbox", configured=cb.get("inbox_dir") or "data/llm_inbox")))
     source_fn = None
+    quota_info_fn = None
     if not dry:
         # llm 은 위 else 분기에서 생성된 ClaudeCLIClient(또는 API 클라이언트).
         _llm_ref = llm  # type: ignore[name-defined]
 
         def source_fn():
             return getattr(_llm_ref, "last_source", None)
+
+        def quota_info_fn():
+            return {
+                "kind": getattr(_llm_ref, "last_quota_kind", None),
+                "reset_at": getattr(_llm_ref, "last_quota_reset_at", None),
+                "error": getattr(_llm_ref, "last_quota_error", None),
+            }
 
     return BrainWorker(
         cycle, store=store, cooldown_sec=cooldown,
@@ -179,6 +187,7 @@ def _build_brain(cfg, gateway, store, args, broker, risk, universe_fn=None,
         bridge_armed_max_age_sec=float(cb.get("armed_max_age_sec", 90)),
         circuit_fail_threshold=int(wcfg.get("circuit_fail_threshold", 2)),
         source_fn=source_fn,
+        quota_info_fn=quota_info_fn,
     )
 
 
@@ -339,10 +348,13 @@ def _start_reconcile_timer(broker, gateway, store, cfg, markets) -> threading.Ev
 
     def _once():
         try:
+            # fetch 직전 gen — 조회 중 주문이 시작·끝나면 apply 시 stale_snapshot 으로 연기
+            gen = broker.activity_generation()
             data = fetch_live_account_data(gateway, seq, markets=tuple(markets))
             res = broker.reconcile(
                 lambda acct: apply_reconcile_from_live(
-                    acct, store, data, markets=tuple(markets)))
+                    acct, store, data, markets=tuple(markets)),
+                expect_gen=gen)
             if res.get("adopted") or res.get("closed") or res.get("error"):
                 store.log_event("reconcile", None, res)
         except Exception as e:

@@ -37,7 +37,8 @@ class BrainWorker:
                  bridge_inbox_dir: str | Path | None = None,
                  bridge_armed_max_age_sec: float = 90.0,
                  circuit_fail_threshold: int = 2,
-                 source_fn: Callable[[], str | None] | None = None) -> None:
+                 source_fn: Callable[[], str | None] | None = None,
+                 quota_info_fn: Callable[[], dict] | None = None) -> None:
         self.cycle_fn = cycle_fn
         self.store = store
         self.cooldown_sec = float(cooldown_sec)
@@ -50,6 +51,8 @@ class BrainWorker:
         self.circuit_fail_threshold = max(1, int(circuit_fail_threshold))
         # 직전 사이클 LLM 출처("cli"|"bridge"|None). watch 가 ClaudeCLIClient.last_source 연결.
         self.source_fn = source_fn
+        # 한도 폴백 메타(kind/reset_at/error) — ClaudeCLIClient.last_quota_* .
+        self.quota_info_fn = quota_info_fn
         self._wake = threading.Event()
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
@@ -102,15 +105,18 @@ class BrainWorker:
     def _apply_mode(self, mode: str, *, reason: str = "",
                     reset_at: float | None = None,
                     last_error: str | None = None,
-                    bridge_armed: bool | None = None) -> dict:
+                    bridge_armed: bool | None = None,
+                    quota_kind: str | None = None) -> dict:
         state = bm.set_mode(
             self.mode_path, mode, reason=reason, reset_at=reset_at,
-            last_error=last_error, bridge_armed=bridge_armed, now=self._now())
+            last_error=last_error, bridge_armed=bridge_armed,
+            quota_kind=quota_kind, now=self._now())
         if state.pop("_changed", False):
             self._log(f"{self.kind_prefix}_mode", {
                 "mode": state["mode"], "reason": state.get("reason"),
                 "reset_at": state.get("reset_at"),
                 "bridge_armed": state.get("bridge_armed"),
+                "quota_kind": state.get("quota_kind"),
             })
             log.warning("뇌 모드 → %s (%s)", state["mode"], reason or "")
         return state
@@ -171,8 +177,17 @@ class BrainWorker:
                 except Exception:
                     src = None
             if src == "bridge":
+                qinfo: dict = {}
+                if self.quota_info_fn is not None:
+                    try:
+                        qinfo = dict(self.quota_info_fn() or {})
+                    except Exception:
+                        qinfo = {}
                 state = self._apply_mode(
-                    "bridge", reason="cursor_bridge", bridge_armed=True)
+                    "bridge", reason="cursor_bridge", bridge_armed=True,
+                    reset_at=qinfo.get("reset_at"),
+                    last_error=qinfo.get("error"),
+                    quota_kind=qinfo.get("kind") or "unknown")
             else:
                 state = self._apply_mode("ok", reason="cli_ok", bridge_armed=armed)
             self._log(f"{self.kind_prefix}_done", {"summary": _summarize(result),
@@ -199,15 +214,18 @@ class BrainWorker:
                 bridge_armed=armed)
 
         if isinstance(e, BrainQuotaError):
+            from ..ops_budget import classify_quota_kind
             reset_at = e.reset_at
+            qk = classify_quota_kind(err_s) or "unknown"
             if not e.bridge_armed:
                 return self._apply_mode(
                     "circuit_open", reason="quota_no_bridge",
-                    reset_at=reset_at, last_error=err_s, bridge_armed=False)
+                    reset_at=reset_at, last_error=err_s, bridge_armed=False,
+                    quota_kind=qk)
             # armed 인데 QuotaError 는 이례 — circuit 으로
             return self._apply_mode(
                 "circuit_open", reason="quota", reset_at=reset_at,
-                last_error=err_s, bridge_armed=True)
+                last_error=err_s, bridge_armed=True, quota_kind=qk)
 
         if bm.is_bridge_timeout(e) or "cursor_bridge" in err_s.lower():
             self._bridge_fail_streak += 1
