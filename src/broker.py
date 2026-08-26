@@ -20,7 +20,7 @@ from .fill_result import ExecuteResult
 from .logging_setup import get_logger
 from .market_hours import current_session
 from .paper_account import PaperAccount
-from .risk_gate import RiskGate, Order
+from .risk_gate import RiskGate, Order, Reservation
 from .strategies.base import Position
 from .toss_client import TossClient
 
@@ -56,7 +56,8 @@ class Broker:
                  limit_slippage_pct: float = 0.01,
                  max_spread_pct_extended: float = 0.02,
                  reconcile_poll_attempts: int = 5,
-                 reconcile_poll_sec: float = 0.4):
+                 reconcile_poll_sec: float = 0.4,
+                 reservation_ttl_sec: float = 300.0):
         self.account = account
         self.gate = gate
         self.client = client
@@ -82,8 +83,12 @@ class Broker:
         # 뇌 워커(진입)와 감시 루프(코드 청산)가 동시에 execute 할 수 있어 직렬화.
         # 주기 재대사(reconcile)도 이 락을 잡아 gate.check/체결과 원자적으로 계좌를 병합한다.
         self._lock = threading.Lock()
-        # 라이브: place_order~apply_fill 사이 동일 종목 중복 주문 차단.
-        self._inflight: set[str] = set()
+        # 접수됐지만 원장 미반영인 주문 {symbol: Reservation}. 동일 종목 중복 주문을
+        # 막을 뿐 아니라, 게이트가 다른 종목 주문을 볼 때 이 예약분을 현금·노출에서
+        # 미리 뺀다(J1). 심볼 집합만으로는 계좌 단위 한도를 지킬 수 없다.
+        self._inflight: dict[str, Reservation] = {}
+        # 예약이 새면 매수가 영구히 막히므로 TTL 로 강제 회수(+경보). 0 이하면 비활성.
+        self.reservation_ttl_sec = float(reservation_ttl_sec)
         # 주문 시작·종료마다 증가. 재대사 API 조회(락 밖) 중 주문이 시작·끝나
         # apply 시점 inflight 가 비어도, 조회 스냅샷이 낡은지 판별한다.
         self._activity_gen: int = 0
@@ -200,17 +205,41 @@ class Broker:
         with self._lock:
             return self._activity_gen
 
-    def _mark_inflight(self, symbol: str) -> None:
-        """락 안: in-flight 등록 + activity_gen 증가."""
-        self._inflight.add(symbol)
+    def _mark_inflight(self, order: Order, order_id: str | None = None) -> None:
+        """락 안: 예약 등록 + activity_gen 증가."""
+        self._inflight[order.symbol] = Reservation(
+            symbol=order.symbol, market=order.market, side=order.side,
+            qty=float(order.qty), price=float(order.price),
+            order_id=order_id, placed_at=time.time())
         self._activity_gen += 1
 
     def _clear_inflight(self, symbol: str) -> None:
-        """락 안: in-flight 해제. 실제로 빠져 나갔을 때만 gen 증가."""
-        if symbol not in self._inflight:
+        """락 안: 예약 해제. 실제로 빠져 나갔을 때만 gen 증가."""
+        if self._inflight.pop(symbol, None) is None:
             return
-        self._inflight.discard(symbol)
         self._activity_gen += 1
+
+    def _active_reservations(self) -> list[Reservation]:
+        """락 안: 만료분을 회수한 뒤 현재 예약 목록.
+
+        해제 누락(예외·프로세스 이상)으로 예약이 남으면 그 현금이 영구히 묶여
+        매수가 통째로 막힌다. 과차단이 과주문보다는 낫지만 조용해선 안 되므로
+        TTL 로 회수하고 반드시 경보를 남긴다.
+        """
+        if self._inflight and self.reservation_ttl_sec > 0:
+            now = time.time()
+            for sym, r in list(self._inflight.items()):
+                if now - r.placed_at <= self.reservation_ttl_sec:
+                    continue
+                self._inflight.pop(sym, None)
+                self._activity_gen += 1
+                log.error("[예약 만료] %s %s x%s (id=%s, %.0f초 경과) — 강제 회수",
+                          r.side, sym, r.qty, r.order_id, now - r.placed_at)
+                self._emit_symbol("reservation_expired", sym, {
+                    "symbol": sym, "side": r.side, "qty": r.qty,
+                    "price": r.price, "order_id": r.order_id,
+                    "age_sec": round(now - r.placed_at, 1)})
+        return list(self._inflight.values())
 
     def reconcile(self, reconcile_fn: Callable[[PaperAccount], Any],
                   *, expect_gen: int | None = None) -> Any:
@@ -227,7 +256,7 @@ class Broker:
         동안 주문이 시작·끝나 inflight 가드에 안 걸려도, 낡은 API 스냅샷 apply 를 막는다.
         """
         with self._lock:
-            if self._inflight:
+            if self._active_reservations():
                 syms = sorted(self._inflight)
                 log.debug("재대사 연기 — in-flight %s", syms)
                 return {"deferred": True, "reason": "inflight", "inflight": syms}
@@ -254,6 +283,7 @@ class Broker:
 
     def _reject_inflight(self, order: Order, base_kw: dict) -> bool:
         """in-flight 거부. True 이면 last_result 설정됨."""
+        self._active_reservations()          # 만료 회수 후 판정
         if order.symbol not in self._inflight:
             return False
         self.last_reject_reason = "동일 종목 주문 처리 중(in-flight)"
@@ -269,7 +299,8 @@ class Broker:
         if self._reject_inflight(order, base_kw):
             return None
 
-        decision = self.gate.check(order, self.account)
+        decision = self.gate.check(order, self.account,
+                                   reserved=self._active_reservations())
         if not decision.approved:
             self.last_reject_reason = decision.reason or "리스크게이트 거부"
             log.info("[거부] %s %s x%s @ %.2f — %s",
@@ -294,13 +325,13 @@ class Broker:
 
         qty_before = float(self.account.position(order.symbol).qty)
         if self.mode != "live":
-            self._mark_inflight(order.symbol)
+            self._mark_inflight(order)
             return {"kind": "paper", "base_kw": base_kw, "qty_before": qty_before}
 
         order_id = self._place_live_order(order, reason)
         if order_id is None:
             return None
-        self._mark_inflight(order.symbol)  # place 직후(락 안) — 중복 주문 race 차단
+        self._mark_inflight(order, order_id)  # place 직후(락 안) — 중복 주문 race 차단
         return {"kind": "live", "order_id": order_id, "base_kw": base_kw,
                 "qty_before": qty_before}
 
@@ -591,9 +622,12 @@ class Broker:
 
     def _emit(self, kind: str, order: Order, payload: dict) -> None:
         """store 가 있으면 라이브 주문 이벤트 기록(없으면 로그만). 기록 실패는 삼킨다."""
+        self._emit_symbol(kind, order.symbol, payload)
+
+    def _emit_symbol(self, kind: str, symbol: str, payload: dict) -> None:
         if self.store is None:
             return
         try:
-            self.store.log_event(kind, order.symbol, payload)
+            self.store.log_event(kind, symbol, payload)
         except Exception as e:
-            log.warning("store 이벤트 기록 실패(무시) [%s %s]: %s", kind, order.symbol, e)
+            log.warning("store 이벤트 기록 실패(무시) [%s %s]: %s", kind, symbol, e)

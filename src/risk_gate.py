@@ -29,6 +29,28 @@ class Order:
 
 
 @dataclass
+class Reservation:
+    """접수됐지만 아직 원장에 반영되지 않은 주문 1건.
+
+    라이브에서 place_order 와 apply_fill 사이에는 수 초의 폴링 구간이 있고, 그
+    동안 cash/positions 는 주문 전 그대로다. 게이트가 원장만 보면 그 구간에 들어온
+    **다른 종목** 주문이 같은 현금을 다시 쓴다(동일 종목은 in-flight 로 막히지만
+    한도는 계좌 단위다). 그래서 미반영 주문을 '예약'으로 들고 게이트에 넘긴다.
+    """
+    symbol: str
+    market: str
+    side: str
+    qty: float
+    price: float
+    order_id: str | None = None
+    placed_at: float = 0.0
+
+    @property
+    def notional(self) -> float:
+        return self.qty * self.price
+
+
+@dataclass
 class GateDecision:
     approved: bool
     reason: str
@@ -133,10 +155,42 @@ class RiskGate:
             total += p.qty * p.avg_price
         return total
 
-    def check(self, order: Order, account) -> GateDecision:
+    def _reserved_notional(self, reserved, market: str,
+                           sector: str | None = None) -> float:
+        """예약된 BUY 명목 합. SELL 예약이 만들 현금은 세지 않는다(미체결일 수 있음)."""
+        if not reserved:
+            return 0.0
+        total = 0.0
+        for r in reserved:
+            if r.side != "BUY" or r.market != market:
+                continue
+            if sector is not None and self.sector_map.get(r.symbol) != sector:
+                continue
+            total += r.notional
+        return total
+
+    def _reserved_new_symbols(self, reserved, account) -> int:
+        """예약 중이면서 아직 보유가 아닌 종목 수 — 보유종목 수 한도에 선반영."""
+        if not reserved:
+            return 0
+        syms = set()
+        for r in reserved:
+            if r.side != "BUY":
+                continue
+            if account.position(r.symbol).is_open:
+                continue
+            syms.add(r.symbol)
+        return len(syms)
+
+    def check(self, order: Order, account, *, reserved=None) -> GateDecision:
         """account: PaperAccount 호환 객체.
-        필요한 속성: buying_power(market), position(symbol), open_count, realized_pnl(dict)."""
+        필요한 속성: buying_power(market), position(symbol), open_count, realized_pnl(dict).
+
+        reserved: 접수됐지만 원장 미반영인 Reservation 목록(선택). 주면 매수여력·
+        총익스포저·섹터·보유종목 수 한도에 선반영한다. None 이면 기존 동작.
+        """
         m = order.market
+        reserved_buy = self._reserved_notional(reserved, m)
 
         # 0) 킬스위치 — 이 파일이 있으면 모든 신규 주문 차단
         if _paths.resolve("halt", configured=self.kill_switch_file).exists():
@@ -186,10 +240,12 @@ class RiskGate:
                     return GateDecision(False,
                         f"드로다운 한도 도달 (실현누적+미실현 {drawdown:,.0f})")
 
-            # 4) 매수여력(현금) 확인
-            if order.notional > account.buying_power(m):
+            # 4) 매수여력(현금) 확인 — 접수 후 미반영 주문(예약)이 쥔 현금을 뺀다.
+            avail = account.buying_power(m) - reserved_buy
+            if order.notional > avail:
+                held = f" (예약 {reserved_buy:,.0f} 차감)" if reserved_buy else ""
                 return GateDecision(False,
-                    f"매수여력 부족 ({order.notional:,.0f} > {account.buying_power(m):,.0f})")
+                    f"매수여력 부족 ({order.notional:,.0f} > {avail:,.0f}){held}")
 
             # 노출 한도(비중·총익스포저·섹터)의 기준 — capital 고정 또는 실자산 추종.
             base = self._exposure_base(account, m)
@@ -201,15 +257,17 @@ class RiskGate:
                 return GateDecision(False,
                     f"종목 비중 초과 (체결후 {post_value:,.0f} > {base * self.max_position_pct:,.0f})")
 
-            # 6) 동시 보유 종목 수 (신규 진입일 때만)
-            if not pos.is_open and account.open_count >= self.max_positions:
-                return GateDecision(False,
-                    f"최대 보유종목 수 초과 ({account.open_count}/{self.max_positions})")
+            # 6) 동시 보유 종목 수 (신규 진입일 때만). 예약된 신규 종목도 센다.
+            if not pos.is_open:
+                open_n = account.open_count + self._reserved_new_symbols(reserved, account)
+                if open_n >= self.max_positions:
+                    return GateDecision(False,
+                        f"최대 보유종목 수 초과 ({open_n}/{self.max_positions})")
 
             # ── 포트폴리오 수준 감독관(선택) — 종목단위 한도를 통과해도 전체 쏠림은 차단 ──
             # 7) 총 익스포저(시장별): 체결 후 투자금이 한도 초과면 거부(현금 버퍼 강제).
             if self.max_gross_exposure is not None and base > 0:
-                post_gross = self._invested(account, m) + order.notional
+                post_gross = self._invested(account, m) + reserved_buy + order.notional
                 limit = base * self.max_gross_exposure
                 if post_gross > limit:
                     return GateDecision(False,
@@ -218,7 +276,9 @@ class RiskGate:
             # 8) 섹터 집중도: 한 섹터에 과도하게 쏠리면 거부(상관 리스크 프록시).
             sector = self.sector_map.get(order.symbol)
             if self.max_sector_pct is not None and sector and base > 0:
-                post_sector = self._invested(account, m, sector) + order.notional
+                post_sector = (self._invested(account, m, sector)
+                               + self._reserved_notional(reserved, m, sector)
+                               + order.notional)
                 limit = base * self.max_sector_pct
                 if post_sector > limit:
                     return GateDecision(False,

@@ -111,7 +111,8 @@ def build_paper_core(cfg: AppConfig, *, live_client=None, account_seq=None,
         limit_slippage_pct=float(broker_cfg.get("limit_slippage_pct", 0.01)),
         max_spread_pct_extended=float(broker_cfg.get("max_spread_pct_extended", 0.02)),
         reconcile_poll_attempts=int(broker_cfg.get("reconcile_poll_attempts", 5)),
-        reconcile_poll_sec=float(broker_cfg.get("reconcile_poll_sec", 0.4)))
+        reconcile_poll_sec=float(broker_cfg.get("reconcile_poll_sec", 0.4)),
+        reservation_ttl_sec=float(broker_cfg.get("reservation_ttl_sec", 300.0)))
     dry = bool(getattr(cfg, "dry_run", True))
     is_live = resolve_execution_mode(
         broker_mode=str(mode), dry_run=dry, live_client=live_client) == "live"
