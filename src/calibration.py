@@ -15,6 +15,8 @@ log = get_logger("calibration")
 
 MIN_N = 20           # 전체 최소 표본
 MIN_BIN = 5          # 구간별 최소
+MIN_VALID_BINS = 3   # 잠금 해제에 필요한 유효(n>=MIN_BIN) 구간 수
+MIN_SLOPE = 0.05     # 최저↔최고 유효 구간 hit_rate 최소 상승폭(동점 해제 금지)
 BINS = [(0.0, 0.4), (0.4, 0.55), (0.55, 0.7), (0.7, 0.85), (0.85, 1.01)]
 
 
@@ -81,16 +83,9 @@ def conviction_calibration(store, since_days: float = 90) -> dict:
         brier = round(sum((c - w) ** 2 for c, w in pairs) / len(pairs), 4)
 
     n = len(pairs)
-    # 캘리브레이션 입증: 표본 충분 + 고확신 구간 hit >= 저확신 (단조 대략)
-    calibrated = False
-    if n >= MIN_N:
-        rates = []
-        for lo, hi in BINS:
-            b = by_bin[_bin_label(lo, hi)]
-            if b.get("n", 0) >= MIN_BIN:
-                rates.append(b["hit_rate"])
-        if len(rates) >= 2 and rates[-1] >= rates[0]:
-            calibrated = True
+    rates = [by_bin[_bin_label(lo, hi)]["hit_rate"] for lo, hi in BINS
+             if by_bin[_bin_label(lo, hi)].get("n", 0) >= MIN_BIN]
+    calibrated, why = _calibration_verdict(n, rates)
 
     return {
         "note": ("확신도 캘리브레이션. calibrated=False 이면 사이징을 평평하게 "
@@ -99,8 +94,35 @@ def conviction_calibration(store, since_days: float = 90) -> dict:
         "brier": brier,
         "by_bin": by_bin,
         "calibrated": calibrated,
+        "calibration_reason": why,
+        "valid_bins": len(rates),
         "min_n": MIN_N,
+        "min_valid_bins": MIN_VALID_BINS,
+        "min_slope": MIN_SLOPE,
     }
+
+
+def _calibration_verdict(n: int, rates: list[float]) -> tuple[bool, str]:
+    """확신도 사이징 잠금 해제 판정. (통과여부, 사유).
+
+    양 끝만 비교하면 V자(중간 붕괴)도 통과하고, `>=` 는 동점만으로도 통과한다.
+    확신도 배율은 실제 주문 크기를 바꾸므로, 노이즈로 열리지 않게 세 조건을 건다:
+    표본 수, 유효 구간 수, 전 구간 비감소 + 최소 상승폭.
+
+    Brier 는 게이트에 쓰지 않는다 — conviction 은 확률이 아니라 mis-specified
+    (EVAL_PROTOCOL "점예측" 참고). 관측용으로만 반환한다.
+    """
+    if n < MIN_N:
+        return False, f"표본 부족 (n={n} < {MIN_N})"
+    if len(rates) < MIN_VALID_BINS:
+        return False, f"유효 구간 부족 ({len(rates)} < {MIN_VALID_BINS})"
+    for prev, cur in zip(rates, rates[1:]):
+        if cur < prev:
+            return False, f"구간 단조성 붕괴 ({prev} → {cur})"
+    slope = rates[-1] - rates[0]
+    if slope < MIN_SLOPE:
+        return False, f"기울기 부족 ({slope:.3f} < {MIN_SLOPE})"
+    return True, f"통과 (n={n}, 유효구간={len(rates)}, 기울기={slope:.3f})"
 
 
 def sizing_enabled(store, *, configured: bool, since_days: float = 90) -> bool:
@@ -110,7 +132,8 @@ def sizing_enabled(store, *, configured: bool, since_days: float = 90) -> bool:
     try:
         cal = conviction_calibration(store, since_days=since_days)
         if not cal.get("calibrated"):
-            log.info("확신도 미캘리브레이션(n=%s) — 사이징 평평", cal.get("n"))
+            log.info("확신도 미캘리브레이션 — 사이징 평평: %s",
+                     cal.get("calibration_reason") or f"n={cal.get('n')}")
             return False
         return True
     except Exception as e:
