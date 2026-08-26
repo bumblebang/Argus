@@ -103,8 +103,13 @@ risk:
   # false 면 실현손익만 본다(구 동작).
   daily_loss_use_sod_delta: true
   allow_fractional: false
+  # 최소 1주 시범매수: 고단가 종목이 목표비중 floor=0 으로 영구 탈락하는 구멍 보완.
+  # 면제 범위는 max_order_notional 뿐이다 — 종목비중·총노출·현금은 그대로 걸린다.
+  # 이미 보유 중인 종목에는 면제하지 않는다(보유 에피소드당 1회 시범).
   allow_min_lot: true
   min_lot_qty: 1.0
+  # 시범매수 절대 상한(원). null=비활성. 스칼라 또는 {KR: 300000} 형태.
+  min_lot_max_notional: null
   max_gross_exposure: 0.90
   max_sector_pct: 0.40
   max_drawdown_pct: null     # 비활성. 숫자면 SoD 대비 DD 매수차단

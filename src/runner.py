@@ -156,10 +156,14 @@ class TradingBot:
                  else getattr(self.risk, "base_position_pct", 0.20))
             equity = self.risk.sizing_base_amount(self.broker, market)
             hard = float(getattr(self.risk, "max_position_pct", 0.25) or 0.25)
+            # 보유분을 뺀 잔여 한도 — 안 빼면 이미 상한을 채운 종목에 계속 얹힌다
+            # (게이트가 막지만 매 틱 거부 주문을 내는 낭비이고, min_lot 부활 경로에선
+            # 실제로 통과했다). cycle.py 의 headroom 정의와 맞춘다.
+            headroom = max(0.0, equity * hard - pos.qty * price)
             qty = self.risk.size_buy(
                 market, price, w,
                 base_equity=equity,
-                notional_cap=max(0.0, equity * hard))
+                notional_cap=headroom)
             self.broker.execute(Order(symbol, market, "BUY", qty, price), signal.reason,
                                 store=self.broker.store)
         elif signal.action == Action.SELL and pos.is_open:

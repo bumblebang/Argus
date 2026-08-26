@@ -95,10 +95,15 @@ class RiskGate:
         # 노출 한도(종목비중·총익스포저·섹터)의 기준: "capital"(고정 자본) | "equity"(실자산).
         # 손실 예산(일손실·드로다운)은 당일 시가(SoD) equity, 없으면 capital 폴백.
         self.exposure_base = str(limits.get("exposure_base", "capital")).lower()
-        # 최소 1주 시범매수: qty==min_lot_qty BUY 는 주문상한·종목비중 면제(현금·총익스포저·
-        # 보유수·킬스위치는 유지). 고단가 종목이 목표비중 floor=0 으로 영구 탈락하는 구멍 보완.
+        # 최소 1주 시범매수: qty==min_lot_qty BUY 는 **주문상한만** 면제한다. 고단가
+        # 종목이 목표비중 floor=0 으로 영구 탈락하는 구멍 보완용인데, 종목비중까지
+        # 면제하면 1주가 종목 상한을 그대로 넘어간다(=J4 재현 경로). 또한 이미 보유
+        # 중인 종목에는 면제하지 않는다 — 보유 에피소드당 1회 시범(피라미딩 차단).
         self.allow_min_lot = bool(limits.get("allow_min_lot", False))
         self.min_lot_qty = float(limits.get("min_lot_qty", 1.0))
+        # 시범매수 절대 상한(원). 면제와 무관하게 이 금액을 넘는 min_lot 주문은 거부.
+        # None 이면 비활성. 시장별 dict 또는 스칼라.
+        self.min_lot_max_notional = limits.get("min_lot_max_notional")
         # KRX 경보·관리 등 하드스킵 심볼(BUY만). 파일/리스트로 주입.
         blocked = limits.get("blocked_symbols") or []
         self.blocked_symbols = {str(s) for s in blocked if s}
@@ -112,6 +117,18 @@ class RiskGate:
 
     def _cap(self, market: str) -> float:
         return float(self.capital.get(market, 0.0))
+
+    def _min_lot_cap(self, market: str) -> float | None:
+        """시범매수 절대 상한. 시장별 dict 또는 스칼라. 없거나 ≤0 이면 None(비활성)."""
+        cfg = self.min_lot_max_notional
+        if cfg is None:
+            return None
+        raw = cfg.get(market) if isinstance(cfg, dict) else cfg
+        try:
+            v = float(raw)
+        except (TypeError, ValueError):
+            return None
+        return v if v > 0 else None
 
     def _loss_budget_base(self, account, market: str) -> float:
         """일손실·DD 분모: 당일 시가(SoD) equity, 없으면 config capital 폴백."""
@@ -233,9 +250,9 @@ class RiskGate:
             return GateDecision(False, f"비정상 수량/가격(qty={order.qty}, px={order.price})")
 
         pos = account.position(order.symbol)
-        # 최소 1주 시범매수면 주문상한·종목비중만 면제(아래 BUY 분기에서 재사용).
+        # 최소 1주 시범매수면 주문상한만 면제. 이미 보유 중이면 시범이 아니다.
         min_lot = (self.allow_min_lot and order.side == "BUY"
-                   and order.qty == self.min_lot_qty)
+                   and order.qty == self.min_lot_qty and not pos.is_open)
 
         if order.side == "BUY":
             # 2) 주문당 최대 금액 — 신규 매수 폭주 방지. SELL에는 미적용.
@@ -246,6 +263,12 @@ class RiskGate:
                     and order.notional > float(cap_notional)):
                 return GateDecision(False,
                     f"주문금액 초과 ({order.notional:,.0f} > {float(cap_notional):,.0f})")
+
+            # 2b) 시범매수 절대 상한 — 면제를 받는 주문일수록 크기를 제한한다.
+            lot_cap = self._min_lot_cap(m)
+            if min_lot and lot_cap is not None and order.notional > lot_cap:
+                return GateDecision(False,
+                    f"시범매수 한도 초과 ({order.notional:,.0f} > {lot_cap:,.0f})")
 
             if order.symbol in self.blocked_symbols:
                 return GateDecision(False, f"KRX 경보·관리 차단({order.symbol})")
@@ -282,9 +305,10 @@ class RiskGate:
             # 노출 한도(비중·총익스포저·섹터)의 기준 — capital 고정 또는 실자산 추종.
             base = self._exposure_base(account, m)
 
-            # 5) 종목당 최대 비중 (체결 후 평가액 기준). 최소 1주 시범매수는 면제.
+            # 5) 종목당 최대 비중 (체결 후 평가액 기준). 시범매수도 예외 없다 —
+            #    1주가 종목 상한을 넘는다면 그 종목은 이 계좌에 안 맞는 것이다.
             post_value = pos.qty * order.price + order.notional
-            if (not min_lot and base > 0
+            if (base > 0
                     and post_value > base * self.max_position_pct):
                 return GateDecision(False,
                     f"종목 비중 초과 (체결후 {post_value:,.0f} > {base * self.max_position_pct:,.0f})")

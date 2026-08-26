@@ -85,7 +85,10 @@ class RiskManager:
         if not self.allow_fractional:
             qty = math.floor(qty)
         qty = max(qty, 0.0)
-        if min_qty > 0 and qty < min_qty and price * min_qty <= base:
+        # 최소 1주 부활은 **예산 안에서만**. 분모(base)만 보면 notional_cap(종목 잔여
+        # 한도·슬리브 room)이 0 이어도 1주가 되살아나 한도를 우회한다 — 이미 목표비중을
+        # 채운 고단가 종목에 1주씩 계속 얹히는 경로가 여기였다.
+        if min_qty > 0 and qty < min_qty and price * min_qty <= min(base, budget):
             qty = float(min_qty) if self.allow_fractional else float(math.floor(min_qty))
         return qty
 

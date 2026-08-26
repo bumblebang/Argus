@@ -104,6 +104,7 @@ def build_paper_core(cfg: AppConfig, *, live_client=None, account_seq=None,
                          "daily_loss_use_sod_delta", True),
                      "allow_min_lot": risk_cfg.get("allow_min_lot", False),
                      "min_lot_qty": risk_cfg.get("min_lot_qty", 1.0),
+                     "min_lot_max_notional": risk_cfg.get("min_lot_max_notional"),
                      "sector_map": sector_map})
     broker_cfg = cfg.raw.get("broker", {}) or {}
     mode = broker_cfg.get("mode", "paper")
