@@ -20,6 +20,13 @@ broker:
   reconcile_poll_sec: 0.4
   reconcile_sec: 300
   max_spread_pct_extended: 0.02
+  # 접수 후 원장 미반영 주문(예약) 강제 회수 시간. 해제 누락 시 매수 영구 차단 방지.
+  reservation_ttl_sec: 300
+  # 미체결 주문 방치 시간(초). 넘으면 취소. 0=즉시취소, 음수=취소 안 함.
+  # 즉시취소는 얇은 호가·시간외에서 정상 체결 기회를 버린다.
+  working_order_ttl_sec: 60
+  # 같은 종목에 미체결 주문이 살아 있으면 재발주 거부(매 틱 중복 발주 차단).
+  block_on_working_order: true
 
 trading_sessions:
   KR: [regular, premarket, aftermarket]

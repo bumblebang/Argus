@@ -356,6 +356,14 @@ def _start_reconcile_timer(broker, gateway, store, cfg, markets) -> threading.Ev
 
     def _once():
         try:
+            # 재대사보다 먼저 — 종결된 미체결 주문을 지우고 만료분을 취소한 뒤
+            # holdings 를 읽어야 방금 취소한 주문의 잔량이 스냅샷에 안 섞인다.
+            sw = broker.sweep_working_orders()
+            if sw.get("canceled") or sw.get("cancel_failed") or sw.get("settled"):
+                store.log_event("working_orders", None, sw)
+        except Exception as e:
+            log.warning("미체결 정산 오류(무시): %s", e)
+        try:
             # fetch 직전 gen — 조회 중 주문이 시작·끝나면 apply 시 stale_snapshot 으로 연기
             gen = broker.activity_generation()
             data = fetch_live_account_data(gateway, seq, markets=tuple(markets))

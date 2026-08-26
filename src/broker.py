@@ -57,7 +57,9 @@ class Broker:
                  max_spread_pct_extended: float = 0.02,
                  reconcile_poll_attempts: int = 5,
                  reconcile_poll_sec: float = 0.4,
-                 reservation_ttl_sec: float = 300.0):
+                 reservation_ttl_sec: float = 300.0,
+                 working_order_ttl_sec: float = 60.0,
+                 block_on_working_order: bool = True):
         self.account = account
         self.gate = gate
         self.client = client
@@ -89,6 +91,11 @@ class Broker:
         self._inflight: dict[str, Reservation] = {}
         # 예약이 새면 매수가 영구히 막히므로 TTL 로 강제 회수(+경보). 0 이하면 비활성.
         self.reservation_ttl_sec = float(reservation_ttl_sec)
+        # 미체결 주문 방치 시간. 넘으면 취소한다. 0 이면 즉시 취소, 음수면 취소 안 함.
+        # 즉시 취소는 얇은 호가·시간외에서 정상 체결 기회를 버리므로 기본은 유예.
+        self.working_order_ttl_sec = float(working_order_ttl_sec)
+        # 미체결 주문이 살아 있는 종목에 재발주를 막는다(매 틱 중복 발주 차단).
+        self.block_on_working_order = bool(block_on_working_order)
         # 주문 시작·종료마다 증가. 재대사 API 조회(락 밖) 중 주문이 시작·끝나
         # apply 시점 inflight 가 비어도, 조회 스냅샷이 낡은지 판별한다.
         self._activity_gen: int = 0
@@ -219,12 +226,12 @@ class Broker:
             return
         self._activity_gen += 1
 
-    def _active_reservations(self) -> list[Reservation]:
-        """락 안: 만료분을 회수한 뒤 현재 예약 목록.
+    def _prune_expired_reservations(self) -> None:
+        """락 안: 만료된 in-flight 예약 회수.
 
         해제 누락(예외·프로세스 이상)으로 예약이 남으면 그 현금이 영구히 묶여
-        매수가 통째로 막힌다. 과차단이 과주문보다는 낫지만 조용해선 안 되므로
-        TTL 로 회수하고 반드시 경보를 남긴다.
+        매수가 통째로 막히고 재대사까지 연기된다. 과차단이 과주문보다는 낫지만
+        조용해선 안 되므로 TTL 로 회수하고 반드시 경보를 남긴다.
         """
         if self._inflight and self.reservation_ttl_sec > 0:
             now = time.time()
@@ -239,7 +246,37 @@ class Broker:
                     "symbol": sym, "side": r.side, "qty": r.qty,
                     "price": r.price, "order_id": r.order_id,
                     "age_sec": round(now - r.placed_at, 1)})
-        return list(self._inflight.values())
+
+    def _active_reservations(self) -> list[Reservation]:
+        """락 안: 게이트에 넘길 예약 목록 = in-flight + 미체결 잔량."""
+        self._prune_expired_reservations()
+        return list(self._inflight.values()) + self._working_reservations()
+
+    def _working_reservations(self) -> list[Reservation]:
+        """미체결 주문의 잔량도 예약으로 본다.
+
+        접수된 주문은 증권사가 현금을 홀드하지만 로컬 원장 cash 는 그대로다.
+        다음 재대사가 buying_power 를 실계좌 값으로 덮기 전까지, 다른 종목 주문이
+        그 현금을 다시 쓸 수 있다. in-flight 로 이미 잡힌 종목은 중복 제외.
+        """
+        if self.store is None:
+            return []
+        try:
+            rows = self.store.get_working_orders()
+        except Exception:
+            return []
+        out: list[Reservation] = []
+        for row in rows:
+            if row["symbol"] in self._inflight:
+                continue
+            remaining = float(row["qty"]) - float(row["filled_qty"] or 0.0)
+            if remaining <= 0:
+                continue
+            out.append(Reservation(
+                symbol=row["symbol"], market=row["market"], side=row["side"],
+                qty=remaining, price=float(row["price"]),
+                order_id=row["order_id"], placed_at=float(row["placed_at"] or 0.0)))
+        return out
 
     def reconcile(self, reconcile_fn: Callable[[PaperAccount], Any],
                   *, expect_gen: int | None = None) -> Any:
@@ -256,7 +293,10 @@ class Broker:
         동안 주문이 시작·끝나 inflight 가드에 안 걸려도, 낡은 API 스냅샷 apply 를 막는다.
         """
         with self._lock:
-            if self._active_reservations():
+            # 연기 판정은 in-flight(폴링 중)만 본다. 미체결 주문으로 연기하면
+            # buying_power 갱신이 막혀 오히려 원장이 더 오래 틀린다.
+            self._prune_expired_reservations()
+            if self._inflight:
                 syms = sorted(self._inflight)
                 log.debug("재대사 연기 — in-flight %s", syms)
                 return {"deferred": True, "reason": "inflight", "inflight": syms}
@@ -281,9 +321,133 @@ class Broker:
         expected = max(0.0, qty_before - sell_qty)
         return abs(pos.qty - expected) < eps and sell_qty > eps
 
+    # ── 미체결 주문 레지스트리 (J2) ────────────────────────────
+    def _register_working_order(self, order: Order, order_id: str, status: str,
+                                filled_qty: float, reason: str) -> None:
+        """미체결/부분체결을 영속 레지스트리에 남긴다.
+
+        토스 API 에 미체결 주문 **목록** 조회가 없다(order_get 단건뿐). 프로세스가
+        죽으면 접수된 주문을 다시 찾을 방법이 이 표뿐이므로, 인메모리로는 안 된다.
+        """
+        if self.store is None:
+            return
+        try:
+            self.store.upsert_working_order(
+                order_id=order_id, symbol=order.symbol, market=order.market,
+                side=order.side, qty=float(order.qty), price=float(order.price),
+                status=status, filled_qty=float(filled_qty), reason=reason)
+        except Exception as e:
+            log.error("미체결 주문 기록 실패 — 고아 주문 위험 id=%s: %s", order_id, e)
+
+    def _reject_working_order(self, order: Order, base_kw: dict) -> bool:
+        """같은 종목에 살아 있는 미체결 주문이 있으면 재발주 거부.
+
+        존 진입기·청산 실행기는 미체결 시 armed/보유를 유지하고 **매 틱 다시**
+        execute 한다 — 레지스트리가 없으면 같은 의도의 주문이 계속 쌓인다.
+        """
+        if not self.block_on_working_order or self.store is None:
+            return False
+        try:
+            if not self.store.has_working_order(order.symbol):
+                return False
+        except Exception as e:
+            log.warning("미체결 조회 실패(통과) %s: %s", order.symbol, e)
+            return False
+        self.last_reject_reason = "동일 종목 미체결 주문 존재"
+        log.info("[거부] %s %s — 미체결 주문 대기 중", order.side, order.symbol)
+        self.last_result = ExecuteResult.rejected(self.last_reject_reason, **base_kw)
+        return True
+
+    def sweep_working_orders(self) -> dict:
+        """레지스트리 정산 — 기동 시 1회 + 주기 재대사마다.
+
+        상태를 재조회해 종결분은 지우고, TTL 초과 미체결은 취소한다. **원장은
+        건드리지 않는다** — 체결 반영은 재대사(live holdings)가 단일 소유자이고,
+        여기서 apply_fill 하면 이중 계상이 된다. 이 표는 (a) 재발주 차단,
+        (b) 고아 주문 회수, (c) J3 귀속용 실체결가 출처의 세 역할만 한다.
+        """
+        if self.store is None or self.client is None or self.account_seq is None:
+            return {"skipped": True}
+        try:
+            rows = self.store.get_working_orders()
+        except Exception as e:
+            log.warning("미체결 목록 조회 실패: %s", e)
+            return {"error": str(e)}
+        out = {"checked": 0, "settled": 0, "canceled": 0, "cancel_failed": 0,
+               "working": 0}
+        now = time.time()
+        for row in rows:
+            out["checked"] += 1
+            oid = row["order_id"]
+            info = self._fetch_order(oid)
+            if info is None:
+                out["working"] += 1
+                continue
+            status = str(info.get("status") or "UNKNOWN")
+            filled = _num((info.get("execution") or {}).get("filledQuantity")) or 0.0
+            self._store_call(self.store.update_working_order, oid,
+                             status=status, filled_qty=filled)
+            if status in _TERMINAL:
+                self._store_call(self.store.delete_working_order, oid)
+                out["settled"] += 1
+                self._emit_symbol("working_order_settled", row["symbol"], {
+                    "order_id": oid, "status": status, "filled_qty": filled,
+                    "qty": row["qty"], "side": row["side"]})
+                continue
+            age = now - float(row["placed_at"] or now)
+            if self.working_order_ttl_sec < 0 or age < self.working_order_ttl_sec:
+                out["working"] += 1
+                continue
+            if self._cancel_and_confirm(oid, row):
+                out["canceled"] += 1
+            else:
+                out["cancel_failed"] += 1
+                out["working"] += 1
+        return out
+
+    def _fetch_order(self, order_id: str) -> dict | None:
+        try:
+            return self.client.get_order(self.account_seq, order_id) or {}
+        except Exception as e:
+            log.warning("미체결 주문 조회 실패 id=%s: %s", order_id, e)
+            return None
+
+    def _cancel_and_confirm(self, order_id: str, row: dict) -> bool:
+        """취소 요청 후 재조회로 확인. 확인 못 하면 레지스트리에 남긴다(재발주 계속 차단)."""
+        try:
+            self.client.cancel_order(self.account_seq, order_id)
+        except Exception as e:
+            log.error("[LIVE] 미체결 취소 실패 id=%s (%s %s) — working 유지: %s",
+                      order_id, row["side"], row["symbol"], e)
+            self._emit_symbol("working_order_cancel_failed", row["symbol"],
+                              {"order_id": order_id, "error": str(e)})
+            return False
+        info = self._fetch_order(order_id) or {}
+        status = str(info.get("status") or "UNKNOWN")
+        filled = _num((info.get("execution") or {}).get("filledQuantity")) or 0.0
+        if status not in _TERMINAL:
+            log.warning("[LIVE] 취소 미확인 id=%s status=%s — working 유지", order_id, status)
+            self._store_call(self.store.update_working_order, order_id, status=status,
+                             filled_qty=filled)
+            return False
+        self._store_call(self.store.delete_working_order, order_id)
+        log.info("[LIVE] 미체결 취소 확인 id=%s status=%s (체결 %s/%s)",
+                 order_id, status, filled, row["qty"])
+        self._emit_symbol("working_order_canceled", row["symbol"], {
+            "order_id": order_id, "status": status, "filled_qty": filled,
+            "qty": row["qty"], "side": row["side"]})
+        return True
+
+    @staticmethod
+    def _store_call(fn, *args, **kw) -> None:
+        try:
+            fn(*args, **kw)
+        except Exception as e:
+            log.warning("미체결 레지스트리 갱신 실패(무시): %s", e)
+
     def _reject_inflight(self, order: Order, base_kw: dict) -> bool:
         """in-flight 거부. True 이면 last_result 설정됨."""
-        self._active_reservations()          # 만료 회수 후 판정
+        self._prune_expired_reservations()    # 만료 회수 후 판정
         if order.symbol not in self._inflight:
             return False
         self.last_reject_reason = "동일 종목 주문 처리 중(in-flight)"
@@ -297,6 +461,8 @@ class Broker:
         self.last_reject_reason = ""
         self.last_result = None
         if self._reject_inflight(order, base_kw):
+            return None
+        if self._reject_working_order(order, base_kw):
             return None
 
         decision = self.gate.check(order, self.account,
@@ -368,6 +534,11 @@ class Broker:
             if exit_reason:
                 payload["exit_reason"] = exit_reason
             self._emit("live_order", order, payload)
+            # 부분체결은 잔량이 아직 살아 있다 — 레지스트리에 남겨 재발주를 막고
+            # 만료 시 취소한다. 지금까지는 성공 반환 후 잔량을 잊었다.
+            if status in _PENDING and filled_qty < float(order.qty):
+                self._register_working_order(order, order_id, status,
+                                             filled_qty, reason)
             self.last_result = ExecuteResult.from_fill(
                 fill_qty=filled_qty, fill_price=avg_px, fee=fee,
                 order_qty=order.qty, limit_price=order.price,
@@ -375,6 +546,8 @@ class Broker:
             return self.last_result
 
         kind = "live_order_pending" if status in _PENDING else "live_order_error"
+        if status in _PENDING:
+            self._register_working_order(order, order_id, status, 0.0, reason)
         log.warning("[LIVE] 미체결 id=%s status=%s — 원장 무변(주기 재대사가 반영): %s %s x%s",
                     order_id, status, order.side, order.symbol, order.qty)
         self._emit(kind, order,

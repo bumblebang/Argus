@@ -127,6 +127,24 @@ CREATE TABLE IF NOT EXISTS shadow_positions (
 );
 CREATE INDEX IF NOT EXISTS idx_shadow_state ON shadow_positions(state);
 CREATE INDEX IF NOT EXISTS idx_shadow_bucket ON shadow_positions(block_bucket);
+
+-- 접수됐지만 종결되지 않은 실주문. 토스 API 에 '미체결 주문 목록' 조회가 없어
+-- (order_get 단건뿐) 프로세스가 죽으면 고아 주문을 발견할 방법이 이 표뿐이다.
+CREATE TABLE IF NOT EXISTS working_orders (
+    order_id     TEXT PRIMARY KEY,
+    symbol       TEXT NOT NULL,
+    market       TEXT NOT NULL,
+    side         TEXT NOT NULL,              -- BUY / SELL
+    qty          REAL NOT NULL,
+    price        REAL NOT NULL,
+    filled_qty   REAL NOT NULL DEFAULT 0,
+    status       TEXT NOT NULL,              -- PENDING / PARTIAL_FILLED / ...
+    placed_at    REAL NOT NULL,
+    last_checked REAL,
+    reason       TEXT,
+    meta         TEXT                        -- JSON
+);
+CREATE INDEX IF NOT EXISTS idx_working_symbol ON working_orders(symbol);
 """
 
 
@@ -187,6 +205,62 @@ class Store:
     def close(self) -> None:
         with self._lock:
             self.conn.close()
+
+    # ── 미체결 주문 레지스트리 (J2) ────────────────────────
+    def upsert_working_order(self, *, order_id: str, symbol: str, market: str,
+                             side: str, qty: float, price: float,
+                             status: str, filled_qty: float = 0.0,
+                             placed_at: float | None = None,
+                             reason: str | None = None,
+                             meta: dict | None = None) -> None:
+        """미체결 주문 기록(멱등). 같은 order_id 재접수 시 상태만 갱신."""
+        now = time.time()
+        with self._lock:
+            self.conn.execute(
+                "INSERT INTO working_orders(order_id, symbol, market, side, qty,"
+                " price, filled_qty, status, placed_at, last_checked, reason, meta)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?)"
+                " ON CONFLICT(order_id) DO UPDATE SET"
+                " filled_qty=excluded.filled_qty, status=excluded.status,"
+                " last_checked=excluded.last_checked",
+                (order_id, symbol, market, side, float(qty), float(price),
+                 float(filled_qty), status, placed_at or now, now, reason,
+                 _dumps(meta)))
+            self.conn.commit()
+
+    def update_working_order(self, order_id: str, *, status: str | None = None,
+                             filled_qty: float | None = None) -> None:
+        sets, vals = ["last_checked=?"], [time.time()]
+        if status is not None:
+            sets.append("status=?")
+            vals.append(status)
+        if filled_qty is not None:
+            sets.append("filled_qty=?")
+            vals.append(float(filled_qty))
+        vals.append(order_id)
+        with self._lock:
+            self.conn.execute(
+                f"UPDATE working_orders SET {', '.join(sets)} WHERE order_id=?", vals)
+            self.conn.commit()
+
+    def delete_working_order(self, order_id: str) -> None:
+        with self._lock:
+            self.conn.execute("DELETE FROM working_orders WHERE order_id=?", (order_id,))
+            self.conn.commit()
+
+    def get_working_orders(self, symbol: str | None = None) -> list[dict]:
+        sql = "SELECT * FROM working_orders"
+        args: tuple = ()
+        if symbol:
+            sql += " WHERE symbol=?"
+            args = (symbol,)
+        sql += " ORDER BY placed_at"
+        return [dict(r) for r in self.conn.execute(sql, args).fetchall()]
+
+    def has_working_order(self, symbol: str) -> bool:
+        row = self.conn.execute(
+            "SELECT 1 FROM working_orders WHERE symbol=? LIMIT 1", (symbol,)).fetchone()
+        return row is not None
 
     # ── 이벤트/스냅샷/판단 기록 ───────────────────────────
     def log_event(self, kind: str, symbol: str | None = None,
