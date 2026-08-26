@@ -371,6 +371,25 @@ class Broker:
         return self._finish_live(order, reason, prep["order_id"], prep["base_kw"],
                                  filled_qty, avg_px, fee, status)
 
+    def _adopt_ledger_market(self, order: Order) -> None:
+        """보유 종목이면 원장 symbol_market 을 market 권위로 삼는다.
+
+        재대사가 실계좌 marketCountry 로 symbol_market 을 갱신하므로 보유분에 대해선
+        이쪽이 사실이다. 상류에서 잘못된 라벨(예: 국내주에 US)이 붙으면 live_markets
+        밖으로 판정돼 **청산이 조용히 스킵**된다 — 보유 중인데 못 파는 상태.
+        """
+        held = self.account.symbol_market.get(order.symbol)
+        if not held or held == order.market:
+            return
+        if self.account.position(order.symbol).qty <= 0:
+            return
+        log.warning("[market 교정] %s %s: 주문 %s → 원장 %s",
+                    order.side, order.symbol, order.market, held)
+        self._emit("market_mismatch", order,
+                   {"symbol": order.symbol, "side": order.side,
+                    "ordered": order.market, "ledger": held})
+        order.market = held
+
     def _prepare_live_order(self, order: Order) -> bool:
         """라이브 주문을 게이트 이전에 실조건으로 보정. 진행 가능하면 True.
 
@@ -384,6 +403,7 @@ class Broker:
             log.error("live 모드인데 client/account_seq 가 없습니다. 집행 중단.")
             self.last_reject_reason = "라이브 client/account_seq 없음"
             return False
+        self._adopt_ledger_market(order)
         if order.market not in self.live_markets:
             log.warning("[LIVE-차단] %s 시장은 live_markets(%s) 밖 — 주문 스킵 (%s %s x%s)",
                         order.market, self.live_markets, order.side, order.symbol, order.qty)

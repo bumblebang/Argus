@@ -106,13 +106,29 @@ class CycleRunner:
 
         universe_fn 이 있으면 그 시점 유니버스를, 없으면 cfg.universe(기동 시 고정)를 본다.
         self.items 는 source 를 안 실으므로 원천 dict 를 직접 찾는다.
+        item 에는 유니버스 키였던 market 을 실어 준다(원천 dict 에는 없음).
         """
         universe = self.universe_fn() if self.universe_fn else (self.cfg.universe or {})
-        for _market, lst in (universe or {}).items():
+        for market, lst in (universe or {}).items():
             for it in (lst or []):
                 if it.get("symbol") == symbol:
-                    return it
+                    return {**it, "market": it.get("market") or market}
         return None
+
+    def market_of(self, symbol: str) -> str | None:
+        """코드 권위 market. 유니버스 → 원장(symbol_market) 순. 없으면 None.
+
+        LLM `proposal.market` 은 스키마(KR|US) 검증만 받고 실제 시장과 대조되지 않는다.
+        그 값이 자본 풀·한도 분모·live 집행 판정까지 흐르므로, 라벨이 아니라 코드가
+        아는 사실을 권위로 쓴다. 심볼 형태 휴리스틱(6자리=KR)은 쓰지 않는다 —
+        예외 티커에서 조용히 틀리느니 거부가 낫다.
+        """
+        item = self._universe_item(symbol)
+        if item and item.get("market"):
+            return str(item["market"])
+        acct = getattr(self.broker, "account", None)
+        held = (getattr(acct, "symbol_market", None) or {}).get(symbol)
+        return str(held) if held else None
 
     def _portfolio(self, earnings: dict | None = None) -> dict:
         """보유 종목에 store 의 진입 thesis/전략/손절목표/보유기간을 붙여 뇌에게 전달.
@@ -424,6 +440,7 @@ class CycleRunner:
                         apply_code_conviction=bool(agents_cfg.get("conviction_code", True)),
                         dossier_brief_fn=(self._dossier_brief if self.store else None),
                         features_by_sym=feat_map,
+                        market_fn=self.market_of,
                         store=self.store)
         self._record(res)
         if self.store:

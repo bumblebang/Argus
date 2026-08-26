@@ -22,6 +22,16 @@ from .. import paths as _paths
 log = get_logger("agents.cycle")
 
 
+def _resolve_market(market_fn, symbol: str) -> str | None:
+    """코드 권위 market 조회. 예외는 '모름'으로 본다(거부 쪽이 안전)."""
+    try:
+        m = market_fn(symbol)
+    except Exception as e:
+        log.warning("market 조회 실패 %s: %s", symbol, e)
+        return None
+    return str(m) if m else None
+
+
 def _already_held(broker, store, symbol: str) -> bool:
     """broker 원장 또는 store open 행 — 피라미딩 차단(allow_add=False 일 때)."""
     if broker.position(symbol).qty > 0:
@@ -51,6 +61,7 @@ def run_cycle(*, context_json: str, decision_agent, validation_agent, broker, ri
               apply_code_conviction: bool = False,
               dossier_brief_fn=None,
               features_by_sym: dict | None = None,
+              market_fn=None,
               store=None,
               allow_add: bool = False,
               tranche_weights: dict[str, float] | None = None,
@@ -78,6 +89,11 @@ def run_cycle(*, context_json: str, decision_agent, validation_agent, broker, ri
     (도시에 없음/레벨 결손/가드 꺼짐) 기존 동작 그대로(하위호환). arm_fn 은 zone 을 함께
     넘겨(arm_fn(p, price, zone=levels)) 감시 루프가 존 기준으로 진입/해제하게 한다.
 
+    market_fn(symbol)->str|None 이 주어지면 **market 은 코드 권위**: proposal.market 을
+    코드가 아는 시장(유니버스·원장)으로 덮어쓰고, 코드가 모르는 심볼은 거부한다
+    (status='market_unknown'). LLM 라벨은 스키마 검증만 받을 뿐 실제 시장과 대조되지
+    않는데, 그 값이 자본 풀·한도 분모·live 집행 판정을 바꾼다.
+
     apply_code_conviction=True 면 BUY 확신도를 코드 루브릭으로 덮어쓴 뒤 검증에 넘긴다
     (LLM 자가채점은 사이징에 쓰지 않음). dossier_brief_fn(symbol)->dict 와
     features_by_sym 이 가감 입력. 연속량은 부호×강도로 W_* 한도 안에 접고,
@@ -100,6 +116,28 @@ def run_cycle(*, context_json: str, decision_agent, validation_agent, broker, ri
         for p in decision.proposals:
             if p.side == "HOLD":
                 continue
+            # market 은 코드 권위 — LLM 라벨을 믿지 않는다. 자본 풀·한도 분모·live
+            # 집행 판정이 전부 이 값에 달려 있어, 틀린 라벨 하나가 과대 사이징이나
+            # 청산 불능(live_markets 밖 스킵)을 만든다.
+            if market_fn is not None:
+                true_market = _resolve_market(market_fn, p.symbol)
+                if true_market is None:
+                    executed.append({"symbol": p.symbol, "action": p.side,
+                                     "status": "market_unknown",
+                                     "reason": "코드가 시장을 모름(유니버스·원장에 없음)"})
+                    continue
+                if true_market != p.market:
+                    log.warning("[market 교정] %s: 제안 %s → 코드 %s",
+                                p.symbol, p.market, true_market)
+                    if store is not None:
+                        try:
+                            store.log_event("market_mismatch", p.symbol,
+                                            {"proposed": p.market, "resolved": true_market,
+                                             "side": p.side})
+                        except Exception:
+                            pass
+                    p.market = true_market
+
             v = verdict_by_sym.get(p.symbol)
             if v is None or not v.approved:
                 executed.append({"symbol": p.symbol, "action": p.side, "status": "vetoed",
