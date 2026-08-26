@@ -24,7 +24,7 @@ from . import DecisionAgent, ValidationAgent
 from .wiring import (
     DATA, LLMFactory, FetchCandles,
     build_paper_core, sector_map_from_universe, earnings_near,
-    resolve_strategy, entry_stop_target,
+    resolve_strategy, combine_stop_target,
 )
 from .. import paths as _paths
 
@@ -534,12 +534,10 @@ class CycleRunner:
                     prop = prop_by_sym.get(sym)
                     horizon = getattr(prop, "horizon", "swing") or "swing"
                     strat, params = resolve_strategy(self.cfg, sym, prop)
-                    stop, target = entry_stop_target(pos.avg_price, horizon, params)
                     d = self._dossier_brief(sym)
-                    if d and d.get("invalidation"):
-                        stop = d["invalidation"]
-                    if d and d.get("target"):
-                        target = d["target"]
+                    stop, target, stop_note = combine_stop_target(
+                        pos.avg_price, horizon, params,
+                        (d or {}).get("invalidation"), (d or {}).get("target"))
                     meta = {"horizon": horizon, "params": params,
                             "entry_regime": self._regime_now.get(market),
                             "dossier_id": (d["id"] if d else None),
@@ -547,6 +545,8 @@ class CycleRunner:
                             "manager_epoch": (res.manager or {}).get("epoch") if res else None}
                     from ..thesis_watch import default_spec_from_dossier
                     meta["thesis_invalidation"] = default_spec_from_dossier(d, horizon)
+                    if stop_note:
+                        meta["stop_note"] = stop_note
                     item = self._universe_item(sym)
                     if item and item.get("source"):
                         meta["source"] = item["source"]
@@ -568,12 +568,10 @@ class CycleRunner:
             prop = prop_by_sym.get(sym)
             horizon = getattr(prop, "horizon", "swing") or "swing"
             strat, params = resolve_strategy(self.cfg, sym, prop)
-            stop, target = entry_stop_target(pos.avg_price, horizon, params)
             d = self._dossier_brief(sym)
-            if d and d.get("invalidation"):
-                stop = d["invalidation"]
-            if d and d.get("target"):
-                target = d["target"]
+            stop, target, stop_note = combine_stop_target(
+                pos.avg_price, horizon, params,
+                (d or {}).get("invalidation"), (d or {}).get("target"))
             meta = {"horizon": horizon, "params": params,
                     "entry_regime": self._regime_now.get(market),
                     "dossier_id": (d["id"] if d else None),
@@ -581,6 +579,8 @@ class CycleRunner:
                     "manager_epoch": (res.manager or {}).get("epoch") if res else None}
             from ..thesis_watch import default_spec_from_dossier
             meta["thesis_invalidation"] = default_spec_from_dossier(d, horizon)
+            if stop_note:
+                meta["stop_note"] = stop_note
             item = self._universe_item(sym)
             if item and item.get("source"):
                 meta["source"] = item["source"]

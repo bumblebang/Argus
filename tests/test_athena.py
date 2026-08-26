@@ -42,6 +42,32 @@ def test_sanitize_valid_bullish_passes():
     assert d.stance == "bullish" and notes == []
 
 
+def test_sanitize_with_price_in_band_passes():
+    d, notes = sanitize(_dossier(), price=102.5)
+    assert d.stance == "bullish" and notes == []
+
+
+def test_sanitize_invalidation_too_close():
+    d, notes = sanitize(_dossier(invalidation=99.8, entry_low=100), price=100)
+    assert d.stance == "neutral" and any("가까움" in n for n in notes)
+
+
+def test_sanitize_invalidation_too_far():
+    d, notes = sanitize(_dossier(invalidation=50, entry_low=90), price=100)
+    assert d.stance == "neutral" and any("멀음" in n for n in notes)
+
+
+def test_sanitize_zone_too_wide():
+    d, notes = sanitize(_dossier(entry_low=80, entry_high=100, invalidation=75,
+                                 target=120), price=100)
+    assert d.stance == "neutral" and any("넓음" in n for n in notes)
+
+
+def test_sanitize_target_too_far():
+    d, notes = sanitize(_dossier(target=200), price=100)
+    assert d.stance == "neutral" and any("목표가" in n for n in notes)
+
+
 def test_sanitize_missing_levels_downgrades():
     d, notes = sanitize(_dossier(target=None))
     assert d.stance == "neutral" and notes
@@ -106,9 +132,12 @@ def test_select_symbols_priority(tmp_path):
 # ── 배치 실행 ──────────────────────────────────────────────────────
 def _mock_llm(stance="bullish"):
     def responder(schema, system, user):
-        sym = json.loads(user)["symbol"]
-        return DossierOutput(stance=stance, thesis=f"{sym} 테스트", conviction=0.6,
-                             entry_low=100, entry_high=105, invalidation=95, target=120)
+        ctx = json.loads(user)
+        px = float((ctx.get("technical") or {}).get("price") or 100)
+        return DossierOutput(
+            stance=stance, thesis=f"{ctx['symbol']} 테스트", conviction=0.6,
+            entry_low=round(px * 0.98, 2), entry_high=round(px * 1.02, 2),
+            invalidation=round(px * 0.95, 2), target=round(px * 1.15, 2))
     return MockLLM(responder)
 
 
@@ -119,9 +148,9 @@ def test_run_batch_saves_dossiers(tmp_path):
     s = run_batch(cfg, store, _mock_llm(), "KR", fetch_df=lambda s_, m: _df())
     assert s["done"] == 2 and s["failed"] == 0
     row = store.get_fresh_dossier("AAA")
-    assert row["rr"] == 2.33 and row["conviction"] == 0.6
     ev = json.loads(row["evidence"])
     assert ev["stance"] == "bullish"
+    assert row["rr"] == 3.0 and row["conviction"] == 0.6
     kinds = {r["kind"] for r in store.conn.execute("SELECT kind FROM events").fetchall()}
     assert {"dossier", "athena_done"} <= kinds
 

@@ -19,7 +19,7 @@ def _buy(**kw):
 
 def _zone(**extra):
     d = {"stance": "bullish", "entry_low": 90, "entry_high": 110,
-         "invalidation": 80, "target": 140, "rr": 2.0}
+         "invalidation": 95, "target": 140, "rr": 2.0}
     d.update(extra)
     return d
 

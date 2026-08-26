@@ -20,6 +20,7 @@ from ..runner import candles_to_df, patch_live_price
 from ..strategies import build_strategy, REGISTRY
 from ..strategies.base import Action, Position
 from ..agents.conviction import size_weight, min_lot_adjust
+from ..agents.wiring import combine_stop_target
 
 log = get_logger("engine.execution")
 
@@ -245,7 +246,8 @@ class EntryExecutor:
                 Order(sym, market, "BUY", qty, price),
                 reason="[entry:zone] 존 진입",
                 store=self.store, armed_id=armed["id"],
-                plan_fn=lambda p, h, params: (zone["invalidation"], zone.get("target")))
+                plan_fn=lambda p, h, params: combine_stop_target(
+                    p, h, params, zone.get("invalidation"), zone.get("target"))[:2])
             if not res:
                 why = res.reject_reason or getattr(self.broker, "last_reject_reason", None) or "gate_rejected"
                 self.store.log_event("error", sym, {"where": "entry", "reason": why})

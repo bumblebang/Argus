@@ -22,6 +22,7 @@ import math
 from dataclasses import dataclass, field
 
 from .athena import compute_rr
+from .wiring import combine_stop_target, entry_stop_target
 
 FLOOR = 0.22
 CAP = 0.82
@@ -122,6 +123,7 @@ class ConvictionScore:
 
 
 def _rr_of(dossier: dict) -> float | None:
+    """도시에에 적힌 RR (저널·표시용). 사이징 가산에는 쓰지 않는다 — LLM 레벨 종속."""
     rr = dossier.get("rr")
     if rr is not None:
         try:
@@ -130,6 +132,43 @@ def _rr_of(dossier: dict) -> float | None:
             pass
     return compute_rr(dossier.get("entry_low"), dossier.get("entry_high"),
                       dossier.get("invalidation"), dossier.get("target"))
+
+
+def _plan_entry(price: float | None, dossier: dict) -> float | None:
+    """사이징 RR 의 기준가 — 진입존 중앙, 없으면 현재가.
+
+    현재가로 나누면 존 위/아래에서 RR 이 바뀌어 사이징이 존 위치 보너스가 된다.
+    존 위치는 체결 경로가 처리하므로 계획은 존 중앙으로 평가한다.
+    """
+    lo, hi = dossier.get("entry_low"), dossier.get("entry_high")
+    try:
+        lo, hi = float(lo), float(hi)
+        if lo > 0 and hi >= lo:
+            return (lo + hi) / 2
+    except (TypeError, ValueError):
+        pass
+    return price if price and price > 0 else None
+
+
+def _sizing_rr(price: float | None, horizon: str, params: dict | None,
+               dossier: dict) -> float | None:
+    """사이징용 손익비 = (코드 목표 − 진입) / (진입 − 클램프 손절).
+
+    분자에서 LLM target 을 빼 허상 상향 가산을 끊고, 분모는 실제로 책에
+    심길 손절(밴드 안 invalidation, 밖이면 코드 손절)을 쓴다.
+    """
+    entry = _plan_entry(price, dossier)
+    if not entry or entry <= 0:
+        return None
+    stop, _, _ = combine_stop_target(
+        entry, horizon, params, dossier.get("invalidation"), None)
+    _, code_target = entry_stop_target(entry, horizon, params)
+    if stop is None or code_target is None:
+        return None
+    risk = entry - stop
+    if risk <= 0:
+        return None
+    return round((code_target - entry) / risk, 2)
 
 
 def _f(v):
@@ -327,7 +366,8 @@ def score_buy(proposal, *, price: float | None, dossier: dict | None,
                     v += dlt
                     parts.append(f"day 과매도 RSI {rsi:g} {dlt:+.2f}")
     else:
-        rr = _rr_of(d)
+        params = getattr(proposal, "params", None) or {}
+        rr = _sizing_rr(price, hz, params, d)
         if rr is not None:
             if rr >= 2.0:
                 v += W_RR_HI

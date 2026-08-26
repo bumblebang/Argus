@@ -2,11 +2,17 @@
 
 재량 패러다임에서 모델/프롬프트 변경은 매니저 교체와 같다.
 결정마다 저널에 남기고 attribution 을 에포크별로 분리한다.
+
+사이징·손절 채점 규칙이 바뀌면 프롬프트가 같아도 새 매니저로 본다
+(이전 표본과 섞이면 캘리브가 오염된다). SCORING_REV 를 올리면 된다.
 """
 from __future__ import annotations
 
 import hashlib
 from typing import Any
+
+# J7: RR 가산이 LLM 레벨이 아니라 클램프 손절 + 코드 목표 기준.
+SCORING_REV = "j7"
 
 
 def prompt_hash(text: str) -> str:
@@ -47,8 +53,9 @@ def manager_snapshot(*, decision_llm=None, validation_llm=None,
             "prompt_hash": prompt_hash(validation_prompt),
         },
     }
-    # 에포크 키: 결정 모델+프롬프트 (검증 폴백은 별도 집계)
-    epoch = f"{snap['decision'].get('model') or '?'}@{snap['decision']['prompt_hash']}"
+    # 에포크 키: 결정 모델+프롬프트+채점규칙 (검증 폴백은 별도 집계)
+    epoch = (f"{snap['decision'].get('model') or '?'}"
+             f"@{snap['decision']['prompt_hash']}:{SCORING_REV}")
     if snap["decision"].get("used_fallback"):
         epoch += ":fallback"
     snap["epoch"] = epoch

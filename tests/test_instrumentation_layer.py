@@ -30,6 +30,7 @@ def test_manager_snapshot_epoch():
     assert snap["decision"]["model"] == "opus"
     assert snap["decision"]["prompt_hash"] == prompt_hash("DEC")
     assert "@" in snap["epoch"]
+    assert ":j7" in snap["epoch"]
     assert "fallback" not in snap["epoch"]
 
 
@@ -42,6 +43,7 @@ def test_manager_fallback_epoch():
         last_source = "cli"
     snap = manager_snapshot(decision_llm=L(), decision_prompt="D",
                             validation_prompt="V")
+    assert ":j7" in snap["epoch"]
     assert snap["epoch"].endswith(":fallback")
 
 

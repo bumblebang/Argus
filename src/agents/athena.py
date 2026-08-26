@@ -184,8 +184,17 @@ def compute_rr(entry_low: float | None, entry_high: float | None,
     return round((target - mid) / risk, 2)
 
 
-def sanitize(d: DossierOutput) -> tuple[DossierOutput, list[str]]:
-    """bullish 도시에의 레벨 정합성 하드가드. 어긋나면 neutral 강등(+사유)."""
+def sanitize(d: DossierOutput, *, price: float | None = None
+             ) -> tuple[DossierOutput, list[str]]:
+    """bullish 도시에의 레벨 정합성 하드가드. 어긋나면 neutral 강등(+사유).
+
+    양수·순서만이 아니라, 현재가가 있으면 무효화 거리·존 폭·목표 거리도 본다.
+    밴드는 wiring 의 코드 손절/목표 하드 바운드와 같다 — 실행이 버릴 레벨을
+    리서치 단계에서 이미 bullish 로 남기지 않는다.
+    """
+    from .wiring import (MAX_STOP_PCT, MAX_TARGET_PCT, MAX_ZONE_WIDTH_PCT,
+                         MIN_STOP_PCT)
+
     notes: list[str] = []
     if d.stance != "bullish":
         return d, notes
@@ -195,6 +204,31 @@ def sanitize(d: DossierOutput) -> tuple[DossierOutput, list[str]]:
     elif not (d.invalidation < d.entry_low <= d.entry_high < d.target):
         notes.append(f"레벨 순서 오류(inv {d.invalidation} < lo {d.entry_low} <= "
                      f"hi {d.entry_high} < tgt {d.target} 위반) → neutral 강등")
+    elif price is not None:
+        try:
+            px = float(price)
+        except (TypeError, ValueError):
+            px = 0.0
+        if px > 0:
+            dist = (px - float(d.invalidation)) / px
+            if dist < MIN_STOP_PCT:
+                notes.append(
+                    f"무효화가 너무 가까움 ({dist:.1%} < {MIN_STOP_PCT:.1%}) "
+                    f"→ neutral 강등")
+            elif dist > MAX_STOP_PCT:
+                notes.append(
+                    f"무효화가 너무 멀음 ({dist:.1%} > {MAX_STOP_PCT:.1%}) "
+                    f"→ neutral 강등")
+            width = (float(d.entry_high) - float(d.entry_low)) / px
+            if width > MAX_ZONE_WIDTH_PCT:
+                notes.append(
+                    f"진입존이 너무 넓음 ({width:.1%} > {MAX_ZONE_WIDTH_PCT:.1%}) "
+                    f"→ neutral 강등")
+            tgt_dist = (float(d.target) - px) / px
+            if tgt_dist > MAX_TARGET_PCT:
+                notes.append(
+                    f"목표가 너무 멀음 ({tgt_dist:.1%} > {MAX_TARGET_PCT:.1%}) "
+                    f"→ neutral 강등")
     if notes:
         d = d.model_copy(update={"stance": "neutral"})
     return d, notes
@@ -310,7 +344,9 @@ def run_batch(cfg, store, llm, market: str, *,
                                          market_state=ms,
                                          base_rates=br, past_trades=past,
                                          focus=focus)
-            out, notes = sanitize(agent.research(ctx))
+            tech = ctx.get("technical") or {}
+            px = tech.get("price") if isinstance(tech, dict) else None
+            out, notes = sanitize(agent.research(ctx), price=px)
             rr = compute_rr(out.entry_low, out.entry_high, out.invalidation, out.target)
             store.save_dossier(
                 sym, market, thesis=out.thesis,
