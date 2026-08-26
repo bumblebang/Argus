@@ -17,7 +17,7 @@ from src.eval.archive import load_context, persist_context
 from src.eval.consistency import consistency_report, fleiss_kappa
 from src.eval.labels import forward_return, policy_return, target_hit_before_stop
 from src.eval.labels import brier_score, log_loss
-from src.eval.null_manager import null_cash, null_random_gated
+from src.eval.null_manager import eligible_candidates, null_cash, null_random_gated
 from src.eval.replay import redecide_record
 from src.eval.score import score_journal
 from src.eval_protocol import can_promote
@@ -116,6 +116,35 @@ def test_null_random_gated_deterministic():
     assert sum(1 for s in a.values() if s == "BUY") == 1
     cash = null_cash(ctx["candidates"])
     assert set(cash.values()) == {"HOLD"}
+
+
+def test_eligible_requires_bullish_stance():
+    ctx = _ctx()
+    ctx["candidates"].append(
+        {"symbol": "NEUT", "market": "KR", "price": 10.0,
+         "dossier": {"entry_low": 9, "entry_high": 11, "invalidation": 8,
+                     "target": 12, "stance": "neutral"}})
+    elig = eligible_candidates(ctx)
+    assert {c["symbol"] for c in elig} == {"005930", "000660"}
+
+
+def test_score_journal_decomposes_delta(tmp_path):
+    data = _history(tmp_path)
+    ctx = _ctx()
+    raw = json.dumps(ctx, ensure_ascii=False)
+    meta = persist_context(raw, cycle_ts=1_768_032_000.0, journal_path=tmp_path / "decisions.jsonl")
+    rec = {
+        "ts": "2026-01-10T06:00:00+00:00",
+        "proposals": [{"symbol": "005930", "side": "HOLD", "horizon": "day"}],
+        **{k: meta[k] for k in ("context_ref", "context_sha256", "context_bytes")},
+        "manager": {"epoch": "test@abc"},
+    }
+    jp = tmp_path / "decisions.jsonl"
+    jp.write_text(json.dumps(rec, ensure_ascii=False) + "\n", encoding="utf-8")
+    out = score_journal(journal_path=jp, data_dir=data, min_n=1)
+    assert "delta_decomp" in out
+    assert "same_pool" in out["delta_decomp"]
+    assert "gate_diff" in out["delta_decomp"]
 
 
 def test_hold_policy_is_zero(tmp_path):
