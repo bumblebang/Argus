@@ -9,6 +9,7 @@ import json
 import math
 from collections import defaultdict
 
+from .eval.trade_defs import scored_trades
 from .logging_setup import get_logger
 
 log = get_logger("calibration")
@@ -43,9 +44,9 @@ def conviction_calibration(store, since_days: float = 90) -> dict:
     # (conviction, win01)
     pairs: list[tuple[float, int]] = []
 
-    for row in store.get_closed_positions(since=since):
+    for trade in scored_trades(store, since=since):
         try:
-            meta = json.loads(row["meta"]) if row["meta"] else {}
+            meta = json.loads(trade["meta"]) if trade["meta"] else {}
         except (ValueError, TypeError):
             meta = {}
         c = meta.get("conviction")
@@ -55,7 +56,7 @@ def conviction_calibration(store, since_days: float = 90) -> dict:
             c = float(c)
         except (TypeError, ValueError):
             continue
-        win = 1 if (row["pnl"] or 0) > 0 else 0
+        win = 1 if (trade["pnl"] or 0) > 0 else 0
         pairs.append((c, win))
         lab = _bin_of(c)
         if lab:

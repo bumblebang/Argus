@@ -104,6 +104,23 @@ def test_small_bins_do_not_count_as_valid():
     assert cal["calibrated"] is False
 
 
+def test_parent_id_slices_count_as_one_trade():
+    """부분매도 3 slice / 같은 parent_id → 캘리브 표본 1건 (attribution 과 일치)."""
+    rows = [
+        {"id": 1, "parent_id": 1, "qty": 1, "pnl": 10,
+         "meta": json.dumps({"conviction": 0.9})},
+        {"id": 2, "parent_id": 1, "qty": 1, "pnl": -4,
+         "meta": json.dumps({"conviction": 0.9})},
+        {"id": 3, "parent_id": 1, "qty": 1, "pnl": 1,
+         "meta": json.dumps({"conviction": 0.9})},
+    ]
+    cal = conviction_calibration(_FakeStore(rows))
+    assert cal["n"] == 1
+    # 순손익 +7 → 승
+    assert cal["by_bin"]["0.85-1.01"]["n"] == 1
+    assert cal["by_bin"]["0.85-1.01"]["hit_rate"] == 1.0
+
+
 def test_brier_reported_but_not_gating():
     store = _FakeStore(_rows({0.2: (6, 1), 0.6: (7, 3), 0.9: (8, 7)}))
     cal = conviction_calibration(store)
