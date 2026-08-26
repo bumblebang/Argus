@@ -200,10 +200,16 @@ def test_build_cursor_bridge_enabled(tmp_path, monkeypatch):
 def test_bridge_docs_use_repo_root_paths():
     root = Path(__file__).resolve().parent.parent
     text = (root / "docs" / "cursor_brain_fallback.md").read_text(encoding="utf-8")
-    assert "`data/llm_inbox/bridge.heartbeat`" in text
-    assert "`data/llm_inbox/request.json`" in text
+    # 컷오버 후 문서는 data/inbox; 레거시 llm_inbox 도 junction 안내로 허용.
+    assert ("`data/inbox/bridge.heartbeat`" in text
+            or "`data/llm_inbox/bridge.heartbeat`" in text)
+    assert ("`data/inbox/request.json`" in text
+            or "`data/llm_inbox/request.json`" in text)
     assert "`argus/data/llm_inbox/bridge.heartbeat`" not in text
+    assert "`argus/data/inbox/bridge.heartbeat`" not in text
     assert "경로 앞에 `argus/`" in text
     ps1 = (root / "scripts" / "cursor_brain_fallback_loop.ps1").read_text(encoding="utf-8")
-    assert "data/llm_inbox/request.json" in ps1
-    assert "argus/data/llm_inbox/request.json" in ps1
+    assert ("data/inbox/request.json" in ps1
+            or "data/llm_inbox/request.json" in ps1)
+    assert ("argus/data/inbox/request.json" in ps1
+            or "argus/data/llm_inbox/request.json" in ps1)

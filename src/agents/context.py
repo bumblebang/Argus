@@ -68,7 +68,10 @@ def build_context(market_state: dict, candidates: list[dict], portfolio: dict,
                   recent_disclosures: list[dict] | None = None,
                   earnings_results: list[dict] | None = None,
                   focus: dict | None = None,
-                  wake: dict | None = None) -> str:
+                  wake: dict | None = None,
+                  *,
+                  headline_limit: int | None = None,
+                  compact: bool = False) -> str:
     """candidates: [{symbol,name,market,price,ma20,rsi,momentum,fundamentals,flows,news[],strategy_fit?}]
 
     track_record(선택): 라이브 성과 귀속(전략별 승률/최근 거래/결정 통계) — 뇌가 자기
@@ -77,8 +80,11 @@ def build_context(market_state: dict, candidates: list[dict], portfolio: dict,
     '오늘 무엇에 집중할지' — 없으면 평소처럼 regime·dossier·수급으로 판단.
     wake(선택): 이번 사이클을 깨운 사유(reason)와 트리거 요약 — periodic/vol_spike/
     regime_flip/disclosure 등. 없으면 정기 각성으로 보면 된다.
+    headline_limit: None 이면 HEADLINE_LIMIT. focus 티어에서 더 세게 자를 때 사용.
+    compact: True 면 indent 없이 직렬화(토큰/바이트 절약, 의미 동일).
     """
     ms = market_state or {}
+    lim = HEADLINE_LIMIT if headline_limit is None else int(headline_limit)
     ctx = {
         "asof": ms.get("asof"),
         "market": {
@@ -91,7 +97,7 @@ def build_context(market_state: dict, candidates: list[dict], portfolio: dict,
             "fx": ms.get("fx"),
             "flows_market": ms.get("flows_market"),
         },
-        "headlines": _trim_news(ms.get("news", [])),
+        "headlines": _trim_news(ms.get("news", []), limit=lim),
         # 뇌가 전략·파라미터를 고를 때 참고할 도구 출력(전략 카탈로그 + 후보별 strategy_fit).
         "strategies": strategy_catalog(),
         "candidates": candidates,
@@ -108,4 +114,6 @@ def build_context(market_state: dict, candidates: list[dict], portfolio: dict,
         ctx["recent_disclosures"] = recent_disclosures   # 워처가 잡은 최근 중대 공시
     if earnings_results:
         ctx["earnings_results"] = earnings_results       # 발표된 실적의 컨센서스 대비 편차
+    if compact:
+        return json.dumps(ctx, ensure_ascii=False, separators=(",", ":"))
     return json.dumps(ctx, ensure_ascii=False, indent=2)

@@ -4,6 +4,7 @@
 #
 # ArgusWatch      = 로그온 시 시작, 무한 실행, 크래시 시 자동 재시작(절전 차단은 watch.py 가 담당).
 # ArgusWatchdog   = 5분마다 heartbeat 검사 -> 멈추면(hang) ArgusWatch 재기동.
+# 무콘솔(pythonw)+scripts\watch.py 직접 실행 — argus.exe(콘솔 런처) 대신 stub 유지(동작 동일).
 param(
     [int]$WatchdogEveryMin = 5
 )
@@ -40,4 +41,4 @@ Register-ScheduledTask -TaskName "ArgusWatchdog" -Action $wdAction -Trigger $wdT
 Write-Host "[OK] ArgusWatch + ArgusWatchdog 등록 완료."
 Write-Host "  시작:  schtasks /Run /TN ArgusWatch"
 Write-Host "  상태:  schtasks /Query /TN ArgusWatch ; schtasks /Query /TN ArgusWatchdog"
-Write-Host "  로그:  logs\watch.run.log (프로세스), data\watch.heartbeat (생존)"
+Write-Host "  로그:  logs\watch.run.log (프로세스), data\state\watch.heartbeat (생존)"

@@ -12,7 +12,13 @@ import time
 from pathlib import Path
 from typing import Any
 
-DEFAULT_PATH = Path("data/brain_wake_request.json")
+from .. import paths as _paths
+
+DEFAULT_PATH = "data/brain_wake_request.json"
+
+
+def _wake_path(path: str | Path | None = None) -> Path:
+    return _paths.ensure_parent("wake_request", configured=path or DEFAULT_PATH)
 
 
 def request_brain_wake(*, reason: str = "athena_done", market: str | None = None,
@@ -20,8 +26,7 @@ def request_brain_wake(*, reason: str = "athena_done", market: str | None = None
                        extra: dict[str, Any] | None = None,
                        now: float | None = None) -> Path:
     """각성 요청 파일을 atomic 기록. Athena 등 배치 프로세스에서 호출."""
-    p = Path(path) if path is not None else DEFAULT_PATH
-    p.parent.mkdir(parents=True, exist_ok=True)
+    p = _wake_path(path)
     payload: dict[str, Any] = {
         "ts": float(now if now is not None else time.time()),
         "reason": reason or "external",
@@ -38,17 +43,13 @@ def request_brain_wake(*, reason: str = "athena_done", market: str | None = None
 
 def consume_brain_wake(path: str | Path | None = None, *,
                        max_age_sec: float = 6 * 3600) -> dict[str, Any] | None:
-    """요청이 있으면 읽고 파일을 지운 뒤 payload 반환. 없거나 만료면 None.
-
-    max_age_sec: 낡은 요청(데몬 장기 정지 후 재기동 등)은 무시.
-    """
-    p = Path(path) if path is not None else DEFAULT_PATH
+    """요청 파일을 읽고 삭제. 없거나 오래됐으면 None."""
+    p = _paths.resolve("wake_request", configured=path or DEFAULT_PATH)
     if not p.is_file():
         return None
     try:
         data = json.loads(p.read_text(encoding="utf-8"))
-        ts = float(data.get("ts") or 0)
-    except (OSError, ValueError, TypeError, json.JSONDecodeError):
+    except (OSError, ValueError, TypeError):
         try:
             p.unlink(missing_ok=True)
         except OSError:
@@ -57,10 +58,11 @@ def consume_brain_wake(path: str | Path | None = None, *,
     try:
         p.unlink(missing_ok=True)
     except OSError:
+        pass
+    try:
+        ts = float(data.get("ts") or 0)
+    except (TypeError, ValueError):
         return None
     if ts <= 0 or (time.time() - ts) > float(max_age_sec):
         return None
-    if not isinstance(data, dict):
-        return None
-    data.setdefault("reason", "external")
-    return data
+    return data if isinstance(data, dict) else None

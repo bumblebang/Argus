@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .logging_setup import get_logger
+from . import paths as _paths
 
 log = get_logger("risk.gate")
 
@@ -125,7 +126,7 @@ class RiskGate:
         m = order.market
 
         # 0) 킬스위치 — 이 파일이 있으면 모든 신규 주문 차단
-        if Path(self.kill_switch_file).exists():
+        if _paths.resolve("halt", configured=self.kill_switch_file).exists():
             return GateDecision(False, "킬스위치 활성(HALT 파일 존재)")
 
         # 1) 수량/가격 정합성

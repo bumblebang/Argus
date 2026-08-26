@@ -22,10 +22,14 @@ Athena / 밸류 트랙은 범위 밖(클코 복구까지 스킵·별도 실패 �
 2. `require_armed: true` (기본) — heartbeat 게이트
 3. watch 재기동 (Windows 작업 스케줄러 또는 macOS launchd — OS 문서)
 4. 기동 로그에 `cursor_bridge ON` 확인
-5. heartbeat 무장: `python scripts/bridge_tick.py --heartbeat-loop 60`
+5. heartbeat 무장: `python scripts/bridge_tick.py --serve 60` (기본 **judge**)
 
-`--auto` 는 Decision=관망·Validation=거부로 inbox 를 채운다(토큰 0).
-직접 판단이 필요하면 같은 스크립트 없이 Cursor 채팅에서 inbox 파일을 채운다.
+`--serve 60 --auto` 는 Decision=관망·Validation=거부(토큰 ≈0, 비상용).
+**기본 `--serve`** 는 judge — `request.json`의 **system+user 전체**로 response 작성.
+
+헤드리스 judge: `CURSOR_API_KEY` + `pip install cursor-sdk` (+ optional `CURSOR_BRIDGE_MODEL`).
+키 없으면 `judge=pending` → Cursor `/loop` judge(스킬 `argus-bridge`)가 inbox를 채운다.
+직접 1회: `python scripts/bridge_tick.py --judge`.
 
 워크스페이스에 Argus 브릿지 스킬이 있으면 그걸 써도 된다. 필수는 아니다.
 
@@ -38,7 +42,7 @@ Athena / 밸류 트랙은 범위 밖(클코 복구까지 스킵·별도 실패 �
 
 ### 1) 무장 신호 (필수)
 
-`data/llm_inbox/bridge.heartbeat` 를 갱신한다:
+`data/inbox/bridge.heartbeat` 를 갱신한다 (`data/llm_inbox` 는 같은 폴더 junction일 수 있음):
 
 ```json
 {"ts": <unix_epoch_seconds>, "source": "cursor_loop"}
@@ -49,7 +53,7 @@ Athena / 밸류 트랙은 범위 밖(클코 복구까지 스킵·별도 실패 �
 
 ### 2) 요청 응답
 
-1. `data/llm_inbox/request.json` 이 있으면 읽는다.
+1. `data/inbox/request.json` 이 있으면 읽는다.
 2. 필드: `id`, `schema` (`DecisionOutput` | `ValidationOutput`), `system`, `user`.
 3. 스키마에 맞는 JSON을 `result`에 넣어 같은 폴더에 `response.json` 작성:
 
@@ -90,7 +94,7 @@ Athena / 밸류 트랙은 범위 밖(클코 복구까지 스킵·별도 실패 �
 
 한 사이클은 Decision 1회 + Validation 1회라 **요청이 두 번** 올 수 있다. 각각 응답.
 
-타임아웃 기본 240초. armed 인데도 그 안에 응답 없으면 브릿지 실패로 쌓이고,
+타임아웃 기본 600초. armed 인데도 그 안에 응답 없으면 브릿지 실패로 쌓이고,
 연속 N회(`watch.circuit_fail_threshold`, 기본 2)면 `circuit_open`.
 
 ## 뇌 모드 (`data/brain_mode.json`)

@@ -120,11 +120,11 @@ def main() -> int:
                         stop_at=stop_at, fetch_df=fetch_df,
                         market_state=ms, base_rates=br)
     print(json.dumps(summary, ensure_ascii=False))
-    # 도씨에 배치 직후 뇌 1회 — watch 데몬이 data/brain_wake_request.json 을 소비.
+    # 도씨에 배치 직후 뇌 1회 — watch 데몬이 wake_request(resolve→state/) 를 소비.
     # --dry 는 배선 검증만이라 각성 요청을 남기지 않는다.
     if not args.dry:
         wake_path = ((cfg.raw.get("watch") or {}).get("wake_request_path")
-                     or "data/brain_wake_request.json")
+                     or "data/state/brain_wake_request.json")
         request_brain_wake(reason="athena_done", market=market, path=wake_path,
                            extra={"done": summary.get("done"),
                                   "failed": summary.get("failed"),
@@ -135,4 +135,6 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    from src.cli.legacy import warn_legacy_script
+    warn_legacy_script("argus athena")
     sys.exit(main())

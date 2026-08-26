@@ -1,0 +1,40 @@
+{
+  "description": "Argus ops path contracts — G0 golden. Legacy relative paths must keep resolving for watch/dashboard/bridge/PokeTokenBarWin.",
+  "paths": {
+    "inbox": "data/llm_inbox",
+    "bridge_hb": "data/llm_inbox/bridge.heartbeat",
+    "bridge_mode": "data/llm_inbox/bridge.mode",
+    "bridge_request": "data/llm_inbox/request.json",
+    "bridge_response": "data/llm_inbox/response.json",
+    "watch_hb": "data/watch.heartbeat",
+    "watch_pid": "data/watch.pid",
+    "halt": "data/HALT",
+    "wake_request": "data/brain_wake_request.json",
+    "paper": "data/paper_account.json",
+    "db": "data/bot.db",
+    "decisions": "data/decisions.jsonl",
+    "brain_mode": "data/brain_mode.json",
+    "bridge_script": "scripts/bridge_tick.py"
+  },
+  "layout": {
+    "inbox": "data/inbox",
+    "bridge_hb": "data/inbox/bridge.heartbeat",
+    "bridge_mode": "data/inbox/bridge.mode",
+    "bridge_request": "data/inbox/request.json",
+    "bridge_response": "data/inbox/response.json",
+    "watch_hb": "data/state/watch.heartbeat",
+    "watch_pid": "data/state/watch.pid",
+    "halt": "data/state/HALT",
+    "wake_request": "data/state/brain_wake_request.json",
+    "paper": "data/state/paper_account.json",
+    "db": "data/state/bot.db",
+    "decisions": "data/ledgers/decisions.jsonl",
+    "brain_mode": "data/state/brain_mode.json",
+    "bridge_script": "scripts/bridge_tick.py"
+  },
+  "config_example_keys": {
+    "risk.kill_switch_file": "data/state/HALT",
+    "watch.wake_request_path": "data/state/brain_wake_request.json",
+    "agents.cursor_bridge.inbox_dir": "data/inbox"
+  }
+}

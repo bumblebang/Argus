@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any
 
 from ..logging_setup import get_logger
+from .. import paths as _paths
 
 log = get_logger("engine.store")
 
@@ -137,7 +138,7 @@ def _dumps(obj: Any) -> str | None:
 
 class Store:
     def __init__(self, path: str | Path = "data/bot.db") -> None:
-        self.path = Path(path)
+        self.path = _paths.resolve("db", configured=path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         # check_same_thread=False + 내부 Lock 으로 멀티스레드 호출 직렬화.
         self.conn = sqlite3.connect(str(self.path), check_same_thread=False)

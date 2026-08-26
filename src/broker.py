@@ -144,7 +144,8 @@ class Broker:
                 res = self._finish_live(
                     order, reason, prep["order_id"], prep["base_kw"],
                     filled_qty, avg_px, fee, status,
-                    qty_before=prep.get("qty_before"))
+                    qty_before=prep.get("qty_before"),
+                    exit_reason=exit_reason)
                 self._mirror_after_fill(mirror_st, order, res, armed_id, plan_fn, exit_reason)
                 return res
         finally:
@@ -283,7 +284,8 @@ class Broker:
 
     def _finish_live(self, order: Order, reason: str, order_id: str, base_kw: dict,
                      filled_qty: float, avg_px: float | None, fee: float,
-                     status: str, *, qty_before: float | None = None) -> ExecuteResult:
+                     status: str, *, qty_before: float | None = None,
+                     exit_reason: str | None = None) -> ExecuteResult:
         if filled_qty > 0 and avg_px and avg_px > 0:
             if self._ledger_already_has_fill(order, filled_qty, qty_before):
                 log.info("[LIVE] 체결 id=%s — 원장 이미 반영(재대사), apply_fill 스킵",
@@ -294,10 +296,15 @@ class Broker:
                 log.info("[LIVE] 체결 id=%s status=%s — %s %s x%s @ %.2f (fee %.2f) - %s",
                          order_id, status, fill.side, fill.symbol, fill.qty, fill.price,
                          fill.fee, reason)
-            self._emit("live_order", order,
-                       {"symbol": order.symbol, "side": order.side, "qty": filled_qty,
-                        "price": avg_px, "fee": fee, "order_id": order_id,
-                        "status": status, "limit_price": order.price})
+            payload = {
+                "symbol": order.symbol, "side": order.side, "qty": filled_qty,
+                "price": avg_px, "fee": fee, "order_id": order_id,
+                "status": status, "limit_price": order.price,
+                "reason": reason or "",
+            }
+            if exit_reason:
+                payload["exit_reason"] = exit_reason
+            self._emit("live_order", order, payload)
             self.last_result = ExecuteResult.from_fill(
                 fill_qty=filled_qty, fill_price=avg_px, fee=fee,
                 order_qty=order.qty, limit_price=order.price,
@@ -309,7 +316,8 @@ class Broker:
                     order_id, status, order.side, order.symbol, order.qty)
         self._emit(kind, order,
                    {"symbol": order.symbol, "side": order.side, "qty": order.qty,
-                    "order_id": order_id, "status": status, "reason": reason})
+                    "order_id": order_id, "status": status, "reason": reason,
+                    **({"exit_reason": exit_reason} if exit_reason else {})})
         self.last_result = ExecuteResult.rejected(
             f"미체결({status})", order_qty=order.qty, limit_price=order.price)
         return self.last_result

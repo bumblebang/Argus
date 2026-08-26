@@ -18,3 +18,14 @@ dependencies = [
 
 [project.optional-dependencies]
 dev = ["pytest>=8.0"]
+
+[project.scripts]
+argus = "src.cli.main:main"
+
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src", "src.*"]

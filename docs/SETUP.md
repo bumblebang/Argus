@@ -20,10 +20,10 @@ Python 3.11+ . 토스 Open API는 본인 앱에서 신청한다. 키를 다른 �
 
 ## 순서
 
-1. `python scripts/bootstrap.py`
+1. `pip install -e .` 후 `argus bootstrap` (레거시: `python scripts/bootstrap.py`)
 2. `.env` 채우기. `config.yaml` 의 `risk.capital` / `paper.cash` 를 본인 금액으로.
-3. `python scripts/doctor.py` — 공인 IP를 토스 허용 목록에 넣는다.
-4. `python scripts/watch.py --dry --ticks 1`
+3. `argus doctor` — 공인 IP를 토스 허용 목록에 넣는다. (뇌: `argus doctor --check-auth` / `--check-cli`)
+4. `argus watch --dry --ticks 1`
 5. 상주는 OS 문서 ([Windows](SETUP_WINDOWS.md) · [macOS](SETUP_MAC.md) · [Linux](SETUP_LINUX.md)). 무인이면 `.env` 에 `NTFY_TOPIC`. 페이퍼로 하루 돌린 뒤 라이브는 [SETUP_LIVE.md](SETUP_LIVE.md).
 
 클론 직후엔 config 의 정적 `universe` 소수만 쓴다. 상주 watch 가 `data/universe.yaml` 을 굴리기 시작하면 그 파일이 우선이다. `scripts/screen.py` 는 수동 재실행용이다.

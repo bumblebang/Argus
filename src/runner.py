@@ -14,7 +14,7 @@ from .config import AppConfig, ROOT
 from .logging_setup import get_logger
 from . import market_hours
 from .broker import Broker
-from .risk import RiskManager
+from .risk import RiskManager, risk_manager_from_cfg
 from .risk_gate import Order
 from .strategies import build_strategy
 from .strategies.base import Action
@@ -78,13 +78,7 @@ class TradingBot:
         self.client = client
         self.broker = broker
         risk_cfg = cfg.risk
-        self.risk = RiskManager(
-            capital=risk_cfg.get("capital", {}),
-            max_position_pct=risk_cfg.get("max_position_pct", 0.20),
-            max_positions=risk_cfg.get("max_positions", 5),
-            daily_loss_limit_pct=risk_cfg.get("daily_loss_limit_pct", 0.05),
-            allow_fractional=risk_cfg.get("allow_fractional", False),
-        )
+        self.risk = risk_manager_from_cfg(risk_cfg)
         # 유니버스 결정: 스크리너 사용 시 data/universe.yaml 우선, 없으면 config 의 수동 목록
         universe, source = self._resolve_universe(cfg)
         self.targets = []
@@ -157,7 +151,15 @@ class TradingBot:
 
         # 신호 -> 주문. 한도/여력/킬스위치 검증은 모두 broker 내부의 하드 게이트가 수행.
         if signal.action == Action.BUY:
-            qty = self.risk.size_buy(market, price, signal.target_weight)
+            # 전략 신호 weight 있으면 사용, 없으면 config base_position_pct
+            w = (signal.target_weight if signal.target_weight is not None
+                 else getattr(self.risk, "base_position_pct", 0.20))
+            equity = self.risk.sizing_base_amount(self.broker, market)
+            hard = float(getattr(self.risk, "max_position_pct", 0.25) or 0.25)
+            qty = self.risk.size_buy(
+                market, price, w,
+                base_equity=equity,
+                notional_cap=max(0.0, equity * hard))
             self.broker.execute(Order(symbol, market, "BUY", qty, price), signal.reason,
                                 store=self.broker.store)
         elif signal.action == Action.SELL and pos.is_open:

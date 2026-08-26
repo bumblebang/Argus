@@ -1,9 +1,11 @@
 """기동 전 점검: 설정·키·뇌·타임존·공인 IP. 네트워크 호출은 토스/IP만(있을 때).
 
 종료코드: 0=기동 가능(페이퍼 또는 라이브 준비), 1=막힘.
+Phase 2: --migrate-data [--apply] 로 data/ 레이아웃 이동(기본 dry-run).
 """
 from __future__ import annotations
 
+import argparse
 import os
 import shutil
 import sys
@@ -85,12 +87,122 @@ def check_claude(cmd: str) -> None:
         _warn("claude", f"설정 경로 없음: {cmd}")
 
 
-def main() -> int:
+def check_ops_paths() -> None:
+    """Phase 2: 논리 키 resolve 상태 (레거시/신 중 무엇이 잡히는지)."""
+    from src import paths as p
+    for key in ("db", "paper", "halt", "watch_hb", "inbox", "decisions", "brain_mode"):
+        got = p.resolve(key)
+        legacy = (ROOT / p.rel(key)).resolve()
+        layout = (ROOT / p.layout_rel(key)).resolve()
+        if got == layout and layout != legacy:
+            tag = "layout"
+        elif got == legacy:
+            tag = "legacy"
+        else:
+            tag = "other"
+        exists = "exists" if got.exists() else "missing"
+        _ok(f"path:{key}", f"{tag} {exists} → {got}")
+
+
+def run_migrate(*, apply: bool) -> int:
+    from src.paths_migrate import apply_moves, format_plan
+    rows = apply_moves(root=ROOT, dry_run=not apply)
+    print(format_plan(rows))
+    if any(r.get("action") == "conflict" or r.get("result") == "conflict"
+           for r in rows):
+        _bad("migrate", "충돌 — 수동 확인 후 재시도 (docs/OPS_CUTOVER.md)")
+        return 1
+    if not apply:
+        _ok("migrate", "dry-run 만. 적용: argus doctor --migrate-data --apply")
+    else:
+        _ok("migrate", "적용 완료 — doctor + watch --dry --ticks 1 로 검증")
+    return 0
+
+
+def check_research_boundary() -> None:
+    """Phase 4: data/quant_review 잔여·research README."""
+    from src import research_boundary as rb
+    readme = ROOT / "research" / "README.md"
+    if readme.is_file():
+        _ok("research", "README.md (lab only)")
+    else:
+        _warn("research", "research/README.md 없음 — Phase 4 인덱스 누락")
+    st = rb.residue_status(root=ROOT)
+    if not st["present"]:
+        _ok("research-residue", "data/quant_review 없음")
+        return
+    _warn(
+        "research-residue",
+        f"data/quant_review unused n={st['files']} — "
+        "런타임 미사용. argus doctor --migrate-research [--apply]",
+    )
+
+
+def run_migrate_research(*, apply: bool, dest: str = "lab") -> int:
+    from src.research_boundary import apply_migrate, format_plan
+    rows = apply_migrate(root=ROOT, dest=dest, dry_run=not apply)
+    print(format_plan(rows))
+    if any(r.get("action") == "conflict" or r.get("result") == "conflict"
+           for r in rows):
+        _bad("migrate-research", "충돌 — 대상에 다른 내용 파일이 있음")
+        return 1
+    if not apply:
+        _ok("migrate-research",
+            "dry-run 만. 적용: argus doctor --migrate-research --apply")
+    else:
+        _ok("migrate-research", f"적용 완료 → {dest}")
+    return 0
+
+
+def _run_helper_script(name: str) -> int:
+    """scripts/check_*.py main() 위임 (doctor 플래그 통합)."""
+    import runpy
+    path = ROOT / "scripts" / name
+    ns = runpy.run_path(str(path), run_name="__argus_doctor__")
+    fn = ns.get("main")
+    if not callable(fn):
+        _bad("doctor", f"no main() in {name}")
+        return 2
+    return int(fn() or 0)
+
+
+def main(argv: list[str] | None = None) -> int:
+    ap = argparse.ArgumentParser(prog="argus doctor")
+    ap.add_argument("--migrate-data", action="store_true",
+                    help="data/ 레이아웃 이동 계획(기본 dry-run)")
+    ap.add_argument("--migrate-research", action="store_true",
+                    help="data/quant_review → research/quant_review/data (기본 dry-run)")
+    ap.add_argument("--apply", action="store_true",
+                    help="--migrate-data/--migrate-research 와 함께: 실제 이동")
+    ap.add_argument("--check-auth", action="store_true",
+                    help="Anthropic API/구독 1회 연결 확인 (구 check_auth.py)")
+    ap.add_argument("--check-cli", action="store_true",
+                    help="claude CLI 백엔드 1회 확인 (구 check_cli.py)")
+    # argv=None + pytest 등 라이브러리 호출: pytest 플래그를 먹지 않음.
+    # scripts/doctor.py 또는 argus CLI(runpy)로 진입 시에만 sys.argv 사용.
+    if argv is None:
+        prog = Path(sys.argv[0]).name if sys.argv else ""
+        if prog == "doctor.py" or prog.endswith("doctor.py"):
+            argv = sys.argv[1:]
+        else:
+            argv = []
+    args = ap.parse_args(argv)
+
     if hasattr(sys.stdout, "reconfigure"):
         try:
             sys.stdout.reconfigure(encoding="utf-8", errors="replace")
         except Exception:
             pass
+
+    if args.check_auth:
+        return _run_helper_script("check_auth.py")
+    if args.check_cli:
+        return _run_helper_script("check_cli.py")
+    if args.migrate_research:
+        return run_migrate_research(apply=bool(args.apply))
+    if args.migrate_data:
+        return run_migrate(apply=bool(args.apply))
+
     from dotenv import load_dotenv
     load_dotenv(ROOT / ".env")
     print("Argus doctor")
@@ -120,6 +232,16 @@ def main() -> int:
 
     cmd = str((raw.get("agents") or {}).get("claude_command") or "claude")
     check_claude(cmd)
+
+    try:
+        check_ops_paths()
+    except Exception as e:
+        _warn("paths", f"resolve 점검 실패: {e}")
+
+    try:
+        check_research_boundary()
+    except Exception as e:
+        _warn("research", f"경계 점검 실패: {e}")
 
     if _filled("TOSS_CLIENT_ID") and _filled("TOSS_CLIENT_SECRET"):
         _ok("toss keys", "CLIENT_ID/SECRET 있음")
@@ -196,4 +318,6 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    from src.cli.legacy import warn_legacy_script
+    warn_legacy_script("argus doctor")
     sys.exit(main())

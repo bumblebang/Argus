@@ -106,6 +106,7 @@ def test_live_success_records_real_fill(tmp_path):
     p = json.loads(evs[0]["payload"])
     assert p["order_id"] == "ORD123" and p["symbol"] == "005930" and p["side"] == "BUY"
     assert p["price"] == 70050.0 and p["status"] == "FILLED" and p["fee"] == 10.5
+    assert p.get("reason") == "test"
 
 
 # ── 1b) 부분체결: 체결분만 원장에 기록 ───────────────────────────────────

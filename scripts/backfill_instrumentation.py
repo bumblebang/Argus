@@ -19,6 +19,7 @@ from src.config import load_config
 from src.engine.store import Store
 from src.logging_setup import setup_logging
 from src.shadow_ledger import backfill_from_jsonl
+from src import paths as _paths
 
 DATA = ROOT / "data"
 LEGACY = legacy_manager_stamp()
@@ -83,7 +84,8 @@ def main() -> None:
     ap.add_argument("--db-only", action="store_true")
     ap.add_argument("--jsonl-only", action="store_true")
     ap.add_argument("--no-shadow", action="store_true", help="skip shadow backfill")
-    ap.add_argument("--db", type=Path, default=DATA / "bot.db")
+    ap.add_argument("--db", type=Path,
+                    default=_paths.resolve("db", configured="data/bot.db"))
     args = ap.parse_args()
 
     cfg = load_config(ROOT / "config.yaml")
@@ -94,13 +96,14 @@ def main() -> None:
         print(json.dumps({"db_manager": db_r}, ensure_ascii=False))
 
     if not args.db_only:
-        for name in ("decisions.jsonl", "value_decisions.jsonl"):
-            p = DATA / name
-            jl = backfill_jsonl_manager(p)
-            print(json.dumps({"jsonl_manager": name, **jl}, ensure_ascii=False))
+        brain_jl = _paths.resolve("decisions", configured="data/decisions.jsonl")
+        for path in (brain_jl, DATA / "value_decisions.jsonl"):
+            jl = backfill_jsonl_manager(path)
+            print(json.dumps({"jsonl_manager": path.name, **jl}, ensure_ascii=False))
 
     if not args.no_shadow:
-        for path, sleeve in ((DATA / "decisions.jsonl", "brain"),
+        brain_jl = _paths.resolve("decisions", configured="data/decisions.jsonl")
+        for path, sleeve in ((brain_jl, "brain"),
                              (DATA / "value_decisions.jsonl", "value")):
             if path.exists():
                 bf = backfill_from_jsonl(

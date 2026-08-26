@@ -20,6 +20,7 @@ sys.path.insert(0, str(ROOT))
 from src.config import load_config
 from src.eval.score import score_journal
 from src.logging_setup import setup_logging
+from src import paths as _paths
 
 DATA = ROOT / "data"
 
@@ -31,11 +32,16 @@ def _print(obj: dict) -> None:
         print(json.dumps({"n_row_preview": len(obj["rows"])}, ensure_ascii=False))
 
 
+def _brain_journal() -> Path:
+    return _paths.resolve("decisions", configured="data/decisions.jsonl")
+
+
 def _cmd_score_live(args: argparse.Namespace) -> None:
     cfg = load_config(ROOT / "config.yaml") if (ROOT / "config.yaml").exists() else None
     raw = cfg.raw if cfg is not None else {}
     sleeve = args.sleeve
-    journal = DATA / ("value_decisions.jsonl" if sleeve == "value" else "decisions.jsonl")
+    journal = (DATA / "value_decisions.jsonl" if sleeve == "value"
+               else _brain_journal())
     if args.journal:
         journal = Path(args.journal)
     out = score_journal(journal_path=journal, data_dir=DATA, cfg=raw,
@@ -51,7 +57,8 @@ def _cmd_redecide(args: argparse.Namespace) -> None:
     from src.eval.replay import redecide_journal
 
     sleeve = args.sleeve
-    journal = DATA / ("value_decisions.jsonl" if sleeve == "value" else "decisions.jsonl")
+    journal = (DATA / "value_decisions.jsonl" if sleeve == "value"
+               else _brain_journal())
     if args.journal:
         journal = Path(args.journal)
 

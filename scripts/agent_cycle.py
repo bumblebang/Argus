@@ -92,4 +92,6 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    from src.cli.legacy import warn_legacy_script
+    warn_legacy_script("argus agent-cycle")
     sys.exit(main())

@@ -4,11 +4,16 @@ from __future__ import annotations
 import json
 import re
 import sqlite3
+import sys
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+from src import paths as _paths  # noqa: E402
+
 DATA = ROOT / "data"
 OUT = DATA / "gate_postmortem.json"
 KST = timezone(timedelta(hours=9))
@@ -183,11 +188,13 @@ def daily_forward(series: list[tuple[datetime, float]], ts_epoch: float,
 
 
 def main() -> None:
-    brain, n_b = collect(load_jsonl(DATA / "decisions.jsonl"), "brain")
+    brain_jl = _paths.resolve("decisions", configured="data/decisions.jsonl")
+    brain, n_b = collect(load_jsonl(brain_jl), "brain")
     value, n_v = collect(load_jsonl(DATA / "value_decisions.jsonl"), "value")
     all_exec = brain + value
 
-    con = sqlite3.connect(str(DATA / "bot.db"))
+    db = _paths.resolve("db", configured="data/bot.db")
+    con = sqlite3.connect(str(db))
     for row in con.execute(
             "SELECT ts, symbol, payload FROM events WHERE kind='buy_blocked'"):
         pay = json.loads(row[2] or "{}")

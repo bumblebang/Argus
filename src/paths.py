@@ -2,9 +2,12 @@
 
 Phase 0: 물리 레이아웃은 그대로. I/O 호출을 이 API로 모은다.
 Phase 2: resolve 가 data/state/… 와 레거시 data/* 둘 다 찾음.
-  - 존재 우선: configured → LAYOUT(신) → LEGACY(구)
-  - 둘 다 없으면 LEGACY 를 쓰기 대상으로 반환 (컷오버 전 기본)
+  - 존재 우선: LAYOUT(신) → configured → LEGACY(구)
+  - 둘 다 없으면 LAYOUT 을 쓰기 대상으로 반환 (컷오버 후 기본)
   - inbox: 신=data/inbox, 구=data/llm_inbox (PokeTokenBarWin 호환 유지)
+
+절대 Path 가 ROOT 아래 레거시/LAYOUT 상대경로와 같으면 dual-search 한다
+(ROOT/'data'/'bot.db' 가 state/bot.db 를 놓치지 않게).
 """
 from __future__ import annotations
 
@@ -84,15 +87,53 @@ def _as_abs(base: Path, maybe: str | Path) -> Path:
     return (base / p)
 
 
+def _posix(s: str) -> str:
+    return str(s).replace("\\", "/")
+
+
+def _under_repo_layout(base: Path, configured: Path, legacy_rel: str,
+                       new_rel: str) -> bool:
+    """configured 가 repo 아래 레거시/LAYOUT 경로면 dual-search 대상."""
+    try:
+        conf = configured.resolve()
+        base_r = base.resolve()
+        rel_s = conf.relative_to(base_r).as_posix()
+    except (ValueError, OSError):
+        return False
+    return rel_s in (legacy_rel, new_rel)
+
+
+def _usable_existing(path: Path) -> bool:
+    """존재하고 '쓸 만한' 후보인가.
+
+    빈 파일(st_size==0)은 LAYOUT 이 레거시보다 먼저 있어도 채택하지 않는다 —
+    부분 컷오버 중 touch 된 빈 state/bot.db 가 찬 레거시를 가리는 사고 방지.
+    빈 디렉터리도 동일(빈 data/inbox 가 찬 llm_inbox 를 가리지 않게).
+    존재하지 않으면 False.
+    """
+    try:
+        if not path.exists():
+            return False
+        if path.is_dir():
+            try:
+                next(path.iterdir())
+                return True
+            except StopIteration:
+                return False
+        return path.stat().st_size > 0
+    except OSError:
+        return False
+
+
 def resolve(key: str, *, root: Path | None = None,
             configured: str | Path | None = None) -> Path:
     """repo root 기준 절대경로.
 
-    존재 우선 (config 가 레거시/LAYOUT 상대경로일 때):
-      configured(존재) → LAYOUT → LEGACY → LEGACY(쓰기 기본)
+    존재 우선: LAYOUT → configured → LEGACY (단, 빈 파일은 건너뜀).
+    쓸 만한 후보가 없으면 LAYOUT(컷오버 후 쓰기 기본).
 
-    configured 가 레거시·LAYOUT 상대경로가 **아니면** (테스트 tmp·절대 오버라이드)
-    dual-search 없이 그 경로를 그대로 쓴다 — 운영 data/* 로 새지 않음.
+    configured 가 repo 밖·다른 상대경로면(테스트 tmp 등) dual-search 없이 그대로.
+    ROOT/'data'/'bot.db' 처럼 절대 Path 여도 레거시/LAYOUT 이면 dual-search.
     """
     if key not in CANONICAL:
         raise KeyError(f"unknown path key {key!r}")
@@ -100,19 +141,22 @@ def resolve(key: str, *, root: Path | None = None,
     legacy_rel = rel(key)
     new_rel = layout_rel(key)
 
+    configured_path: Path | None = None
+    dual = True
     if configured is not None and str(configured).strip():
-        conf_s = str(configured).replace("\\", "/")
-        if conf_s not in (legacy_rel, new_rel):
-            return _as_abs(base, configured).resolve()
+        conf_s = _posix(configured)
         configured_path = _as_abs(base, configured)
-    else:
-        configured_path = None
+        if conf_s not in (legacy_rel, new_rel):
+            # 절대경로·이상 상대경로 — repo 레이아웃이면 dual, 아니면 오버라이드
+            if not _under_repo_layout(base, configured_path, legacy_rel, new_rel):
+                return configured_path.resolve()
+            dual = True
 
     candidates: list[Path] = []
+    if dual and new_rel != legacy_rel:
+        candidates.append(base / new_rel)
     if configured_path is not None:
         candidates.append(configured_path)
-    if new_rel != legacy_rel:
-        candidates.append(base / new_rel)
     candidates.append(base / legacy_rel)
 
     seen: set[str] = set()
@@ -124,12 +168,19 @@ def resolve(key: str, *, root: Path | None = None,
         seen.add(k)
         uniq.append(c)
 
+    # 1순위: 비어 있지 않은 존재 파일/디렉터리 (LAYOUT→configured→LEGACY 순서 유지)
     for c in uniq:
-        if c.exists():
+        if _usable_existing(c):
             return c.resolve()
-    if configured_path is not None:
-        return configured_path.resolve()
-    return (base / legacy_rel).resolve()
+    # 2순위: 빈 파일만 있을 때 — 그래도 있는 쪽(쓰기/HALT touch 등)
+    for c in uniq:
+        try:
+            if c.exists():
+                return c.resolve()
+        except OSError:
+            continue
+    # 쓰기 기본: LAYOUT (컷오버 후)
+    return (base / new_rel).resolve()
 
 
 def ensure_parent(key: str, *, root: Path | None = None,
