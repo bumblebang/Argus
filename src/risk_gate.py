@@ -73,6 +73,10 @@ class RiskGate:
         self.max_position_pct = float(limits.get("max_position_pct", 0.20))
         self.max_positions = int(limits.get("max_positions", 5))
         self.daily_loss_limit_pct = float(limits.get("daily_loss_limit_pct", 0.05))
+        # 일손실 판정에 SoD equity 델타를 함께 볼지. realized_pnl 을 우회한 체결
+        # (폴링 밖 체결 → 재대사 흡수)을 잡는다. False 면 실현손익만(구 동작).
+        self.daily_loss_use_sod_delta = bool(
+            limits.get("daily_loss_use_sod_delta", True))
         self.max_order_notional = limits.get("max_order_notional", {})
         self.kill_switch_file = limits.get("kill_switch_file", "data/HALT")
         # 포트폴리오 수준 감독관 한도(선택). None 이면 비활성 — 종목단위 한도만 적용.
@@ -121,6 +125,34 @@ class RiskGate:
         if base <= 0:
             base = self._cap(market)
         return base
+
+    def _today_pnl(self, account, market: str) -> tuple[float, str]:
+        """당일 손익 판정값 = realized_today 와 SoD equity 델타 중 **나쁜 쪽**.
+
+        realized_pnl 은 봇이 apply_fill 을 본 체결만 센다. 미체결 주문이 폴링
+        밖에서 체결되고 주기 재대사가 holdings 로 흡수하면 그 매도의 손익은
+        realized 에 안 잡힌다 — 손실이 나도 일손실 게이트가 0 을 본다. cash/
+        positions 는 재대사가 실계좌 값으로 덮으므로 equity 델타는 그 체결을
+        자동으로 반영한다.
+
+        두 값 중 나쁜 쪽을 쓰는 이유: 델타는 미실현 변동·입출금도 섞으므로
+        단독 채택은 오탐이 많고, realized 단독은 위 구멍이 남는다. 최소값은
+        어느 쪽이 눈이 밝든 손실을 놓치지 않는다(과차단 방향).
+        """
+        realized_today = (account.daily_realized_pnl(market)
+                          if hasattr(account, "daily_realized_pnl")
+                          else account.realized_pnl.get(market, 0.0))
+        if not self.daily_loss_use_sod_delta:
+            return realized_today, "실현손익"
+        delta = None
+        if hasattr(account, "sod_equity_delta"):
+            try:
+                delta = account.sod_equity_delta(market)
+            except Exception as e:
+                log.warning("SoD 델타 산출 실패 — 실현손익만 사용(%s): %s", market, e)
+        if delta is None or delta >= realized_today:
+            return realized_today, "실현손익"
+        return delta, "자산변화"
 
     def _exposure_base(self, account, market: str) -> float:
         """노출 한도의 기준 금액. exposure_base='equity' 면 현재 실자산(현금+보유평가).
@@ -218,20 +250,20 @@ class RiskGate:
             if order.symbol in self.blocked_symbols:
                 return GateDecision(False, f"KRX 경보·관리 차단({order.symbol})")
 
-            # 3) 일 손실 한도 도달 시 신규 매수 차단 — '오늘' 실현손익 기준(시장 타임존
-            #    날짜로 리셋). 분모=당일 시가(SoD) equity(없으면 capital). 누적 realized_pnl
-            #    을 쓰면 영구 차단이 돼버린다.
+            # 3) 일 손실 한도 도달 시 신규 매수 차단 — 시장 타임존 날짜로 리셋.
+            #    분모=당일 시가(SoD) equity(없으면 capital). 누적 realized_pnl 을
+            #    쓰면 영구 차단이 돼버린다.
             base = self._loss_budget_base(account, m)
-            realized_today = (account.daily_realized_pnl(m)
-                              if hasattr(account, "daily_realized_pnl")
-                              else account.realized_pnl.get(m, 0.0))
-            if base > 0 and realized_today <= -base * self.daily_loss_limit_pct:
+            today_pnl, pnl_src = self._today_pnl(account, m)
+            if base > 0 and today_pnl <= -base * self.daily_loss_limit_pct:
                 return GateDecision(False,
-                    f"일 손실 한도 도달 (오늘 실현손익 {realized_today:,.0f})")
+                    f"일 손실 한도 도달 (오늘 {pnl_src} {today_pnl:,.0f})")
 
             # 3b) 드로다운 브레이커: 미실현 손실 포함 총 드로다운이 한도 초과면 신규 매수
             #     차단(보유가 깊은 손실인데 위험을 더 쌓는 것을 막는다). 마크는 감시 루프가
             #     매 틱 갱신 — 마크 없으면 미실현 0(배치 등 비루프 경로는 기존과 동일).
+            #     여기는 **누적 축**이다. 당일 SoD 델타를 섞으면 일손실 게이트와
+            #     같은 축이 돼 두 브레이커가 하나로 붕괴한다 — 축을 분리해 둔다.
             if self.max_drawdown_pct is not None and base > 0:
                 unreal = (account.unrealized_pnl(m)
                           if hasattr(account, "unrealized_pnl") else 0.0)

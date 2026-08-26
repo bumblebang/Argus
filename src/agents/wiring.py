@@ -100,6 +100,8 @@ def build_paper_core(cfg: AppConfig, *, live_client=None, account_seq=None,
                      "max_drawdown_pct": risk_cfg.get("max_drawdown_pct"),
                      # 노출 한도 기준: capital(고정) | equity(실자산 추종)
                      "exposure_base": risk_cfg.get("exposure_base", "capital"),
+                     "daily_loss_use_sod_delta": risk_cfg.get(
+                         "daily_loss_use_sod_delta", True),
                      "allow_min_lot": risk_cfg.get("allow_min_lot", False),
                      "min_lot_qty": risk_cfg.get("min_lot_qty", 1.0),
                      "sector_map": sector_map})

@@ -96,6 +96,9 @@ risk:
   conviction_size_span: 0.25 # floor+span=1.0 이면 확신 1에서 base 전량
   max_positions: 5
   daily_loss_limit_pct: 0.05 # SoD equity 대비
+  # 일손실 판정에 SoD equity 델타도 반영(realized 를 우회한 체결을 잡음).
+  # false 면 실현손익만 본다(구 동작).
+  daily_loss_use_sod_delta: true
   allow_fractional: false
   allow_min_lot: true
   min_lot_qty: 1.0

@@ -109,6 +109,26 @@ class PaperAccount:
         """손실예산 분모(SoD). 아직 스냅 전이면 ensure 로 찍거나 0."""
         return self.ensure_sod_equity(market)
 
+    def sod_equity_delta(self, market: str) -> float | None:
+        """당일 시가 equity 대비 현재 equity 변화. 스냅 전이면 None.
+
+        realized_pnl 은 봇이 apply_fill 을 본 체결만 센다. 폴링 밖에서 체결된 매도
+        (재대사가 holdings 로 흡수)는 realized 를 우회하므로, 실제로 그날 얼마를
+        잃었는지는 이 델타가 더 정확하다 — cash/positions 는 재대사가 실계좌
+        값으로 덮으니까.
+
+        한계: 입출금도 델타에 섞인다. 출금은 손실처럼, 입금은 이익처럼 보인다.
+        이 값은 신규 매수 차단에만 쓰이므로 오탐은 보수(더 막음) 방향이다.
+        """
+        base = self.ensure_sod_equity(market)
+        if base <= 0:
+            return None
+        try:
+            eq = float(self.equity(market, self.marks if self.marks else None))
+        except Exception:
+            return None
+        return eq - base
+
     def unrealized_pnl(self, market: str) -> float:
         """보유분 미실현 손익(마크 기준). 마크 없는 종목은 0으로 본다(보수 아님·결정적)."""
         total = 0.0
