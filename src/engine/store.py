@@ -674,6 +674,19 @@ class Store:
                 (symbol, since_ts)).fetchone()
             return row is not None
 
+    def had_position_since(self, symbol: str, since_ts: float) -> bool:
+        """since 이후 실제 진입(open 또는 이미 청산)이 있었는지.
+
+        has_open_since 는 지금 들고 있는 것만 본다. 그림자 채점 시점에 이미
+        청산됐으면 '막아서 손해'로 남고, 실제로는 그 종목을 샀었다.
+        """
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT 1 FROM positions WHERE symbol=? AND state IN ('open','closed')"
+                " AND IFNULL(qty,0) > 0 AND opened_at >= ? LIMIT 1",
+                (symbol, since_ts)).fetchone()
+            return row is not None
+
     def get_scored_shadow_positions(self, *, since: float | None = None,
                                     limit: int | None = None) -> list[sqlite3.Row]:
         sql = "SELECT * FROM shadow_positions WHERE state='scored'"

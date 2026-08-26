@@ -10,6 +10,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from .eval.trade_defs import roundtrip_cost_pct
 from .logging_setup import get_logger
 
 log = get_logger("shadow_ledger")
@@ -392,11 +393,17 @@ def score_open_shadows(store, *, now: float | None = None,
         entry_ts = float(row["entry_ts"])
         sym = row["symbol"]
         st = row["state"]
+        market = row["market"] if "market" in row.keys() else "KR"
+        held = (store.had_position_since(sym, entry_ts)
+                if hasattr(store, "had_position_since")
+                else store.has_open_since(sym, entry_ts))
+        if held:
+            # pending 뿐 아니라 hard-block(open) 그림자도 실체결이 있으면 취소.
+            # 안 그러면 '막아서 손해' 채점이 실제 산 거래를 유령으로 남긴다.
+            store.cancel_shadow_positions(sym, after_ts=entry_ts)
+            stats["cancelled"] += 1
+            continue
         if st == "pending":
-            if store.has_open_since(sym, entry_ts):
-                store.cancel_shadow_positions(sym, after_ts=entry_ts)
-                stats["cancelled"] += 1
-                continue
             if store.is_symbol_armed(sym):
                 meta = {}
                 if row["meta"]:
@@ -437,7 +444,8 @@ def score_open_shadows(store, *, now: float | None = None,
             continue
 
         entry_px = float(row["entry_price"])
-        ret = round((exit_px / entry_px - 1) * 100, 3)
+        cost_pct = roundtrip_cost_pct(market or "KR", cfg) * 100.0
+        ret = round((exit_px / entry_px - 1) * 100 - cost_pct, 3)
         exit_ts = entry_ts + hdays * 86400
         store.score_shadow_position(
             row["id"], exit_price=exit_px, exit_ts=exit_ts,
