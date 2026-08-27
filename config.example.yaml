@@ -20,6 +20,16 @@ broker:
   reconcile_poll_sec: 0.4
   reconcile_sec: 300
   max_spread_pct_extended: 0.02
+  # 접수 후 원장 미반영 주문(예약) 강제 회수 시간. 해제 누락 시 매수 영구 차단 방지.
+  reservation_ttl_sec: 300
+  # 미체결 주문 방치 시간(초). 넘으면 취소. 0=즉시취소, 음수=취소 안 함.
+  # 즉시취소는 얇은 호가·시간외에서 정상 체결 기회를 버린다.
+  working_order_ttl_sec: 60
+  # 같은 종목에 미체결 주문이 살아 있으면 재발주 거부(매 틱 중복 발주 차단).
+  block_on_working_order: true
+  # 종결된 체결분을 원장 귀속(실체결가 기입)까지 보관하는 시간(초). 재대사가 수량
+  # 감소를 못 보면 만료 회수하고 unattributed_fill 을 남긴다. 음수=무제한.
+  attribution_ttl_sec: 1800
 
 trading_sessions:
   KR: [regular, premarket, aftermarket]
@@ -77,7 +87,7 @@ alerts:
   ntfy_topic: ""             # .env NTFY_TOPIC 이 우선
 
 risk:
-  # 본인 운용 금액으로 바꿀 것 (KR 원, US 달러)
+  # 배정 자본 — 손실예산(SoD) 폴백·US 차단(0). 일손실·DD 분모는 당일 시가 equity.
   capital:
     KR: 1000000
     US: 0
@@ -88,13 +98,21 @@ risk:
   conviction_size_floor: 0.75
   conviction_size_span: 0.25 # floor+span=1.0 이면 확신 1에서 base 전량
   max_positions: 5
-  daily_loss_limit_pct: 0.05
+  daily_loss_limit_pct: 0.05 # SoD equity 대비
+  # 일손실 판정에 SoD equity 델타도 반영(realized 를 우회한 체결을 잡음).
+  # false 면 실현손익만 본다(구 동작).
+  daily_loss_use_sod_delta: true
   allow_fractional: false
+  # 최소 1주 시범매수: 고단가 종목이 목표비중 floor=0 으로 영구 탈락하는 구멍 보완.
+  # 면제 범위는 max_order_notional 뿐이다 — 종목비중·총노출·현금은 그대로 걸린다.
+  # 이미 보유 중인 종목에는 면제하지 않는다(보유 에피소드당 1회 시범).
   allow_min_lot: true
   min_lot_qty: 1.0
+  # 시범매수 절대 상한(원). null=비활성. 스칼라 또는 {KR: 300000} 형태.
+  min_lot_max_notional: null
   max_gross_exposure: 0.90
   max_sector_pct: 0.40
-  max_drawdown_pct: 0.10
+  max_drawdown_pct: null     # 비활성. 숫자면 SoD 대비 DD 매수차단
   exposure_base: "equity"
   max_order_notional: {}     # BUY 절대캡. {}=비활성(현금·비중·총노출). 예: {KR: 500000}
   kill_switch_file: "data/state/HALT"
@@ -209,6 +227,11 @@ agents:
     poll_sec: 1.0
     require_armed: true
     armed_max_age_sec: 90
+  # 클코 세션 추정 %(JSONL 합÷cap). 공식 /usage 아님. Pro~$20·5h 커뮤니티 추정치.
+  claude_budget:
+    enabled: true
+    session_token_cap: 44000
+    session_window_sec: 18000
   val_model: "claude-opus-4-8"
 
 watcher:

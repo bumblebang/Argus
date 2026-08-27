@@ -127,6 +127,32 @@ CREATE TABLE IF NOT EXISTS shadow_positions (
 );
 CREATE INDEX IF NOT EXISTS idx_shadow_state ON shadow_positions(state);
 CREATE INDEX IF NOT EXISTS idx_shadow_bucket ON shadow_positions(block_bucket);
+
+-- 접수됐지만 종결되지 않은 실주문. 토스 API 에 '미체결 주문 목록' 조회가 없어
+-- (order_get 단건뿐) 프로세스가 죽으면 고아 주문을 발견할 방법이 이 표뿐이다.
+-- settled_at 이 찍힌 행은 종결됐지만 아직 원장 귀속(J3)이 안 된 체결분이다 —
+-- 재대사가 실체결가 출처로 소비한 뒤 삭제한다.
+CREATE TABLE IF NOT EXISTS working_orders (
+    order_id        TEXT PRIMARY KEY,
+    symbol          TEXT NOT NULL,
+    market          TEXT NOT NULL,
+    side            TEXT NOT NULL,           -- BUY / SELL
+    qty             REAL NOT NULL,
+    price           REAL NOT NULL,
+    filled_qty      REAL NOT NULL DEFAULT 0, -- 마지막 조회의 누적 체결수량
+    filled_avg      REAL,                    -- 누적 평균체결가
+    fee             REAL,                    -- 누적 수수료+세금
+    applied_qty     REAL NOT NULL DEFAULT 0, -- 이미 원장에 반영된 체결수량
+    applied_notional REAL NOT NULL DEFAULT 0,
+    applied_fee     REAL NOT NULL DEFAULT 0,
+    status          TEXT NOT NULL,           -- PENDING / PARTIAL_FILLED / ...
+    placed_at       REAL NOT NULL,
+    last_checked    REAL,
+    settled_at      REAL,                    -- 종결 확인 시각(귀속 대기)
+    reason          TEXT,
+    meta            TEXT                     -- JSON
+);
+CREATE INDEX IF NOT EXISTS idx_working_symbol ON working_orders(symbol);
 """
 
 
@@ -158,6 +184,14 @@ class Store:
                           ("parent_id", "parent_id INTEGER")):
             if name not in cols:
                 self.conn.execute(f"ALTER TABLE positions ADD COLUMN {ddl}")
+        wcols = {r["name"] for r in self.conn.execute("PRAGMA table_info(working_orders)")}
+        for name, ddl in (("filled_avg", "filled_avg REAL"), ("fee", "fee REAL"),
+                          ("applied_qty", "applied_qty REAL NOT NULL DEFAULT 0"),
+                          ("applied_notional", "applied_notional REAL NOT NULL DEFAULT 0"),
+                          ("applied_fee", "applied_fee REAL NOT NULL DEFAULT 0"),
+                          ("settled_at", "settled_at REAL")):
+            if name not in wcols:
+                self.conn.execute(f"ALTER TABLE working_orders ADD COLUMN {ddl}")
         self._dedupe_open_positions()
         self.conn.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_positions_one_open_per_symbol "
@@ -187,6 +221,92 @@ class Store:
     def close(self) -> None:
         with self._lock:
             self.conn.close()
+
+    # ── 미체결 주문 레지스트리 (J2) ────────────────────────
+    def upsert_working_order(self, *, order_id: str, symbol: str, market: str,
+                             side: str, qty: float, price: float,
+                             status: str, filled_qty: float = 0.0,
+                             filled_avg: float | None = None,
+                             fee: float | None = None,
+                             applied_qty: float = 0.0,
+                             applied_notional: float = 0.0,
+                             applied_fee: float = 0.0,
+                             placed_at: float | None = None,
+                             reason: str | None = None,
+                             meta: dict | None = None) -> None:
+        """미체결 주문 기록(멱등). 같은 order_id 재접수 시 상태만 갱신.
+
+        applied_* 는 '이미 원장에 반영된' 체결분이다. 접수 시점에 한 번만 쓰고
+        이후 갱신하지 않는다 — 재대사 귀속이 미반영분을 정확히 계산하는 기준선.
+        """
+        now = time.time()
+        with self._lock:
+            self.conn.execute(
+                "INSERT INTO working_orders(order_id, symbol, market, side, qty,"
+                " price, filled_qty, filled_avg, fee, applied_qty, applied_notional,"
+                " applied_fee, status, placed_at, last_checked, reason, meta)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
+                " ON CONFLICT(order_id) DO UPDATE SET"
+                " filled_qty=excluded.filled_qty, status=excluded.status,"
+                " last_checked=excluded.last_checked",
+                (order_id, symbol, market, side, float(qty), float(price),
+                 float(filled_qty), filled_avg, fee, float(applied_qty),
+                 float(applied_notional), float(applied_fee),
+                 status, placed_at or now, now, reason, _dumps(meta)))
+            self.conn.commit()
+
+    def update_working_order(self, order_id: str, *, status: str | None = None,
+                             filled_qty: float | None = None,
+                             filled_avg: float | None = None,
+                             fee: float | None = None,
+                             settled_at: float | None = None,
+                             applied_qty: float | None = None,
+                             applied_notional: float | None = None,
+                             applied_fee: float | None = None) -> None:
+        sets, vals = ["last_checked=?"], [time.time()]
+        for col, val in (("status", status), ("filled_qty", filled_qty),
+                         ("filled_avg", filled_avg), ("fee", fee),
+                         ("settled_at", settled_at), ("applied_qty", applied_qty),
+                         ("applied_notional", applied_notional),
+                         ("applied_fee", applied_fee)):
+            if val is None:
+                continue
+            sets.append(f"{col}=?")
+            vals.append(val if col == "status" else float(val))
+        vals.append(order_id)
+        with self._lock:
+            self.conn.execute(
+                f"UPDATE working_orders SET {', '.join(sets)} WHERE order_id=?", vals)
+            self.conn.commit()
+
+    def delete_working_order(self, order_id: str) -> None:
+        with self._lock:
+            self.conn.execute("DELETE FROM working_orders WHERE order_id=?", (order_id,))
+            self.conn.commit()
+
+    def get_working_orders(self, symbol: str | None = None, *,
+                           settled: bool | None = None) -> list[dict]:
+        """settled=None 전체 / False 진행 중만 / True 귀속 대기분만."""
+        sql, args = "SELECT * FROM working_orders", []
+        where = []
+        if symbol:
+            where.append("symbol=?")
+            args.append(symbol)
+        if settled is True:
+            where.append("settled_at IS NOT NULL")
+        elif settled is False:
+            where.append("settled_at IS NULL")
+        if where:
+            sql += " WHERE " + " AND ".join(where)
+        sql += " ORDER BY placed_at"
+        return [dict(r) for r in self.conn.execute(sql, tuple(args)).fetchall()]
+
+    def has_working_order(self, symbol: str) -> bool:
+        """진행 중인(종결 미확인) 주문이 있는지. 귀속 대기분은 재발주를 막지 않는다."""
+        row = self.conn.execute(
+            "SELECT 1 FROM working_orders WHERE symbol=? AND settled_at IS NULL LIMIT 1",
+            (symbol,)).fetchone()
+        return row is not None
 
     # ── 이벤트/스냅샷/판단 기록 ───────────────────────────
     def log_event(self, kind: str, symbol: str | None = None,
@@ -551,6 +671,19 @@ class Store:
             row = self.conn.execute(
                 "SELECT 1 FROM positions WHERE symbol=? AND state='open'"
                 " AND opened_at >= ? LIMIT 1",
+                (symbol, since_ts)).fetchone()
+            return row is not None
+
+    def had_position_since(self, symbol: str, since_ts: float) -> bool:
+        """since 이후 실제 진입(open 또는 이미 청산)이 있었는지.
+
+        has_open_since 는 지금 들고 있는 것만 본다. 그림자 채점 시점에 이미
+        청산됐으면 '막아서 손해'로 남고, 실제로는 그 종목을 샀었다.
+        """
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT 1 FROM positions WHERE symbol=? AND state IN ('open','closed')"
+                " AND IFNULL(qty,0) > 0 AND opened_at >= ? LIMIT 1",
                 (symbol, since_ts)).fetchone()
             return row is not None
 

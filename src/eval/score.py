@@ -15,7 +15,7 @@ from ..shadow_ledger import parse_ts
 from .archive import load_context, parse_context
 from .labels import MIN_N, forward_return, policy_return, target_hit_before_stop
 from .labels import brier_score, log_loss
-from .null_manager import null_cash, null_random_gated
+from .null_manager import eligible_candidates, null_cash, null_random_gated
 
 
 def _parse_min_date(s: str | date | None) -> date | None:
@@ -118,6 +118,8 @@ def score_journal(*, journal_path: Path | str, data_dir: Path | str,
             cash = null_cash(cands)
             gated = null_random_gated(ctx, cycle_ts=cycle_ts, n_buy=n_buy,
                                       require_dossier=require_dossier)
+            elig_syms = {str(c.get("symbol")) for c in
+                         eligible_candidates(ctx, require_dossier=require_dossier)}
             asof = (ctx.get("asof") or rec.get("ts"))
             epoch = ((rec.get("manager") or {}).get("epoch"))
             for c in cands:
@@ -141,6 +143,7 @@ def score_journal(*, journal_path: Path | str, data_dir: Path | str,
                     "live_side": live_side,
                     "null_cash_side": cash.get(sym, "HOLD"),
                     "null_gated_side": gated.get(sym, "HOLD"),
+                    "in_eligible_pool": sym in elig_syms,
                     "fwd_ret": lab["fwd_ret"],
                     "live_policy": policy_return(live_side, lab["fwd_ret"]),
                     "null_cash_policy": policy_return(cash.get(sym, "HOLD"), lab["fwd_ret"]),
@@ -168,6 +171,15 @@ def _summary(rows: list[dict], *, min_n: int, skipped_no_ctx: int,
     cash_m = _mean([r["null_cash_policy"] for r in scored])
     gated_m = _mean([r["null_gated_policy"] for r in scored])
     delta = None if live_m is None or gated_m is None else live_m - gated_m
+    same = [r for r in scored if r.get("in_eligible_pool")]
+    other = [r for r in scored if not r.get("in_eligible_pool")]
+
+    def _delta(subset: list[dict]) -> float | None:
+        lm = _mean([r["live_policy"] for r in subset])
+        gm = _mean([r["null_gated_policy"] for r in subset])
+        if lm is None or gm is None:
+            return None
+        return lm - gm
     status = "shadow_only" if n < min_n else "scored"
     promote_ok, promote_why = can_promote(
         change="replay_score", evidence_n=n)
@@ -200,6 +212,14 @@ def _summary(rows: list[dict], *, min_n: int, skipped_no_ctx: int,
         "mean_null_cash_policy": cash_m,
         "mean_null_gated_policy": gated_m,
         "delta_vs_gated": delta,
+        "delta_decomp": {
+            "same_pool": _delta(same),
+            "gate_diff": _delta(other),
+            "n_same_pool": len(same),
+            "n_gate_diff": len(other),
+            "note": ("same_pool=라이브와 같은 bullish 풀에서의 Δ. "
+                     "gate_diff=풀 불일치(stance/존). 합산 Δ로 스킬 주장 금지."),
+        },
         "by_side": by_side,
         "skipped_no_ctx": skipped_no_ctx,
         "skipped_date": skipped_date,

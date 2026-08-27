@@ -210,6 +210,53 @@ def test_pending_timeout_score(tmp_path):
     assert scored[0]["exit_reason"] == "pending_timeout"
 
 
+def test_shadow_ret_subtracts_roundtrip_cost(tmp_path):
+    """왕복비용을 빼지 않으면 그림자가 실거래보다 유리해 '막아서 손해'로 기울었다."""
+    store = Store(tmp_path / "t.db")
+    hist = tmp_path / "history"
+    hist.mkdir()
+    lines = ["Date,Open,High,Low,Close,Volume"]
+    base = datetime(2026, 1, 1, tzinfo=KST)
+    for i in range(30):
+        d = (base + timedelta(days=i)).strftime("%Y-%m-%d")
+        close = 100.0 + i * (10.0 / 29)
+        lines.append(f"{d},100,100,100,{close:.2f},1000")
+    (hist / "COSTSYM_1d_1y.csv").write_text("\n".join(lines), encoding="utf-8")
+    entry_ts = base.timestamp() + 3600
+    res, prices = _vetoed_cycle(sym="COSTSYM", price=100.0, cycle_ts=entry_ts)
+    book_blocked(store, res, prices, sleeve="brain", cfg={"exit_policy": {
+        "time_stop": {"enabled": True, "by_horizon": {"swing": {"max_days": 20}}}}})
+    now = entry_ts + 21 * 86400
+    ep = {"exit_policy": {"time_stop": {"enabled": True,
+                                        "by_horizon": {"swing": {"max_days": 20}}}}}
+    zero = dict(ep, paper={"fee_rate": {"KR": 0}, "slippage_bps": {"KR": 0},
+                           "sell_tax_rate": {"KR": 0}})
+    score_open_shadows(store, now=now, data_dir=tmp_path, cfg=zero)
+    gross = store.get_scored_shadow_positions()[0]["ret_pct"]
+    store2 = Store(tmp_path / "t2.db")
+    book_blocked(store2, res, prices, sleeve="brain", cfg=ep)
+    score_open_shadows(store2, now=now, data_dir=tmp_path, cfg=ep)
+    net = store2.get_scored_shadow_positions()[0]["ret_pct"]
+    assert gross > net
+    from src.eval.trade_defs import roundtrip_cost_pct
+    assert abs((gross - net) - roundtrip_cost_pct("KR") * 100) < 1e-6
+
+
+def test_open_shadow_cancelled_if_had_closed_position(tmp_path):
+    """hard-block 그림자도 실체결(이미 청산)이 있으면 취소 — 생존편향 제거."""
+    store = Store(tmp_path / "t.db")
+    ts = time.time() - 86400
+    store.insert_shadow_position(
+        cycle_ts=ts, sleeve="brain", symbol="HAD", market="KR",
+        block_status="gate_rejected", block_bucket="게이트:자본/한도",
+        entry_price=100, entry_ts=ts, state="open")
+    pid = store.open_position("HAD", "KR", 1, 100)
+    store.close_position(pid, exit_price=110, reason="target")
+    stats = score_open_shadows(store, now=ts + 30 * 86400, data_dir=tmp_path)
+    assert stats["cancelled"] == 1
+    assert store.get_scored_shadow_positions() == []
+
+
 def test_horizon_calendar_days():
     assert horizon_calendar_days("day") == 1
     assert horizon_calendar_days("swing") == 20

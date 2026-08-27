@@ -176,6 +176,53 @@ def test_daily_loss_blocks_when_today_over_limit(tmp_path):
     assert not d.approved and "일 손실" in d.reason
 
 
+def test_daily_loss_scales_with_sod_equity(tmp_path):
+    """SoD 가 크면 같은 원 손실도 비율 한도 안에 들어 매수 허용."""
+    from src.market_hours import market_day
+    gate = _gate(tmp_path, max_order_notional={"KR": 10_000_000})
+    acct = _acct(tmp_path, cash={"KR": 100_000_000})
+    acct.realized_pnl_today["KR"] = -60_000                 # 고정 capital 5%면 차단이던 금액
+    acct._pnl_day["KR"] = market_day("KR")
+    assert gate.check(Order("005930", "KR", "BUY", 100, 100), acct).approved
+    acct.realized_pnl_today["KR"] = -5_500_000              # SoD 1억의 5.5%
+    d = gate.check(Order("005930", "KR", "BUY", 100, 100), acct)
+    assert not d.approved and "일 손실" in d.reason
+
+
+def test_sod_equity_persists_across_reload(tmp_path):
+    from src.market_hours import market_day
+    path = tmp_path / "acct.json"
+    acct = PaperAccount(cash={"KR": 1_000_000}, state_path=path)
+    day = market_day("KR")
+    acct._sod_day["KR"] = day
+    acct._sod_equity["KR"] = 100_000_000.0
+    acct._save()
+    reloaded = PaperAccount(cash={"KR": 1_000_000}, state_path=path)
+    assert reloaded.ensure_sod_equity("KR") == 100_000_000.0
+    # 장중 equity 가 줄어도 당일 SoD 유지
+    reloaded.cash["KR"] = 500_000
+    assert reloaded.ensure_sod_equity("KR") == 100_000_000.0
+
+
+def test_sod_day_rollover_resnaps(tmp_path):
+    acct = _acct(tmp_path, cash={"KR": 2_000_000})
+    acct._sod_day["KR"] = "2000-01-01"
+    acct._sod_equity["KR"] = 50_000.0
+    assert acct.ensure_sod_equity("KR") == 2_000_000.0
+
+
+def test_loss_budget_falls_back_to_capital_when_sod_zero(tmp_path):
+    """당일 SoD 가 0으로 고정되면 capital 폴백(기존 100만×5%)."""
+    from src.market_hours import market_day
+    gate, acct = _gate(tmp_path), _acct(tmp_path)
+    acct._sod_day["KR"] = market_day("KR")
+    acct._sod_equity["KR"] = 0.0
+    acct.realized_pnl_today["KR"] = -60_000
+    acct._pnl_day["KR"] = market_day("KR")
+    d = gate.check(Order("005930", "KR", "BUY", 100, 100), acct)
+    assert not d.approved and "일 손실" in d.reason
+
+
 # ── 드로다운 브레이커: 미실현 손실 포함 ────────────────────────────
 def test_drawdown_breaker_blocks_with_unrealized(tmp_path):
     gate = _gate(tmp_path, max_drawdown_pct=0.10, max_position_pct=1.0,
@@ -237,14 +284,53 @@ def test_max_order_notional_disabled_when_empty_or_zero(tmp_path):
 
 
 # ── 최소 1주 시범매수 (allow_min_lot) ────────────────────────────────
-def test_min_lot_exempts_order_notional_and_position_pct(tmp_path):
-    """qty=1 이면 주문상한·종목비중을 넘어도 통과(현금만 되면)."""
+def test_min_lot_exempts_order_notional_only(tmp_path):
+    """qty=1 은 주문상한만 면제. 종목비중 안에는 들어와야 한다."""
+    gate = _gate(tmp_path, allow_min_lot=True, max_position_pct=0.50,
+                 max_order_notional={"KR": 200_000})
+    acct = _acct(tmp_path)
+    # 농심급 단가 35.7만 — 주문상한 20만 초과(면제), 비중 50%(50만) 안(통과)
+    assert gate.check(Order("004370", "KR", "BUY", 1, 357_000), acct).approved
+
+
+def test_min_lot_does_not_exempt_position_pct(tmp_path):
+    """J4 재현: 1주가 종목 상한을 그대로 넘어가던 경로."""
     gate = _gate(tmp_path, allow_min_lot=True, max_position_pct=0.20,
                  max_order_notional={"KR": 200_000})
     acct = _acct(tmp_path)
-    # 농심급 단가 35.7만 — 주문상한 20만·비중 20%(20만) 둘 다 초과
     d = gate.check(Order("004370", "KR", "BUY", 1, 357_000), acct)
-    assert d.approved
+    assert not d.approved and "비중" in d.reason
+
+
+def test_min_lot_not_exempt_when_already_held(tmp_path):
+    """보유 중이면 시범이 아니다 — 1주 피라미딩 차단."""
+    gate = _gate(tmp_path, allow_min_lot=True, max_position_pct=0.50,
+                 max_order_notional={"KR": 200_000})
+    acct = _acct(tmp_path)
+    order = Order("004370", "KR", "BUY", 1, 357_000)
+    assert gate.check(order, acct).approved            # 첫 시범은 통과
+    acct.apply_fill("004370", "KR", "BUY", 1, 357_000, 0.0, "probe")
+    d = gate.check(order, acct)
+    assert not d.approved and "주문금액" in d.reason
+
+
+def test_min_lot_absolute_cap(tmp_path):
+    """면제를 받는 주문일수록 절대 크기를 제한한다."""
+    gate = _gate(tmp_path, allow_min_lot=True, max_position_pct=1.0,
+                 max_order_notional={"KR": 200_000},
+                 min_lot_max_notional=300_000)
+    acct = _acct(tmp_path)
+    d = gate.check(Order("004370", "KR", "BUY", 1, 357_000), acct)
+    assert not d.approved and "시범매수 한도" in d.reason
+    assert gate.check(Order("005930", "KR", "BUY", 1, 250_000), acct).approved
+
+
+def test_min_lot_absolute_cap_per_market(tmp_path):
+    gate = _gate(tmp_path, allow_min_lot=True, max_position_pct=1.0,
+                 max_order_notional={"KR": 200_000},
+                 min_lot_max_notional={"KR": 300_000})
+    acct = _acct(tmp_path)
+    assert not gate.check(Order("004370", "KR", "BUY", 1, 357_000), acct).approved
 
 
 def test_min_lot_off_still_rejects_over_limits(tmp_path):
@@ -258,7 +344,7 @@ def test_min_lot_off_still_rejects_over_limits(tmp_path):
 def test_min_lot_only_for_exact_min_qty(tmp_path):
     """2주면 시범매수 면제 대상이 아니다."""
     gate = _gate(tmp_path, allow_min_lot=True, min_lot_qty=1.0,
-                 max_position_pct=0.20, max_order_notional={"KR": 200_000})
+                 max_position_pct=1.0, max_order_notional={"KR": 200_000})
     acct = _acct(tmp_path)
     d = gate.check(Order("004370", "KR", "BUY", 2, 150_000), acct)  # 30만
     assert not d.approved

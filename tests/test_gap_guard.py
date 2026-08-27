@@ -371,28 +371,41 @@ def test_day_armed_ignores_conviction_sizing(tmp_path):
     assert ex.broker.position("005930").qty == 200
 
 
-def test_zone_mode_min_lot_fills_one_share(tmp_path):
-    """스윙 갭대기 고단가: 확신도 OK 면 즉시 체결과 같이 qty=1."""
+def _zone_min_lot(tmp_path, *, hard_cap: float):
     store = Store(tmp_path / "t.db")
     store.arm_candidate(
         "004370", "KR", strategy="rsi_reversion",
-        meta={"horizon": "swing", "target_weight": 0.15, "conviction": 0.62,
+        meta={"horizon": "swing", "target_weight": 0.05, "conviction": 0.62,
               "conviction_sizing": True, "min_lot_conviction": 0.6,
               "entry_zone": {"low": 350_000, "high": 360_000, "invalidation": 300_000,
                              "target": 400_000, "expires_at": None}})
     acct = PaperAccount(cash={"KR": 1_000_000}, fee_rate={"KR": 0.0},
                         slippage_bps={"KR": 0.0}, state_path=tmp_path / "pa.json")
-    gate = RiskGate({"capital": {"KR": 1_000_000}, "max_position_pct": 0.2,
+    gate = RiskGate({"capital": {"KR": 1_000_000}, "max_position_pct": hard_cap,
                      "max_positions": 5, "max_order_notional": {"KR": 200_000},
                      "allow_min_lot": True,
                      "kill_switch_file": str(tmp_path / "HALT")})
     broker = Broker(account=acct, gate=gate, mode="paper")
     ex = EntryExecutor(_CountingGW(), broker,
-                       RiskManager(capital={"KR": 1_000_000}, max_position_pct=0.2),
+                       RiskManager(capital={"KR": 1_000_000},
+                                   max_position_pct=hard_cap,
+                                   base_position_pct=0.05),
                        store)
-    r = ex.evaluate(dict(store.get_armed()[0]), "KR", price=357_000)
+    return ex.evaluate(dict(store.get_armed()[0]), "KR", price=357_000), broker
+
+
+def test_zone_mode_min_lot_fills_one_share(tmp_path):
+    """스윙 갭대기 고단가: 1주가 종목 상한 안이면 즉시 체결과 같이 qty=1."""
+    r, broker = _zone_min_lot(tmp_path, hard_cap=0.5)
     assert r["executed"] is True
     assert broker.position("004370").qty == 1
+
+
+def test_zone_mode_min_lot_rejected_over_position_pct(tmp_path):
+    """J4: 1주가 종목 상한을 넘으면 존 진입에서도 거부."""
+    r, broker = _zone_min_lot(tmp_path, hard_cap=0.2)
+    assert r["executed"] is False
+    assert broker.position("004370").qty == 0
 
 
 def test_zone_mode_min_lot_skipped_when_conviction_low(tmp_path):

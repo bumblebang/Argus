@@ -13,6 +13,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from src import paths as _paths  # noqa: E402
+from src.engine.store import Store  # noqa: E402
+from src.eval.trade_defs import roundtrip_cost_pct, scored_trades  # noqa: E402
 
 DATA = ROOT / "data"
 OUT = DATA / "gate_postmortem.json"
@@ -216,11 +218,11 @@ def main() -> None:
     blocked = [x for x in all_exec if x["status"] in BLOCK_STATUSES | SOFT_MISS]
     filled = [x for x in all_exec if x["status"] in ("filled", "armed")]
 
-    # closed positions (actual)
-    closed = list(con.execute(
-        "SELECT symbol, avg_price, exit_price, pnl, exit_reason, opened_at, "
-        "closed_at, strategy, thesis FROM positions WHERE state='closed'"))
-    actual_wins = sum(1 for r in closed if (r[3] or 0) > 0)
+    # 채점용 청산만 (pnl 확정 + qty>0, parent_id 그룹). 필터 없는 closed 행은
+    # 손익 null 이 승률 분모를 깎는다.
+    store = Store(db)
+    trades = scored_trades(store)
+    actual_wins = sum(1 for t in trades if (t.get("pnl") or 0) > 0)
 
     # counterfactual on blocked
     daily_cache: dict[str, list] = {}
@@ -238,18 +240,20 @@ def main() -> None:
         entry_px = None
         fwd = {}
         if series:
+            cost = roundtrip_cost_pct(x.get("market") or "KR") * 100.0
             for h in horizons:
                 e, f = daily_forward(series, x["ts_epoch"], h)
                 entry_px = e
                 if e and f:
-                    fwd[f"d{h}"] = round((f / e - 1) * 100, 3)
+                    fwd[f"d{h}"] = round((f / e - 1) * 100 - cost, 3)
         else:
             entry_px = snap_price(con, sym, x["ts_epoch"])
             if entry_px:
+                cost = roundtrip_cost_pct(x.get("market") or "KR") * 100.0
                 for h in horizons:
                     f = snap_forward(con, sym, x["ts_epoch"], float(h))
                     if f:
-                        fwd[f"d{h}"] = round((f / entry_px - 1) * 100, 3)
+                        fwd[f"d{h}"] = round((f / entry_px - 1) * 100 - cost, 3)
         if not fwd:
             continue
         cf_rows.append({
@@ -298,22 +302,30 @@ def main() -> None:
     report = {
         "asof": datetime.now(tz=KST).isoformat(),
         "source": "decisions.jsonl + value_decisions.jsonl + events.buy_blocked",
+        "comparison_forbidden": True,
+        "comparison_note": (
+            "actual_closed 와 counterfactual 은 정의·비용·표본이 다르다. "
+            "승률을 나란히 두고 게이트를 판단하지 마라."),
         "proposals": {"brain_buy": n_b, "value_buy": n_v},
         "executed_status": dict(by_status),
         "blocked_buckets": dict(by_bucket.most_common()),
         "actual_closed": {
-            "n": len(closed),
+            "definition": "scored_trades: closed AND pnl NOT NULL AND qty>0, parent_id 그룹",
+            "n": len(trades),
             "wins": actual_wins,
-            "win_rate": round(actual_wins / len(closed), 3) if closed else None,
+            "win_rate": round(actual_wins / len(trades), 3) if trades else None,
             "rows": [
-                {"symbol": r[0], "pnl": r[3], "exit_reason": r[4],
-                 "strategy": r[7], "avg": r[1], "exit": r[2]}
-                for r in closed
+                {"symbol": t["symbol"], "pnl": t["pnl"], "exit_reason": t.get("exit_reason"),
+                 "strategy": t.get("strategy"), "avg": t.get("avg_price"),
+                 "exit": t.get("exit_price")}
+                for t in trades
             ],
         },
         "counterfactual": {
             "definition": "blocked BUY entry=prior daily close; "
-                          "win=forward close > entry; horizons=1/5/20 trading days",
+                          "win=forward close > entry after roundtrip_cost_pct; "
+                          "horizons=1/5/20 trading days. NOT comparable to actual_closed.",
+            "cost_model": "fee*2 + sell_tax + slippage_bps*2 (paper.*)",
             "n_with_price": len(cf_rows),
             "overall": {f"d{h}": cf_stats(cf_rows, f"d{h}") for h in horizons},
             "by_bucket": cf_by_bucket,
@@ -334,13 +346,15 @@ def main() -> None:
         )[:8],
     }
     OUT.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    print("COMPARISON_FORBIDDEN: actual_closed 와 counterfactual 을 나란히 비교하지 마라.")
     print(json.dumps({
         "wrote": str(OUT),
         "blocked": len(blocked),
         "cf_n": len(cf_rows),
         "buckets": report["blocked_buckets"],
         "cf_overall": report["counterfactual"]["overall"],
-        "actual": report["actual_closed"],
+        "actual_n": report["actual_closed"]["n"],
+        "actual_win_rate": report["actual_closed"]["win_rate"],
     }, ensure_ascii=False, indent=2))
 
 

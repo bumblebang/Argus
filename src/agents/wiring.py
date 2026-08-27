@@ -5,6 +5,7 @@ build_paper_core · select_backend · bridge/LLM 팩토리 · 전략·손절 헬
 from __future__ import annotations
 
 import json
+import math
 import time
 from pathlib import Path
 from typing import Callable
@@ -99,8 +100,11 @@ def build_paper_core(cfg: AppConfig, *, live_client=None, account_seq=None,
                      "max_drawdown_pct": risk_cfg.get("max_drawdown_pct"),
                      # 노출 한도 기준: capital(고정) | equity(실자산 추종)
                      "exposure_base": risk_cfg.get("exposure_base", "capital"),
+                     "daily_loss_use_sod_delta": risk_cfg.get(
+                         "daily_loss_use_sod_delta", True),
                      "allow_min_lot": risk_cfg.get("allow_min_lot", False),
                      "min_lot_qty": risk_cfg.get("min_lot_qty", 1.0),
+                     "min_lot_max_notional": risk_cfg.get("min_lot_max_notional"),
                      "sector_map": sector_map})
     broker_cfg = cfg.raw.get("broker", {}) or {}
     mode = broker_cfg.get("mode", "paper")
@@ -110,7 +114,11 @@ def build_paper_core(cfg: AppConfig, *, live_client=None, account_seq=None,
         limit_slippage_pct=float(broker_cfg.get("limit_slippage_pct", 0.01)),
         max_spread_pct_extended=float(broker_cfg.get("max_spread_pct_extended", 0.02)),
         reconcile_poll_attempts=int(broker_cfg.get("reconcile_poll_attempts", 5)),
-        reconcile_poll_sec=float(broker_cfg.get("reconcile_poll_sec", 0.4)))
+        reconcile_poll_sec=float(broker_cfg.get("reconcile_poll_sec", 0.4)),
+        reservation_ttl_sec=float(broker_cfg.get("reservation_ttl_sec", 300.0)),
+        working_order_ttl_sec=float(broker_cfg.get("working_order_ttl_sec", 60.0)),
+        block_on_working_order=bool(broker_cfg.get("block_on_working_order", True)),
+        attribution_ttl_sec=float(broker_cfg.get("attribution_ttl_sec", 1800.0)))
     dry = bool(getattr(cfg, "dry_run", True))
     is_live = resolve_execution_mode(
         broker_mode=str(mode), dry_run=dry, live_client=live_client) == "live"
@@ -231,18 +239,98 @@ def resolve_strategy(cfg: AppConfig, symbol: str, proposal=None) -> tuple[str | 
     return name, base
 
 
+# 손절/익절 비율의 최종 하드 바운드. strategies.base.COMMON_PARAMS 와 같은 범위.
+# store meta 등 validate 를 안 거친 params 가 들어와도 여기서 잘린다.
+MIN_STOP_PCT = 0.005
+MAX_STOP_PCT = 0.30
+MIN_TARGET_PCT = 0.005
+MAX_TARGET_PCT = 0.50
+MAX_ZONE_WIDTH_PCT = 0.15   # sanitize: (entry_high-entry_low)/price 상한
+_PCT_BOUNDS = {"stop_loss_pct": (MIN_STOP_PCT, MAX_STOP_PCT),
+               "target_profit_pct": (MIN_TARGET_PCT, MAX_TARGET_PCT)}
+
+
+def _plan_pct(params: dict | None, key: str, default: float) -> float:
+    """손절/익절 비율을 유한·범위 안으로 강제. 위반이면 보유기간 기본값."""
+    raw = (params or {}).get(key)
+    if raw is None:
+        return default
+    try:
+        v = float(raw)
+    except (TypeError, ValueError):
+        log.warning("%s 비정상값 %r → 기본 %s", key, raw, default)
+        return default
+    lo, hi = _PCT_BOUNDS[key]
+    if not math.isfinite(v) or not (lo <= v <= hi):
+        log.warning("%s 범위 밖 %r (허용 %s~%s) → 기본 %s", key, v, lo, hi, default)
+        return default
+    return v
+
+
 def entry_stop_target(entry_price: float, horizon: str,
                       params: dict | None) -> tuple[float | None, float | None]:
     """진입가·보유기간·전략 파라미터로 (손절가, 목표가) 산출.
 
     손절/익절%는 전략 params(stop_loss_pct/target_profit_pct), 없으면 보유기간 기본값.
+    비유한값·범위 밖은 기본값으로 되돌린다(NaN 손절가 = 손절 무발화).
     """
     d_stop, d_target = _HORIZON_DEFAULTS.get(horizon, _HORIZON_DEFAULTS["swing"])
-    stop_pct = float((params or {}).get("stop_loss_pct", d_stop))
-    target_pct = float((params or {}).get("target_profit_pct", d_target))
+    stop_pct = _plan_pct(params, "stop_loss_pct", d_stop)
+    target_pct = _plan_pct(params, "target_profit_pct", d_target)
     stop = round(entry_price * (1 - stop_pct), 2) if entry_price else None
     target = round(entry_price * (1 + target_pct), 2) if entry_price else None
     return stop, target
+
+
+def combine_stop_target(entry_price: float, horizon: str, params: dict | None,
+                        invalidation: float | None = None,
+                        target: float | None = None,
+                        ) -> tuple[float | None, float | None, str | None]:
+    """코드 손절/목표를 권위로, Athena 레벨은 밴드 안에만 채택.
+
+    손절: invalidation 이 [entry*(1-max_stop), entry*(1-min_stop)] 안에 있으면
+    그 값. 범위 밖·비유한값이면 코드 손절(+note). 얇은 손절(쉽게 털림)과
+    넓은 손절(보호 무력)을 한 규칙으로 막는다 — max/min 결합이 아니라 거부.
+
+    목표: [entry*(1+min_target), entry*(1+max_target)] 안에 있으면 채택,
+    밖이면 코드 목표. 허상 상향이 손익비 가산으로 흘러가지 않게 한다.
+    """
+    code_stop, code_target = entry_stop_target(entry_price, horizon, params)
+    if not entry_price or entry_price <= 0:
+        return code_stop, code_target, None
+
+    notes: list[str] = []
+    stop = code_stop
+    try:
+        inv = float(invalidation) if invalidation is not None else None
+    except (TypeError, ValueError):
+        inv = None
+    if inv is not None and math.isfinite(inv):
+        lo = entry_price * (1 - MAX_STOP_PCT)
+        hi = entry_price * (1 - MIN_STOP_PCT)
+        if lo <= inv <= hi:
+            stop = round(inv, 2)
+        else:
+            notes.append(
+                f"invalidation {inv:g} 밴드 밖 [{lo:.4g},{hi:.4g}] "
+                f"→ 코드 손절 {code_stop}")
+
+    out_target = code_target
+    try:
+        tgt = float(target) if target is not None else None
+    except (TypeError, ValueError):
+        tgt = None
+    if tgt is not None and math.isfinite(tgt):
+        floor = entry_price * (1 + MIN_TARGET_PCT)
+        cap = entry_price * (1 + MAX_TARGET_PCT)
+        if floor <= tgt <= cap:
+            out_target = round(tgt, 2)
+        else:
+            notes.append(
+                f"target {tgt:g} 범위 밖 [{floor:.4g},{cap:.4g}] "
+                f"→ 코드 목표 {code_target}")
+
+    return stop, out_target, ("; ".join(notes) if notes else None)
 
 
 def position_plan(cfg: AppConfig, symbol: str, entry_price: float,

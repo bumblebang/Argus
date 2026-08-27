@@ -165,12 +165,20 @@ def _build_brain(cfg, gateway, store, args, broker, risk, universe_fn=None,
                  else str(_paths.resolve(
                      "inbox", configured=cb.get("inbox_dir") or "data/llm_inbox")))
     source_fn = None
+    quota_info_fn = None
     if not dry:
         # llm 은 위 else 분기에서 생성된 ClaudeCLIClient(또는 API 클라이언트).
         _llm_ref = llm  # type: ignore[name-defined]
 
         def source_fn():
             return getattr(_llm_ref, "last_source", None)
+
+        def quota_info_fn():
+            return {
+                "kind": getattr(_llm_ref, "last_quota_kind", None),
+                "reset_at": getattr(_llm_ref, "last_quota_reset_at", None),
+                "error": getattr(_llm_ref, "last_quota_error", None),
+            }
 
     return BrainWorker(
         cycle, store=store, cooldown_sec=cooldown,
@@ -179,6 +187,7 @@ def _build_brain(cfg, gateway, store, args, broker, risk, universe_fn=None,
         bridge_armed_max_age_sec=float(cb.get("armed_max_age_sec", 90)),
         circuit_fail_threshold=int(wcfg.get("circuit_fail_threshold", 2)),
         source_fn=source_fn,
+        quota_info_fn=quota_info_fn,
     )
 
 
@@ -339,11 +348,24 @@ def _start_reconcile_timer(broker, gateway, store, cfg, markets) -> threading.Ev
 
     def _once():
         try:
+            # 재대사보다 먼저 — 종결된 미체결 주문을 지우고 만료분을 취소한 뒤
+            # holdings 를 읽어야 방금 취소한 주문의 잔량이 스냅샷에 안 섞인다.
+            sw = broker.sweep_working_orders()
+            if (sw.get("canceled") or sw.get("cancel_failed") or sw.get("settled")
+                    or sw.get("dropped")):
+                store.log_event("working_orders", None, sw)
+        except Exception as e:
+            log.warning("미체결 정산 오류(무시): %s", e)
+        try:
+            # fetch 직전 gen — 조회 중 주문이 시작·끝나면 apply 시 stale_snapshot 으로 연기
+            gen = broker.activity_generation()
             data = fetch_live_account_data(gateway, seq, markets=tuple(markets))
             res = broker.reconcile(
                 lambda acct: apply_reconcile_from_live(
-                    acct, store, data, markets=tuple(markets)))
-            if res.get("adopted") or res.get("closed") or res.get("error"):
+                    acct, store, data, markets=tuple(markets)),
+                expect_gen=gen)
+            if (res.get("adopted") or res.get("closed") or res.get("error")
+                    or res.get("attributed")):
                 store.log_event("reconcile", None, res)
         except Exception as e:
             log.warning("주기 재대사 오류(무시): %s", e)
@@ -501,7 +523,8 @@ def main() -> int:
         return 1
 
     # 단일 인스턴스 락 — 오펀/중복 기동 시 토스 토큰 경합(→401)·claude 동시 스폰 경합 방지.
-    lock = SingleInstance(_paths.resolve("watch_pid", configured="data/watch.pid"))
+    lock = SingleInstance(_paths.resolve("watch_pid", configured="data/watch.pid"),
+                          lockfile=_paths.resolve("watch_lock"))
     try:
         lock.acquire()
     except AlreadyRunning as e:

@@ -20,6 +20,7 @@ from ..runner import candles_to_df, patch_live_price
 from ..strategies import build_strategy, REGISTRY
 from ..strategies.base import Action, Position
 from ..agents.conviction import size_weight, min_lot_adjust
+from ..agents.wiring import combine_stop_target
 
 log = get_logger("engine.execution")
 
@@ -135,6 +136,20 @@ class EntryExecutor:
         self.store = store
         self.plan_fn = plan_fn
 
+    def _headroom(self, symbol: str, market: str, price: float,
+                  equity: float) -> float:
+        """종목 잔여 한도 = equity×종목상한 − 현 보유 평가액.
+
+        보유분을 빼지 않으면 이미 상한을 채운 종목에도 예산이 남은 것처럼 보이고,
+        min_lot 부활 경로에선 실제로 1주가 통과한다. cycle.py 와 정의를 맞춘다.
+        """
+        hard_cap = float(getattr(self.risk, "max_position_pct", 0.25) or 0.25)
+        try:
+            held = float(self.broker.position(symbol).qty) * float(price)
+        except (TypeError, ValueError, AttributeError):
+            held = 0.0
+        return max(0.0, equity * hard_cap - held)
+
     def evaluate(self, armed: dict, market: str, price: float | None = None) -> dict:
         """진입대기 1건에 전략 적용. BUY 신호면 진입 집행. 반환: {action, executed, reason}.
 
@@ -169,10 +184,9 @@ class EntryExecutor:
         equity = _sizing_equity(self.risk, self.broker, market)
         weight, min_qty = _entry_lot(meta, market, price, self.risk, sig.target_weight,
                                     equity=equity)
-        hard_cap = float(getattr(self.risk, "max_position_pct", 0.25) or 0.25)
-        headroom = max(0.0, equity * hard_cap)
         qty = self.risk.size_buy(market, price, weight, min_qty=min_qty,
-                                 base_equity=equity, notional_cap=headroom)
+                                 base_equity=equity,
+                                 notional_cap=self._headroom(sym, market, price, equity))
         if qty <= 0:
             return {"action": "buy", "executed": False, "reason": "사이징 0"}
 
@@ -223,17 +237,17 @@ class EntryExecutor:
         if zone["low"] <= price <= zone["high"]:
             equity = _sizing_equity(self.risk, self.broker, market)
             weight, min_qty = _entry_lot(meta, market, price, self.risk, equity=equity)
-            hard_cap = float(getattr(self.risk, "max_position_pct", 0.25) or 0.25)
-            headroom = max(0.0, equity * hard_cap)
-            qty = self.risk.size_buy(market, price, weight, min_qty=min_qty,
-                                     base_equity=equity, notional_cap=headroom)
+            qty = self.risk.size_buy(
+                market, price, weight, min_qty=min_qty, base_equity=equity,
+                notional_cap=self._headroom(sym, market, price, equity))
             if qty <= 0:
                 return {"action": "buy", "executed": False, "reason": "사이징 0"}
             res = self.broker.execute_with_mirror(
                 Order(sym, market, "BUY", qty, price),
                 reason="[entry:zone] 존 진입",
                 store=self.store, armed_id=armed["id"],
-                plan_fn=lambda p, h, params: (zone["invalidation"], zone.get("target")))
+                plan_fn=lambda p, h, params: combine_stop_target(
+                    p, h, params, zone.get("invalidation"), zone.get("target"))[:2])
             if not res:
                 why = res.reject_reason or getattr(self.broker, "last_reject_reason", None) or "gate_rejected"
                 self.store.log_event("error", sym, {"where": "entry", "reason": why})

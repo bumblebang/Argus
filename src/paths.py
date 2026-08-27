@@ -24,6 +24,7 @@ CANONICAL: dict[str, str] = {
     "bridge_response": "data/llm_inbox/response.json",
     "watch_hb": "data/watch.heartbeat",
     "watch_pid": "data/watch.pid",
+    "watch_lock": "data/watch.pid.lock",
     "halt": "data/HALT",
     "wake_request": "data/brain_wake_request.json",
     "paper": "data/paper_account.json",
@@ -42,6 +43,7 @@ LAYOUT: dict[str, str] = {
     "bridge_response": "data/inbox/response.json",
     "watch_hb": "data/state/watch.heartbeat",
     "watch_pid": "data/state/watch.pid",
+    "watch_lock": "data/state/watch.pid.lock",
     "halt": "data/state/HALT",
     "wake_request": "data/state/brain_wake_request.json",
     "paper": "data/state/paper_account.json",
@@ -50,6 +52,14 @@ LAYOUT: dict[str, str] = {
     "brain_mode": "data/state/brain_mode.json",
     "bridge_script": "scripts/bridge_tick.py",
 }
+
+# 존재우선 dual-search 를 하지 않고 항상 LAYOUT 을 쓰는 키.
+#
+# 상호배제 락은 "어떤 파일이 존재하느냐"에 따라 대상이 바뀌면 안 된다. 존재우선
+# 규칙 아래서는 컷오버 도중 A 프로세스가 data/watch.pid.lock 을, B 가
+# data/state/watch.pid.lock 을 잡아 **둘 다 기동**할 수 있다 — 락의 목적이
+# 정확히 그것을 막는 건데. 이동도 하지 않는다(Windows 는 잠긴 파일 move 실패).
+FIXED_LAYOUT_KEYS: frozenset[str] = frozenset({"watch_lock"})
 
 # 컷오버 시 디렉터리/파일 이동 계획 (src → dst). inbox 는 특수(junction).
 MIGRATE_MOVES: list[tuple[str, str]] = [
@@ -131,6 +141,7 @@ def resolve(key: str, *, root: Path | None = None,
 
     존재 우선: LAYOUT → configured → LEGACY (단, 빈 파일은 건너뜀).
     쓸 만한 후보가 없으면 LAYOUT(컷오버 후 쓰기 기본).
+    FIXED_LAYOUT_KEYS(락 등)는 존재우선을 건너뛰고 항상 LAYOUT.
 
     configured 가 repo 밖·다른 상대경로면(테스트 tmp 등) dual-search 없이 그대로.
     ROOT/'data'/'bot.db' 처럼 절대 Path 여도 레거시/LAYOUT 이면 dual-search.
@@ -140,6 +151,9 @@ def resolve(key: str, *, root: Path | None = None,
     base = ROOT if root is None else Path(root)
     legacy_rel = rel(key)
     new_rel = layout_rel(key)
+
+    if key in FIXED_LAYOUT_KEYS:
+        return (base / new_rel).resolve()
 
     configured_path: Path | None = None
     dual = True

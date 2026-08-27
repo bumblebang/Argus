@@ -149,11 +149,19 @@ def test_brainworker_quota_opens_circuit(tmp_path):
 def test_brainworker_bridge_success_sets_mode(tmp_path):
     mode_path = tmp_path / "brain_mode.json"
     store = Store(tmp_path / "t.db")
-    bw = BrainWorker(lambda: "ok", store=store, mode_path=mode_path,
-                     source_fn=lambda: "bridge")
+    bw = BrainWorker(
+        lambda: "ok", store=store, mode_path=mode_path,
+        source_fn=lambda: "bridge",
+        quota_info_fn=lambda: {
+            "kind": "weekly", "reset_at": 2_100_000.0,
+            "error": "weekly limit resets 6pm",
+        })
     bw.wake()
     assert bw.run_pending() is True
-    assert bm.load_mode(mode_path)["mode"] == "bridge"
+    st = bm.load_mode(mode_path)
+    assert st["mode"] == "bridge"
+    assert st.get("quota_kind") == "weekly"
+    assert st.get("reset_at") == 2_100_000.0
 
 
 def test_brainworker_bridge_fail_threshold_opens(tmp_path):

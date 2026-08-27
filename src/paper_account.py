@@ -51,6 +51,9 @@ class PaperAccount:
         self.realized_pnl: dict[str, float] = {}          # 누적(리포팅용)
         self.realized_pnl_today: dict[str, float] = {}    # 오늘 실현손익(일 손실 한도용)
         self._pnl_day: dict[str, str] = {}                # 시장별 '오늘'(시장 타임존 날짜)
+        # 당일 시가(SoD) equity — 일손실·DD 분모. 장중 재스냅 금지(영속).
+        self._sod_day: dict[str, str] = {}
+        self._sod_equity: dict[str, float] = {}
         self.marks: dict[str, float] = {}   # 실시간 평가가(감시 루프가 갱신, 비영속)
         self.journal: list[Fill] = []
         self._load()
@@ -73,10 +76,58 @@ class PaperAccount:
         return self.realized_pnl_today.get(market, 0.0)
 
     def set_marks(self, price_of: dict[str, float]) -> None:
-        """실시간 평가가 갱신(감시 루프가 매 틱 호출). 미실현 손익 산출 재료."""
+        """실시간 평가가 갱신(감시 루프가 매 틱 호출). 미실현 손익 산출 재료.
+
+        마크 반영 후 시장별 SoD equity 를 조기 스냅 — 당일 첫 BUY 전에 분모가
+        현금만으로 굳지 않게 한다(이미 오늘 값이 있으면 no-op).
+        """
         for sym, px in (price_of or {}).items():
             if px and px > 0:
                 self.marks[sym] = float(px)
+        markets = set(self.cash) | {m for m in self.symbol_market.values() if m}
+        for m in markets:
+            self.ensure_sod_equity(m)
+
+    def ensure_sod_equity(self, market: str) -> float:
+        """당일 시가 equity. 날짜가 바뀌면 현재 equity(>0)로 한 번만 스냅·영속."""
+        day = market_day(market)
+        if self._sod_day.get(market) == day:
+            return float(self._sod_equity.get(market, 0.0) or 0.0)
+        marks = self.marks if self.marks else None
+        try:
+            eq = float(self.equity(market, marks))
+        except Exception:
+            return 0.0
+        if eq <= 0:
+            return 0.0
+        self._sod_day[market] = day
+        self._sod_equity[market] = eq
+        self._save()
+        return eq
+
+    def loss_budget_base(self, market: str) -> float:
+        """손실예산 분모(SoD). 아직 스냅 전이면 ensure 로 찍거나 0."""
+        return self.ensure_sod_equity(market)
+
+    def sod_equity_delta(self, market: str) -> float | None:
+        """당일 시가 equity 대비 현재 equity 변화. 스냅 전이면 None.
+
+        realized_pnl 은 봇이 apply_fill 을 본 체결만 센다. 폴링 밖에서 체결된 매도
+        (재대사가 holdings 로 흡수)는 realized 를 우회하므로, 실제로 그날 얼마를
+        잃었는지는 이 델타가 더 정확하다 — cash/positions 는 재대사가 실계좌
+        값으로 덮으니까.
+
+        한계: 입출금도 델타에 섞인다. 출금은 손실처럼, 입금은 이익처럼 보인다.
+        이 값은 신규 매수 차단에만 쓰이므로 오탐은 보수(더 막음) 방향이다.
+        """
+        base = self.ensure_sod_equity(market)
+        if base <= 0:
+            return None
+        try:
+            eq = float(self.equity(market, self.marks if self.marks else None))
+        except Exception:
+            return None
+        return eq - base
 
     def unrealized_pnl(self, market: str) -> float:
         """보유분 미실현 손익(마크 기준). 마크 없는 종목은 0으로 본다(보수 아님·결정적)."""
@@ -161,6 +212,35 @@ class PaperAccount:
         self._save()
         return f
 
+    def record_exit_attribution(self, symbol: str, market: str, qty: float,
+                                exec_price: float, avg_price: float,
+                                fee: float = 0.0, reason: str = "") -> Fill | None:
+        """매도 실현손익·저널만 기입 — 현금/보유수량은 건드리지 않는다.
+
+        재대사가 실계좌 holdings/buying-power 로 cash·positions 를 덮은 **뒤** 호출된다.
+        수량과 현금은 이미 실계좌 값이므로 apply_fill 을 쓰면 이중 계상이다. 빠진
+        것은 그 매도의 손익 귀속뿐이다 — realized_pnl(누적·당일)과 저널.
+
+        avg_price 는 재대사 전 평균단가(덮이기 전 값)를 호출측이 넘긴다.
+        """
+        qty, exec_price = float(qty), float(exec_price)
+        if qty <= 0 or exec_price <= 0 or float(avg_price) <= 0:
+            return None
+        fee = float(fee or 0.0)
+        pnl = (exec_price - float(avg_price)) * qty - fee
+        self.realized_pnl[market] = self.realized_pnl.get(market, 0.0) + pnl
+        day = market_day(market)
+        if self._pnl_day.get(market) != day:
+            self._pnl_day[market] = day
+            self.realized_pnl_today[market] = 0.0
+        self.realized_pnl_today[market] = self.realized_pnl_today.get(market, 0.0) + pnl
+        f = Fill(ts=datetime.now(timezone.utc).isoformat(), symbol=symbol,
+                 market=market, side="SELL", qty=qty, price=exec_price, fee=fee,
+                 reason=reason or "reconcile_attribution")
+        self.journal.append(f)
+        self._save()
+        return f
+
     # ── 영속화 ───────────────────────────────────────────
     def _load(self) -> None:
         """저장된 원장 복원. 깨진 파일에 죽지 않는다.
@@ -192,6 +272,14 @@ class PaperAccount:
         self.realized_pnl = data.get("realized_pnl", {})
         self.realized_pnl_today = data.get("realized_pnl_today", {})
         self._pnl_day = data.get("pnl_day", {})
+        self._sod_day = {str(k): str(v) for k, v in (data.get("sod_day") or {}).items()}
+        raw_sod = data.get("sod_equity") or {}
+        self._sod_equity = {}
+        for k, v in raw_sod.items():
+            try:
+                self._sod_equity[str(k)] = float(v)
+            except (TypeError, ValueError):
+                continue
         self.symbol_market = data.get("symbol_market", {})
         for sym, p in data.get("positions", {}).items():
             self.positions[sym] = Position(symbol=sym, qty=p["qty"], avg_price=p["avg_price"])
@@ -205,6 +293,8 @@ class PaperAccount:
             "realized_pnl": self.realized_pnl,
             "realized_pnl_today": self.realized_pnl_today,
             "pnl_day": self._pnl_day,
+            "sod_day": dict(self._sod_day),
+            "sod_equity": dict(self._sod_equity),
             "symbol_market": self.symbol_market,
             "positions": {s: {"qty": p.qty, "avg_price": p.avg_price}
                           for s, p in self.positions.items() if p.is_open},

@@ -36,7 +36,12 @@ def _price(c: dict) -> float | None:
 
 def eligible_candidates(context: dict, *, require_dossier: bool = True
                         ) -> list[dict]:
-    """아카이브 스칼라로 재현 가능한 코드 게이트만 적용."""
+    """아카이브 스칼라로 재현 가능한 코드 게이트만 적용.
+
+    라이브 `_has_bullish_dossier` 와 같이 stance=='bullish' 만 통과시킨다.
+    도시레가 있기만 하면 넣으면 라이브가 안 사는 중립/약세 종목을 널이 집어
+    delta_vs_gated 가 스킬처럼 보인다.
+    """
     out: list[dict] = []
     constraints = context.get("constraints") or {}
     for c in context.get("candidates") or context.get("universe") or []:
@@ -46,8 +51,9 @@ def eligible_candidates(context: dict, *, require_dossier: bool = True
         if not sym:
             continue
         d = _dossier(c)
-        if require_dossier and not d:
-            continue
+        if require_dossier:
+            if not d or (d.get("stance") or "").lower() != "bullish":
+                continue
         px = _price(c)
         lo, hi = d.get("entry_low"), d.get("entry_high")
         inv = d.get("invalidation")

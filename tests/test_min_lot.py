@@ -13,11 +13,21 @@ from src.risk_gate import RiskGate
 
 def test_size_buy_min_qty_bumps_high_price():
     risk = RiskManager(capital={"KR": 1_000_000}, max_position_pct=0.2)
-    # 목표비중 12% → 12만 / 35.7만 = floor 0
+    # 목표비중 12% → 12만 / 35.7만 = floor 0. 부활은 min_lot_adjust 가 비중을
+    # 1주분(≥0.357)으로 올려 준 뒤에만 — 예산 밖 1주는 되살리지 않는다.
     assert risk.size_buy("KR", 357_000, 0.12) == 0
-    assert risk.size_buy("KR", 357_000, 0.12, min_qty=1) == 1
+    assert risk.size_buy("KR", 357_000, 0.12, min_qty=1) == 0
+    assert risk.size_buy("KR", 357_000, 0.36, min_qty=1) == 1
     # 자본보다 비싸면 올리지 않음
     assert risk.size_buy("KR", 2_000_000, 0.12, min_qty=1) == 0
+
+
+def test_size_buy_min_qty_respects_notional_cap():
+    """J4: 종목 잔여 한도(headroom)가 0 이면 1주도 되살리지 않는다."""
+    risk = RiskManager(capital={"KR": 1_000_000}, max_position_pct=0.2)
+    assert risk.size_buy("KR", 357_000, 0.36, min_qty=1, notional_cap=0.0) == 0
+    assert risk.size_buy("KR", 357_000, 0.36, min_qty=1, notional_cap=300_000) == 0
+    assert risk.size_buy("KR", 357_000, 0.36, min_qty=1, notional_cap=400_000) == 1
 
 
 def _responder(decision):
@@ -32,8 +42,8 @@ def _responder(decision):
     return r
 
 
-def test_cycle_min_lot_fills_one_share_of_expensive_name(tmp_path):
-    """확신도 OK + 고단가 → 목표비중 상향 + qty=1 체결(allow_min_lot)."""
+def _min_lot_cycle(tmp_path, *, hard_cap: float, gate_over: dict | None = None):
+    """고단가 1주 시범매수 사이클 1회. 종목상한(hard_cap)만 바꿔 통과/거부를 본다."""
     decision = DecisionOutput(market_view="밸류", proposals=[Proposal(
         symbol="004370", market="KR", side="BUY", conviction=0.62,
         horizon="position", target_weight=0.15, thesis="저평가 시범",
@@ -41,23 +51,47 @@ def test_cycle_min_lot_fills_one_share_of_expensive_name(tmp_path):
     llm = MockLLM(_responder(decision))
     acct = PaperAccount(cash={"KR": 1_000_000}, fee_rate={"KR": 0.0},
                         slippage_bps={"KR": 0.0}, state_path=tmp_path / "a.json")
-    gate = RiskGate({"capital": {"KR": 1_000_000}, "max_position_pct": 0.2,
-                     "max_positions": 5, "daily_loss_limit_pct": 0.05,
-                     "max_order_notional": {"KR": 200_000},
-                     "allow_min_lot": True,
-                     "kill_switch_file": str(tmp_path / "HALT")})
-    broker = Broker(account=acct, gate=gate, client=None, mode="paper")
-    risk = RiskManager(capital={"KR": 1_000_000}, max_position_pct=0.2)
+    limits = {"capital": {"KR": 1_000_000}, "max_position_pct": hard_cap,
+              "max_positions": 5, "daily_loss_limit_pct": 0.05,
+              "max_order_notional": {"KR": 200_000},
+              "allow_min_lot": True,
+              "kill_switch_file": str(tmp_path / "HALT")}
+    limits.update(gate_over or {})
+    broker = Broker(account=acct, gate=RiskGate(limits), client=None, mode="paper")
+    # 목표비중 5% (5만) 로는 35.7만짜리 1주가 안 나온다 — min_lot 부활 경로
+    risk = RiskManager(capital={"KR": 1_000_000}, max_position_pct=hard_cap,
+                       base_position_pct=0.05)
     res = run_cycle(
         context_json="{}", decision_agent=DecisionAgent(llm),
         validation_agent=ValidationAgent(llm, min_conviction=0.6),
         broker=broker, risk=risk, price_lookup={"004370": 357_000},
         journal_path=tmp_path / "d.jsonl",
         conviction_sizing=True, min_lot_conviction=0.6)
+    return res, broker, decision
+
+
+def test_cycle_min_lot_fills_one_share_of_expensive_name(tmp_path):
+    """확신도 OK + 고단가 → 목표비중 상향 + qty=1 체결(주문상한만 면제)."""
+    res, broker, decision = _min_lot_cycle(tmp_path, hard_cap=0.5)
     assert res.executed[0]["status"] == "filled"
     assert broker.account.position("004370").qty == 1
     # 목표비중이 1주분(≥0.357)으로 올라갔는지
     assert decision.proposals[0].target_weight >= 0.357
+
+
+def test_cycle_min_lot_rejected_when_over_position_pct(tmp_path):
+    """J4: 1주가 종목 상한을 넘으면 시범매수도 거부된다."""
+    res, broker, _ = _min_lot_cycle(tmp_path, hard_cap=0.2)
+    assert res.executed[0]["status"] == "gate_rejected"
+    assert broker.account.position("004370").qty == 0
+
+
+def test_cycle_min_lot_rejected_over_absolute_cap(tmp_path):
+    """시범매수 절대 상한을 넘으면 거부."""
+    res, broker, _ = _min_lot_cycle(
+        tmp_path, hard_cap=0.5, gate_over={"min_lot_max_notional": 300_000})
+    assert res.executed[0]["status"] == "gate_rejected"
+    assert "시범매수" in res.executed[0]["reason"]
 
 
 def test_cycle_min_lot_skipped_when_conviction_low(tmp_path):

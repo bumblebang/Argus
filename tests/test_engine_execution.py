@@ -219,7 +219,7 @@ def test_inflight_rejects_duplicate_live_order(tmp_path):
                          order_detail=_filled(1, 70000, "FILLED"))
     broker = _broker(tmp_path, mode="live", client=client, store=store)
     with broker._lock:
-        broker._inflight.add("005930")
+        broker._mark_inflight(Order("005930", "KR", "BUY", 1, 70000.0))
     res = broker.execute(Order("005930", "KR", "BUY", 1, 70000.0), "dup")
     assert not res.ok and "in-flight" in (res.reject_reason or "")
     assert client.calls == []  # prep/place 까지 가지 않음
@@ -273,7 +273,7 @@ def test_inflight_blocks_concurrent_live_order(tmp_path):
 def test_reconcile_deferred_while_inflight(tmp_path):
     """in-flight 중 periodic reconcile apply 는 연기."""
     broker = _broker(tmp_path, mode="live")
-    broker._inflight.add("005930")
+    broker._mark_inflight(Order("005930", "KR", "BUY", 1, 70000.0))
     applied = {"called": False}
 
     def _apply(acct):
@@ -282,8 +282,36 @@ def test_reconcile_deferred_while_inflight(tmp_path):
 
     res = broker.reconcile(_apply)
     assert res.get("deferred") is True
+    assert res.get("reason") == "inflight"
     assert "005930" in res.get("inflight", [])
     assert applied["called"] is False
+
+
+def test_reconcile_deferred_on_stale_snapshot_gen(tmp_path):
+    """API 조회 중 주문이 시작·끝나면 inflight 가 비어도 stale snapshot apply 연기."""
+    broker = _broker(tmp_path, mode="live")
+    gen = broker.activity_generation()
+    with broker._lock:
+        broker._mark_inflight(Order("005930", "KR", "BUY", 1, 70000.0))
+        broker._clear_inflight("005930")
+    assert broker.activity_generation() == gen + 2
+    assert not broker._inflight
+
+    applied = {"called": False}
+
+    def _apply(acct):
+        applied["called"] = True
+        return {"ok": True}
+
+    res = broker.reconcile(_apply, expect_gen=gen)
+    assert res.get("deferred") is True
+    assert res.get("reason") == "stale_snapshot"
+    assert applied["called"] is False
+
+    # gen 이 맞으면 apply 진행
+    res2 = broker.reconcile(_apply, expect_gen=broker.activity_generation())
+    assert res2 == {"ok": True}
+    assert applied["called"] is True
 
 
 def test_finish_live_skips_double_apply_after_reconcile(tmp_path):
@@ -308,7 +336,7 @@ def test_paper_inflight_rejects_duplicate(tmp_path):
     """페이퍼: in-flight 중이면 두 번째 주문 거부."""
     broker = _broker(tmp_path, mode="paper")
     with broker._lock:
-        broker._inflight.add("005930")
+        broker._mark_inflight(Order("005930", "KR", "BUY", 1, 70000.0))
     res = broker.execute(Order("005930", "KR", "BUY", 1, 70000.0), "dup")
     assert not res.ok and "in-flight" in (res.reject_reason or "")
 
@@ -329,6 +357,6 @@ def test_paper_begin_registers_inflight_before_finish(tmp_path):
     res = broker.execute(Order("005930", "KR", "BUY", 1, 70000.0), "first", store=store)
     assert res.ok and seen.get("inflight") is True
     with broker._lock:
-        broker._inflight.add("005930")
+        broker._mark_inflight(Order("005930", "KR", "BUY", 1, 70000.0))
     dup = broker.execute(Order("005930", "KR", "BUY", 1, 70000.0), "dup")
     assert not dup.ok and "in-flight" in (dup.reject_reason or "")

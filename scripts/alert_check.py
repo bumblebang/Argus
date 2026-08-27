@@ -8,7 +8,10 @@
        bridge        -> 클코 한도, Cursor 브릿지 운용
        circuit_open  -> 뇌 회로차단(브릿지 미준비/실패)
        auth_needed   -> 인증 만료(재로그인 필요)
+  B2. bridge 모드 + bridge.heartbeat 미무장     -> circuit 위험(조기 경보)
   C. (레거시 폴백) DB 최근 인증 에러 — mode 파일 없을 때
+
+푸시/대시보드 '다음:' 액션은 src.ops_playbook.
 
 제거된 플리핑 경보(2026-08):
   - 최근 20분 brain 에러 N건
@@ -41,8 +44,10 @@ for _s in (sys.stdout, sys.stderr):
     except (AttributeError, ValueError):
         pass
 
+from src.agents.llm import is_bridge_armed  # noqa: E402
 from src.engine import brain_mode as bm  # noqa: E402
 from src.market_hours import is_open  # noqa: E402
+from src.ops_playbook import actions_for, format_push_body  # noqa: E402
 from src import paths as _paths  # noqa: E402
 
 DB = _paths.resolve("db", configured="data/bot.db")
@@ -70,16 +75,22 @@ def _fmt_reset(reset_at: float | None) -> str:
 
 
 def mode_reasons(brain_mode: str, *, reset_at: float | None = None,
-                 reason: str = "") -> list[str]:
+                 reason: str = "",
+                 quota_kind: str | None = None) -> list[str]:
     """뇌 모드 → 경보 문구. ok 면 빈 리스트."""
+    from src.ops_budget import KIND_LABEL, format_countdown, format_reset_clock
     mode = brain_mode or "ok"
     if mode == "ok":
         return []
+    kind_l = KIND_LABEL.get(quota_kind or "", "")
+    kind_bit = f"{kind_l} · " if kind_l else ""
+    cd = format_countdown(reset_at)
+    clock = format_reset_clock(reset_at)
     if mode == "bridge":
-        return [f"클코 한도 — Cursor 브릿지 운용 중 (리셋 {_fmt_reset(reset_at)})"]
+        return [f"클코 {kind_bit}Cursor 브릿지 운용 중 (리셋까지 {cd}, {clock})"]
     if mode == "circuit_open":
         detail = reason or "브릿지 미준비/실패"
-        return [f"뇌 회로차단 — {detail}, 리셋 {_fmt_reset(reset_at)}까지 정지"]
+        return [f"뇌 회로차단 — {kind_bit}{detail}, 리셋까지 {cd} ({clock})"]
     if mode == "auth_needed":
         return ["claude 인증 만료 — 뇌 전면 정지. scripts\\claude_login.bat 로 재로그인 필요"]
     return [f"뇌 모드 이상: {mode}"]
@@ -89,11 +100,14 @@ def evaluate(now: float, hb_age: float | None, market_open: bool = True,
              brain_errors_recent: int = 0, last_brain_done_age: float | None = None,
              auth_expired: bool = False, *,
              brain_mode: str = "ok", reset_at: float | None = None,
-             mode_reason: str = "") -> list[str]:
+             mode_reason: str = "",
+             bridge_armed: bool | None = None,
+             quota_kind: str | None = None) -> list[str]:
     """순수 판정 — 경보 사유 리스트(빈 리스트=정상).
 
     brain_errors_recent / last_brain_done_age 는 하위호환으로 받지만 **무시**한다
     (슬라이딩 창 플리핑 제거). market_open 도 뇌 모드 경보를 막지 않는다.
+    bridge_armed=False 이고 mode=bridge 이면 미무장 조기 경보.
     """
     del brain_errors_recent, last_brain_done_age, market_open  # 명시적 미사용
     reasons: list[str] = []
@@ -105,8 +119,27 @@ def evaluate(now: float, hb_age: float | None, market_open: bool = True,
     mode = brain_mode or "ok"
     if auth_expired and mode == "ok":
         mode = "auth_needed"
-    reasons.extend(mode_reasons(mode, reset_at=reset_at, reason=mode_reason))
+    reasons.extend(mode_reasons(mode, reset_at=reset_at, reason=mode_reason,
+                                quota_kind=quota_kind))
+    if mode == "bridge" and bridge_armed is False:
+        reasons.append(
+            "브릿지 모드인데 미무장 — bridge.heartbeat 만료/없음 → circuit 위험")
     return reasons
+
+
+def _bridge_inbox_and_max_age() -> tuple[Path, float]:
+    """config agents.cursor_bridge → inbox · armed_max_age_sec."""
+    max_age = 90.0
+    configured = "data/llm_inbox"
+    try:
+        from src.config import load_config
+        cb = (load_config().raw.get("agents") or {}).get("cursor_bridge") or {}
+        max_age = float(cb.get("armed_max_age_sec", 90) or 90)
+        configured = str(cb.get("inbox_dir") or configured)
+    except Exception:
+        pass
+    inbox = _paths.resolve("inbox", configured=configured)
+    return Path(inbox), max_age
 
 
 def _read_heartbeat_age(now: float) -> float | None:
@@ -251,13 +284,28 @@ def main() -> int:
     mode = str(mode_state.get("mode") or "ok")
     reset_at = mode_state.get("reset_at")
     auth_expired = (mode == "auth_needed") or _auth_expired_recent(now)
+    inbox, max_age = _bridge_inbox_and_max_age()
+    armed = is_bridge_armed(inbox, max_age_sec=max_age, now=now)
+    from src.ops_budget import budget_gauge, format_budget_push_line
+    cfg_raw = None
+    try:
+        from src.config import load_config
+        cfg_raw = load_config().raw
+    except Exception:
+        cfg_raw = None
+    gauge = budget_gauge(mode_state, now=now, cfg=cfg_raw)
+    qk = gauge.get("quota_kind") or mode_state.get("quota_kind")
     reasons = evaluate(
         now, hb_age, market_open,
         auth_expired=auth_expired,
         brain_mode=mode,
         reset_at=reset_at if isinstance(reset_at, (int, float)) else None,
         mode_reason=str(mode_state.get("reason") or ""),
+        bridge_armed=armed,
+        quota_kind=qk if isinstance(qk, str) else None,
     )
+    next_actions = actions_for(reasons, brain_mode=mode)
+    budget_line = format_budget_push_line(gauge)
 
     prev = _load_prev()
     was_active = bool(prev.get("active"))
@@ -270,13 +318,22 @@ def main() -> int:
             "active": True, "since": since, "reasons": reasons, "ts": now,
             "brain_mode": mode, "reset_at": reset_at,
             "market_open": market_open,
+            "bridge_armed": armed,
+            "actions": next_actions,
+            "budget": gauge,
         }
         ALERT.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
         should_fire = (not was_active) or (prev_mode != mode) or (prev_reasons != reasons)
         if should_fire:
-            _log("FIRED", reasons, brain_mode=mode)
-            _push(_push_title_for(reasons, mode), " | ".join(reasons))
+            _log("FIRED", reasons, brain_mode=mode, actions=next_actions,
+                 budget=gauge)
+            _push(_push_title_for(reasons, mode),
+                  format_push_body(reasons, next_actions, budget_line=budget_line))
         print("[alert] ACTIVE:", " | ".join(reasons))
+        if gauge.get("line"):
+            print("[alert] 예산:", gauge["line"])
+        if next_actions:
+            print("[alert] 다음:", " / ".join(next_actions))
         if not _ntfy_topic():
             print("[alert] ⚠ 푸시 통로 없음(NTFY_TOPIC 미설정) — 이 경보는 무음입니다. "
                   ".env 에 NTFY_TOPIC=<임의문자열> 를 넣고 폰 ntfy 앱에서 같은 토픽을 구독하세요.")
@@ -284,12 +341,16 @@ def main() -> int:
         ALERT.write_text(json.dumps({
             "active": False, "ts": now, "brain_mode": mode,
             "market_open": market_open,
+            "bridge_armed": armed,
+            "budget": gauge,
         }, ensure_ascii=False), encoding="utf-8")
         if was_active:
             _log("CLEARED", [], brain_mode=mode)
             # 진짜 복구만 — 휴장으로 꺼진 것처럼 보이게 하지 않음(모드 ok 일 때만 여기 옴)
             _push("Argus brain OK", "뇌 정상 재개")
         print("[alert] ok" + (" (휴장)" if not market_open else ""))
+        if gauge.get("line"):
+            print("[alert] 예산:", gauge["line"])
 
     _push_live_orders(now)
     return 0
