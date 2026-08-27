@@ -7,7 +7,7 @@
     EDGAR/DART 재무는 티커당 다콜인데 일중 거의 안 바뀐다. KRX 확장은 쿼터 민감.
   - 따라서 전량 느린 재빌드는 하지 않는다. 장중 신선도는 기존 빠른 슬라이스
     (regime/sentiment/markets/flows_market) + 배치 2회/일에 맡긴다.
-  - focus(이벤트) shortlist(보유∪wake, 상한~십수)에만 FlowsSource(+옵션 종목뉴스)
+  - focus(이벤트) shortlist(보유∪wake, 상한~십수)에만 FlowsSource(+옵션 종목뉴스 KR·US)
     온디맨드 — 콜 ≈ shortlist 크기, 토스 Gateway 미사용, market_state 파일 미오염.
 
 토큰:
@@ -324,15 +324,46 @@ def fetch_ondemand_flows(symbols: list[str], *, dry: bool = False) -> dict[str, 
     return {str(k): v for k, v in flows.items() if isinstance(v, dict)}
 
 
-def fetch_ondemand_news(symbols: list[str], *, per: int = 3) -> dict[str, list]:
-    """KR 종목 네이버 헤드라인. 실패 시 해당 심볼 생략."""
+def fetch_ondemand_news(
+    symbols: list[str],
+    *,
+    per: int = 3,
+    finnhub_key: str | None = None,
+    spacing_sec: float = 1.1,
+) -> dict[str, list]:
+    """종목 헤드라인 온디맨드. KR=네이버, US=Finnhub company-news. 실패 심볼 생략.
+
+    finnhub_key 가 None 이면 FINNHUB_API_KEY 환경변수. 키 없으면 US 는 스킵.
+    spacing_sec 는 US 연속 콜 pacing(무료 60콜/분).
+    """
+    import os
+    import time
+
+    from ..datasources.finnhub import fetch_company_news
     from ..datasources.news import fetch_kr_stock_news
+
+    key = (finnhub_key if finnhub_key is not None
+           else (os.getenv("FINNHUB_API_KEY") or "").strip())
     out: dict[str, list] = {}
+    us: list[str] = []
     for s in symbols:
-        if not (s and str(s).isdigit() and len(str(s)) == 6):
+        if not s:
             continue
-        rows = fetch_kr_stock_news(s, per=per)
+        sym = str(s)
+        if sym.isdigit() and len(sym) == 6:
+            rows = fetch_kr_stock_news(sym, per=per)
+            if rows:
+                out[sym] = [{"source": r.get("source"), "title": r.get("title"),
+                             "symbol": sym} for r in rows]
+        else:
+            us.append(sym)
+    if not key:
+        return out
+    for i, sym in enumerate(us):
+        rows = fetch_company_news(key, sym, per=per)
         if rows:
-            out[s] = [{"source": r.get("source"), "title": r.get("title"),
-                        "symbol": s} for r in rows]
+            out[sym] = [{"source": r.get("source"), "title": r.get("title"),
+                         "symbol": sym, "date": r.get("date")} for r in rows]
+        if spacing_sec and i < len(us) - 1:
+            time.sleep(spacing_sec)
     return out

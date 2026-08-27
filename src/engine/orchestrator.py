@@ -5,7 +5,7 @@ CLI 파싱은 scripts/watch.py (또는 argus watch). 여기는 run_from_args(arg
 WakeBus (문서화): 여러 생산자가 brain.wake(reason) 로 합류한다.
   - WatchLoop 트리거/주기/extra_wakes
   - Athena → brain_wake_request.json
-  - disclosure / earnings watchers
+  - disclosure / earnings / edgar watchers
   - movers (universe refresher)
   - value timer (별도 ValueWorker)
 BrainWorker 가 coalesce + cooldown 으로 소비. 스테이지 DAG 가 아니라 버스.
@@ -30,7 +30,7 @@ if str(_SCRIPTS) not in sys.path:
 # 골든/문서용 — forever 모드에서 기동될 수 있는 워커·타이머 이름 (옵션에 따라 None).
 RUNTIME_WORKER_KEYS = (
     "brain", "value_worker", "value_timer", "dashboard",
-    "disclosure_watcher", "earnings_watcher", "slice_refresher",
+    "disclosure_watcher", "earnings_watcher", "edgar_watcher", "slice_refresher",
     "universe_refresher", "session_refresher", "account_refresher",
     "reconcile_timer", "watch_loop",
 )
@@ -45,6 +45,7 @@ from src.engine.store import Store
 from src.engine.disclosure import DisclosureWatcher, start_watcher_thread
 from src.engine.earnings_watch import (EarningsResultWatcher,
                                        start_earnings_watcher_thread)
+from src.engine.edgar_watch import EdgarWatcher, start_edgar_watcher_thread
 from src.engine.slice_refresher import SliceRefresher, start_slice_refresher_thread
 from src.engine.universe_refresher import (UniverseRefresher,
                                           start_universe_refresher_thread)
@@ -53,6 +54,7 @@ from src.market_hours import is_open, is_tradable, calendar_covers
 from src.live_slice import build_fast_slice, apply_fast_slice
 from src.datasources.dart import fetch_recent_disclosures, fetch_earnings_actuals
 from src.datasources.earnings import dday_of, fetch_us_results
+from src.datasources.edgar import fetch_recent_filings
 from src.datasources.market_calendar import refresh_sessions
 from src.datasources.account_snapshot import fetch_account_snapshot, save_snapshot
 from src.datasources.stock_info import (check_tradable, is_sell_tax_exempt,
@@ -537,6 +539,50 @@ def _build_earnings_watcher(cfg, store, brain,
         calendar_fn=read_cal)
 
 
+def _build_edgar_watcher(cfg, store, brain,
+                         universe_fn=None) -> EdgarWatcher | None:
+    """EDGAR 중대 필링 워처. config 로 끄면 None. User-Agent 없으면 비활성.
+
+    대상 = US 유니버스 ∪ 보유/armed US. submissions 폴당 N콜이라 주기는 DART보다 완화.
+    """
+    wcfg = cfg.raw.get("watcher", {})
+    if not wcfg.get("enabled", True) or not wcfg.get("edgar", True):
+        return None
+    ua = (cfg.raw.get("market_state") or {}).get(
+        "sec_user_agent") or "argus example@example.com"
+
+    def universe_us() -> set:
+        uni = universe_fn() if universe_fn else (cfg.universe or {})
+        return {it.get("symbol") for it in (uni or {}).get("US", [])
+                if it.get("symbol")}
+
+    def held_armed_us() -> set:
+        try:
+            out = {r["symbol"] for r in store.get_open_positions()
+                   if (r["market"] or "").upper() == "US"}
+            out |= {r["symbol"] for r in store.get_armed()
+                    if (r["market"] or "").upper() == "US"}
+            return out
+        except Exception as e:
+            log.warning("보유 US 종목 조회 실패(무시): %s", e)
+            return set()
+
+    def fetch() -> list:
+        symbols = sorted(universe_us() | held_armed_us())
+        if not symbols:
+            return []
+        return fetch_recent_filings(
+            symbols, ua, cache_dir=ROOT / "data",
+            spacing_sec=float(wcfg.get("edgar_spacing_sec", 0.15)))
+
+    return EdgarWatcher(
+        store, fetch, universe_us, on_wake=(brain.wake if brain else None),
+        poll_active_sec=float(wcfg.get("edgar_poll_sec_active", 120)),
+        poll_idle_sec=float(wcfg.get("edgar_poll_sec_idle", 900)),
+        after_close_hours=float(wcfg.get("edgar_after_close_hours",
+                                         wcfg.get("active_after_close_hours", 2))))
+
+
 def run_from_args(args) -> int:
     # args: Namespace from CLI (scripts/watch.py)
     # 데몬은 무콘솔(pythonw)로 돌므로 전용 파일에 로깅(logs/watch.log).
@@ -692,6 +738,14 @@ def run_from_args(args) -> int:
         _et, earn_watcher_stop = start_earnings_watcher_thread(earn_watcher)
         log.info("실적 결과 워처 기동 — 임박 %.0fs / 평시 %.0fs",
                  earn_watcher.poll_sec, earn_watcher.idle_poll_sec)
+    # EDGAR 필링 워처: US 8-K/6-K → disclosure 3단 라우팅(보유 각성 / 유니버스 큐).
+    edgar_watcher_stop = None
+    edgar_watcher = _build_edgar_watcher(cfg, store, brain,
+                                         universe_fn=provider.markets)
+    if edgar_watcher:
+        _eg, edgar_watcher_stop = start_edgar_watcher_thread(edgar_watcher)
+        log.info("EDGAR 워처 기동 — US 장중 %.0fs / 장외 %.0fs",
+                 edgar_watcher.poll_active_sec, edgar_watcher.poll_idle_sec)
     # 빠른 슬라이스 갱신기: 별도 데몬 스레드로 장중 5분마다 regime/sentiment/markets 갱신
     # (Yahoo 만, 토스 무접촉). regime_flip 트리거가 장중에 먹게 파일을 신선하게 유지.
     slice_stop = None
@@ -771,6 +825,8 @@ def run_from_args(args) -> int:
             watcher_stop.set()
         if earn_watcher_stop:
             earn_watcher_stop.set()
+        if edgar_watcher_stop:
+            edgar_watcher_stop.set()
         if slice_stop:
             slice_stop.set()
         if uni_stop:

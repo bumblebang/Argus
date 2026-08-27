@@ -178,6 +178,40 @@ def test_fetch_ondemand_flows_dry_no_http():
     assert "AAPL" not in got  # KR 6자리만
 
 
+def test_fetch_ondemand_news_kr_and_us(monkeypatch):
+    """KR=네이버, US=Finnhub. 네트워크 없이 mock."""
+    monkeypatch.setattr(
+        "src.datasources.news.fetch_kr_stock_news",
+        lambda sym, per=3: [{"title": f"kr-{sym}", "source": "naver"}])
+    monkeypatch.setattr(
+        "src.datasources.finnhub.fetch_company_news",
+        lambda key, sym, per=3: [{"title": f"us-{sym}", "source": "Finnhub",
+                                  "date": "2026-01-01"}])
+    got = serve.fetch_ondemand_news(
+        ["005930", "AAPL", "NVDA"], per=2, finnhub_key="K", spacing_sec=0)
+    assert got["005930"][0]["title"] == "kr-005930"
+    assert got["AAPL"][0]["title"] == "us-AAPL"
+    assert got["NVDA"][0]["symbol"] == "NVDA"
+
+
+def test_fetch_ondemand_news_skips_us_without_key(monkeypatch):
+    monkeypatch.delenv("FINNHUB_API_KEY", raising=False)
+    monkeypatch.setattr(
+        "src.datasources.news.fetch_kr_stock_news",
+        lambda sym, per=3: [{"title": "k", "source": "n"}])
+    calls = []
+
+    def boom(*a, **k):
+        calls.append(1)
+        return []
+
+    monkeypatch.setattr("src.datasources.finnhub.fetch_company_news", boom)
+    got = serve.fetch_ondemand_news(
+        ["005930", "AAPL"], finnhub_key="", spacing_sec=0)
+    assert "005930" in got and "AAPL" not in got
+    assert calls == []
+
+
 def test_build_context_focus_compact_and_headline_limit():
     ms = {"news": [{"source": "t", "title": f"n{i}"} for i in range(80)]}
     wide = build_context(ms, [{"symbol": "1"}], {"cash": 0, "positions": []}, {})

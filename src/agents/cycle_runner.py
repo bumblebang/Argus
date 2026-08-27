@@ -190,7 +190,8 @@ class CycleRunner:
                 item = {"symbol": r["symbol"], "report_nm": p.get("report_nm"),
                         "keyword": p.get("keyword"), "route": p.get("route"),
                         "rcept_dt": p.get("rcept_dt")}
-                for k in ("actuals", "consensus", "surprise_pct", "rcept_no"):
+                for k in ("actuals", "consensus", "surprise_pct", "rcept_no",
+                          "market", "form", "items", "accession", "filing_date"):
                     if p.get(k) is not None:
                         item[k] = p[k]
                 out.append(item)

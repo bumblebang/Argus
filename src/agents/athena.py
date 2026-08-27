@@ -45,7 +45,12 @@ ATHENA_SYSTEM = """\
 - past_trades(이 시스템이 이 종목을 거래한 결과)가 있으면 복기하라 — 같은 논리로
   졌던 자리면 무엇이 달라졌는지 명시해야 한다.
 - 증거(evidence)는 서로 독립적인 갈래로: 기술적 구조 / 베이스레이트 / 재무·펀더멘털 /
-  수급 / 뉴스·재료. 갈래가 많이 정렬될수록 conviction 을 높여라. 한 갈래뿐이면 0.5 이하.
+  수급 / 뉴스·재료 / 실적(예정·발표 결과). 갈래가 많이 정렬될수록 conviction 을 높여라.
+  한 갈래뿐이면 0.5 이하.
+- earnings(다음 실적 일정·컨센서스)가 있으면 dday·hour·consensus를 계획에 반영하라.
+  임박만으로 기계적 neutral 하지 말고, 갭 리스크면 진입존을 더 보수적으로 그어라.
+- earnings_results(이미 발표된 서프라이즈)가 있으면 eps/revenue surprise%를 evidence에
+  수치로 인용하라. 상회·하회와 가격 반응을 교차해 stance를 정해라.
 - 확신이 없으면 neutral 이 정답이다. 억지로 계획을 만들지 마라.
 - 주어진 데이터에만 근거하라. 데이터에 없는 사실(실적 전망, 루머 등)을 지어내지 마라.
 
@@ -86,7 +91,9 @@ ATHENA_SYSTEM = """\
   고유의 증거로 말하라.
 - 한국 종목이면 macro_kr(한국은행 기준금리·국고채/CD 금리·물가·고용·심리)이 국내 거시
   배경으로 함께 주어진다 — KR 금리·물가의 정본은 이것이다(미국 지표로 대신하지 마라).
-  금리 민감 업종이라면 evidence 에 수치로 인용하라."""
+  금리 민감 업종이라면 evidence 에 수치로 인용하라.
+- 미국 종목이면 macro(FRED: 기준금리·국채·달러인덱스·실업·CPI 등)가 거시 배경이다.
+  macro_kr 로 US 금리·물가를 대신하지 마라. 금리 민감이면 evidence 에 수치로 인용하라."""
 
 
 # ── 기술적 요약(코드 계산 — LLM 에 원시 캔들 대신 압축 수치를 준다) ──────
@@ -127,13 +134,18 @@ def build_research_context(symbol: str, name: str, market: str, *,
                            market_state: dict | None = None,
                            base_rates: dict | None = None,
                            past_trades: list[dict] | None = None,
-                           focus: dict | None = None) -> dict:
+                           focus: dict | None = None,
+                           earnings: dict | None = None,
+                           earnings_results: list[dict] | None = None) -> dict:
     """종목 1개의 딥리서치 입력 묶음(~수 KB). LLM 이 이걸 보고 도시에를 쓴다.
 
     focus: 주의층 렌즈. None 이면 이 호출에서 build_focus 로 계산한다.
     market_state.json 에는 focus 를 저장하지 않으므로(dday 신선도) 파일에서
     ms['focus'] 를 읽으면 항상 비었다 — 예전 dead wire. 배치(run_batch)는
     창마다 한 번 계산해 넘겨 중복 계산을 피한다.
+
+    earnings / earnings_results: 뇌 cycle_runner 와 같은 실적 슬롯. 없으면 생략.
+    macro(FRED)는 market_state 에서 항상 실어 US 거시 배경을 맞춘다.
     """
     ms = market_state or {}
     br = base_rates if base_rates is not None else (
@@ -143,7 +155,7 @@ def build_research_context(symbol: str, name: str, market: str, *,
     attach_krx_fields([cand], ms)
     if focus is None:
         focus = build_focus(ms, candidates=[cand])
-    return {
+    ctx = {
         "symbol": symbol, "name": name, "market": market,
         "technical": technical_summary(history_df),
         "base_rates": br,
@@ -154,6 +166,7 @@ def build_research_context(symbol: str, name: str, market: str, *,
         "regime": (ms.get("regime") or {}).get(market),
         "sentiment": ms.get("sentiment"),
         "markets": ms.get("markets"),
+        "macro": ms.get("macro"),
         "macro_kr": ms.get("macro_kr"),
         "flows_market": ms.get("flows_market"),
         "program_flows": ms.get("program_flows"),
@@ -162,6 +175,11 @@ def build_research_context(symbol: str, name: str, market: str, *,
         "news": [{"source": n.get("source"), "title": n.get("title")} for n in news],
         "past_trades": past_trades or [],
     }
+    if earnings:
+        ctx["earnings"] = earnings
+    if earnings_results:
+        ctx["earnings_results"] = earnings_results
+    return ctx
 
 
 def _pick_exhaustion(ms: dict, symbol: str) -> dict | None:
@@ -251,29 +269,122 @@ class AthenaAgent:
 def _disclosure_queued(store, market: str, since_hours: float = 24.0) -> list[str]:
     """공시 워처가 큐(route=queue)로 남긴 종목 — 새 재료가 뜬 종목을 우선 재리서치.
 
-    DART=KR 전용이라 KR 창에서만 소환한다. 유니버스에서 빠졌어도 재료가 뜬 종목은 본다.
+    KR=DART, US=EDGAR. 유니버스에서 빠졌어도 재료가 뜬 종목은 본다.
+    payload.market 이 있으면 시장 필터, 없으면 심볼 형태(6자리=KR)로 추정.
     """
-    if market != "KR":
-        return []
-    import json as _json
+    mkt = str(market or "").upper()
     out: list[str] = []
     try:
         rows = store.recent_events("disclosure", time.time() - since_hours * 3600,
                                    limit=50)
         for r in rows:
-            p = _json.loads(r["payload"]) if r["payload"] else {}
-            if p.get("route") == "queue" and r["symbol"]:
-                out.append(r["symbol"])
+            p = json.loads(r["payload"]) if r["payload"] else {}
+            if p.get("route") != "queue":
+                continue
+            sym = r["symbol"]
+            if not sym:
+                continue
+            pm = str(p.get("market") or "").upper()
+            if pm:
+                if pm != mkt:
+                    continue
+            else:
+                looks_kr = str(sym).isdigit() and len(str(sym)) == 6
+                if mkt == "KR" and not looks_kr:
+                    continue
+                if mkt == "US" and looks_kr:
+                    continue
+            out.append(sym)
     except Exception as e:
         log.warning("공시 큐 조회 실패(무시): %s", e)
     return list(dict.fromkeys(out))
 
 
-def select_symbols(cfg, store, market: str, limit: int | None = None) -> list[dict]:
-    """리서치 우선순위: 보유/진입대기 > 공시 큐 > 도시에 없음 > 오래된 도시에 순.
+def _earnings_result_queued(store, market: str, since_hours: float = 36.0
+                            ) -> list[str]:
+    """실적 결과 이벤트(route=queue|wake) 종목 — 발표 직후 도시레 재소환.
 
-    보유/armed 는 유니버스 밖이어도 포함한다(들고 있는 걸 모르는 게 최악). 공시 큐
-    (최근 24h 중대공시가 뜬 커버 종목)는 재료 반영을 위해 미커버보다 먼저 재소환.
+    US=Finnhub 워처, KR=DART 잠정실적 파싱. 뇌 earnings_results 창(36h)과 맞춤.
+    payload.market 이 있으면 시장 필터, 없으면 심볼 형태(6자리=KR)로 추정.
+    """
+    mkt = str(market or "").upper()
+    out: list[str] = []
+    try:
+        rows = store.recent_events(
+            "earnings_result", time.time() - since_hours * 3600, limit=50)
+        for r in rows:
+            p = json.loads(r["payload"]) if r["payload"] else {}
+            if p.get("route") not in ("queue", "wake"):
+                continue
+            sym = r["symbol"]
+            if not sym:
+                continue
+            pm = str(p.get("market") or "").upper()
+            if pm:
+                if pm != mkt:
+                    continue
+            else:
+                looks_kr = str(sym).isdigit() and len(str(sym)) == 6
+                if mkt == "KR" and not looks_kr:
+                    continue
+                if mkt == "US" and looks_kr:
+                    continue
+            out.append(sym)
+    except Exception as e:
+        log.warning("실적 결과 큐 조회 실패(무시): %s", e)
+    return list(dict.fromkeys(out))
+
+
+def _load_earnings_calendar() -> dict:
+    """data/earnings_calendar.json 종목맵. 없거나 깨지면 {}."""
+    from .wiring import DATA
+    p = DATA / "earnings_calendar.json"
+    try:
+        if p.exists():
+            return json.loads(p.read_text(encoding="utf-8")).get("symbols", {}) or {}
+    except (OSError, ValueError) as e:
+        log.warning("earnings_calendar 로드 실패(생략): %s", e)
+    return {}
+
+
+def _earnings_results_by_symbol(store, since_hours: float = 36.0,
+                                limit: int = 50) -> dict[str, list[dict]]:
+    """최근 earnings_result 이벤트를 심볼→[compact…] 로 묶는다."""
+    out: dict[str, list[dict]] = {}
+    try:
+        rows = store.recent_events(
+            "earnings_result", time.time() - since_hours * 3600, limit=limit)
+    except Exception as e:
+        log.warning("실적 결과 로드 실패(생략): %s", e)
+        return out
+    for r in rows:
+        sym = r["symbol"]
+        if not sym:
+            continue
+        try:
+            p = json.loads(r["payload"]) if r["payload"] else {}
+        except (TypeError, ValueError):
+            p = {}
+        item = {"symbol": sym, "date": p.get("date"),
+                "eps_estimate": p.get("eps_estimate"),
+                "eps_actual": p.get("eps_actual"),
+                "eps_surprise_pct": p.get("eps_surprise_pct"),
+                "revenue_surprise_pct": p.get("revenue_surprise_pct"),
+                "route": p.get("route")}
+        for k in ("market", "parse_ok", "unit", "scope",
+                  "revenue_actual", "op_profit_actual", "net_income_actual",
+                  "op_profit_surprise_pct", "net_income_surprise_pct"):
+            if p.get(k) is not None:
+                item[k] = p[k]
+        out.setdefault(sym, []).append(item)
+    return out
+
+
+def select_symbols(cfg, store, market: str, limit: int | None = None) -> list[dict]:
+    """리서치 우선순위: 보유/진입대기 > 공시 큐 > 실적결과 큐 > 도시레 없음 > 오래된 순.
+
+    보유/armed 는 유니버스 밖이어도 포함한다(들고 있는 걸 모르는 게 최악). 공시·실적
+    큐는 재료 반영을 위해 미커버보다 먼저 재소환.
     """
     uni = {it["symbol"]: it.get("name", it["symbol"])
            for it in (cfg.universe or {}).get(market, []) if it.get("symbol")}
@@ -284,7 +395,8 @@ def select_symbols(cfg, store, market: str, limit: int | None = None) -> list[di
     covered = {r["symbol"]: r["created_at"] for r in store.dossier_coverage()}
     fresh_order: list[str] = []
     fresh_order += held_syms
-    fresh_order += _disclosure_queued(store, market)              # 공시 재소환
+    fresh_order += _disclosure_queued(store, market)              # 공시 재소환(KR/US)
+    fresh_order += _earnings_result_queued(store, market)         # 실적결과 재소환
     fresh_order += [s for s in uni if s not in covered]           # 미커버
     fresh_order += sorted((s for s in uni if s in covered),       # 오래된 순
                           key=lambda s: covered[s])
@@ -313,11 +425,13 @@ def run_batch(cfg, store, llm, market: str, *,
               market_state: dict | None = None,
               base_rates: dict | None = None,
               now_fn: Callable[[], float] = time.time) -> dict:
-    """리서치 창 1회 실행: 우선순위 종목들에 도시에 생성. 반환: 요약 dict.
+    """리서치 창 1회 실행: 우선순위 종목들에 도시레 생성. 반환: 요약 dict.
 
     stop_at(epoch) 도달 시 즉시 중단(하드스톱 — 개장 전 뇌 LLM 예산 보호).
     한 종목 실패는 로깅 후 다음 종목으로(배치가 죽지 않는다).
     """
+    from ..datasources.earnings import with_fresh_dday
+
     agent = AthenaAgent(llm)
     targets = select_symbols(cfg, store, market, limit=limit)
     ms = market_state or {}
@@ -329,6 +443,8 @@ def run_batch(cfg, store, llm, market: str, *,
         candidates=[{"symbol": t["symbol"], "name": t["name"], "market": market}
                     for t in targets],
         positions=held)
+    earnings_cal = _load_earnings_calendar()
+    ers_by_sym = _earnings_results_by_symbol(store)
     done, failed, stopped = 0, 0, False
     for t in targets:
         if stop_at is not None and now_fn() >= stop_at:
@@ -340,10 +456,13 @@ def run_batch(cfg, store, llm, market: str, *,
             df = fetch_df(sym, market) if fetch_df else None
             br = (base_rates or {}).get(sym) if base_rates is not None else None
             past = [tr for tr in _past_trades(store) if tr["symbol"] == sym][:5]
+            earn = with_fresh_dday(earnings_cal.get(sym))
+            ers = ers_by_sym.get(sym) or None
             ctx = build_research_context(sym, t["name"], market, history_df=df,
                                          market_state=ms,
                                          base_rates=br, past_trades=past,
-                                         focus=focus)
+                                         focus=focus, earnings=earn,
+                                         earnings_results=ers)
             tech = ctx.get("technical") or {}
             px = tech.get("price") if isinstance(tech, dict) else None
             out, notes = sanitize(agent.research(ctx), price=px)
@@ -363,7 +482,7 @@ def run_batch(cfg, store, llm, market: str, *,
             done += 1
         except Exception as e:
             failed += 1
-            log.error("[%s] 도시에 생성 실패: %s", sym, e)
+            log.error("[%s] 도시레 생성 실패: %s", sym, e)
             store.log_event("error", sym, {"where": "athena", "err": str(e)})
     summary = {"market": market, "targets": len(targets), "done": done,
                "failed": failed, "stopped_by_deadline": stopped}
