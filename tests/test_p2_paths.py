@@ -122,6 +122,56 @@ def test_p2_migrate_apply_moves_files(tmp_path):
     assert any(r.get("result") in ("moved", "moved+alias") for r in rows)
 
 
+def test_p2_migrate_wal_checkpoint_preserves_tail(tmp_path):
+    """migrate 는 bot.db 이동 전 wal_checkpoint — 꼬리 행이 살아 있다."""
+    import sqlite3
+    from pathlib import Path
+    from src.paths_migrate import apply_moves
+
+    data = tmp_path / "data"
+    data.mkdir()
+    db = data / "bot.db"
+    conn = sqlite3.connect(str(db))
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("CREATE TABLE events(kind TEXT)")
+    conn.execute("INSERT INTO events VALUES ('seed')")
+    conn.commit()
+    conn.execute("INSERT INTO events VALUES ('tail')")
+    conn.commit()
+    conn.close()
+
+    (data / "llm_inbox").mkdir()
+    apply_moves(root=tmp_path, dry_run=False)
+    moved = data / "state" / "bot.db"
+    assert moved.is_file()
+    assert not (data / "bot.db").exists()
+    for side in (Path(str(data / "bot.db") + "-wal"),
+                 Path(str(moved) + "-wal")):
+        assert not side.exists() or side.stat().st_size == 0
+    mconn = sqlite3.connect(str(moved))
+    kinds = [r[0] for r in mconn.execute("SELECT kind FROM events").fetchall()]
+    mconn.close()
+    assert kinds == ["seed", "tail"]
+
+
+def test_checkpoint_sqlite_truncates_wal(tmp_path):
+    import sqlite3
+    from pathlib import Path
+    from src.paths_migrate import checkpoint_sqlite
+
+    db = tmp_path / "bot.db"
+    conn = sqlite3.connect(str(db))
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("CREATE TABLE t(x)")
+    conn.execute("INSERT INTO t VALUES (1)")
+    conn.commit()
+    conn.close()
+    wal = Path(str(db) + "-wal")
+    checkpoint_sqlite(db)
+    if wal.exists():
+        assert wal.stat().st_size == 0
+
+
 def test_p2_halt_gate_finds_layout(tmp_path):
     from src.broker import Broker
     from src.paper_account import PaperAccount

@@ -22,3 +22,15 @@ def _isolate_fear_history(tmp_path, monkeypatch):
     """
     import src.datasources.fear_greed as fg
     monkeypatch.setattr(fg, "HISTORY_PATH", str(tmp_path / "fear_history.json"))
+
+
+@pytest.fixture(autouse=True)
+def _sod_snap_when_closed(monkeypatch):
+    """SoD 첫 스냅은 장중에 거부된다 — 테스트 기본은 휴장으로 고정(결정적).
+
+    장중 거부 회귀는 개별 테스트가 current_session 을 'regular' 로 덮어쓴다.
+    """
+    monkeypatch.setattr("src.market_hours.current_session",
+                        lambda market, now=None: "closed")
+    monkeypatch.setattr("src.paper_account.current_session",
+                        lambda market, now=None: "closed")

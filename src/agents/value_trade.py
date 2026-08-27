@@ -648,6 +648,8 @@ class ValueRunner:
         mlc = agents_cfg.get("min_lot_conviction")
         if mlc is None and self.cfg.risk.get("allow_min_lot"):
             mlc = self.min_conviction
+        # market 코드 권위(J6): 밸류는 시장별 루프라 세션 market 이 곧 권위.
+        # 미전달 시 LLM 오라벨이 자본 풀·원장 symbol_market 을 오염(US→KR 과대주문).
         cyc = run_cycle(
             context_json=context,
             decision_agent=ValueDecisionAgent(llm, max_position_pct=self.max_position_pct,
@@ -657,6 +659,7 @@ class ValueRunner:
             journal_path=self.journal_path,
             arm_fn=None, dossier_fn=None, zone_fn=None, conviction_sizing=True,
             min_lot_conviction=float(mlc) if mlc is not None else None,
+            market_fn=lambda s: market,
             store=self.store,
             allow_add=True,
             tranche_weights={

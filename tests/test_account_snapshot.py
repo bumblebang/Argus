@@ -56,11 +56,16 @@ def test_fetch_normalizes_strings_to_float():
     assert snap["total_purchase"] == {"KR": 267500.0}
     assert snap["market_value"] == {"KR": 273500.0}
     assert snap["profit"] == {"KR": 6000.0}
-    assert snap["profit_rate"] == {"KR": 0.0224}
+    # 원장 rate = pnl/purchase (Toss 스칼라 복붙 아님)
+    assert abs(snap["profit_rate"]["KR"] - 6000.0 / 267500.0) < 1e-9
     assert snap["daily_profit"] == {"KR": 10500.0}
-    assert snap["daily_profit_rate"] == {"KR": 0.0392}
+    # daily rate = daily_pnl / equity(cash+mv)
+    equity = 732463.0 + 273500.0
+    assert abs(snap["daily_profit_rate"]["KR"] - 10500.0 / equity) < 1e-9
     assert isinstance(snap["ts"], float)
     assert client.bp_calls == ["KR"]
+    assert "books" in snap and "KR" in snap["books"]
+    assert snap["totals"]["equity_krw"] == equity
 
 
 def test_fetch_item_fields_parsed():
@@ -91,9 +96,17 @@ def test_fetch_us_item_kept_and_currency_split():
     assert snap["total_purchase"] == {"KR": 100000.0, "US": 500.0}
     assert snap["market_value"] == {"KR": 110000.0, "US": 550.0}
     assert snap["profit"] == {"KR": 10000.0, "US": 50.0}
-    # rate 는 스칼라 → 손익이 있는 시장 키에 매단다(KR·US 둘 다)
-    assert snap["profit_rate"] == {"KR": 0.1, "US": 0.1}
+    # 원장별 rate — Toss 스칼라를 KR·US에 복붙하지 않음
+    assert abs(snap["profit_rate"]["KR"] - 10000.0 / 100000.0) < 1e-9
+    assert abs(snap["profit_rate"]["US"] - 50.0 / 500.0) < 1e-9
     assert snap["items"][0]["market"] == "US" and snap["items"][0]["qty"] == 2.0
+    # FX 없으면 US 포함 시 합산 null
+    assert snap["totals"]["equity_krw"] is None
+
+    snap_fx = acc.fetch_account_snapshot(
+        client, 1, markets=("KR", "US"), fx_usdkrw=1300.0, fx_ts=1.0)
+    assert snap_fx["totals"]["equity_krw"] == 110000.0 + 550.0 * 1300.0
+    assert snap_fx["books"]["US"]["equity_krw"] == 550.0 * 1300.0
 
 
 # ── 안전성: 파싱 실패·빈 items·조회 실패 market ───────────────────────
@@ -160,7 +173,10 @@ def test_load_missing_returns_none(tmp_path, monkeypatch):
 # ── 대시보드 자산 패널 렌더 스모크(예외 없이 렌더) ─────────────────────
 def _base_d(snap, live_trades=None, live_mode=True):
     return {"now": time.time(), "snapshot": snap, "live_mode": live_mode,
-            "live_trades": live_trades or [], "names": {"005930": "삼성전자"}}
+            "live_trades": live_trades or [], "names": {"005930": "삼성전자"},
+            "risk_control": {"max_positions": {"KR": 5, "US": 3},
+                             "open": {"KR": 0, "US": 0}, "pause": "none"},
+            "fx": None}
 
 
 def test_asset_html_renders_snapshot():

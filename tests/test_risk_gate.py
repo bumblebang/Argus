@@ -285,7 +285,7 @@ def test_max_order_notional_disabled_when_empty_or_zero(tmp_path):
 
 # ── 최소 1주 시범매수 (allow_min_lot) ────────────────────────────────
 def test_min_lot_exempts_order_notional_only(tmp_path):
-    """qty=1 은 주문상한만 면제. 종목비중 안에는 들어와야 한다."""
+    """qty=1 은 주문상한 면제. 종목비중 안이면 통과(비중 면제와 별개 경로)."""
     gate = _gate(tmp_path, allow_min_lot=True, max_position_pct=0.50,
                  max_order_notional={"KR": 200_000})
     acct = _acct(tmp_path)
@@ -293,13 +293,15 @@ def test_min_lot_exempts_order_notional_only(tmp_path):
     assert gate.check(Order("004370", "KR", "BUY", 1, 357_000), acct).approved
 
 
-def test_min_lot_does_not_exempt_position_pct(tmp_path):
-    """J4 재현: 1주가 종목 상한을 그대로 넘어가던 경로."""
+def test_min_lot_exempts_position_pct_for_first_share(tmp_path):
+    """시범 1주는 종목비중을 넘어도 통과. 2주째는 면제 없음."""
     gate = _gate(tmp_path, allow_min_lot=True, max_position_pct=0.20,
                  max_order_notional={"KR": 200_000})
     acct = _acct(tmp_path)
+    assert gate.check(Order("004370", "KR", "BUY", 1, 357_000), acct).approved
+    acct.apply_fill("004370", "KR", "BUY", 1, 357_000, 0.0, "probe")
     d = gate.check(Order("004370", "KR", "BUY", 1, 357_000), acct)
-    assert not d.approved and "비중" in d.reason
+    assert not d.approved
 
 
 def test_min_lot_not_exempt_when_already_held(tmp_path):
@@ -355,3 +357,56 @@ def test_min_lot_still_requires_cash(tmp_path):
     acct = _acct(tmp_path, cash={"KR": 100_000})
     d = gate.check(Order("004370", "KR", "BUY", 1, 357_000), acct)
     assert not d.approved and "매수여력" in d.reason
+
+
+# ── KR/US 슬롯·마켓 pause ──────────────────────────────────────────────
+def test_max_positions_int_normalizes_to_both_markets(tmp_path):
+    gate = _gate(tmp_path, max_positions=3)
+    assert gate.max_positions == {"KR": 3, "US": 3}
+    assert gate.max_positions_for("KR") == 3
+
+
+def test_max_positions_per_market_kr_does_not_block_us(tmp_path):
+    gate = _gate(
+        tmp_path,
+        capital={"KR": 1_000_000, "US": 10_000},
+        max_positions={"KR": 1, "US": 2},
+        max_position_pct=1.0,
+        max_order_notional={},
+        daily_loss_limit_pct=0.5,
+    )
+    acct = PaperAccount(
+        cash={"KR": 1_000_000, "US": 10_000},
+        fee_rate={"KR": 0.0, "US": 0.0},
+        slippage_bps={"KR": 0.0, "US": 0.0},
+        state_path=tmp_path / "dual.json",
+    )
+    acct.apply_fill("005930", "KR", "BUY", 1, 1_000, 0.0, "seed")
+    # KR 슬롯 가득 → KR 신규 거부
+    d_kr = gate.check(Order("000660", "KR", "BUY", 1, 1_000), acct)
+    assert not d_kr.approved and "KR" in d_kr.reason
+    # US 슬롯은 비어 있음 → 통과
+    d_us = gate.check(Order("AAPL", "US", "BUY", 1, 100), acct)
+    assert d_us.approved
+
+
+def test_market_pause_blocks_buy_allows_sell(tmp_path):
+    gate = _gate(tmp_path, max_position_pct=1.0, max_order_notional={})
+    acct = _acct(tmp_path)
+    acct.apply_fill("005930", "KR", "BUY", 2, 100, 0.0, "seed")
+    pause = gate._market_pause_path("KR")
+    pause.write_text("pause", encoding="utf-8")
+    assert gate.pause_status() == "KR"
+    d_buy = gate.check(Order("000660", "KR", "BUY", 1, 100), acct)
+    assert not d_buy.approved and "pause" in d_buy.reason
+    d_sell = gate.check(Order("005930", "KR", "SELL", 1, 100), acct)
+    assert d_sell.approved
+
+
+def test_global_halt_blocks_sell_too(tmp_path):
+    (tmp_path / "HALT").write_text("halt", encoding="utf-8")
+    gate, acct = _gate(tmp_path), _acct(tmp_path)
+    acct.apply_fill("005930", "KR", "BUY", 1, 100, 0.0, "seed")
+    d = gate.check(Order("005930", "KR", "SELL", 1, 100), acct)
+    assert not d.approved and "킬스위치" in d.reason
+    assert gate.pause_status() == "ALL"

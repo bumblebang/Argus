@@ -126,11 +126,15 @@ class TossGateway:
         with self._lock:
             return self.client.get_buying_power(account_seq, market)
 
-    def fetch_account_snapshot(self, account_seq, markets=("KR",)) -> dict:
+    def fetch_account_snapshot(self, account_seq, markets=("KR",), *,
+                               fx_usdkrw=None, fx_ts=None) -> dict:
         """account_refresher 전용 — gateway 락 경유."""
         from ..datasources.account_snapshot import fetch_account_snapshot
         with self._lock:
-            return fetch_account_snapshot(self.client, account_seq, markets=markets)
+            return fetch_account_snapshot(
+                self.client, account_seq, markets=markets,
+                fx_usdkrw=fx_usdkrw, fx_ts=fx_ts,
+            )
 
     def refresh_market_sessions(self, markets=("KR", "US")) -> dict:
         from ..datasources.market_calendar import refresh_sessions

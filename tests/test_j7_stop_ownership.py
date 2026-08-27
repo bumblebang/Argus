@@ -1,5 +1,5 @@
 """J7: Athena invalidation 이 코드 손절을 덮어쓰던 경로 + RR 순환 차단."""
-from src.agents.conviction import score_buy, BASE, W_RR_HI, W_RR_LO
+from src.agents.conviction import score_buy, BASE, W_RR_HI
 from src.agents.manager_id import SCORING_REV, manager_snapshot
 from src.agents.schemas import Proposal
 from src.agents.wiring import (MAX_STOP_PCT, MIN_STOP_PCT, combine_stop_target,
@@ -60,13 +60,20 @@ def test_score_buy_ignores_llm_target():
     assert a.value == b.value == round(BASE + W_RR_HI, 2)
 
 
-def test_score_buy_wide_stop_is_rr_penalty():
-    """넓은 손절(밴드 안 20%)은 코드 목표 10% 대비 RR<1.5 → 감점."""
-    wide = {"stance": "bullish", "entry_low": 90, "entry_high": 110,
-            "invalidation": 80, "target": 140}
-    sc = score_buy(_buy(), price=100, dossier=wide)
-    assert sc.value == round(BASE + W_RR_LO, 2)
-    assert "손익비" in " ".join(sc.parts)
+def test_score_buy_rr_ignores_athena_invalidation_and_llm_params():
+    """확신도 RR: Athena 손절·LLM params 가 가산/감점을 못 만든다(스윙 기본 RR=2)."""
+    base_d = {"stance": "bullish", "entry_low": 90, "entry_high": 110,
+              "invalidation": 95, "target": 140}
+    wide_inv = dict(base_d, invalidation=80)          # 밴드 안 20% — 예전엔 감점
+    thin_inv = dict(base_d, invalidation=99)          # 얇은 손절 — 예전엔 가산 유혹
+    plain = score_buy(_buy(), price=100, dossier=base_d)
+    fat_params = score_buy(
+        _buy(params={"stop_loss_pct": 0.01, "target_profit_pct": 0.40}),
+        price=100, dossier=base_d)
+    wide = score_buy(_buy(), price=100, dossier=wide_inv)
+    thin = score_buy(_buy(), price=100, dossier=thin_inv)
+    expect = round(BASE + W_RR_HI, 2)   # swing 기본 10%/5% = 2.0
+    assert plain.value == fat_params.value == wide.value == thin.value == expect
 
 
 def test_scoring_rev_in_epoch():
@@ -77,5 +84,5 @@ def test_scoring_rev_in_epoch():
         last_source = "cli"
     snap = manager_snapshot(decision_llm=L(), decision_prompt="D",
                             validation_prompt="V")
-    assert SCORING_REV == "j7"
+    assert SCORING_REV == "j7b"
     assert f":{SCORING_REV}" in snap["epoch"]

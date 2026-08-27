@@ -79,11 +79,11 @@ def test_cycle_min_lot_fills_one_share_of_expensive_name(tmp_path):
     assert decision.proposals[0].target_weight >= 0.357
 
 
-def test_cycle_min_lot_rejected_when_over_position_pct(tmp_path):
-    """J4: 1주가 종목 상한을 넘으면 시범매수도 거부된다."""
+def test_cycle_min_lot_fills_when_over_position_pct(tmp_path):
+    """시범 1주는 종목상한(20%)을 넘어도 체결. 추가매수는 게이트가 막는다."""
     res, broker, _ = _min_lot_cycle(tmp_path, hard_cap=0.2)
-    assert res.executed[0]["status"] == "gate_rejected"
-    assert broker.account.position("004370").qty == 0
+    assert res.executed[0]["status"] == "filled"
+    assert broker.account.position("004370").qty == 1
 
 
 def test_cycle_min_lot_rejected_over_absolute_cap(tmp_path):

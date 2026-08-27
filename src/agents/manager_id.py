@@ -12,7 +12,7 @@ import hashlib
 from typing import Any
 
 # J7: RR 가산이 LLM 레벨이 아니라 클램프 손절 + 코드 목표 기준.
-SCORING_REV = "j7"
+SCORING_REV = "j7b"  # j7 + 확신도 RR 코드고정(LLM/Athena 되먹임 차단)
 
 
 def prompt_hash(text: str) -> str:

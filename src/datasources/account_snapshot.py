@@ -56,17 +56,27 @@ def _split_by_ccy(obj) -> dict:
     return out
 
 
-def fetch_account_snapshot(client, account_seq, markets=("KR",)) -> dict:
+def fetch_account_snapshot(
+    client,
+    account_seq,
+    markets=("KR",),
+    *,
+    fx_usdkrw: float | None = None,
+    fx_ts: float | None = None,
+) -> dict:
     """실계좌 스냅샷을 표준 dict 로. buying-power(시장별) + holdings(단일 호출) 정규화.
 
     - cash: 시장별 매수여력(cashBuyingPower). 조회 실패 시장은 스킵+로깅.
     - total_purchase/market_value/profit/daily_profit: holdings 종합(통화→시장 분리).
-    - profit_rate/daily_profit_rate: 종합 rate 는 스칼라(계좌 가중) — 해당 손익이 있는
-      시장 키에 그대로 매단다(현재 KR 단독이면 {"KR": rate}).
+    - profit_rate/daily_profit_rate: **원장 자체** pnl/purchase, daily/equity
+      (Toss 스칼라 rate 를 KR·US에 복붙하지 않음).
+    - books/totals/fx: portfolio_books 파생(₩ 환산은 fx_usdkrw 있을 때).
     - items: 종목별(marketCountry→market, 문자열→float). US 종목이 있으면 그대로 담는다.
 
     모든 파싱은 안전(실패→None/0/스킵). holdings 조회 자체가 실패하면 빈 보유로 진행한다.
     """
+    from ..portfolio_books import apply_books
+
     snap: dict = {"ts": time.time(), "cash": {}, "total_purchase": {}, "market_value": {},
                   "profit": {}, "profit_rate": {}, "daily_profit": {},
                   "daily_profit_rate": {}, "items": []}
@@ -88,16 +98,9 @@ def fetch_account_snapshot(client, account_seq, markets=("KR",)) -> dict:
     snap["market_value"] = _split_by_ccy((h.get("marketValue") or {}).get("amount"))
     pl = h.get("profitLoss") or {}
     snap["profit"] = _split_by_ccy(pl.get("amount"))
-    rate = _to_float(pl.get("rate"))
-    if rate is not None:
-        for mk in (snap["profit"] or snap["market_value"]):
-            snap["profit_rate"][mk] = rate
+    # Toss 스칼라 rate 는 계좌 가중 1개라 멀티마켓에 복붙하지 않음 — apply_books 가 원장 계산.
     dpl = h.get("dailyProfitLoss") or {}
     snap["daily_profit"] = _split_by_ccy(dpl.get("amount"))
-    drate = _to_float(dpl.get("rate"))
-    if drate is not None:
-        for mk in (snap["daily_profit"] or snap["market_value"]):
-            snap["daily_profit_rate"][mk] = drate
     # 종목별
     for it in (h.get("items") or []):
         if not isinstance(it, dict):
@@ -117,7 +120,13 @@ def fetch_account_snapshot(client, account_seq, markets=("KR",)) -> dict:
             })
         except Exception as e:
             log.warning("보유 종목 파싱 실패(스킵) %s: %s", it.get("symbol"), e)
-    return snap
+    ensure = tuple(str(m).upper() for m in markets)
+    return apply_books(
+        snap,
+        fx_usdkrw=fx_usdkrw,
+        fx_ts=fx_ts,
+        ensure_markets=ensure,
+    )
 
 
 def save_snapshot(data: dict) -> None:

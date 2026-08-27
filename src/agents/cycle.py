@@ -14,7 +14,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .schemas import DecisionOutput, ValidationOutput
-from .conviction import apply_buy_conviction, size_weight, min_lot_adjust
+from .conviction import (
+    apply_buy_conviction, size_weight, min_lot_adjust, skip_position_headroom,
+)
 from ..logging_setup import get_logger
 from ..risk_gate import Order
 from .. import paths as _paths
@@ -233,17 +235,19 @@ def run_cycle(*, context_json: str, decision_agent, validation_agent, broker, ri
                 except (TypeError, ValueError):
                     cur_notional = 0.0
                 headroom = max(0.0, equity * hard_cap - cur_notional)
-                caps: list[float] = [headroom]
                 extra = (budget_caps or {}).get(p.symbol)
+                weight, min_qty = min_lot_adjust(
+                    weight, price=price, capital=equity, conviction=p.conviction,
+                    min_lot_conviction=min_lot_conviction)
+                caps: list[float] = []
+                if not skip_position_headroom(min_qty):
+                    caps.append(headroom)
                 if extra is not None:
                     try:
                         caps.append(float(extra))
                     except (TypeError, ValueError):
                         pass
                 notional_cap = min(caps) if caps else None
-                weight, min_qty = min_lot_adjust(
-                    weight, price=price, capital=equity, conviction=p.conviction,
-                    min_lot_conviction=min_lot_conviction)
                 # 저널용: 실제 쓴 비중을 target_weight 에 기록(LLM 값 덮어씀)
                 p.target_weight = float(weight)
                 if min_qty > 0 and equity > 0:

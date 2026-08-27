@@ -111,6 +111,45 @@ def test_equity_gain_does_not_mask_realized_loss(tmp_path):
     assert not d.approved and "실현손익" in d.reason
 
 
+def test_midday_first_sod_snap_refused(tmp_path, monkeypatch):
+    """장중 최초 기동: 현재 equity 를 SoD 로 찍지 않는다(일손실 리셋 방지)."""
+    monkeypatch.setattr("src.paper_account.current_session",
+                        lambda m, now=None: "regular")
+    gate, acct = _gate(tmp_path), _acct(tmp_path, cash=940_000)  # 이미 -6%
+    assert acct.ensure_sod_equity("KR") == 0.0
+    assert acct.sod_equity_delta("KR") is None
+    # capital 폴백(1M×5%=50k). 실현 -60k 면 차단.
+    _set_realized_today(acct, "KR", -60_000)
+    d = gate.check(_order(), acct)
+    assert not d.approved and "일 손실" in d.reason
+
+
+def test_deposit_does_not_mask_bypass_loss(tmp_path):
+    """입금이 SoD 를 같이 올려 우회 손실 델타를 가리지 못한다."""
+    gate, acct = _gate(tmp_path), _acct(tmp_path)
+    acct.ensure_sod_equity("KR")                     # SoD=1,000,000
+    acct.cash["KR"] = 940_000                        # 우회 손실 -60k
+    assert acct.sod_equity_delta("KR") == -60_000.0
+    acct.adjust_sod_for_external_cash("KR", 200_000)  # 입금
+    acct.cash["KR"] = 1_140_000                      # 940k+200k
+    # SoD 도 1.2M 으로 이동 → 델타는 여전히 -60k
+    assert acct._sod_equity["KR"] == 1_200_000.0
+    assert acct.sod_equity_delta("KR") == -60_000.0
+    d = gate.check(_order(), acct)
+    assert not d.approved and "자산변화" in d.reason
+
+
+def test_reconcile_deposit_adjusts_sod(tmp_path):
+    from src.broker_sync import apply_reconcile_from_live
+    acct = _acct(tmp_path)
+    acct.ensure_sod_equity("KR")
+    data = {"cash": {"KR": 1_200_000}, "holdings_ok": True, "items": []}
+    out = apply_reconcile_from_live(acct, None, data)
+    assert out.get("external_cash", {}).get("KR") == 200_000
+    assert acct._sod_equity["KR"] == 1_200_000.0
+    assert acct.sod_equity_delta("KR") == 0.0
+
+
 def test_flag_off_restores_legacy_behaviour(tmp_path):
     gate = _gate(tmp_path, daily_loss_use_sod_delta=False)
     acct = _acct(tmp_path)
