@@ -68,3 +68,30 @@ xcopy /E /I backup\llm_inbox data\llm_inbox
 - `bot.db` 스키마 변경·vacuum을 이 컷오버에 묶기
 - 레거시 경로 **조기 삭제** (shim/별칭 제거는 별 승인)
 - **watch 실행 중·checkpoint 없이** `bot.db` 만 복사/이동 (WAL 꼬리 유실)
+
+---
+
+# 코드 업그레이드 (구 데몬 → 신 바이너리)
+
+데이터 컷오버와 별개로, **구 watch 프로세스와 신 코드가 동시에 돌면** 서로 다른
+락 파일을 잡아 이중 기동이 될 수 있다(구: `data/watch.pid.lock` 파생, 신:
+`data/state/watch.pid.lock` + 레거시 동시 점유). 신 코드는 두 경로를 같이 잠그지만,
+**구 바이너리는 신 락을 모른다** — 반드시 구 프로세스를 먼저 내린다.
+
+## 교체 절차
+
+1. 작업 스케줄러 **ArgusWatch** Disable (또는 End)
+2. 브릿지 serve / hb 창 종료
+3. 잔존 프로세스 확인
+   - `data/watch.pid` / `data/state/watch.pid` 의 pid 가 살아 있으면 taskkill
+   - `data/watch.pid.lock` · `data/state/watch.pid.lock` 핸들 보유 프로세스 없음
+4. 신 코드 배포(venv/wheel/소스)
+5. `argus doctor` (또는 pytest 스모크) 그린 확인
+6. ArgusWatch Enable + Run
+7. 15분: heartbeat `ok`·`polled`, 이중 pid 없음, 의도치 않은 실주문 없음
+
+## 하지 말 것 (업그레이드)
+
+- 구 watch 살린 채 신 `watch.py` / 스케줄러 작업만 추가
+- 락 파일만 지우고 구·신 동시 기동
+- `argus live-smoke --confirm` 로 HALT/DRY_RUN 우회 검증(가드가 막음 — 정상)

@@ -522,15 +522,31 @@ def test_sweep_survives_api_failure(tmp_path):
     store.upsert_working_order(order_id="X1", symbol="005930", market="KR",
                                side="BUY", qty=1, price=1_000, status="PENDING")
     out = broker.sweep_working_orders()
-    assert out["working"] == 1
+    assert out["working"] == 1 and out["fetch_failed"] == 1
+    assert out["block_reconcile"] is False          # BUY 조회 실패는 재대사 막지 않음
     assert len(store.get_working_orders()) == 1     # 조회 실패 시 지우지 않는다
+
+
+def test_sweep_sell_fetch_fail_blocks_reconcile(tmp_path):
+    """매도 조회 실패 시 재대사 차단 — 감소 선흡수로 귀속 대상이 사라지는 구멍 방지."""
+    class _Boom(_Client):
+        def get_order(self, account_seq, order_id):
+            raise RuntimeError("api down")
+
+    store = Store(tmp_path / "t.db")
+    broker = _broker(tmp_path, store, _Boom(), working_order_ttl_sec=-1.0)
+    store.upsert_working_order(order_id="S1", symbol="005930", market="KR",
+                               side="SELL", qty=10, price=71_000, status="PENDING")
+    out = broker.sweep_working_orders()
+    assert out["fetch_failed"] == 1 and out["block_reconcile"] is True
+    assert len(store.get_working_orders()) == 1
 
 
 def test_sweep_noop_in_paper_mode(tmp_path):
     store = Store(tmp_path / "t.db")
     broker = Broker(account=_acct(tmp_path), gate=_gate(tmp_path), mode="paper",
                     store=store)
-    assert broker.sweep_working_orders() == {"skipped": True}
+    assert broker.sweep_working_orders() == {"skipped": True, "block_reconcile": False}
 
 
 # ── 재시작 복구: 이 표가 유일한 경로 ────────────────────────────

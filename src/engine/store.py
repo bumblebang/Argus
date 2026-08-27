@@ -163,8 +163,20 @@ def _dumps(obj: Any) -> str | None:
 
 
 class Store:
-    def __init__(self, path: str | Path = "data/bot.db") -> None:
+    def __init__(self, path: str | Path = "data/bot.db", *,
+                 readonly: bool = False) -> None:
         self.path = _paths.resolve("db", configured=path)
+        self.readonly = bool(readonly)
+        self._lock = threading.Lock()
+        if self.readonly:
+            # 대시보드 등 관측 경로 — migrate/dedupe 쓰기 금지, WAL 체크포인트 없음.
+            if not self.path.exists():
+                raise FileNotFoundError(f"DB 없음(readonly): {self.path}")
+            uri = self.path.resolve().as_uri() + "?mode=ro"
+            self.conn = sqlite3.connect(uri, uri=True, check_same_thread=False,
+                                       timeout=2.0)
+            self.conn.row_factory = sqlite3.Row
+            return
         self.path.parent.mkdir(parents=True, exist_ok=True)
         # check_same_thread=False + 내부 Lock 으로 멀티스레드 호출 직렬화.
         self.conn = sqlite3.connect(str(self.path), check_same_thread=False)
@@ -174,10 +186,11 @@ class Store:
         self.conn.executescript(_SCHEMA)
         self._migrate()
         self.conn.commit()
-        self._lock = threading.Lock()
 
     def _migrate(self) -> None:
         """기존 DB 에 새 컬럼 추가(멱등). CREATE IF NOT EXISTS 는 기존 테이블을 못 바꾼다."""
+        if self.readonly:
+            return
         cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(positions)")}
         for name, ddl in (("exit_price", "exit_price REAL"), ("pnl", "pnl REAL"),
                           ("exit_reason", "exit_reason TEXT"),
@@ -199,6 +212,8 @@ class Store:
 
     def _dedupe_open_positions(self) -> None:
         """symbol 당 open 2행 이상이면 최신 id만 남기고 나머지는 closed 처리."""
+        if self.readonly:
+            return
         dupes = self.conn.execute(
             "SELECT symbol FROM positions WHERE state='open' "
             "GROUP BY symbol HAVING COUNT(*) > 1").fetchall()
@@ -221,12 +236,12 @@ class Store:
     def close(self) -> None:
         """연결 종료. WAL 을 메인에 합쳐 강제 종료·컷오버 시 꼬리 유실을 줄인다."""
         with self._lock:
-            try:
-                self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
-            except Exception:
-                pass
+            if not self.readonly:
+                try:
+                    self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+                except Exception:
+                    pass
             self.conn.close()
-
     # ── 미체결 주문 레지스트리 (J2) ────────────────────────
     def upsert_working_order(self, *, order_id: str, symbol: str, market: str,
                              side: str, qty: float, price: float,

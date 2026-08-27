@@ -451,14 +451,19 @@ class WatchLoop:
             return set(self.illiquid_symbols)
 
     # ── 하트비트: stall 감지용. 매 틱 epoch 기록 → 외부 watchdog 이 신선도 검사. ──
-    def _beat(self, res: "TickResult") -> None:
+    def _beat(self, res: "TickResult", *, tick_error: bool = False) -> None:
         if not self.heartbeat_path:
             return
         try:
             self.heartbeat_path.parent.mkdir(parents=True, exist_ok=True)
+            # 장중인데 폴링 0 또는 틱 예외면 ok=False — age 만 보면 가짜 초록이 된다.
+            markets = list(res.markets_open or [])
+            polled = int(res.polled or 0)
+            ok = (not tick_error) and (not markets or polled > 0)
             self.heartbeat_path.write_text(json.dumps({
                 "ts": self._now(), "ticks": self._ticks,
-                "markets_open": res.markets_open, "polled": res.polled,
+                "markets_open": markets, "polled": polled,
+                "ok": ok, "tick_error": bool(tick_error),
             }), encoding="utf-8")
         except OSError as e:
             log.warning("하트비트 기록 실패: %s", e)
@@ -906,15 +911,17 @@ class WatchLoop:
                     break
                 if max_ticks is not None and ticks >= max_ticks:
                     break
+                tick_error = False
                 try:
                     res = self.run_once()
                 except Exception as e:  # 한 틱 실패가 루프를 죽이지 않게.
                     log.exception("틱 실패: %s", e)
                     self.store.log_event("error", None, {"where": "tick", "err": str(e)})
                     res = TickResult()
+                    tick_error = True
                 ticks += 1
                 self._ticks = ticks
-                self._beat(res)                 # 살아있음을 외부에 알린다(stall 감지).
+                self._beat(res, tick_error=tick_error)  # ok 포함 — polled=0 가짜 초록 방지
                 interval = (self.cfg.watch_interval_sec if res.markets_open
                             else self.cfg.idle_interval_sec)
                 self._sleep(interval)
