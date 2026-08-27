@@ -118,7 +118,9 @@ def build_paper_core(cfg: AppConfig, *, live_client=None, account_seq=None,
         reservation_ttl_sec=float(broker_cfg.get("reservation_ttl_sec", 300.0)),
         working_order_ttl_sec=float(broker_cfg.get("working_order_ttl_sec", 60.0)),
         block_on_working_order=bool(broker_cfg.get("block_on_working_order", True)),
-        attribution_ttl_sec=float(broker_cfg.get("attribution_ttl_sec", 1800.0)))
+        attribution_ttl_sec=float(broker_cfg.get("attribution_ttl_sec", 1800.0)),
+        working_order_abandon_ttl_sec=float(
+            broker_cfg.get("working_order_abandon_ttl_sec", 1800.0)))
     dry = bool(getattr(cfg, "dry_run", True))
     is_live = resolve_execution_mode(
         broker_mode=str(mode), dry_run=dry, live_client=live_client) == "live"

@@ -2,11 +2,15 @@
 
 장후·watch 중지 후에만 --apply. 기본은 dry-run.
 inbox: data/llm_inbox → data/inbox 이동 후 레거시 경로에 junction/symlink.
+
+SQLite(bot.db)는 WAL 모드라 -wal/-shm 사이드카에 최근 커밋이 남아 있을 수 있다.
+메인 파일만 옮기면 원장이 과거로 롤백된다 — 이동 직전 wal_checkpoint(TRUNCATE).
 """
 from __future__ import annotations
 
 import os
 import shutil
+import sqlite3
 import sys
 from pathlib import Path
 
@@ -19,6 +23,70 @@ def _same_file(a: Path, b: Path) -> bool:
         return a.exists() and b.exists() and a.resolve() == b.resolve()
     except OSError:
         return False
+
+
+def _is_sqlite_db(path: Path) -> bool:
+    return path.suffix.lower() == ".db"
+
+
+def _wal_sidecars(db_path: Path) -> tuple[Path, Path]:
+    s = str(db_path)
+    return Path(s + "-wal"), Path(s + "-shm")
+
+
+def checkpoint_sqlite(db_path: Path) -> None:
+    """WAL 프레임을 메인 DB 로 합치고 사이드카를 truncate.
+
+    컷오버·강제 종료 뒤 -wal 만 남은 상태에서 메인 파일만 옮기면 원장 꼬리가
+    사라진다. 이동 전 한 번 호출하면 된다.
+    """
+    if not db_path.is_file():
+        return
+    try:
+        if db_path.stat().st_size == 0:
+            return
+        header = db_path.read_bytes()[:16]
+    except OSError:
+        return
+    if not header.startswith(b"SQLite format 3"):
+        return  # 가짜/빈 바이트 — opaque 이동
+    try:
+        conn = sqlite3.connect(str(db_path), timeout=60.0)
+    except sqlite3.Error as e:
+        raise OSError(f"sqlite open 실패 ({db_path}): {e}") from e
+    try:
+        mode = conn.execute("PRAGMA journal_mode;").fetchone()
+        if mode and str(mode[0]).lower() == "wal":
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+        conn.commit()
+    except sqlite3.Error as e:
+        raise OSError(f"wal_checkpoint 실패 ({db_path}): {e}") from e
+    finally:
+        conn.close()
+
+
+def _cleanup_sidecars(db_path: Path) -> None:
+    """checkpoint 후 남은 빈/잔여 -wal/-shm 삭제(고아 방지)."""
+    for side in _wal_sidecars(db_path):
+        if not side.exists():
+            continue
+        try:
+            side.unlink()
+        except OSError:
+            pass
+
+
+def _move_path(src: Path, dst: Path) -> None:
+    """일반 파일 이동. .db 는 checkpoint 후 이동·사이드카 정리."""
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    if _is_sqlite_db(src):
+        checkpoint_sqlite(src)
+        shutil.move(str(src), str(dst))
+        # 사이드카는 원 경로 이름(bot.db-wal)에 남음 — 메인만 옮겨진 뒤 삭제.
+        _cleanup_sidecars(src)
+        _cleanup_sidecars(dst)
+        return
+    shutil.move(str(src), str(dst))
 
 
 def plan_moves(*, root: Path | None = None) -> list[dict]:
@@ -102,8 +170,7 @@ def apply_moves(*, root: Path | None = None, dry_run: bool = True) -> list[dict]
         src = Path(row["src_abs"])
         dst = Path(row["dst_abs"])
         if action == "move":
-            dst.parent.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(src), str(dst))
+            _move_path(src, dst)
             out["result"] = "moved"
         elif action == "move_inbox":
             dst.parent.mkdir(parents=True, exist_ok=True)

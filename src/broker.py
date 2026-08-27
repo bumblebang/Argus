@@ -82,7 +82,8 @@ class Broker:
                  reservation_ttl_sec: float = 300.0,
                  working_order_ttl_sec: float = 60.0,
                  block_on_working_order: bool = True,
-                 attribution_ttl_sec: float = 1800.0):
+                 attribution_ttl_sec: float = 1800.0,
+                 working_order_abandon_ttl_sec: float = 1800.0):
         self.account = account
         self.gate = gate
         self.client = client
@@ -122,6 +123,10 @@ class Broker:
         # 종결됐지만 원장 귀속(J3)이 안 된 체결분을 얼마나 들고 있을지. 재대사가
         # 수량 감소를 못 보면 영구히 남으므로 만료 회수(+경보). 음수면 무제한.
         self.attribution_ttl_sec = float(attribution_ttl_sec)
+        # 미체결(settled_at 없음) 행 강제 회수. 취소 실패·조회 불능이어도 이 시간이
+        # 지나면 레지스트리에서 버리고 경보 — 한 행이 매수여력을 영구 홀드하면
+        # 전 종목 매수가 죽는다. 음수면 비활성(구동작). 0 이면 즉시 회수.
+        self.working_order_abandon_ttl_sec = float(working_order_abandon_ttl_sec)
         # 주문 시작·종료마다 증가. 재대사 API 조회(락 밖) 중 주문이 시작·끝나
         # apply 시점 inflight 가 비어도, 조회 스냅샷이 낡은지 판별한다.
         self._activity_gen: int = 0
@@ -276,7 +281,55 @@ class Broker:
     def _active_reservations(self) -> list[Reservation]:
         """락 안: 게이트에 넘길 예약 목록 = in-flight + 미체결 잔량."""
         self._prune_expired_reservations()
+        self._prune_abandoned_working_orders()
         return list(self._inflight.values()) + self._working_reservations()
+
+    def _working_age(self, row: dict, now: float | None = None) -> float:
+        now = time.time() if now is None else now
+        return now - float(row.get("placed_at") or now)
+
+    def _should_abandon_working(self, row: dict, now: float | None = None) -> bool:
+        """미체결 행을 강제 회수할지. settled 행은 _expire_settled 담당."""
+        if self.working_order_abandon_ttl_sec < 0:
+            return False
+        if row.get("settled_at"):
+            return False
+        return self._working_age(row, now) >= self.working_order_abandon_ttl_sec
+
+    def _abandon_working_order(self, row: dict, now: float, *, why: str) -> None:
+        """취소·조회가 안 되는 미체결 행을 레지스트리에서 버리고 경보.
+
+        증권사 쪽 주문이 아직 살아 있을 수 있다(고아 위험). 그래도 한 행이
+        매수여력을 영구 홀드해 전 종목 매수를 죽이는 쪽이 더 비싸다 — inflight
+        reservation_ttl 과 같은 취지. 이벤트·에러 로그로 조용히 넘어가지 않는다.
+        """
+        oid = row["order_id"]
+        age = self._working_age(row, now)
+        log.error("[미체결 강제회수] %s %s x%s @ %s (id=%s, %.0f초, %s) — 예약 해제",
+                  row.get("side"), row.get("symbol"), row.get("qty"),
+                  row.get("price"), oid, age, why)
+        self._store_call(self.store.delete_working_order, oid)
+        self._emit_symbol("working_order_abandoned", row.get("symbol"), {
+            "order_id": oid, "side": row.get("side"), "qty": row.get("qty"),
+            "price": row.get("price"), "filled_qty": row.get("filled_qty"),
+            "status": row.get("status"), "age_sec": round(age, 1), "why": why})
+
+    def _prune_abandoned_working_orders(self) -> None:
+        """락 안: abandon TTL 지난 미체결 행 회수(게이트 직전 방어).
+
+        sweep 이 취소 실패만 반복하면 예약이 남는다. execute 경로에서도
+        같은 TTL 로 비워 전 종목 매수 동결을 끊는다.
+        """
+        if self.store is None or self.working_order_abandon_ttl_sec < 0:
+            return
+        try:
+            rows = self.store.get_working_orders(settled=False)
+        except Exception:
+            return
+        now = time.time()
+        for row in rows:
+            if self._should_abandon_working(row, now):
+                self._abandon_working_order(row, now, why="ttl_prune")
 
     def _working_reservations(self) -> list[Reservation]:
         """미체결 주문의 잔량도 예약으로 본다.
@@ -292,7 +345,11 @@ class Broker:
         except Exception:
             return []
         out: list[Reservation] = []
+        now = time.time()
         for row in rows:
+            # abandon 대상은 예약에서 제외(직전 prune 이 지웠어도 경합 대비).
+            if self._should_abandon_working(row, now):
+                continue
             if row["symbol"] in self._inflight:
                 continue
             remaining = float(row["qty"]) - float(row["filled_qty"] or 0.0)
@@ -484,7 +541,8 @@ class Broker:
             log.warning("미체결 목록 조회 실패: %s", e)
             return {"error": str(e)}
         out = {"checked": 0, "settled": 0, "canceled": 0, "cancel_failed": 0,
-               "working": 0, "awaiting_attribution": 0, "dropped": 0}
+               "working": 0, "awaiting_attribution": 0, "dropped": 0,
+               "abandoned": 0}
         now = time.time()
         for row in rows:
             oid = row["order_id"]
@@ -497,7 +555,11 @@ class Broker:
             out["checked"] += 1
             info = self._fetch_order(oid)
             if info is None:
-                out["working"] += 1
+                if self._should_abandon_working(row, now):
+                    self._abandon_working_order(row, now, why="fetch_failed")
+                    out["abandoned"] += 1
+                else:
+                    out["working"] += 1
                 continue
             status, filled, avg, fee = _parse_execution(info)
             self._store_call(self.store.update_working_order, oid, status=status,
@@ -512,10 +574,18 @@ class Broker:
                 continue
             age = now - float(row["placed_at"] or now)
             if self.working_order_ttl_sec < 0 or age < self.working_order_ttl_sec:
-                out["working"] += 1
+                # 취소 유예 중이라도 abandon TTL 이면 강제 회수(영구 동결 방지).
+                if self._should_abandon_working(row, now):
+                    self._abandon_working_order(row, now, why="ttl_no_cancel")
+                    out["abandoned"] += 1
+                else:
+                    out["working"] += 1
                 continue
             if self._cancel_and_confirm(oid, row):
                 out["canceled"] += 1
+            elif self._should_abandon_working(row, now):
+                self._abandon_working_order(row, now, why="cancel_failed")
+                out["abandoned"] += 1
             else:
                 out["cancel_failed"] += 1
                 out["working"] += 1
@@ -598,6 +668,8 @@ class Broker:
         """락 안: 게이트·주문 접수까지. 라이브 prep(I/O)은 execute()에서 락 밖 선행."""
         self.last_reject_reason = ""
         self.last_result = None
+        self._prune_expired_reservations()
+        self._prune_abandoned_working_orders()
         if self._reject_inflight(order, base_kw):
             return None
         if self._reject_working_order(order, base_kw):

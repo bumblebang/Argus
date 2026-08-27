@@ -327,7 +327,19 @@ def _start_account_refresher(gateway, cfg) -> threading.Event | None:
     def _once():
         try:
             from src.datasources.account_snapshot import save_snapshot
-            save_snapshot(gateway.fetch_account_snapshot(account_seq, markets=markets))
+            from src.portfolio_books import read_fx_usdkrw
+            fx_rate, fx_ts = None, None
+            try:
+                ms_path = ROOT / "data" / "market_state.json"
+                if ms_path.is_file():
+                    ms = json.loads(ms_path.read_text(encoding="utf-8"))
+                    fx_rate, fx_ts = read_fx_usdkrw(ms)
+            except (OSError, ValueError, TypeError):
+                pass
+            save_snapshot(gateway.fetch_account_snapshot(
+                account_seq, markets=markets,
+                fx_usdkrw=fx_rate, fx_ts=fx_ts,
+            ))
         except Exception as e:
             log.warning("자산 스냅샷 조회 오류(무시, 마지막 캐시 유지): %s", e)
 
@@ -341,18 +353,32 @@ def _start_account_refresher(gateway, cfg) -> threading.Event | None:
     return stop
 
 
-def _start_reconcile_timer(broker, gateway, store, cfg, markets) -> threading.Event | None:
+def _start_reconcile_timer(broker, gateway, store, cfg, markets,
+                           risk=None) -> threading.Event | None:
     """라이브 원장 주기 재대사 타이머(라이브만). broker.reconcile(락) 경유로 실계좌
     (holdings+buying-power)를 봇 원장에 병합해 드리프트를 없앤다 — 체결가 근사 오차·수수료·
     수동 계좌변경·기업행위·미체결 지연 등 모든 잔여 드리프트를 주기적으로 자가치유한다.
 
     주기=broker.reconcile_sec(기본 300s). 봇 관리 포지션의 thesis/손절/목표는 보존, 고아는
-    채택, 유령은 청산(reconcile_from_live). 페이퍼면 None(스킵). Event.set() 으로 정지."""
+    채택, 유령은 청산(reconcile_from_live). 페이퍼면 None(스킵). Event.set() 으로 정지.
+    재대사 성공 후 risk.capital 을 실자산 equity 에 동기화(폴백 한도 입출금 추종)."""
     if getattr(broker, "mode", "paper") != "live":
         return None
     sec = float((cfg.raw.get("broker", {}) or {}).get("reconcile_sec", 300))
     seq = broker.account_seq
     stop = threading.Event()
+    sync_cfg = ((cfg.raw.get("risk") or {}).get("capital_sync") or {})
+
+    def _sync_capital(acct):
+        try:
+            from src.capital_sync import apply_capital_sync
+            cap = apply_capital_sync(
+                gate=getattr(broker, "gate", None), risk=risk, cfg_raw=cfg.raw,
+                account=acct, markets=tuple(markets), sync_cfg=sync_cfg)
+            if cap.get("changed"):
+                store.log_event("capital_sync", None, cap)
+        except Exception as e:
+            log.warning("capital 동기화 오류(무시): %s", e)
 
     def _once():
         try:
@@ -360,7 +386,7 @@ def _start_reconcile_timer(broker, gateway, store, cfg, markets) -> threading.Ev
             # holdings 를 읽어야 방금 취소한 주문의 잔량이 스냅샷에 안 섞인다.
             sw = broker.sweep_working_orders()
             if (sw.get("canceled") or sw.get("cancel_failed") or sw.get("settled")
-                    or sw.get("dropped")):
+                    or sw.get("dropped") or sw.get("abandoned")):
                 store.log_event("working_orders", None, sw)
         except Exception as e:
             log.warning("미체결 정산 오류(무시): %s", e)
@@ -375,6 +401,8 @@ def _start_reconcile_timer(broker, gateway, store, cfg, markets) -> threading.Ev
             if (res.get("adopted") or res.get("closed") or res.get("error")
                     or res.get("attributed")):
                 store.log_event("reconcile", None, res)
+            if not res.get("deferred"):
+                _sync_capital(broker.account)
         except Exception as e:
             log.warning("주기 재대사 오류(무시): %s", e)
 
@@ -728,10 +756,12 @@ def run_from_args(args) -> int:
         _snap_sec = float(wcfg.get("account_snapshot_sec", 300))
         log.info("자산 스냅샷=on(%.0f분) — 실계좌 매수여력+보유 캐시", _snap_sec / 60)
     # 라이브 원장 주기 재대사 — 실계좌를 봇 원장에 병합해 드리프트 자가치유(라이브만).
-    reconcile_stop = _start_reconcile_timer(broker, gateway, store, cfg, markets)
+    reconcile_stop = _start_reconcile_timer(broker, gateway, store, cfg, markets,
+                                            risk=risk)
     if reconcile_stop:
         _rec_sec = float(broker_cfg.get("reconcile_sec", 300))
-        log.info("원장 재대사=on(%.0f분) — 실계좌 병합으로 드리프트 차단", _rec_sec / 60)
+        log.info("원장 재대사=on(%.0f분) — 실계좌 병합으로 드리프트 차단 · capital 동기화",
+                 _rec_sec / 60)
     _keep_awake(True)
     try:
         loop.run_forever(max_ticks=args.ticks)

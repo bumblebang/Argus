@@ -122,13 +122,68 @@ def _read_fear_history() -> dict:
     return d if isinstance(d, dict) else {}
 
 
-def _read_snapshot() -> dict | None:
-    """실계좌 자산 스냅샷(데몬이 캐시). 없거나 깨졌으면 None('스냅샷 대기중')."""
+def _read_snapshot(fx: float | None = None) -> dict | None:
+    """실계좌 자산 스냅샷(데몬이 캐시). 없거나 깨졌으면 None('스냅샷 대기중').
+
+    구 캐시에 books/totals 없으면 FX 로 즉시 파생(대시 폴백).
+    """
     try:
-        return json.loads(SNAPSHOT.read_text(encoding="utf-8"))
+        snap = json.loads(SNAPSHOT.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
+    if not isinstance(snap, dict):
+        return None
+    if snap.get("books") and snap.get("totals"):
+        return snap
+    try:
+        from src.portfolio_books import apply_books
+        fx_rate = fx
+        fx_ts = None
+        if fx_rate is None:
+            fx_blob = snap.get("fx") or {}
+            if isinstance(fx_blob, dict) and fx_blob.get("USDKRW"):
+                fx_rate = float(fx_blob["USDKRW"])
+                fx_ts = fx_blob.get("ts")
+        apply_books(snap, fx_usdkrw=fx_rate, fx_ts=fx_ts,
+                    ensure_markets=("KR", "US"))
+    except Exception:
+        pass
+    return snap
 
+
+def _risk_control_meta(paper: dict | None = None) -> dict:
+    """슬롯·pause 배지용 메타(대시 표시 전용, 게이트와 동일 규칙)."""
+    try:
+        from src.config import load_config
+        from src.risk_gate import RiskGate, _normalize_max_positions
+        cfg = load_config().raw
+        risk = cfg.get("risk") or {}
+        gate = RiskGate(risk)
+        max_pos = dict(gate.max_positions)
+        pause = gate.pause_status()
+    except Exception:
+        max_pos = {"KR": 5, "US": 5}
+        pause = "none"
+        try:
+            from src.risk_gate import _normalize_max_positions
+            max_pos = _normalize_max_positions(5)
+        except Exception:
+            pass
+    open_n = {"KR": 0, "US": 0}
+    if isinstance(paper, dict):
+        sm = paper.get("symbol_market") or {}
+        positions = paper.get("positions") or {}
+        for sym, pos in positions.items():
+            if not isinstance(pos, dict):
+                continue
+            qty = float(pos.get("qty") or 0)
+            if qty <= 0:
+                continue
+            mk = str(sm.get(sym) or "KR").upper()
+            if mk not in open_n:
+                open_n[mk] = 0
+            open_n[mk] += 1
+    return {"max_positions": max_pos, "open": open_n, "pause": pause}
 
 def _conv(v) -> float:
     """확신도 등 정렬용 수치 캐스팅 — 값이 없거나 깨졌으면 0."""
@@ -652,11 +707,18 @@ def _parse_jts(ts) -> datetime | None:
         return None
 
 
-def _hist_closes(symbol: str, market: str = "KR") -> dict[str, float]:
-    """일봉 종가 {YYYY-MM-DD: close}. 실패 시 빈 dict."""
+def _hist_closes(symbol: str, market: str = "KR", *,
+                 refresh: bool = False,
+                 max_age_hours: float | None = None) -> dict[str, float]:
+    """일봉 종가 {YYYY-MM-DD: close}. 실패 시 빈 dict.
+
+    refresh/max_age_hours 는 fetch_history 에 그대로 전달 — 벤치(S&P)처럼
+    캐시가 낡으면 차트가 평평해지는 것을 막는다.
+    """
     try:
         from src.datasources.history import fetch_history
-        df = fetch_history(symbol, interval="1d", range_="1y", market=market)
+        df = fetch_history(symbol, interval="1d", range_="1y", market=market,
+                           refresh=refresh, max_age_hours=max_age_hours)
     except Exception:
         return {}
     if df is None or not len(df):
@@ -719,9 +781,10 @@ def _kr_journal_fills(paper: dict, store_rows: list | None = None) -> list[dict]
 def _equity_vs_kospi(paper: dict | None, snap: dict | None,
                      store_rows: list | None = None,
                      latest_px: dict | None = None) -> dict | None:
-    """KR 포트 평가수익률 vs 코스피 누적 수익률 시계열.
+    """KR 포트 평가수익률 vs 코스피(+S&P) 누적 수익률 시계열.
 
-    반환: {dates, port, bench, port_now, bench_now, alpha_now, since, bench_name}
+    반환: {dates, port, bench, bench2?, port_now, bench_now, bench2_now?,
+           alpha_now, since, bench_name, bench2_name?}
     포인트는 일별(%). 데이터 부족 시 None.
     """
     now = time.time()
@@ -742,14 +805,27 @@ def _equity_vs_kospi(paper: dict | None, snap: dict | None,
 
     # 심볼별 일봉
     syms = {f["symbol"] for f in fills} | set((paper.get("positions") or {}).keys())
-    closes = {s: _hist_closes(s, "KR") for s in syms}
+    closes = {s: _hist_closes(s, "KR", max_age_hours=24) for s in syms}
     bsym, bname = BENCH["KR"]
-    bcloses = _hist_closes(bsym, "KR")
+    bcloses = _hist_closes(bsym, "KR", max_age_hours=24)
     if not bcloses:
         return None
-
+    # S&P(SPY) — KR 캘린더에 ffill 정렬. 캐시가 since 이전이면 강제 갱신
+    # (낡은 SPY면 전 구간 동일 종가 → 수익률 0% 평평선).
+    usym, uname = BENCH.get("US", ("SPY", "S&P500"))
+    ucloses = _hist_closes(usym, "US", max_age_hours=24)
     first_dt = fills[0]["dt"] if fills else datetime.now()
     since = first_dt.strftime("%Y-%m-%d")
+    if ucloses:
+        last_u = max(ucloses)
+        if last_u < since:
+            ucloses = _hist_closes(usym, "US", refresh=True)
+    if not ucloses or (ucloses and max(ucloses) < since):
+        # SPY 실패 시 ^GSPC 폴백
+        ucloses = _hist_closes("^GSPC", "US", refresh=True)
+        if ucloses and max(ucloses) >= since:
+            uname = "S&P500"
+            usym = "^GSPC"
     # 벤치 캘린더 중 since 이후
     days = sorted(d for d in bcloses if d >= since)
     if not days:
@@ -765,6 +841,14 @@ def _equity_vs_kospi(paper: dict | None, snap: dict | None,
             return prev[-1]
         return holdings_px.get(sym)
 
+    def _ffill_close(closes_map: dict[str, float], day: str) -> float | None:
+        if not closes_map:
+            return None
+        if day in closes_map:
+            return closes_map[day]
+        prev = [closes_map[d] for d in sorted(closes_map) if d <= day]
+        return prev[-1] if prev else None
+
     cash = start_cash
     hold: dict[str, float] = {}
     hold_px: dict[str, float] = {}
@@ -772,7 +856,10 @@ def _equity_vs_kospi(paper: dict | None, snap: dict | None,
     dates: list[str] = []
     port: list[float] = []
     bench: list[float] = []
+    bench2: list[float] = []
     b0 = None
+    u0 = None
+    have_spy = bool(ucloses)
 
     for day in days:
         # 당일 체결 반영(그날 종가 평가 전에)
@@ -805,6 +892,17 @@ def _equity_vs_kospi(paper: dict | None, snap: dict | None,
         dates.append(day)
         port.append(pret)
         bench.append(Bret)
+        if have_spy:
+            uc = _ffill_close(ucloses, day)
+            if uc is not None:
+                if u0 is None:
+                    u0 = uc
+                bench2.append((uc / u0 - 1.0) * 100.0)
+            elif bench2:
+                bench2.append(bench2[-1])
+            else:
+                # S&P 아직 시작 전 — 0으로 맞춤(축 정렬)
+                bench2.append(0.0)
 
     # 오늘 실계좌 스냅샷으로 종점 보정(저널 누락·미실현 반영)
     if snap and dates:
@@ -821,6 +919,8 @@ def _equity_vs_kospi(paper: dict | None, snap: dict | None,
                     dates.append(today)
                     port.append(live_ret)
                     bench.append(bench[-1])
+                    if bench2:
+                        bench2.append(bench2[-1])
         except (TypeError, ValueError):
             pass
     # latest_px 로도 종점 보강(스냅 없을 때)
@@ -833,27 +933,38 @@ def _equity_vs_kospi(paper: dict | None, snap: dict | None,
 
     if len(dates) < 2:
         return None
+    # bench2 길이 어긋나면 버림(부분 실패)
+    if bench2 and len(bench2) != len(dates):
+        bench2 = []
     payload = {
         "dates": dates, "port": port, "bench": bench,
         "port_now": port[-1], "bench_now": bench[-1],
         "alpha_now": port[-1] - bench[-1],
         "since": since, "bench_name": bname, "snap_ts": snap_ts,
     }
+    if bench2:
+        payload["bench2"] = bench2
+        payload["bench2_now"] = bench2[-1]
+        payload["bench2_name"] = uname
+        payload["alpha2_now"] = port[-1] - bench2[-1]
     _chart_cache["KR"] = (now, payload)
     return payload
 
 
-def _ret_chart_svg(series: dict, w: int = 640, h: int = 220) -> str:
-    """수익률(%) 이중선 SVG — Argus vs 벤치마크."""
+def _ret_chart_svg(series: dict, w: int = 960, h: int = 240) -> str:
+    """수익률(%) 다중선 SVG — Argus vs 코스피(+S&P). 컨테이너 가로 풀폭."""
     dates = series.get("dates") or []
     port = series.get("port") or []
     bench = series.get("bench") or []
+    bench2 = series.get("bench2") or []
     if len(dates) < 2 or len(port) != len(dates) or len(bench) != len(dates):
         return ""
-    pad_l, pad_r, pad_t, pad_b = 44.0, 12.0, 16.0, 28.0
+    if bench2 and len(bench2) != len(dates):
+        bench2 = []
+    pad_l, pad_r, pad_t, pad_b = 48.0, 8.0, 16.0, 28.0
     plot_w = w - pad_l - pad_r
     plot_h = h - pad_t - pad_b
-    vals = list(port) + list(bench) + [0.0]
+    vals = list(port) + list(bench) + list(bench2) + [0.0]
     lo, hi = min(vals), max(vals)
     if hi - lo < 1e-6:
         hi, lo = hi + 1.0, lo - 1.0
@@ -866,9 +977,9 @@ def _ret_chart_svg(series: dict, w: int = 640, h: int = 220) -> str:
     def _y(v: float) -> float:
         return pad_t + (hi - v) / (hi - lo) * plot_h
 
-    def _poly(arr, color: str) -> str:
+    def _poly(arr, color: str, width: str = "2") -> str:
         pts = " ".join(f"{_x(i):.1f},{_y(v):.1f}" for i, v in enumerate(arr))
-        return (f"<polyline fill=none stroke='{color}' stroke-width='2' "
+        return (f"<polyline fill=none stroke='{color}' stroke-width='{width}' "
                 f"stroke-linejoin=round points='{pts}'/>")
 
     # 0% 기준선
@@ -889,47 +1000,69 @@ def _ret_chart_svg(series: dict, w: int = 640, h: int = 220) -> str:
         labs.append(f"<text x='{_x(i):.1f}' y='{h-8}' text-anchor='middle' "
                     f"fill='#8b94a3' font-size='10'>{escape(dates[i][5:])}</text>")
 
-    pcol, bcol = "#5aa9ff", "#ffb454"
-    hover = (
-        f"<g class=bc-hover-layer>"
-        f"<line class=bc-vline x1='0' y1='{pad_t:.1f}' x2='0' y2='{pad_t + plot_h:.1f}' "
-        f"stroke='#5a6373' stroke-width='1' stroke-dasharray='4 3' visibility='hidden'/>"
+    pcol, bcol, ucol = "#5aa9ff", "#ffb454", "#7ee787"
+    hover_dots = (
         f"<circle class='bc-dot bc-dot-port' r='4' fill='{pcol}' stroke='#0b0e14' "
         f"stroke-width='1.5' visibility='hidden'/>"
         f"<circle class='bc-dot bc-dot-bench' r='4' fill='{bcol}' stroke='#0b0e14' "
         f"stroke-width='1.5' visibility='hidden'/>"
+    )
+    if bench2:
+        hover_dots += (
+            f"<circle class='bc-dot bc-dot-bench2' r='4' fill='{ucol}' stroke='#0b0e14' "
+            f"stroke-width='1.5' visibility='hidden'/>"
+        )
+    hover = (
+        f"<g class=bc-hover-layer>"
+        f"<line class=bc-vline x1='0' y1='{pad_t:.1f}' x2='0' y2='{pad_t + plot_h:.1f}' "
+        f"stroke='#5a6373' stroke-width='1' stroke-dasharray='4 3' visibility='hidden'/>"
+        f"{hover_dots}"
         f"<rect class=bc-overlay x='{pad_l:.1f}' y='{pad_t:.1f}' width='{plot_w:.1f}' "
         f"height='{plot_h:.1f}' fill='transparent' cursor='crosshair'/>"
         f"</g>"
     )
+    lines = _poly(bench, bcol)
+    if bench2:
+        lines += _poly(bench2, ucol, "1.75")
+    lines += _poly(port, pcol)
+    ends = (
+        f"<circle cx='{_x(len(dates)-1):.1f}' cy='{_y(port[-1]):.1f}' r='3' fill='{pcol}'/>"
+        f"<circle cx='{_x(len(dates)-1):.1f}' cy='{_y(bench[-1]):.1f}' r='3' fill='{bcol}'/>"
+    )
+    if bench2:
+        ends += (
+            f"<circle cx='{_x(len(dates)-1):.1f}' cy='{_y(bench2[-1]):.1f}' "
+            f"r='3' fill='{ucol}'/>"
+        )
     return (
         f"<svg viewBox='0 0 {w} {h}' width='100%' height='{h}' "
-        f"style='display:block;max-width:{w}px'>"
+        f"preserveAspectRatio='none' style='display:block;width:100%;max-width:none'>"
         f"<rect x='{pad_l}' y='{pad_t}' width='{plot_w}' height='{plot_h}' "
         f"fill='#0d1320' stroke='#1c2433'/>"
         f"{''.join(grid)}"
         f"<line x1='{pad_l}' y1='{y0:.1f}' x2='{w-pad_r}' y2='{y0:.1f}' "
         f"stroke='#3a4558' stroke-width='1'/>"
-        f"{_poly(bench, bcol)}{_poly(port, pcol)}"
-        f"<circle cx='{_x(len(dates)-1):.1f}' cy='{_y(port[-1]):.1f}' r='3' fill='{pcol}'/>"
-        f"<circle cx='{_x(len(dates)-1):.1f}' cy='{_y(bench[-1]):.1f}' r='3' fill='{bcol}'/>"
+        f"{lines}{ends}"
         f"{''.join(labs)}"
         f"{hover}"
         f"</svg>"
     )
 
 
-def _bench_chart_points(series: dict, w: int = 640, h: int = 220) -> list[dict]:
+def _bench_chart_points(series: dict, w: int = 960, h: int = 240) -> list[dict]:
     """툴팁용 날짜별 좌표·수익률."""
     dates = series.get("dates") or []
     port = series.get("port") or []
     bench = series.get("bench") or []
+    bench2 = series.get("bench2") or []
     if len(dates) < 2:
         return []
-    pad_l, pad_r, pad_t, pad_b = 44.0, 12.0, 16.0, 28.0
+    if bench2 and len(bench2) != len(dates):
+        bench2 = []
+    pad_l, pad_r, pad_t, pad_b = 48.0, 8.0, 16.0, 28.0
     plot_w = w - pad_l - pad_r
     plot_h = h - pad_t - pad_b
-    vals = list(port) + list(bench) + [0.0]
+    vals = list(port) + list(bench) + list(bench2) + [0.0]
     lo, hi = min(vals), max(vals)
     if hi - lo < 1e-6:
         hi, lo = hi + 1.0, lo - 1.0
@@ -946,10 +1079,16 @@ def _bench_chart_points(series: dict, w: int = 640, h: int = 220) -> list[dict]:
     out = []
     for i, d in enumerate(dates):
         pv, bv = float(port[i]), float(bench[i])
-        out.append({
+        row = {
             "date": d, "port": pv, "bench": bv, "alpha": pv - bv,
             "x": round(_x(i), 1), "yp": round(_y(pv), 1), "yb": round(_y(bv), 1),
-        })
+        }
+        if bench2:
+            uv = float(bench2[i])
+            row["bench2"] = uv
+            row["alpha2"] = pv - uv
+            row["yb2"] = round(_y(uv), 1)
+        out.append(row)
     return out
 
 
@@ -1152,8 +1291,9 @@ def _gather() -> dict:
     )
     data["names"] = _load_names()
     data["base_rates"] = _read_base_rates()
-    data["snapshot"] = _read_snapshot()
+    data["snapshot"] = _read_snapshot(fx=fx)
     data["live_mode"] = _read_live_mode()
+    data["risk_control"] = _risk_control_meta(data.get("paper"))
     try:
         data["bench_chart"] = _equity_vs_kospi(
             data.get("paper"), data.get("snapshot"),
@@ -1472,6 +1612,15 @@ table.trades td.num{font-variant-numeric:tabular-nums;font-family:ui-monospace,C
 .asset-grid .big{font-size:28px;font-weight:700;margin-top:5px;font-variant-numeric:tabular-nums;line-height:1.15;}
 .asset-grid .big small{font-size:13px;font-weight:500;}
 .asset-grid .sub2{font-size:12px;margin-top:3px;font-variant-numeric:tabular-nums;}
+.asset-books{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:12px;margin-top:14px;}
+.asset-book{background:#0b1220;border:1px solid #243349;border-radius:10px;padding:12px 14px;}
+.asset-book .bk-hd{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:8px;}
+.asset-book .bk-title{font-size:13px;font-weight:700;letter-spacing:.3px;}
+.asset-book .bk-slot{font-size:11px;color:#8b94a3;font-variant-numeric:tabular-nums;}
+.asset-book .bk-row{display:flex;justify-content:space-between;gap:8px;font-size:12px;margin-top:4px;font-variant-numeric:tabular-nums;}
+.asset-book .bk-row .k{color:#8b94a3;}
+.b-pause{padding:2px 10px;border-radius:20px;font-size:11px;font-weight:700;background:#332a10;color:#ffcf6b;border:1px solid #ffb454;}
+.b-pause-ok{padding:2px 10px;border-radius:20px;font-size:11px;font-weight:600;background:#12341f;color:#3ddc84;}
 .b-live{padding:2px 10px;border-radius:20px;font-size:12px;font-weight:700;background:#3a1013;color:#ff8c91;border:1px solid #ff5c63;}
 .b-paper{padding:2px 10px;border-radius:20px;font-size:12px;font-weight:700;background:#12341f;color:#3ddc84;}
 .freshwarn{color:#ffb454;}
@@ -1506,15 +1655,16 @@ table.trades td.num{font-variant-numeric:tabular-nums;font-family:ui-monospace,C
 .fg-note{font-size:12px;color:#8b94a3;margin-left:auto;}
 .fg-cap{font-size:10px;color:#5a6373;margin-top:3px;text-align:right;}
 .fg-src{font-size:11px;color:#5a6373;margin-top:8px;}
-/* Argus vs 코스피 수익률 차트 */
-.bench-chart{margin-top:16px;padding-top:14px;border-top:1px solid #1c2433;}
+/* Argus vs 코스피·S&P 수익률 차트 */
+.bench-chart{margin-top:16px;padding-top:14px;border-top:1px solid #1c2433;width:100%;}
 .bench-chart .bc-hd{display:flex;align-items:baseline;gap:12px;flex-wrap:wrap;margin-bottom:10px;}
 .bench-chart .bc-ttl{font-size:12px;color:#8b94a3;text-transform:uppercase;letter-spacing:.6px;}
 .bench-chart .bc-leg{display:flex;gap:14px;flex-wrap:wrap;font-size:12px;margin-left:auto;}
 .bench-chart .bc-leg i{display:inline-block;width:10px;height:3px;border-radius:2px;margin-right:5px;vertical-align:middle;}
 .bench-chart .bc-stats{display:flex;gap:16px;flex-wrap:wrap;margin-top:8px;font-size:13px;font-variant-numeric:tabular-nums;}
 .bench-chart .bc-stats .k{color:#8b94a3;font-size:11px;margin-right:4px;}
-.bench-chart .bc-wrap{position:relative;}
+.bench-chart .bc-wrap{position:relative;width:100%;}
+.bench-chart .bc-wrap svg{display:block;width:100%;max-width:none;height:240px;}
 .bench-chart .bc-tip{position:absolute;z-index:5;min-width:168px;padding:10px 12px;border-radius:10px;
   background:#141925;border:1px solid #2a3344;box-shadow:0 8px 24px rgba(0,0,0,.45);
   font-size:12px;line-height:1.55;pointer-events:none;}
@@ -1778,11 +1928,11 @@ def _snap_name(it: dict, names: dict) -> str:
 # ───────────────────────── 자산 관제 패널(탭 위) ─────────────────────────
 
 def _bench_chart_html(d: dict) -> str:
-    """메인 상단: Argus vs 코스피 누적 수익률 차트."""
+    """메인 상단: Argus vs 코스피·S&P 누적 수익률 차트."""
     s = d.get("bench_chart")
     if not s:
         return ("<div class=bench-chart><div class=bc-hd>"
-                "<span class=bc-ttl>수익률 · Argus vs 코스피</span></div>"
+                "<span class=bc-ttl>수익률 · Argus vs 코스피 · S&P</span></div>"
                 "<span class=muted>차트 데이터 준비중(체결·지수 히스토리 부족).</span></div>")
     svg = _ret_chart_svg(s)
     if not svg:
@@ -1793,27 +1943,56 @@ def _bench_chart_html(d: dict) -> str:
     ac = "pos" if an >= 0 else "neg"
     bname_raw = str(s.get("bench_name") or "코스피")
     bname = escape(bname_raw)
+    u2_raw = s.get("bench2_name")
+    u2 = escape(str(u2_raw)) if u2_raw else ""
+    has2 = bool(s.get("bench2")) and u2_raw
     pts = _bench_chart_points(s)
-    tip_data = json.dumps({"bench": bname_raw, "points": pts}, ensure_ascii=False)
-    return (
-        "<div class=bench-chart>"
-        "<div class=bc-hd>"
-        f"<span class=bc-ttl>수익률 · Argus vs {bname}</span>"
-        f"<span class=muted>첫 체결 {escape(s.get('since') or '')}~ · 평가 기준</span>"
+    tip_meta = {"bench": bname_raw, "points": pts}
+    if has2:
+        tip_meta["bench2"] = str(u2_raw)
+    tip_data = json.dumps(tip_meta, ensure_ascii=False)
+    leg = (
         "<span class=bc-leg>"
         "<span><i style='background:#5aa9ff'></i>Argus</span>"
         f"<span><i style='background:#ffb454'></i>{bname}</span>"
-        "</span></div>"
+    )
+    if has2:
+        leg += f"<span><i style='background:#7ee787'></i>{u2}</span>"
+    leg += "</span>"
+    stats = (
+        f"<span><span class=k>Argus</span><span class='mono {pc}'>{pn:+.2f}%</span></span>"
+        f"<span><span class=k>{bname}</span><span class='mono {bc}'>{bn:+.2f}%</span></span>"
+    )
+    if has2:
+        un = float(s.get("bench2_now") or 0)
+        a2 = float(s.get("alpha2_now") or (pn - un))
+        uc = "pos" if un >= 0 else "neg"
+        a2c = "pos" if a2 >= 0 else "neg"
+        stats += (
+            f"<span><span class=k>{u2}</span><span class='mono {uc}'>{un:+.2f}%</span></span>"
+            f"<span><span class=k>알파({bname})</span>"
+            f"<span class='mono {ac}'><b>{an:+.2f}%p</b></span></span>"
+            f"<span><span class=k>알파({u2})</span>"
+            f"<span class='mono {a2c}'><b>{a2:+.2f}%p</b></span></span>"
+        )
+    else:
+        stats += (
+            f"<span><span class=k>알파</span>"
+            f"<span class='mono {ac}'><b>{an:+.2f}%p</b></span></span>"
+        )
+    title = f"수익률 · Argus vs {bname}" + (f" · {u2}" if has2 else "")
+    return (
+        "<div class=bench-chart>"
+        "<div class=bc-hd>"
+        f"<span class=bc-ttl>{title}</span>"
+        f"<span class=muted>첫 체결 {escape(s.get('since') or '')}~ · 평가 기준</span>"
+        f"{leg}</div>"
         "<div class=bc-wrap>"
         f"<script type='application/json' class=bc-data>{tip_data}</script>"
         "<div class=bc-tip hidden></div>"
         f"{svg}"
         "</div>"
-        "<div class=bc-stats>"
-        f"<span><span class=k>Argus</span><span class='mono {pc}'>{pn:+.2f}%</span></span>"
-        f"<span><span class=k>{bname}</span><span class='mono {bc}'>{bn:+.2f}%</span></span>"
-        f"<span><span class=k>알파</span><span class='mono {ac}'><b>{an:+.2f}%p</b></span></span>"
-        "</div></div>"
+        f"<div class=bc-stats>{stats}</div></div>"
     )
 
 
@@ -1860,39 +2039,112 @@ def _asset_html(d: dict) -> str:
         fcls = "freshwarn" if age > SNAP_STALE_SEC else ""
     p.append(f"<span class='fresh {fcls}'>{escape(fresh)}</span></div>")
 
-    # KR 종합: 총자산=현금+평가, 투입원금(원가)=현금+매입원가, 평가손익=총자산-투입원금
-    cash = snap.get("cash") or {}
-    mv = snap.get("market_value") or {}
-    tp = snap.get("total_purchase") or {}
-    cash_kr = float(cash.get("KR", 0) or 0)
-    mv_kr = float(mv.get("KR", 0) or 0)
-    tp_kr = float(tp.get("KR", 0) or 0)
-    total = cash_kr + mv_kr
-    principal = cash_kr + tp_kr
-    pnl = (snap.get("profit") or {}).get("KR")
-    pr = (snap.get("profit_rate") or {}).get("KR")
-    dpnl = (snap.get("daily_profit") or {}).get("KR")
-    dpr = (snap.get("daily_profit_rate") or {}).get("KR")
-    pcls = "pos" if (pnl or 0) >= 0 else "neg"
-    dcls = "pos" if (dpnl or 0) >= 0 else "neg"
-    pnl_disp = f"₩{pnl:+,.0f}" if pnl is not None else "–"
-    dpnl_disp = f"₩{dpnl:+,.0f}" if dpnl is not None else "–"
-    pr_s = f" <small>({pr*100:+.2f}%)</small>" if pr is not None else ""
-    dpr_s = f" <small>({dpr*100:+.2f}%)</small>" if dpr is not None else ""
+    # books/totals 보장(구 스냅샷·테스트 직접 주입 대비)
+    books = snap.get("books")
+    totals = snap.get("totals")
+    if not books or not totals:
+        try:
+            from src.portfolio_books import apply_books
+            fx_rate = d.get("fx")
+            fx_blob = snap.get("fx") or {}
+            if fx_rate is None and isinstance(fx_blob, dict):
+                fx_rate = fx_blob.get("USDKRW")
+            apply_books(snap, fx_usdkrw=fx_rate, ensure_markets=("KR", "US"))
+            books = snap.get("books") or {}
+            totals = snap.get("totals") or {}
+        except Exception:
+            books, totals = {}, {}
+
+    rc = d.get("risk_control") or {}
+    pause = str(rc.get("pause") or "none")
+    max_pos = rc.get("max_positions") or {}
+    open_n = rc.get("open") or {}
+    if pause == "none":
+        p.append("<div style='margin:0 0 10px'><span class=b-pause-ok>pause none</span></div>")
+    else:
+        p.append(f"<div style='margin:0 0 10px'><span class=b-pause>pause {escape(pause)}</span></div>")
+
+    # 히어로: 원화 환산 총자산
+    eq_krw = totals.get("equity_krw")
+    pnl_krw = totals.get("pnl_krw")
+    daily_krw = totals.get("daily_pnl_krw")
+    fx_note = totals.get("fx_note") or ""
+    fx_blob = snap.get("fx") or {}
+    fx_rate = None
+    if isinstance(fx_blob, dict) and fx_blob.get("USDKRW"):
+        fx_rate = float(fx_blob["USDKRW"])
+    elif d.get("fx"):
+        fx_rate = float(d["fx"])
+
     p.append("<div class=asset-grid>")
-    p.append(f"<div><div class=k>총자산</div><div class=big>₩{total:,.0f}</div>"
-             f"<div class='sub2 muted'>현금 ₩{cash_kr:,.0f} + 평가 ₩{mv_kr:,.0f}</div></div>")
-    p.append(f"<div><div class=k>투입원금 <small>원가</small></div><div class=big>₩{principal:,.0f}</div>"
-             f"<div class='sub2 muted'>현금 ₩{cash_kr:,.0f} + 매입 ₩{tp_kr:,.0f}</div></div>")
-    p.append(f"<div><div class=k>평가손익</div><div class='big {pcls}'>{pnl_disp}{pr_s}</div></div>")
-    p.append(f"<div><div class=k>일손익</div><div class='big {dcls}'>{dpnl_disp}{dpr_s}</div></div>")
+    if eq_krw is not None:
+        fx_bit = f" · USDKRW {fx_rate:,.2f}" if fx_rate else ""
+        p.append(f"<div><div class=k>총자산 <small>₩환산</small></div>"
+                 f"<div class=big>₩{float(eq_krw):,.0f}</div>"
+                 f"<div class='sub2 muted'>{escape(fx_note)}{fx_bit}</div></div>")
+    else:
+        p.append("<div><div class=k>총자산 <small>₩환산</small></div>"
+                 "<div class=big>–</div>"
+                 f"<div class='sub2 muted'>{escape(fx_note or 'FX 없음 — 원장만 표시')}</div></div>")
+    pcls = "pos" if (pnl_krw or 0) >= 0 else "neg"
+    dcls = "pos" if (daily_krw or 0) >= 0 else "neg"
+    pnl_disp = f"₩{float(pnl_krw):+,.0f}" if pnl_krw is not None else "–"
+    daily_disp = f"₩{float(daily_krw):+,.0f}" if daily_krw is not None else "–"
+    p.append(f"<div><div class=k>평가손익 <small>₩환산</small></div>"
+             f"<div class='big {pcls}'>{pnl_disp}</div></div>")
+    p.append(f"<div><div class=k>일손익 <small>₩환산</small></div>"
+             f"<div class='big {dcls}'>{daily_disp}</div></div>")
     p.append("</div>")  # asset-grid
-    # US 잔고(있으면, 환산 미포함 참고선)
-    us_cash = cash.get("US")
-    us_mv = mv.get("US")
-    if us_cash or us_mv:
-        p.append(f"<div class='sub2 muted' style='margin-top:8px'>US: 현금 "
-                 f"${float(us_cash or 0):,.2f} · 평가 ${float(us_mv or 0):,.2f} (₩환산 미포함)</div>")
+
+    # KR | US 원장 카드
+    p.append("<div class=asset-books>")
+    for mk in ("KR", "US"):
+        b = (books or {}).get(mk)
+        if not b:
+            continue
+        ccy = b.get("ccy") or ("KRW" if mk == "KR" else "USD")
+        cash_v = float(b.get("cash") or 0)
+        mv_v = float(b.get("mv") or 0)
+        pu_v = float(b.get("purchase") or 0)
+        eq_v = float(b.get("equity") or 0)
+        pnl_v = b.get("pnl")
+        pr = b.get("pnl_rate")
+        dpnl = b.get("daily_pnl")
+        dpr = b.get("daily_pnl_rate")
+        if mk == "KR":
+            def _m(v):
+                return f"₩{float(v):,.0f}"
+            def _ms(v):
+                return f"₩{float(v):+,.0f}"
+        else:
+            def _m(v):
+                return f"${float(v):,.2f}"
+            def _ms(v):
+                return f"${float(v):+,.2f}"
+        slot_max = int(max_pos.get(mk, 5) or 5)
+        slot_open = int(open_n.get(mk, 0) or 0)
+        pcls_b = "pos" if (pnl_v or 0) >= 0 else "neg"
+        dcls_b = "pos" if (dpnl or 0) >= 0 else "neg"
+        pr_s = f" ({pr*100:+.2f}%)" if pr is not None else ""
+        dpr_s = f" ({dpr*100:+.2f}%)" if dpr is not None else ""
+        pnl_s = _ms(pnl_v) if pnl_v is not None else "–"
+        dpnl_s = _ms(dpnl) if dpnl is not None else "–"
+        p.append("<div class=asset-book>")
+        p.append(f"<div class=bk-hd><span class=bk-title>{mk} · {escape(ccy)}</span>"
+                 f"<span class=bk-slot>슬롯 {slot_open}/{slot_max}</span></div>")
+        p.append(f"<div class=bk-row><span class=k>자산</span><span>{_m(eq_v)}</span></div>")
+        p.append(f"<div class=bk-row><span class=k>현금</span><span>{_m(cash_v)}</span></div>")
+        p.append(f"<div class=bk-row><span class=k>평가</span><span>{_m(mv_v)}</span></div>")
+        p.append(f"<div class=bk-row><span class=k>매입</span><span>{_m(pu_v)}</span></div>")
+        p.append(f"<div class=bk-row><span class=k>평가손익</span>"
+                 f"<span class='{pcls_b}'>{pnl_s}{pr_s}</span></div>")
+        p.append(f"<div class=bk-row><span class=k>일손익</span>"
+                 f"<span class='{dcls_b}'>{dpnl_s}{dpr_s}</span></div>")
+        if mk == "US" and b.get("equity_krw") is not None:
+            p.append(f"<div class=bk-row><span class=k>₩환산</span>"
+                     f"<span>₩{float(b['equity_krw']):,.0f}</span></div>")
+        p.append("</div>")
+    p.append("</div>")  # asset-books
 
     # Argus vs 코스피 누적 수익률
     p.append(_bench_chart_html(d))
@@ -1907,6 +2159,8 @@ def _asset_html(d: dict) -> str:
     if items:
         p.append("<table><tr><th>종목명</th><th>시장</th><th>수량</th><th>평단</th>"
                  "<th>현재가</th><th>평가금액</th><th>평가손익</th><th>손절</th><th>목표</th></tr>")
+        sub = {"KR": {"n": 0, "value": 0.0, "pnl": 0.0},
+               "US": {"n": 0, "value": 0.0, "pnl": 0.0}}
         for it in items:
             mk = str(it.get("market") or "KR")
             dp = 0 if mk == "KR" else 2
@@ -1924,6 +2178,27 @@ def _asset_html(d: dict) -> str:
                      f"<td class=mono>{_money(it.get('value'), mk)}</td>"
                      f"<td class='mono {rcls}'>{pnl_v_s} ({rate_s})</td>"
                      f"{_plan_cells(row, dp)}</tr>")
+            bucket = sub.setdefault(mk, {"n": 0, "value": 0.0, "pnl": 0.0})
+            bucket["n"] += 1
+            try:
+                bucket["value"] += float(it.get("value") or 0)
+            except (TypeError, ValueError):
+                pass
+            try:
+                if pnl_v is not None:
+                    bucket["pnl"] += float(pnl_v)
+            except (TypeError, ValueError):
+                pass
+        # 시장별 소계
+        for mk in ("KR", "US"):
+            b = sub.get(mk) or {}
+            if not b.get("n"):
+                continue
+            pcls_s = "pos" if (b.get("pnl") or 0) >= 0 else "neg"
+            p.append(f"<tr><td colspan=5 class=muted><b>{escape(mk)} 소계</b> · {b['n']}종목</td>"
+                     f"<td class=mono>{_money(b.get('value'), mk)}</td>"
+                     f"<td class='mono {pcls_s}'>{_money(b.get('pnl'), mk)}</td>"
+                     f"<td></td><td></td></tr>")
         p.append("</table>")
     else:
         p.append("<span class=muted>보유 없음.</span>")
@@ -3180,15 +3455,16 @@ BENCH_CHART_JS = """
   document.querySelectorAll('.bc-wrap').forEach(function(wrap){
     var dataEl=wrap.querySelector('.bc-data');
     if(!dataEl)return;
-    var meta,pts,bname;
+    var meta,pts,bname,b2name;
     try{meta=JSON.parse(dataEl.textContent);}catch(e){return;}
-    pts=meta.points||[]; bname=meta.bench||'코스피';
+    pts=meta.points||[]; bname=meta.bench||'코스피'; b2name=meta.bench2||'';
     if(!pts.length)return;
     var svg=wrap.querySelector('svg');
     var overlay=svg.querySelector('.bc-overlay');
     var vline=svg.querySelector('.bc-vline');
     var dotP=svg.querySelector('.bc-dot-port');
     var dotB=svg.querySelector('.bc-dot-bench');
+    var dotU=svg.querySelector('.bc-dot-bench2');
     var tip=wrap.querySelector('.bc-tip');
     if(!overlay||!tip)return;
     function show(i,clientX,clientY){
@@ -3199,14 +3475,30 @@ BENCH_CHART_JS = """
       dotP.setAttribute('visibility','visible');
       dotB.setAttribute('cx',p.x); dotB.setAttribute('cy',p.yb);
       dotB.setAttribute('visibility','visible');
-      tip.innerHTML=
+      if(dotU && p.yb2!=null){
+        dotU.setAttribute('cx',p.x); dotU.setAttribute('cy',p.yb2);
+        dotU.setAttribute('visibility','visible');
+      }
+      var html=
         '<div class=bc-tip-dt>'+p.date+'</div>'+
         '<div class=bc-tip-row><span class=bc-tip-lab>Argus</span>'+
         '<span class="bc-tip-val '+cls(p.port)+'">'+fmtPct(p.port)+'</span></div>'+
         '<div class=bc-tip-row><span class=bc-tip-lab>'+bname+'</span>'+
-        '<span class="bc-tip-val '+cls(p.bench)+'">'+fmtPct(p.bench)+'</span></div>'+
-        '<div class=bc-tip-row><span class=bc-tip-lab>알파</span>'+
-        '<span class="bc-tip-val '+cls(p.alpha)+'"><b>'+fmtAlpha(p.alpha)+'</b></span></div>';
+        '<span class="bc-tip-val '+cls(p.bench)+'">'+fmtPct(p.bench)+'</span></div>';
+      if(b2name && p.bench2!=null){
+        html+=
+          '<div class=bc-tip-row><span class=bc-tip-lab>'+b2name+'</span>'+
+          '<span class="bc-tip-val '+cls(p.bench2)+'">'+fmtPct(p.bench2)+'</span></div>'+
+          '<div class=bc-tip-row><span class=bc-tip-lab>알파('+bname+')</span>'+
+          '<span class="bc-tip-val '+cls(p.alpha)+'"><b>'+fmtAlpha(p.alpha)+'</b></span></div>'+
+          '<div class=bc-tip-row><span class=bc-tip-lab>알파('+b2name+')</span>'+
+          '<span class="bc-tip-val '+cls(p.alpha2)+'"><b>'+fmtAlpha(p.alpha2)+'</b></span></div>';
+      }else{
+        html+=
+          '<div class=bc-tip-row><span class=bc-tip-lab>알파</span>'+
+          '<span class="bc-tip-val '+cls(p.alpha)+'"><b>'+fmtAlpha(p.alpha)+'</b></span></div>';
+      }
+      tip.innerHTML=html;
       tip.hidden=false;
       var wr=wrap.getBoundingClientRect();
       var tx=clientX-wr.left+14, ty=clientY-wr.top-72;
@@ -3217,6 +3509,7 @@ BENCH_CHART_JS = """
       vline.setAttribute('visibility','hidden');
       dotP.setAttribute('visibility','hidden');
       dotB.setAttribute('visibility','hidden');
+      if(dotU) dotU.setAttribute('visibility','hidden');
       tip.hidden=true;
     }
     overlay.addEventListener('mousemove',function(ev){

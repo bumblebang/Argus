@@ -219,7 +219,12 @@ class Store:
         self.conn.commit()
 
     def close(self) -> None:
+        """연결 종료. WAL 을 메인에 합쳐 강제 종료·컷오버 시 꼬리 유실을 줄인다."""
         with self._lock:
+            try:
+                self.conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+            except Exception:
+                pass
             self.conn.close()
 
     # ── 미체결 주문 레지스트리 (J2) ────────────────────────

@@ -13,11 +13,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .logging_setup import get_logger
-from .market_hours import market_day
+from .market_hours import market_day, current_session
 from . import paths as _paths
 from .strategies.base import Position
 
 log = get_logger("paper")
+
+# 입출금 판별 시 무시할 잔돈(원/달러). 수수료·반올림 노이즈.
+_EXT_CASH_EPS = 1.0
 
 
 @dataclass
@@ -67,7 +70,21 @@ class PaperAccount:
 
     @property
     def open_count(self) -> int:
-        return sum(1 for p in self.positions.values() if p.is_open)
+        """전체 시장 합산 보유 종목 수(하위호환)."""
+        return self.count_open()
+
+    def count_open(self, market: str | None = None) -> int:
+        """보유 종목 수. market 주면 해당 시장만(미표기 심볼은 보수적으로 포함)."""
+        n = 0
+        for sym, p in self.positions.items():
+            if not p.is_open:
+                continue
+            if market is not None:
+                sm = self.symbol_market.get(sym)
+                if sm is not None and sm != market:
+                    continue
+            n += 1
+        return n
 
     def daily_realized_pnl(self, market: str) -> float:
         """시장 타임존 기준 '오늘' 실현손익. 날짜가 넘어가면 0부터(일 손실 한도의 리셋)."""
@@ -89,10 +106,22 @@ class PaperAccount:
             self.ensure_sod_equity(m)
 
     def ensure_sod_equity(self, market: str) -> float:
-        """당일 시가 equity. 날짜가 바뀌면 현재 equity(>0)로 한 번만 스냅·영속."""
+        """당일 시가 equity. 날짜가 바뀌면 현재 equity(>0)로 한 번만 스냅·영속.
+
+        장중(세션≠closed) 최초 스냅은 거부한다. 원장 유실·컨테이너 재기동 직후
+        이미 깎인 equity 를 SoD 로 찍으면 일손실 델타가 0 으로 리셋되어 게이트가
+        무력화된다. 거부 시 sod=0 을 당일로 고정 → 게이트는 capital 폴백.
+        """
         day = market_day(market)
         if self._sod_day.get(market) == day:
             return float(self._sod_equity.get(market, 0.0) or 0.0)
+        if current_session(market) != "closed":
+            log.error("[SoD] 장중 최초 스냅 거부(%s) — capital 폴백(일손실 리셋 방지)",
+                      market)
+            self._sod_day[market] = day
+            self._sod_equity[market] = 0.0
+            self._save()
+            return 0.0
         marks = self.marks if self.marks else None
         try:
             eq = float(self.equity(market, marks))
@@ -109,6 +138,33 @@ class PaperAccount:
         """손실예산 분모(SoD). 아직 스냅 전이면 ensure 로 찍거나 0."""
         return self.ensure_sod_equity(market)
 
+    def adjust_sod_for_external_cash(self, market: str, amount: float) -> None:
+        """입출금만큼 당일 SoD 기준을 함께 이동.
+
+        입금(+): SoD 도 올려 델타가 '이익'으로 위장되지 않게.
+        출금(-): SoD 도 내려 델타가 '손실' 오탐이 되지 않게.
+        당일 SoD 가 없거나 장중 거부로 0 이면 no-op(분모는 capital 폴백).
+        """
+        try:
+            amt = float(amount)
+        except (TypeError, ValueError):
+            return
+        if abs(amt) < _EXT_CASH_EPS:
+            return
+        day = market_day(market)
+        if self._sod_day.get(market) != day:
+            return
+        base = float(self._sod_equity.get(market, 0.0) or 0.0)
+        if base <= 0:
+            return
+        new_base = base + amt
+        if new_base <= 0:
+            log.warning("[SoD] 출금 후 기준≤0 (%s %.0f%+.0f) — 0 고정", market, base, amt)
+            new_base = 0.0
+        self._sod_equity[market] = new_base
+        log.info("[SoD] 입출금 보정 %s %.0f → %.0f (%+.0f)", market, base, new_base, amt)
+        self._save()
+
     def sod_equity_delta(self, market: str) -> float | None:
         """당일 시가 equity 대비 현재 equity 변화. 스냅 전이면 None.
 
@@ -117,8 +173,8 @@ class PaperAccount:
         잃었는지는 이 델타가 더 정확하다 — cash/positions 는 재대사가 실계좌
         값으로 덮으니까.
 
-        한계: 입출금도 델타에 섞인다. 출금은 손실처럼, 입금은 이익처럼 보인다.
-        이 값은 신규 매수 차단에만 쓰이므로 오탐은 보수(더 막음) 방향이다.
+        입출금은 adjust_sod_for_external_cash 로 SoD 기준을 같이 옮겨 델타에서
+        제외한다. (미보정 입금이 우회 손실을 이익으로 가리는 구멍 차단)
         """
         base = self.ensure_sod_equity(market)
         if base <= 0:

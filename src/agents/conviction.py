@@ -22,7 +22,7 @@ import math
 from dataclasses import dataclass, field
 
 from .athena import compute_rr
-from .wiring import combine_stop_target, entry_stop_target
+from .wiring import entry_stop_target
 
 FLOOR = 0.22
 CAP = 0.82
@@ -111,6 +111,18 @@ def min_lot_adjust(weight: float, *, price: float, capital: float,
     return w, 0.0
 
 
+def skip_position_headroom(min_qty: float) -> bool:
+    """시범 1주(min_qty>0)는 종목비중 headroom 을 사이징 캡으로 쓰지 않는다.
+
+    게이트도 같은 1주만 비중 면제. 이미 보유 추가는 호출측이 min_qty=0 이거나
+    BUY 스킵이라 여기로 안 온다.
+    """
+    try:
+        return float(min_qty) > 0
+    except (TypeError, ValueError):
+        return False
+
+
 def _part(delta: float, label: str) -> tuple[float, str]:
     return (delta, f"{label} {delta:+.2f}")
 
@@ -150,22 +162,20 @@ def _plan_entry(price: float | None, dossier: dict) -> float | None:
     return price if price and price > 0 else None
 
 
-def _sizing_rr(price: float | None, horizon: str, params: dict | None,
-               dossier: dict) -> float | None:
-    """사이징용 손익비 = (코드 목표 − 진입) / (진입 − 클램프 손절).
+def _sizing_rr(price: float | None, horizon: str, dossier: dict) -> float | None:
+    """사이징용 손익비 = (코드 목표 − 진입) / (진입 − 코드 손절).
 
-    분자에서 LLM target 을 빼 허상 상향 가산을 끊고, 분모는 실제로 책에
-    심길 손절(밴드 안 invalidation, 밖이면 코드 손절)을 쓴다.
+    확신도 RR 은 LLM/Athena 레벨·proposal.params 를 쓰지 않는다.
+    책에 심는 손절은 combine_stop_target 이 별도 경로 — 채점 되먹임 차단.
     """
     entry = _plan_entry(price, dossier)
     if not entry or entry <= 0:
         return None
-    stop, _, _ = combine_stop_target(
-        entry, horizon, params, dossier.get("invalidation"), None)
-    _, code_target = entry_stop_target(entry, horizon, params)
-    if stop is None or code_target is None:
+    # params=None → 보유기간 기본%만 (stop_loss_pct/target_profit_pct 무시)
+    code_stop, code_target = entry_stop_target(entry, horizon, None)
+    if code_stop is None or code_target is None:
         return None
-    risk = entry - stop
+    risk = entry - code_stop
     if risk <= 0:
         return None
     return round((code_target - entry) / risk, 2)
@@ -366,8 +376,7 @@ def score_buy(proposal, *, price: float | None, dossier: dict | None,
                     v += dlt
                     parts.append(f"day 과매도 RSI {rsi:g} {dlt:+.2f}")
     else:
-        params = getattr(proposal, "params", None) or {}
-        rr = _sizing_rr(price, hz, params, d)
+        rr = _sizing_rr(price, hz, d)
         if rr is not None:
             if rr >= 2.0:
                 v += W_RR_HI

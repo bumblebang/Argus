@@ -379,7 +379,8 @@ def test_sweep_keeps_order_within_ttl(tmp_path):
 def test_negative_ttl_never_cancels(tmp_path):
     store = Store(tmp_path / "t.db")
     client = _Client({"status": "PENDING", "execution": {"filledQuantity": 0}})
-    broker = _broker(tmp_path, store, client, working_order_ttl_sec=-1.0)
+    broker = _broker(tmp_path, store, client, working_order_ttl_sec=-1.0,
+                     working_order_abandon_ttl_sec=-1.0)
     store.upsert_working_order(order_id="X1", symbol="005930", market="KR",
                                side="BUY", qty=1, price=1_000, status="PENDING",
                                placed_at=time.time() - 100_000)
@@ -395,7 +396,8 @@ def test_cancel_failure_keeps_order_working(tmp_path):
 
     store = Store(tmp_path / "t.db")
     client = _BadCancel({"status": "PENDING", "execution": {"filledQuantity": 0}})
-    broker = _broker(tmp_path, store, client, working_order_ttl_sec=0.0)
+    broker = _broker(tmp_path, store, client, working_order_ttl_sec=0.0,
+                     working_order_abandon_ttl_sec=1800.0)
     store.upsert_working_order(order_id="X1", symbol="005930", market="KR",
                                side="BUY", qty=1, price=1_000, status="PENDING",
                                placed_at=time.time() - 10)
@@ -404,13 +406,88 @@ def test_cancel_failure_keeps_order_working(tmp_path):
     assert len(store.get_working_orders()) == 1
 
 
+def test_cancel_failure_abandons_after_ttl(tmp_path):
+    """취소가 계속 실패해도 abandon TTL 이면 강제 회수(+경보) — 전 종목 매수 동결 방지."""
+    class _BadCancel(_Client):
+        def cancel_order(self, account_seq, order_id):
+            raise RuntimeError("취소 거부")
+
+    store = Store(tmp_path / "t.db")
+    client = _BadCancel({"status": "PENDING", "execution": {"filledQuantity": 0}})
+    broker = _broker(tmp_path, store, client, working_order_ttl_sec=0.0,
+                     working_order_abandon_ttl_sec=60.0)
+    store.upsert_working_order(order_id="X1", symbol="005930", market="KR",
+                               side="BUY", qty=1, price=600_000, status="PENDING",
+                               placed_at=time.time() - 120)
+    out = broker.sweep_working_orders()
+    assert out["abandoned"] == 1 and store.get_working_orders() == []
+    kinds = [r["kind"] for r in store.conn.execute(
+        "SELECT kind FROM events WHERE kind='working_order_abandoned'").fetchall()]
+    assert kinds == ["working_order_abandoned"]
+    # 예약이 풀려 다른 종목 매수가 다시 통과한다.
+    ok_client = _Client({"status": "FILLED",
+                         "execution": {"filledQuantity": 1,
+                                       "averageFilledPrice": 600_000,
+                                       "commission": 0, "tax": 0}})
+    broker.client = ok_client
+    assert broker.execute(Order("000660", "KR", "BUY", 1, 600_000), "thaw").ok
+
+
+def test_fetch_failure_abandons_after_ttl(tmp_path):
+    class _Boom(_Client):
+        def get_order(self, account_seq, order_id):
+            raise RuntimeError("api down")
+
+    store = Store(tmp_path / "t.db")
+    broker = _broker(tmp_path, store, _Boom(), working_order_ttl_sec=0.0,
+                     working_order_abandon_ttl_sec=0.0)
+    store.upsert_working_order(order_id="X1", symbol="005930", market="KR",
+                               side="BUY", qty=1, price=1_000, status="PENDING",
+                               placed_at=time.time() - 10)
+    out = broker.sweep_working_orders()
+    assert out["abandoned"] == 1 and store.get_working_orders() == []
+
+
+def test_negative_abandon_ttl_never_drops(tmp_path):
+    class _BadCancel(_Client):
+        def cancel_order(self, account_seq, order_id):
+            raise RuntimeError("취소 거부")
+
+    store = Store(tmp_path / "t.db")
+    client = _BadCancel({"status": "PENDING", "execution": {"filledQuantity": 0}})
+    broker = _broker(tmp_path, store, client, working_order_ttl_sec=0.0,
+                     working_order_abandon_ttl_sec=-1.0)
+    store.upsert_working_order(order_id="X1", symbol="005930", market="KR",
+                               side="BUY", qty=1, price=1_000, status="PENDING",
+                               placed_at=time.time() - 100_000)
+    out = broker.sweep_working_orders()
+    assert out.get("abandoned", 0) == 0 and out["cancel_failed"] == 1
+    assert len(store.get_working_orders()) == 1
+
+
+def test_execute_prunes_abandoned_before_gate(tmp_path):
+    """sweep 전이라도 execute 가 abandon 행을 비워 매수여력을 푼다."""
+    store = Store(tmp_path / "t.db")
+    client = _Client({"status": "FILLED",
+                      "execution": {"filledQuantity": 1,
+                                    "averageFilledPrice": 600_000,
+                                    "commission": 0, "tax": 0}})
+    broker = _broker(tmp_path, store, client, working_order_abandon_ttl_sec=60.0)
+    store.upsert_working_order(order_id="X1", symbol="005930", market="KR",
+                               side="BUY", qty=1, price=600_000, status="PENDING",
+                               placed_at=time.time() - 120)
+    assert broker.execute(Order("000660", "KR", "BUY", 1, 600_000), "thaw").ok
+    assert store.get_working_orders() == []
+
+
 def test_unconfirmed_cancel_keeps_order_working(tmp_path):
     """취소 요청은 갔지만 종결 확인이 안 되면 남긴다."""
     store = Store(tmp_path / "t.db")
     client = _Client({"status": "PENDING", "execution": {"filledQuantity": 0}})
     client.details_after_cancel = {"status": "PENDING_CANCEL",
                                    "execution": {"filledQuantity": 0}}
-    broker = _broker(tmp_path, store, client, working_order_ttl_sec=0.0)
+    broker = _broker(tmp_path, store, client, working_order_ttl_sec=0.0,
+                     working_order_abandon_ttl_sec=1800.0)
     store.upsert_working_order(order_id="X1", symbol="005930", market="KR",
                                side="BUY", qty=1, price=1_000, status="PENDING",
                                placed_at=time.time() - 10)

@@ -56,22 +56,40 @@ class GateDecision:
     reason: str
 
 
+def _normalize_max_positions(raw) -> dict[str, int]:
+    """int → {KR,US: n}; dict → 시장별 int. 빈/이상값은 기본 5."""
+    if isinstance(raw, dict):
+        out: dict[str, int] = {}
+        for k, v in raw.items():
+            try:
+                out[str(k).upper()] = int(v)
+            except (TypeError, ValueError):
+                continue
+        return out or {"KR": 5, "US": 5}
+    try:
+        n = int(raw)
+    except (TypeError, ValueError):
+        n = 5
+    return {"KR": n, "US": n}
+
+
 class RiskGate:
     """계좌 스냅샷 + 제안 주문 -> 승인/거부.
 
     limits 예:
       capital: {KR: 1e7, US: 1e4}
       max_position_pct: 0.2
-      max_positions: 5
+      max_positions: 5            # 또는 {KR: 5, US: 3}
       daily_loss_limit_pct: 0.05
       max_order_notional: {KR: 5e6, US: 5e3}
-      kill_switch_file: "data/HALT"
+      kill_switch_file: "data/HALT"          # 전역 — BUY/SELL 전부
+      # 마켓 pause: kill_switch_file 옆에 HALT.KR / HALT.US (BUY만 차단)
     """
 
     def __init__(self, limits: dict):
         self.capital = limits.get("capital", {})
         self.max_position_pct = float(limits.get("max_position_pct", 0.20))
-        self.max_positions = int(limits.get("max_positions", 5))
+        self.max_positions = _normalize_max_positions(limits.get("max_positions", 5))
         self.daily_loss_limit_pct = float(limits.get("daily_loss_limit_pct", 0.05))
         # 일손실 판정에 SoD equity 델타를 함께 볼지. realized_pnl 을 우회한 체결
         # (폴링 밖 체결 → 재대사 흡수)을 잡는다. False 면 실현손익만(구 동작).
@@ -95,10 +113,9 @@ class RiskGate:
         # 노출 한도(종목비중·총익스포저·섹터)의 기준: "capital"(고정 자본) | "equity"(실자산).
         # 손실 예산(일손실·드로다운)은 당일 시가(SoD) equity, 없으면 capital 폴백.
         self.exposure_base = str(limits.get("exposure_base", "capital")).lower()
-        # 최소 1주 시범매수: qty==min_lot_qty BUY 는 **주문상한만** 면제한다. 고단가
-        # 종목이 목표비중 floor=0 으로 영구 탈락하는 구멍 보완용인데, 종목비중까지
-        # 면제하면 1주가 종목 상한을 그대로 넘어간다(=J4 재현 경로). 또한 이미 보유
-        # 중인 종목에는 면제하지 않는다 — 보유 에피소드당 1회 시범(피라미딩 차단).
+        # 최소 1주 시범매수: qty==min_lot_qty BUY 는 주문상한·종목비중을 면제한다.
+        # 고단가 floor=0 보완(US NVDA 1주가 25%를 넘는 경우). 현금·gross·섹터·
+        # 보유수는 그대로. 이미 보유 중이면 면제하지 않는다(에피소드당 1회).
         self.allow_min_lot = bool(limits.get("allow_min_lot", False))
         self.min_lot_qty = float(limits.get("min_lot_qty", 1.0))
         # 시범매수 절대 상한(원). 면제와 무관하게 이 금액을 넘는 min_lot 주문은 거부.
@@ -114,6 +131,38 @@ class RiskGate:
                 self.blocked_symbols |= load_blocked_symbols(Path(blocked_file))
             except Exception as e:
                 log.warning("blocked_symbols_file 로드 실패: %s", e)
+
+    def max_positions_for(self, market: str) -> int:
+        m = str(market or "").upper()
+        if m in self.max_positions:
+            return int(self.max_positions[m])
+        # 미지정 시장: dict 값 중 최소(보수) 또는 기본 5
+        if self.max_positions:
+            return int(min(self.max_positions.values()))
+        return 5
+
+    def _halt_path(self) -> Path:
+        return _paths.resolve("halt", configured=self.kill_switch_file)
+
+    def _market_pause_path(self, market: str) -> Path:
+        """전역 HALT 옆 HALT.{KR|US}. 전역은 BUY/SELL 전부, 마켓 pause 는 BUY만."""
+        base = self._halt_path()
+        return base.with_name(f"{base.name}.{str(market).upper()}")
+
+    def is_globally_halted(self) -> bool:
+        return self._halt_path().exists()
+
+    def is_market_paused(self, market: str) -> bool:
+        return self._market_pause_path(market).exists()
+
+    def pause_status(self) -> str:
+        """대시 배지용: ALL | KR | US | KR+US | none."""
+        if self.is_globally_halted():
+            return "ALL"
+        paused = [m for m in ("KR", "US") if self.is_market_paused(m)]
+        if not paused:
+            return "none"
+        return "+".join(paused)
 
     def _cap(self, market: str) -> float:
         return float(self.capital.get(market, 0.0))
@@ -152,9 +201,11 @@ class RiskGate:
         positions 는 재대사가 실계좌 값으로 덮으므로 equity 델타는 그 체결을
         자동으로 반영한다.
 
-        두 값 중 나쁜 쪽을 쓰는 이유: 델타는 미실현 변동·입출금도 섞으므로
-        단독 채택은 오탐이 많고, realized 단독은 위 구멍이 남는다. 최소값은
+        두 값 중 나쁜 쪽을 쓰는 이유: 델타는 미실현 변동도 섞으므로 단독
+        채택은 오탐이 많고, realized 단독은 위 구멍이 남는다. 최소값은
         어느 쪽이 눈이 밝든 손실을 놓치지 않는다(과차단 방향).
+        입출금은 PaperAccount.adjust_sod_for_external_cash 가 SoD 기준을
+        같이 옮겨 델타에서 빼 둔다(입금으로 우회 손실을 가리는 구멍 차단).
         """
         realized_today = (account.daily_realized_pnl(market)
                           if hasattr(account, "daily_realized_pnl")
@@ -218,13 +269,18 @@ class RiskGate:
             total += r.notional
         return total
 
-    def _reserved_new_symbols(self, reserved, account) -> int:
-        """예약 중이면서 아직 보유가 아닌 종목 수 — 보유종목 수 한도에 선반영."""
+    def _reserved_new_symbols(self, reserved, account, market: str | None = None) -> int:
+        """예약 중이면서 아직 보유가 아닌 종목 수 — 보유종목 수 한도에 선반영.
+
+        market 이 있으면 해당 시장 예약만 센다(심볼의 Reservation.market 기준).
+        """
         if not reserved:
             return 0
         syms = set()
         for r in reserved:
             if r.side != "BUY":
+                continue
+            if market is not None and str(r.market).upper() != str(market).upper():
                 continue
             if account.position(r.symbol).is_open:
                 continue
@@ -233,7 +289,7 @@ class RiskGate:
 
     def check(self, order: Order, account, *, reserved=None) -> GateDecision:
         """account: PaperAccount 호환 객체.
-        필요한 속성: buying_power(market), position(symbol), open_count, realized_pnl(dict).
+        필요한 속성: buying_power(market), position(symbol), count_open/open_count, realized_pnl(dict).
 
         reserved: 접수됐지만 원장 미반영인 Reservation 목록(선택). 주면 매수여력·
         총익스포저·섹터·보유종목 수 한도에 선반영한다. None 이면 기존 동작.
@@ -241,9 +297,13 @@ class RiskGate:
         m = order.market
         reserved_buy = self._reserved_notional(reserved, m)
 
-        # 0) 킬스위치 — 이 파일이 있으면 모든 신규 주문 차단
-        if _paths.resolve("halt", configured=self.kill_switch_file).exists():
+        # 0) 킬스위치 — 전역 HALT 파일이 있으면 BUY/SELL 전부 차단
+        if self.is_globally_halted():
             return GateDecision(False, "킬스위치 활성(HALT 파일 존재)")
+
+        # 0b) 마켓 pause — HALT.{market} 있으면 해당 시장 BUY만 차단(청산 SELL 허용)
+        if order.side == "BUY" and self.is_market_paused(m):
+            return GateDecision(False, f"시장 pause 활성(HALT.{str(m).upper()})")
 
         # 1) 수량/가격 정합성
         if order.qty <= 0 or order.price <= 0:
@@ -305,20 +365,25 @@ class RiskGate:
             # 노출 한도(비중·총익스포저·섹터)의 기준 — capital 고정 또는 실자산 추종.
             base = self._exposure_base(account, m)
 
-            # 5) 종목당 최대 비중 (체결 후 평가액 기준). 시범매수도 예외 없다 —
-            #    1주가 종목 상한을 넘는다면 그 종목은 이 계좌에 안 맞는 것이다.
+            # 5) 종목당 최대 비중 (체결 후 평가액 기준). 시범 1주(min_lot)만 면제 —
+            #    목표비중이 1주도 안 되는 고단가 첫 진입. 2주 이상·추가매수는 그대로.
             post_value = pos.qty * order.price + order.notional
-            if (base > 0
+            if (not min_lot and base > 0
                     and post_value > base * self.max_position_pct):
                 return GateDecision(False,
                     f"종목 비중 초과 (체결후 {post_value:,.0f} > {base * self.max_position_pct:,.0f})")
 
-            # 6) 동시 보유 종목 수 (신규 진입일 때만). 예약된 신규 종목도 센다.
+            # 6) 동시 보유 종목 수 (신규 진입일 때만). 해당 시장 + 예약된 신규만.
             if not pos.is_open:
-                open_n = account.open_count + self._reserved_new_symbols(reserved, account)
-                if open_n >= self.max_positions:
+                if hasattr(account, "count_open"):
+                    open_n = account.count_open(m)
+                else:
+                    open_n = int(account.open_count)
+                open_n += self._reserved_new_symbols(reserved, account, m)
+                cap = self.max_positions_for(m)
+                if open_n >= cap:
                     return GateDecision(False,
-                        f"최대 보유종목 수 초과 ({open_n}/{self.max_positions})")
+                        f"최대 보유종목 수 초과 ({open_n}/{cap} {m})")
 
             # ── 포트폴리오 수준 감독관(선택) — 종목단위 한도를 통과해도 전체 쏠림은 차단 ──
             # 7) 총 익스포저(시장별): 체결 후 투자금이 한도 초과면 거부(현금 버퍼 강제).

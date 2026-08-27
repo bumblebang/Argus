@@ -19,7 +19,7 @@ from ..risk_gate import Order
 from ..runner import candles_to_df, patch_live_price
 from ..strategies import build_strategy, REGISTRY
 from ..strategies.base import Action, Position
-from ..agents.conviction import size_weight, min_lot_adjust
+from ..agents.conviction import size_weight, min_lot_adjust, skip_position_headroom
 from ..agents.wiring import combine_stop_target
 
 log = get_logger("engine.execution")
@@ -184,9 +184,10 @@ class EntryExecutor:
         equity = _sizing_equity(self.risk, self.broker, market)
         weight, min_qty = _entry_lot(meta, market, price, self.risk, sig.target_weight,
                                     equity=equity)
-        qty = self.risk.size_buy(market, price, weight, min_qty=min_qty,
-                                 base_equity=equity,
-                                 notional_cap=self._headroom(sym, market, price, equity))
+        qty = self.risk.size_buy(
+            market, price, weight, min_qty=min_qty, base_equity=equity,
+            notional_cap=(None if skip_position_headroom(min_qty)
+                          else self._headroom(sym, market, price, equity)))
         if qty <= 0:
             return {"action": "buy", "executed": False, "reason": "사이징 0"}
 
@@ -239,7 +240,8 @@ class EntryExecutor:
             weight, min_qty = _entry_lot(meta, market, price, self.risk, equity=equity)
             qty = self.risk.size_buy(
                 market, price, weight, min_qty=min_qty, base_equity=equity,
-                notional_cap=self._headroom(sym, market, price, equity))
+                notional_cap=(None if skip_position_headroom(min_qty)
+                              else self._headroom(sym, market, price, equity)))
             if qty <= 0:
                 return {"action": "buy", "executed": False, "reason": "사이징 0"}
             res = self.broker.execute_with_mirror(

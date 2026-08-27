@@ -13,11 +13,12 @@ from dataclasses import dataclass
 
 def risk_manager_from_cfg(risk_cfg: dict | None) -> "RiskManager":
     """config.risk 블록 → RiskManager. 키 빠져도 기본값으로 안전 기동."""
+    from .risk_gate import _normalize_max_positions
     rc = risk_cfg or {}
     return RiskManager(
         capital=dict(rc.get("capital") or {}),
         max_position_pct=float(rc.get("max_position_pct", 0.25)),
-        max_positions=int(rc.get("max_positions", 5)),
+        max_positions=_normalize_max_positions(rc.get("max_positions", 5)),
         daily_loss_limit_pct=float(rc.get("daily_loss_limit_pct", 0.05)),
         allow_fractional=bool(rc.get("allow_fractional", False)),
         base_position_pct=float(rc.get("base_position_pct", 0.20)),
@@ -31,7 +32,7 @@ def risk_manager_from_cfg(risk_cfg: dict | None) -> "RiskManager":
 class RiskManager:
     capital: dict          # {"KR": 1000000, "US": 1000} — 손실예산 폴백·US 차단
     max_position_pct: float = 0.25
-    max_positions: int = 5
+    max_positions: dict | int = None  # type: ignore[assignment]
     daily_loss_limit_pct: float = 0.05
     allow_fractional: bool = False
     # 사이징 정책(config 로 조정) — 기본 총자산 20%, 확신도 75~100% 배율
@@ -39,6 +40,22 @@ class RiskManager:
     sizing_base: str = "equity"          # "equity" | "capital"
     conviction_size_floor: float = 0.75
     conviction_size_span: float = 0.25
+
+    def __post_init__(self):
+        from .risk_gate import _normalize_max_positions
+        if self.max_positions is None:
+            self.max_positions = {"KR": 5, "US": 5}
+        else:
+            self.max_positions = _normalize_max_positions(self.max_positions)
+
+    def max_positions_for(self, market: str | None = None) -> int:
+        mp = self.max_positions if isinstance(self.max_positions, dict) else {"KR": 5, "US": 5}
+        if market is None:
+            return int(min(mp.values()) if mp else 5)
+        m = str(market).upper()
+        if m in mp:
+            return int(mp[m])
+        return int(min(mp.values()) if mp else 5)
 
     def capital_of(self, market: str) -> float:
         return float(self.capital.get(market, 0) or 0)
@@ -92,8 +109,8 @@ class RiskManager:
             qty = float(min_qty) if self.allow_fractional else float(math.floor(min_qty))
         return qty
 
-    def can_open_new(self, open_positions: int) -> bool:
-        return open_positions < self.max_positions
+    def can_open_new(self, open_positions: int, market: str | None = None) -> bool:
+        return open_positions < self.max_positions_for(market)
 
     def daily_loss_exceeded(self, market: str, realized_pnl: float,
                             *, budget_base: float | None = None) -> bool:
@@ -103,3 +120,4 @@ class RiskManager:
         if base <= 0:
             return False
         return realized_pnl <= -base * self.daily_loss_limit_pct
+

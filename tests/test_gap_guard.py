@@ -401,11 +401,11 @@ def test_zone_mode_min_lot_fills_one_share(tmp_path):
     assert broker.position("004370").qty == 1
 
 
-def test_zone_mode_min_lot_rejected_over_position_pct(tmp_path):
-    """J4: 1주가 종목 상한을 넘으면 존 진입에서도 거부."""
+def test_zone_mode_min_lot_fills_over_position_pct(tmp_path):
+    """시범 1주는 종목상한을 넘어도 존 진입 체결."""
     r, broker = _zone_min_lot(tmp_path, hard_cap=0.2)
-    assert r["executed"] is False
-    assert broker.position("004370").qty == 0
+    assert r["executed"] is True
+    assert broker.position("004370").qty == 1
 
 
 def test_zone_mode_min_lot_skipped_when_conviction_low(tmp_path):

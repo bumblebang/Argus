@@ -14,6 +14,8 @@ from .strategies.base import Position
 
 log = get_logger("broker.sync")
 
+_EXT_CASH_EPS = 1.0
+
 
 def _num(v, default: float | None = 0.0) -> float | None:
     if v is None:
@@ -23,6 +25,59 @@ def _num(v, default: float | None = 0.0) -> float | None:
         return float(s) if s else default
     except (TypeError, ValueError):
         return default
+
+
+def _qty_map(positions: dict) -> dict[str, float]:
+    out: dict[str, float] = {}
+    for sym, p in (positions or {}).items():
+        try:
+            q = float(getattr(p, "qty", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        if q > 0:
+            out[sym] = q
+    return out
+
+
+def _note_external_cash(account, new_cash: dict, new_pos: dict,
+                        new_mkt: dict) -> dict[str, float]:
+    """매매로 설명되지 않는 현금 증감 → SoD 기준 이동.
+
+    입금: 현금↑ + 해당 시장 매도 없음. 출금: 현금↓ + 해당 시장 매수 없음.
+    같은 창에 매매+입출금이 겹치면 보수적으로 스킵(오보정 방지).
+    """
+    noted: dict[str, float] = {}
+    if not hasattr(account, "adjust_sod_for_external_cash"):
+        return noted
+    old_qty = _qty_map(account.positions)
+    new_qty = _qty_map(new_pos)
+    old_mkt = dict(getattr(account, "symbol_market", {}) or {})
+    for market, raw in (new_cash or {}).items():
+        try:
+            old_c = float(account.cash.get(market, 0) or 0)
+            new_c = float(raw)
+        except (TypeError, ValueError):
+            continue
+        d_cash = new_c - old_c
+        if abs(d_cash) < _EXT_CASH_EPS:
+            continue
+        sold = bought = False
+        for sym in set(old_qty) | set(new_qty):
+            sm = (new_mkt or {}).get(sym) or old_mkt.get(sym) or "KR"
+            if sm != market:
+                continue
+            oq, nq = old_qty.get(sym, 0.0), new_qty.get(sym, 0.0)
+            if nq < oq - 1e-9:
+                sold = True
+            if nq > oq + 1e-9:
+                bought = True
+        if d_cash > 0 and not sold:
+            account.adjust_sod_for_external_cash(market, d_cash)
+            noted[market] = d_cash
+        elif d_cash < 0 and not bought:
+            account.adjust_sod_for_external_cash(market, d_cash)
+            noted[market] = d_cash
+    return noted
 
 
 def should_sync(broker) -> bool:
@@ -299,16 +354,21 @@ def _emit(store, kind: str, symbol: str, payload: dict) -> None:
 def apply_reconcile_from_live(account, store, data: dict,
                               *, markets=("KR", "US")) -> dict:
     """주기 재대사 apply — broker.run_locked/reconcile 안에서 호출."""
-    for market, cash in (data.get("cash") or {}).items():
+    items = data.get("items") or []
+    live_pos, live_mkt = (
+        _parse_holdings_items(items) if data.get("holdings_ok") else ({}, {}))
+    new_cash = dict(data.get("cash") or {})
+    # 현금 덮기 전에 입출금 보정 — SoD 델타가 입금을 이익으로 위장하지 않게.
+    ext = _note_external_cash(account, new_cash, live_pos, live_mkt) if new_cash else {}
+
+    for market, cash in new_cash.items():
         account.cash[market] = cash
 
     if not data.get("holdings_ok"):
         return {"cash": dict(account.cash), "holdings": 0,
                 "adopted": [], "updated": [], "closed": [], "attributed": {},
+                "external_cash": ext,
                 "error": data.get("error", "holdings fetch failed")}
-
-    items = data.get("items") or []
-    live_pos, live_mkt = _parse_holdings_items(items)
 
     # 덮어쓰기 전 평균단가 스냅 — 손익 귀속의 원가 기준(덮으면 사라진다).
     before = {sym: (float(p.qty), float(p.avg_price),
@@ -372,7 +432,7 @@ def apply_reconcile_from_live(account, store, data: dict,
         log.info("재대사 병합 — 채택=%s, 청산(유령)=%s, 갱신=%s", adopted, closed, updated)
     return {"cash": dict(account.cash), "holdings": len(live_pos),
             "adopted": adopted, "updated": updated, "closed": closed,
-            "attributed": attributed}
+            "attributed": attributed, "external_cash": ext}
 
 
 def reconcile_from_live(client, account_seq, account, store=None,

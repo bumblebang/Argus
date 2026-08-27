@@ -26,6 +26,11 @@ cd /d <argus-root>
 .venv\Scripts\argus.exe doctor --migrate-data --apply
 ```
 
+`--apply` 는 `bot.db` 이동 직전 `PRAGMA wal_checkpoint(TRUNCATE)` 를 한 뒤 옮긴다.
+WAL 사이드카(`bot.db-wal`/`-shm`)만 두고 메인만 옮기면 **원장 꼬리가 과거로 롤백**된다.
+watch 를 문서대로 내려도 checkpoint 없이 수동 복사하면 같은 사고가 난다 — 반드시
+doctor `--apply` 경로를 쓰거나, 수동이면 이동 전 checkpoint 한 번.
+
 - inbox: `data/llm_inbox` → `data/inbox` 이동 후 **`data/llm_inbox` junction** (PokeTokenBarWin 무수정)
 - state: `bot.db`, `paper_account.json`, heartbeats, pid, HALT, brain_* → `data/state/`
 - ledgers: `decisions.jsonl` → `data/ledgers/`
@@ -37,6 +42,7 @@ cd /d <argus-root>
 3. 대시보드 `http://127.0.0.1:8787` (재기동 후)
 4. 브릿지 재기동 후 `data/inbox/bridge.heartbeat` (또는 `llm_inbox` junction 경유) 90s 내 갱신
 5. PokeTokenBarWin 브릿지 armed 표시 (형제 레포 있으면)
+6. `data/bot.db-wal` / `data/state/bot.db-wal` 고아가 새로 생기지 않는지(정상 종료면 truncate)
 
 ## 재기동
 
@@ -61,3 +67,4 @@ xcopy /E /I backup\llm_inbox data\llm_inbox
 - 장중 `--apply`
 - `bot.db` 스키마 변경·vacuum을 이 컷오버에 묶기
 - 레거시 경로 **조기 삭제** (shim/별칭 제거는 별 승인)
+- **watch 실행 중·checkpoint 없이** `bot.db` 만 복사/이동 (WAL 꼬리 유실)

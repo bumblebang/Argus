@@ -137,22 +137,27 @@ def _mock_llm_factory(cands):
     return MockLLM(responder)
 
 
-def _build_runner(tmp_path, watchlist, *, now=_OPEN_NOW, fetch_fn=None):
+def _build_runner(tmp_path, watchlist, *, now=_OPEN_NOW, fetch_fn=None,
+                  llm_factory=_mock_llm_factory):
     cfg = load_config()
     cfg.raw.setdefault("value_trade", {})["enabled"] = True
+    # example capital 이 바뀌어도 슬리브 수치 테스트가 흔들리지 않게 고정.
+    capital = {"KR": 1_000_000, "US": 10_000}
+    cfg.risk["capital"] = dict(capital)
+    cfg.raw.setdefault("risk", {})["capital"] = dict(capital)
     acct = PaperAccount(cash={"KR": 10_000_000, "US": 10_000},
                         state_path=tmp_path / "pa.json")
-    gate = RiskGate({"capital": cfg.risk.get("capital", {}), "max_position_pct": 0.2,
+    gate = RiskGate({"capital": capital, "max_position_pct": 0.2,
                      "max_positions": 5, "daily_loss_limit_pct": 0.05,
                      "max_order_notional": {"KR": 5_000_000, "US": 50_000},
                      "kill_switch_file": str(tmp_path / "HALT")})
     broker = Broker(account=acct, gate=gate, mode="paper")
-    risk = RiskManager(capital=cfg.risk.get("capital", {}), max_position_pct=0.2)
+    risk = RiskManager(capital=capital, max_position_pct=0.2)
     store = Store(tmp_path / "bot.db")
     wl_path = tmp_path / "wl.json"
     wl_path.write_text(json.dumps(watchlist, ensure_ascii=False), encoding="utf-8")
     runner = ValueRunner(
-        cfg, store, broker, risk, _mock_llm_factory, None,
+        cfg, store, broker, risk, llm_factory, None,
         fetch_history_fn=(fetch_fn or (lambda s, m: _synth_uptrend())),
         price_fn=None, watchlist_path=wl_path,
         state_path=tmp_path / "state.json", now_fn=lambda: now)
@@ -177,6 +182,30 @@ def test_runner_e2e_fills_and_mirrors_to_store(tmp_path):
     assert row["target_price"] == 1300.0                        # target = fair_price_low
     # 결정 저널(tmp) 기록
     assert (tmp_path / "value_decisions.jsonl").exists()
+
+
+def test_value_market_fn_corrects_wrong_llm_label(tmp_path):
+    """J6 구멍: 밸류 run_cycle 에 market_fn 없으면 LLM US 라벨이 원장·사이징을 오염한다."""
+    def wrong_market_llm(cands):
+        def responder(schema, system, user):
+            if schema is DecisionOutput:
+                props = [Proposal(symbol=c["symbol"], market="US", side="BUY",
+                                  conviction=0.7, horizon="position",
+                                  target_weight=0.15, thesis="오라벨",
+                                  key_risks=["r"]) for c in cands]
+                return DecisionOutput(market_view="mv", proposals=props)
+            syms = [p["symbol"] for p in json.loads(user)["proposals"]]
+            return ValidationOutput(verdicts=[ValidationVerdict(
+                symbol=s, approved=True, reason="ok") for s in syms])
+        return MockLLM(responder)
+
+    wl = {"900001": _entry(name="밸류1", conviction=0.7, fair_low_pct=30.0,
+                           metrics={"price": 1000.0})}
+    runner, _ = _build_runner(tmp_path, wl, llm_factory=wrong_market_llm)
+    summary = runner.run()
+    assert summary["markets"]["KR"]["filled"] == 1
+    assert runner.broker.account.symbol_market["900001"] == "KR"
+    assert runner.broker.account.position("900001").qty > 0
 
 
 # ── 6) due 판정: 같은 날 두 번째 run() 은 no-op ──────────────────
