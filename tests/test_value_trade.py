@@ -141,14 +141,18 @@ def _build_runner(tmp_path, watchlist, *, now=_OPEN_NOW, fetch_fn=None,
                   llm_factory=_mock_llm_factory):
     cfg = load_config()
     cfg.raw.setdefault("value_trade", {})["enabled"] = True
+    # example capital 이 바뀌어도 슬리브 수치 테스트가 흔들리지 않게 고정.
+    capital = {"KR": 1_000_000, "US": 10_000}
+    cfg.risk["capital"] = dict(capital)
+    cfg.raw.setdefault("risk", {})["capital"] = dict(capital)
     acct = PaperAccount(cash={"KR": 10_000_000, "US": 10_000},
                         state_path=tmp_path / "pa.json")
-    gate = RiskGate({"capital": cfg.risk.get("capital", {}), "max_position_pct": 0.2,
+    gate = RiskGate({"capital": capital, "max_position_pct": 0.2,
                      "max_positions": 5, "daily_loss_limit_pct": 0.05,
                      "max_order_notional": {"KR": 5_000_000, "US": 50_000},
                      "kill_switch_file": str(tmp_path / "HALT")})
     broker = Broker(account=acct, gate=gate, mode="paper")
-    risk = RiskManager(capital=cfg.risk.get("capital", {}), max_position_pct=0.2)
+    risk = RiskManager(capital=capital, max_position_pct=0.2)
     store = Store(tmp_path / "bot.db")
     wl_path = tmp_path / "wl.json"
     wl_path.write_text(json.dumps(watchlist, ensure_ascii=False), encoding="utf-8")
