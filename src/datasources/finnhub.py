@@ -16,6 +16,36 @@ log = get_logger("src.finnhub")
 
 BASE = "https://finnhub.io/api/v1"
 
+# 배치 종목뉴스 기본 상한. free tier ~60콜/분 + general 1콜 → 여유 두고 캡.
+DEFAULT_NEWS_US_MAX = 20
+
+
+def select_us_news_symbols(
+    universe: list[str] | None,
+    *,
+    priority: list[str] | None = None,
+    max_n: int = DEFAULT_NEWS_US_MAX,
+) -> list[str]:
+    """US 종목뉴스 대상: priority(보유·armed 등) 먼저, 유니버스로 패딩, max_n 캡.
+
+    KR 6자리 코드는 제외. 순서·중복 제거 유지.
+    """
+    if max_n <= 0:
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for raw in list(priority or []) + list(universe or []):
+        s = str(raw or "").strip()
+        if not s or s in seen:
+            continue
+        if s.isdigit() and len(s) == 6:
+            continue
+        seen.add(s)
+        out.append(s)
+        if len(out) >= max_n:
+            break
+    return out
+
 
 def fetch_company_news(api_key: str, symbol: str, per: int = 3, days: int = 5,
                        timeout: int = 15) -> list[dict]:

@@ -59,6 +59,25 @@ class TestFetchCompanyNews:
         assert fh.fetch_company_news("KEY", "AAPL") == []
 
 
+class TestSelectUsNewsSymbols:
+    def test_priority_먼저_유니버스_패딩_캡(self):
+        out = fh.select_us_news_symbols(
+            ["AAPL", "MSFT", "NVDA", "AMD"],
+            priority=["NVDA", "BULL"],
+            max_n=3)
+        assert out == ["NVDA", "BULL", "AAPL"]
+
+    def test_kr_6자리_제외_및_중복제거(self):
+        out = fh.select_us_news_symbols(
+            ["005930", "AAPL", "AAPL", "TSLA"],
+            priority=["005930", "TSLA"],
+            max_n=10)
+        assert out == ["TSLA", "AAPL"]
+
+    def test_max_n_0(self):
+        assert fh.select_us_news_symbols(["AAPL"], priority=["NVDA"], max_n=0) == []
+
+
 class TestFetchKrStockNews:
     def test_다중블록_펼침_태그제거_최신순_per컷(self, monkeypatch):
         data = [

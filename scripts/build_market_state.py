@@ -44,6 +44,27 @@ def _synth(symbol: str, market: str) -> pd.DataFrame:
                          "close": close, "volume": [1000] * 30})
 
 
+def _priority_us_symbols(cfg) -> list[str]:
+    """보유·armed US 티커 — 배치 뉴스에서 유니버스 앞자리보다 우선."""
+    out: list[str] = []
+    try:
+        from src.engine.store import Store
+        db = (cfg.raw.get("run") or {}).get("db_path", "data/bot.db")
+        store = Store(db)
+        for rows in (store.get_open_positions(), store.get_armed()):
+            for r in rows:
+                sym = str(r["symbol"] or "").strip()
+                if not sym:
+                    continue
+                mkt = str(r["market"] or "").upper()
+                if mkt == "US" or not (sym.isdigit() and len(sym) == 6):
+                    out.append(sym)
+    except Exception as e:
+        log = get_logger("build_state")
+        log.warning("US 뉴스 priority(보유/armed) 조회 실패(유니버스만): %s", e)
+    return list(dict.fromkeys(out))
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--dry", action="store_true")
@@ -70,7 +91,8 @@ def main() -> int:
 
     # 재무는 실제 종목 대상 (지수 프록시 아님). 유니버스에서 상한만큼.
     cap = int(ms_cfg.get("fundamentals_max", 10))
-    us_tickers = [s for (_m, s, _n) in load_candidates(DATA_DIR, ["US"])][:cap]
+    us_universe = [s for (_m, s, _n) in load_candidates(DATA_DIR, ["US"])]
+    us_tickers = us_universe[:cap]
     kr_codes = [s for (_m, s, _n) in load_candidates(DATA_DIR, ["KR"])][:cap]
 
     sources = [
@@ -114,7 +136,13 @@ def main() -> int:
         log.warning("ECOS_API_KEY 없음 -> macro_kr 스킵")
     finnhub_key = os.getenv("FINNHUB_API_KEY")
     if finnhub_key:
-        sources.append(FinnhubNewsSource(api_key=finnhub_key, symbols=us_tickers[:5]))
+        from src.datasources.finnhub import (
+            DEFAULT_NEWS_US_MAX, select_us_news_symbols)
+        news_max = int(ms_cfg.get("news_us_max", DEFAULT_NEWS_US_MAX))
+        news_syms = select_us_news_symbols(
+            us_universe, priority=_priority_us_symbols(cfg), max_n=news_max)
+        log.info("Finnhub 종목뉴스 대상 %d종 (cap=%d)", len(news_syms), news_max)
+        sources.append(FinnhubNewsSource(api_key=finnhub_key, symbols=news_syms))
     else:
         log.warning("FINNHUB_API_KEY 없음 -> 미국 뉴스 스킵")
     dart_key = os.getenv("DART_API_KEY")

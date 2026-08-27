@@ -166,7 +166,7 @@ class DisclosureWatcher:
                 continue                          # 비중대/비상장 → 무시(소음 차단)
             payload = {"rcept_no": f["rcept_no"], "report_nm": f["report_nm"],
                        "corp_name": f.get("corp_name"), "keyword": kw,
-                       "rcept_dt": f.get("rcept_dt")}
+                       "rcept_dt": f.get("rcept_dt"), "market": "KR"}
             # 실적 공시면 컨센서스(+가능하면 DART 실제 수치)를 붙여 뇌가 각성하는 즉시
             # '발표 vs 기대'를 비교하게 한다. 조회 실패는 삼킨다 — 컨센서스/actuals 가
             # 없어도 각성 자체는 그대로 나가야 한다.
@@ -309,7 +309,7 @@ class DisclosureWatcher:
                         "corp_name": f.get("corp_name"),
                         "keyword": is_material(f.get("report_nm")) or "잠정실적",
                         "rcept_dt": f.get("rcept_dt"), "recovered": True,
-                        "symbol": sym, "actuals": actuals,
+                        "symbol": sym, "actuals": actuals, "market": "KR",
                     }
                     wake_payloads.append(payload)
                     res["woke"].append(sym)

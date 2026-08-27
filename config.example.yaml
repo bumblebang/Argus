@@ -165,6 +165,8 @@ market_state:
   request_spacing_sec: 0.6
   sec_user_agent: "Argus your-email@example.com"
   fundamentals_max: 10
+  # Finnhub 종목뉴스 상한(보유·armed 우선 + 유니버스 패딩). free tier pacing 고려.
+  news_us_max: 20
   sector_symbols:
     US:
       Technology: "XLK"
@@ -252,6 +254,10 @@ watcher:
   earnings_result: true
   earnings_poll_sec: 600
   earnings_idle_poll_sec: 3600
+  edgar: true
+  edgar_poll_sec_active: 120
+  edgar_poll_sec_idle: 900
+  edgar_after_close_hours: 2
 
 athena:
   model: "sonnet"

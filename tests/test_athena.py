@@ -117,6 +117,31 @@ def test_build_research_context_uses_injected_focus():
     assert ctx["focus"] is injected
 
 
+def test_build_research_context_carries_macro_and_earnings():
+    """US 거시(FRED) + 실적 슬롯이 Athena 컨텍스트에 실린다."""
+    ms = {"macro": {"fed_funds": 3.63, "cpi_yoy": 0.035},
+          "macro_kr": {"bok_base_rate": 2.75},
+          "news": [], "fundamentals": {}, "flows": {}}
+    earn = {"market": "US", "symbol": "NVDA", "date": "2026-08-28", "dday": 1,
+            "consensus": {"eps": 1.0}}
+    ers = [{"symbol": "NVDA", "eps_surprise_pct": 8.2, "route": "queue",
+            "market": "US"}]
+    ctx = build_research_context(
+        "NVDA", "NVIDIA", "US", history_df=_df(), market_state=ms,
+        earnings=earn, earnings_results=ers)
+    assert ctx["macro"]["fed_funds"] == 3.63
+    assert ctx["macro_kr"]["bok_base_rate"] == 2.75
+    assert ctx["earnings"]["dday"] == 1
+    assert ctx["earnings_results"][0]["eps_surprise_pct"] == 8.2
+
+
+def test_athena_prompt_mentions_us_macro_and_earnings():
+    from src.agents.athena import ATHENA_SYSTEM as ATH
+    assert "macro(FRED" in ATH
+    assert "earnings_results" in ATH
+    assert "macro_kr 로 US" in ATH
+
+
 # ── 우선순위 ───────────────────────────────────────────────────────
 def test_select_symbols_priority(tmp_path):
     cfg = load_config()

@@ -181,6 +181,27 @@ def test_select_symbols_prioritizes_disclosure_queue(tmp_path):
     store = Store(tmp_path / "t.db")
     for s in ("AAA", "BBB", "CCC"):                               # 전부 커버된 상태
         store.save_dossier(s, "KR", thesis="old")
-    store.log_event("disclosure", "BBB", {"route": "queue", "report_nm": "공급계약"})
+    store.log_event("disclosure", "BBB", {"route": "queue", "report_nm": "공급계약",
+                                          "market": "KR"})
     order = [t["symbol"] for t in select_symbols(cfg, store, "KR")]
     assert order[0] == "BBB"                                      # 공시 뜬 종목 최우선
+
+
+def test_select_symbols_prioritizes_us_earnings_result_queue(tmp_path):
+    """US 실적 결과 큐 종목이 미커버/오래된 커버보다 먼저 재소환된다."""
+    from src.agents.athena import select_symbols
+    cfg = load_config()
+    cfg.universe["US"] = [{"symbol": "AAA", "name": "a"}, {"symbol": "NVDA", "name": "n"},
+                          {"symbol": "CCC", "name": "c"}]
+    store = Store(tmp_path / "t.db")
+    for s in ("AAA", "NVDA", "CCC"):
+        store.save_dossier(s, "US", thesis="old")
+    store.log_event("earnings_result", "NVDA", {
+        "market": "US", "route": "queue", "eps_surprise_pct": 12.0})
+    order = [t["symbol"] for t in select_symbols(cfg, store, "US")]
+    assert order[0] == "NVDA"
+    # KR 창에는 US 실적 큐가 섞이지 않는다
+    cfg.universe["KR"] = [{"symbol": "005930", "name": "삼성"}]
+    store.save_dossier("005930", "KR", thesis="old")
+    kr_order = [t["symbol"] for t in select_symbols(cfg, store, "KR")]
+    assert "NVDA" not in kr_order
