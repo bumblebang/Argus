@@ -285,6 +285,7 @@ class Store:
             self.conn.commit()
 
     def get_working_orders(self, symbol: str | None = None, *,
+                           side: str | None = None,
                            settled: bool | None = None) -> list[dict]:
         """settled=None 전체 / False 진행 중만 / True 귀속 대기분만."""
         sql, args = "SELECT * FROM working_orders", []
@@ -292,6 +293,9 @@ class Store:
         if symbol:
             where.append("symbol=?")
             args.append(symbol)
+        if side:
+            where.append("side=?")
+            args.append(side)
         if settled is True:
             where.append("settled_at IS NOT NULL")
         elif settled is False:
@@ -301,11 +305,18 @@ class Store:
         sql += " ORDER BY placed_at"
         return [dict(r) for r in self.conn.execute(sql, tuple(args)).fetchall()]
 
-    def has_working_order(self, symbol: str) -> bool:
-        """진행 중인(종결 미확인) 주문이 있는지. 귀속 대기분은 재발주를 막지 않는다."""
-        row = self.conn.execute(
-            "SELECT 1 FROM working_orders WHERE symbol=? AND settled_at IS NULL LIMIT 1",
-            (symbol,)).fetchone()
+    def has_working_order(self, symbol: str, side: str | None = None) -> bool:
+        """진행 중인(종결 미확인) 주문이 있는지. 귀속 대기분은 재발주를 막지 않는다.
+
+        side 를 주면 같은 방향만 본다 — 미체결 BUY 가 손절 SELL 을 막지 않게.
+        """
+        sql = ("SELECT 1 FROM working_orders WHERE symbol=? AND settled_at IS NULL")
+        args: list[Any] = [symbol]
+        if side:
+            sql += " AND side=?"
+            args.append(side)
+        sql += " LIMIT 1"
+        row = self.conn.execute(sql, tuple(args)).fetchone()
         return row is not None
 
     # ── 이벤트/스냅샷/판단 기록 ───────────────────────────
@@ -711,6 +722,14 @@ class Store:
                 " exit_reason=?, ret_pct=?, scored_at=? WHERE id=?"
                 " AND state IN ('open','pending')",
                 (exit_price, exit_ts, exit_reason, ret_pct, now, shadow_id))
+            self.conn.commit()
+
+    def update_shadow_ret_pct(self, shadow_id: int, ret_pct: float) -> None:
+        """이미 scored 된 행의 ret_pct 만 갱신(비용 재채점). scored_at 유지."""
+        with self._lock:
+            self.conn.execute(
+                "UPDATE shadow_positions SET ret_pct=? WHERE id=? AND state='scored'",
+                (float(ret_pct), shadow_id))
             self.conn.commit()
 
     def skip_shadow_position(self, shadow_id: int, reason: str) -> None:

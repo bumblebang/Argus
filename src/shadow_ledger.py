@@ -10,7 +10,6 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
-from .eval.trade_defs import roundtrip_cost_pct
 from .logging_setup import get_logger
 
 log = get_logger("shadow_ledger")
@@ -384,6 +383,11 @@ def score_open_shadows(store, *, now: float | None = None,
                        data_dir: Path | str = "data",
                        cfg: dict | None = None) -> dict[str, int]:
     """state=open|pending 그림자 포지션 채점. {scored, skipped, pending, cancelled} 반환."""
+    # 지연 import: 상단 from .eval.trade_defs 는 eval.__init__→labels→shadow_ledger
+    # 순환을 만들고, score_shadow_ledger.py(프로덕션)가 shadow를 먼저 로드하면 ImportError.
+    # pytest는 알파벳순으로 src.eval을 먼저 로드해 순환을 우회한다.
+    from .eval.trade_defs import roundtrip_cost_pct
+
     now = now or datetime.now(timezone.utc).timestamp()
     data_dir = Path(data_dir)
     stats = {"scored": 0, "skipped": 0, "pending": 0, "cancelled": 0}
@@ -456,6 +460,46 @@ def score_open_shadows(store, *, now: float | None = None,
                   sym, row["block_bucket"], ret, price_source)
 
     return stats
+
+
+def rescore_shadow_costs(store, *, cfg: dict | None = None) -> dict[str, int]:
+    """이미 scored 된 그림자의 ret_pct 에 왕복비용을 다시 깐다.
+
+    J11 순환 import 기간에 채점된 행은 cost=0 시절 값이다. exit/entry 가격은
+    그대로 두고 ret 만 재계산한다(히스토리 재조회 없음).
+    """
+    from .eval.trade_defs import roundtrip_cost_pct
+
+    updated = unchanged = skipped = 0
+    for row in store.get_scored_shadow_positions():
+        try:
+            entry_px = float(row["entry_price"])
+            exit_px = float(row["exit_price"])
+        except (TypeError, ValueError, KeyError):
+            skipped += 1
+            continue
+        if entry_px <= 0 or exit_px <= 0:
+            skipped += 1
+            continue
+        market = "KR"
+        try:
+            if row["market"]:
+                market = str(row["market"])
+        except (KeyError, IndexError, TypeError):
+            pass
+        cost_pct = roundtrip_cost_pct(market, cfg) * 100.0
+        new_ret = round((exit_px / entry_px - 1) * 100 - cost_pct, 3)
+        old = row["ret_pct"]
+        try:
+            old_f = float(old) if old is not None else None
+        except (TypeError, ValueError):
+            old_f = None
+        if old_f is not None and abs(old_f - new_ret) < 1e-9:
+            unchanged += 1
+            continue
+        store.update_shadow_ret_pct(int(row["id"]), new_ret)
+        updated += 1
+    return {"updated": updated, "unchanged": unchanged, "skipped": skipped}
 
 
 def _agg_rows(rows: list) -> dict:

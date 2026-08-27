@@ -110,6 +110,47 @@ def test_rejected_order_not_recorded(tmp_path):
     assert store.get_working_orders() == []
 
 
+def test_unknown_poll_failure_is_recorded(tmp_path):
+    """place 성공 + get_order 전부 실패 → UNKNOWN.
+
+    등록 조건이 _PENDING 만이면 표·예약이 비고 inflight 해제와 함께
+    J1(이중지출)·J2(재발주)가 동시에 열린다. 주문조회가 흔들릴 때가
+    미체결 잔존과 겹치기 쉬운 구간이다.
+    """
+    class _FailPoll(_Client):
+        def get_order(self, account_seq, order_id):
+            raise RuntimeError("ORDER_HISTORY down")
+
+    store, client, broker = _setup(tmp_path, client=_FailPoll())
+    res = broker.execute(Order("005930", "KR", "BUY", 1, 70_000), "entry")
+    assert not res.ok
+    rows = store.get_working_orders()
+    assert len(rows) == 1
+    assert rows[0]["order_id"] == "O1" and rows[0]["status"] == "UNKNOWN"
+
+
+def test_unknown_blocks_reorder_and_holds_buying_power(tmp_path):
+    """UNKNOWN 등록 후 동심볼 재발주 거부 + 타심볼 매수여력 홀드."""
+    class _FailPoll(_Client):
+        def get_order(self, account_seq, order_id):
+            raise RuntimeError("ORDER_HISTORY down")
+
+    store = Store(tmp_path / "t.db")
+    client = _FailPoll()
+    broker = _broker(tmp_path, store, client)  # cash 1_000_000
+    broker.execute(Order("005930", "KR", "BUY", 1, 600_000), "tick1")
+    assert len(store.get_working_orders()) == 1
+    assert len(client.placed) == 1
+
+    again = broker.execute(Order("005930", "KR", "BUY", 1, 600_000), "tick2")
+    assert not again.ok and "미체결" in (again.reject_reason or "")
+    assert len(client.placed) == 1
+
+    other = broker.execute(Order("000660", "KR", "BUY", 1, 600_000), "other")
+    assert not other.ok and "매수여력" in (other.reject_reason or "")
+    assert len(client.placed) == 1
+
+
 # ── 재발주 차단 (매 틱 중복 발주 재현) ──────────────────────────
 def test_reorder_blocked_while_working(tmp_path):
     store, client, broker = _setup(tmp_path)
@@ -118,6 +159,136 @@ def test_reorder_blocked_while_working(tmp_path):
     res = broker.execute(Order("005930", "KR", "BUY", 1, 70_000), "tick2")
     assert not res.ok and "미체결" in (res.reject_reason or "")
     assert len(client.placed) == 1, "두 번째 틱에서 발주되면 안 된다"
+
+
+def test_working_buy_does_not_block_stop_sell(tmp_path):
+    """미체결 BUY 가 같은 종목 손절 SELL 을 막던 구멍 — ExitExecutor 경로 재현."""
+    from src.engine.execution import ExitExecutor
+
+    class _Trig:
+        kind = "stop_hit"
+
+    class _SellFills(_Client):
+        def get_order(self, account_seq, order_id):
+            if order_id == "WB1":
+                return {"status": "PENDING", "execution": {"filledQuantity": 0}}
+            return {"status": "FILLED",
+                    "execution": {"filledQuantity": 10, "averageFilledPrice": 65_000,
+                                  "commission": 0, "tax": 0}}
+
+    store = Store(tmp_path / "t.db")
+    client = _SellFills()
+    broker = _broker(tmp_path, store, client)
+    broker.account.apply_fill("005930", "KR", "BUY", 10, 70_000, 0.0, "seed")
+    store.open_position("005930", "KR", 10, 70_000, stop_price=66_000)
+    store.upsert_working_order(order_id="WB1", symbol="005930", market="KR",
+                               side="BUY", qty=1, price=70_000, status="PENDING")
+
+    ex = ExitExecutor(broker, store)
+    assert ex("005930", "KR", 65_000, _Trig()) is True
+    assert len(client.placed) == 1
+    assert client.placed[0]["side"] == "SELL"
+    assert store.has_working_order("005930", side="BUY")
+    assert broker.position("005930").qty == 0
+
+
+def test_stop_sell_cancels_opposing_working_buy(tmp_path):
+    """손절 SELL 직전 같은 종목 미체결 BUY 를 취소 — 청산 후 재롱 방지."""
+    from src.engine.execution import ExitExecutor
+
+    class _Trig:
+        kind = "stop_hit"
+
+    class _CancelBuyThenSell(_Client):
+        def get_order(self, account_seq, order_id):
+            if order_id in self.canceled or order_id == "WB1":
+                if order_id in self.canceled:
+                    return {"status": "CANCELED",
+                            "execution": {"filledQuantity": 0}}
+                return {"status": "PENDING", "execution": {"filledQuantity": 0}}
+            return {"status": "FILLED",
+                    "execution": {"filledQuantity": 10, "averageFilledPrice": 65_000,
+                                  "commission": 0, "tax": 0}}
+
+    store = Store(tmp_path / "t.db")
+    client = _CancelBuyThenSell()
+    broker = _broker(tmp_path, store, client)
+    broker.account.apply_fill("005930", "KR", "BUY", 10, 70_000, 0.0, "seed")
+    store.open_position("005930", "KR", 10, 70_000, stop_price=66_000)
+    store.upsert_working_order(order_id="WB1", symbol="005930", market="KR",
+                               side="BUY", qty=1, price=70_000, status="PENDING")
+
+    ex = ExitExecutor(broker, store)
+    assert ex("005930", "KR", 65_000, _Trig()) is True
+    assert client.canceled == ["WB1"]
+    assert not store.has_working_order("005930", side="BUY")
+    assert len(client.placed) == 1 and client.placed[0]["side"] == "SELL"
+
+
+def test_same_side_sell_still_blocks_without_replace(tmp_path):
+    """같은 방향·같은(비공격) 가격 미체결 SELL 은 재발주 차단 유지."""
+    store = Store(tmp_path / "t.db")
+    client = _Client({"status": "FILLED",
+                      "execution": {"filledQuantity": 1,
+                                    "averageFilledPrice": 65_000,
+                                    "commission": 0, "tax": 0}})
+    broker = _broker(tmp_path, store, client)
+    broker.account.apply_fill("005930", "KR", "BUY", 1, 70_000, 0.0, "seed")
+    store.upsert_working_order(order_id="WS1", symbol="005930", market="KR",
+                               side="SELL", qty=1, price=65_000, status="PENDING")
+    res = broker.execute(Order("005930", "KR", "SELL", 1, 65_000), "stop")
+    assert not res.ok and "미체결" in (res.reject_reason or "")
+    assert client.placed == [] and client.canceled == []
+
+
+def test_aggressive_sell_cancels_working_without_waiting_sweep(tmp_path):
+    """가격이 더 빠진 공격 지정가 — 재대사 sweep 전에 execute 경로에서 교체."""
+    store = Store(tmp_path / "t.db")
+
+    class _Replace(_Client):
+        def get_order(self, account_seq, order_id):
+            if order_id in self.canceled:
+                return {"status": "CANCELED", "execution": {"filledQuantity": 0}}
+            return self.detail
+
+    client = _Replace({"status": "FILLED",
+                       "execution": {"filledQuantity": 1,
+                                     "averageFilledPrice": 60_000,
+                                     "commission": 0, "tax": 0}})
+    broker = _broker(tmp_path, store, client, working_order_ttl_sec=600.0)
+    broker.account.apply_fill("005930", "KR", "BUY", 1, 70_000, 0.0, "seed")
+    store.upsert_working_order(order_id="WS1", symbol="005930", market="KR",
+                               side="SELL", qty=1, price=65_000, status="PENDING")
+    res = broker.execute(Order("005930", "KR", "SELL", 1, 60_000), "stop_reprice")
+    assert res.ok
+    assert client.canceled == ["WS1"]
+    assert len(client.placed) == 1
+    assert all(r["order_id"] != "WS1" for r in store.get_working_orders())
+
+
+def test_ttl_release_on_execute_not_only_reconcile_timer(tmp_path):
+    """TTL 경과 working 은 reconcile_sec 를 기다리지 않고 execute 때 취소."""
+    store = Store(tmp_path / "t.db")
+
+    class _Replace(_Client):
+        def get_order(self, account_seq, order_id):
+            if order_id in self.canceled:
+                return {"status": "CANCELED", "execution": {"filledQuantity": 0}}
+            return self.detail
+
+    client = _Replace({"status": "FILLED",
+                       "execution": {"filledQuantity": 1,
+                                     "averageFilledPrice": 65_000,
+                                     "commission": 0, "tax": 0}})
+    broker = _broker(tmp_path, store, client, working_order_ttl_sec=60.0)
+    broker.account.apply_fill("005930", "KR", "BUY", 1, 70_000, 0.0, "seed")
+    store.upsert_working_order(order_id="WS1", symbol="005930", market="KR",
+                               side="SELL", qty=1, price=65_000, status="PENDING",
+                               placed_at=time.time() - 120)
+    res = broker.execute(Order("005930", "KR", "SELL", 1, 65_000), "stop_retry")
+    assert res.ok
+    assert client.canceled == ["WS1"]
+    assert len(client.placed) == 1
 
 
 def test_other_symbol_still_allowed(tmp_path):

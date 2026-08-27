@@ -18,8 +18,8 @@ sys.path.insert(0, str(ROOT))
 from src.config import load_config
 from src.engine.store import Store
 from src.logging_setup import setup_logging
-from src.shadow_ledger import (backfill_from_jsonl, score_open_shadows,
-                               shadow_stats)
+from src.shadow_ledger import (backfill_from_jsonl, rescore_shadow_costs,
+                               score_open_shadows, shadow_stats)
 from src import paths as _paths
 
 DATA = ROOT / "data"
@@ -31,6 +31,8 @@ def main() -> None:
     ap.add_argument("--stats", action="store_true", help="skip scoring, print stats only")
     ap.add_argument("--backfill", action="store_true",
                     help="replay decisions.jsonl (+ value) into shadow_positions")
+    ap.add_argument("--rescore-cost", action="store_true",
+                    help="scored 행 ret_pct 에 왕복비용 재적용(J11 공백 보정)")
     ap.add_argument("--limit", type=int, default=None,
                     help="backfill max journal lines per file")
     ap.add_argument("--db", type=Path,
@@ -54,6 +56,10 @@ def main() -> None:
                     store, path, sleeve=sleeve, data_dir=DATA,
                     cfg=cfg.raw, limit=args.limit)
                 print(json.dumps({"backfill": sleeve, **bf}, ensure_ascii=False))
+
+    if args.rescore_cost:
+        rs = rescore_shadow_costs(store, cfg=cfg.raw)
+        print(json.dumps({"rescore_cost": rs}, ensure_ascii=False))
 
     if not args.stats:
         result = score_open_shadows(store, data_dir=DATA, cfg=cfg.raw)
