@@ -1,4 +1,6 @@
 """그림자 장부 v1 — 등록·채점·집계."""
+import importlib
+import sys
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -8,6 +10,21 @@ from src.agents.schemas import DecisionOutput, Proposal, ValidationOutput, Valid
 from src.engine.store import Store
 from src.shadow_ledger import (book_blocked, horizon_calendar_days, score_open_shadows,
                                shadow_stats)
+
+
+def test_shadow_ledger_imports_before_eval():
+    """프로덕션 경로: score_shadow_ledger.py 는 shadow를 eval보다 먼저 로드한다.
+
+    J11 상단 trade_defs import 는 eval.__init__→labels→shadow 순환을 만들고,
+    pytest 알파벳 수집(src.eval 선로드)이 결함을 가린다.
+    """
+    doomed = [k for k in list(sys.modules)
+              if k == "src.shadow_ledger" or k.startswith("src.shadow_ledger.")
+              or k == "src.eval" or k.startswith("src.eval.")]
+    for k in doomed:
+        del sys.modules[k]
+    mod = importlib.import_module("src.shadow_ledger")
+    assert callable(mod.score_open_shadows)
 
 KST = timezone(timedelta(hours=9))
 
@@ -240,6 +257,37 @@ def test_shadow_ret_subtracts_roundtrip_cost(tmp_path):
     assert gross > net
     from src.eval.trade_defs import roundtrip_cost_pct
     assert abs((gross - net) - roundtrip_cost_pct("KR") * 100) < 1e-6
+
+
+def test_rescore_shadow_costs_fixes_zero_cost_era(tmp_path):
+    """J11 공백 때 찍힌 scored ret 에 비용을 소급 적용."""
+    from src.shadow_ledger import rescore_shadow_costs
+    from src.eval.trade_defs import roundtrip_cost_pct
+
+    store = Store(tmp_path / "t.db")
+    hist = tmp_path / "history"
+    hist.mkdir()
+    lines = ["Date,Open,High,Low,Close,Volume"]
+    base = datetime(2026, 1, 1, tzinfo=KST)
+    for i in range(30):
+        d = (base + timedelta(days=i)).strftime("%Y-%m-%d")
+        close = 100.0 + i * (10.0 / 29)
+        lines.append(f"{d},100,100,100,{close:.2f},1000")
+    (hist / "RESCORE_1d_1y.csv").write_text("\n".join(lines), encoding="utf-8")
+    entry_ts = base.timestamp() + 3600
+    res, prices = _vetoed_cycle(sym="RESCORE", price=100.0, cycle_ts=entry_ts)
+    ep = {"exit_policy": {"time_stop": {"enabled": True,
+                                        "by_horizon": {"swing": {"max_days": 20}}}}}
+    zero = dict(ep, paper={"fee_rate": {"KR": 0}, "slippage_bps": {"KR": 0},
+                           "sell_tax_rate": {"KR": 0}})
+    book_blocked(store, res, prices, sleeve="brain", cfg=ep)
+    score_open_shadows(store, now=entry_ts + 21 * 86400, data_dir=tmp_path, cfg=zero)
+    before = store.get_scored_shadow_positions()[0]["ret_pct"]
+    out = rescore_shadow_costs(store, cfg=ep)
+    assert out["updated"] == 1
+    after = store.get_scored_shadow_positions()[0]["ret_pct"]
+    assert abs((before - after) - roundtrip_cost_pct("KR") * 100) < 1e-6
+    assert rescore_shadow_costs(store, cfg=ep)["unchanged"] == 1
 
 
 def test_open_shadow_cancelled_if_had_closed_position(tmp_path):

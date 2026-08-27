@@ -34,6 +34,19 @@ _ORDER_ID_KEYS = ("orderId", "orderNo")
 # 체결분(filledQuantity>0)이 있어 별도로 조기 종료한다(잔량은 주기 재대사가 반영).
 _TERMINAL = {"FILLED", "CANCELED", "REJECTED", "CANCEL_REJECTED", "REPLACE_REJECTED"}
 _PENDING = {"PENDING", "PENDING_CANCEL", "PENDING_REPLACE", "PARTIAL_FILLED", "REPLACED"}
+# place 성공 뒤 get_order 폴링이 전부 실패하면 status=UNKNOWN. _PENDING 에 없어
+# 레지스트리·예약을 건너뛰면 J1(이중지출)·J2(재발주)가 동시에 풀린다.
+# REJECTED 등 확정 종결은 여기 넣지 않는다.
+_TRACK_WORKING = _PENDING | {"UNKNOWN"}
+
+
+def _more_aggressive(side: str, new_px: float, old_px: float) -> bool:
+    """재지정가가 기존 미체결보다 공격적인지. SELL 은 더 낮은 가, BUY 는 더 높은 가."""
+    if old_px <= 0 or new_px <= 0:
+        return False
+    if str(side).upper() == "SELL":
+        return new_px < old_px
+    return new_px > old_px
 
 
 def _num(v: Any) -> float | None:
@@ -363,21 +376,91 @@ class Broker:
             log.error("미체결 주문 기록 실패 — 고아 주문 위험 id=%s: %s", order_id, e)
 
     def _reject_working_order(self, order: Order, base_kw: dict) -> bool:
-        """같은 종목에 살아 있는 미체결 주문이 있으면 재발주 거부.
+        """같은 종목·같은 방향 미체결이 있으면 재발주 거부.
 
-        존 진입기·청산 실행기는 미체결 시 armed/보유를 유지하고 **매 틱 다시**
-        execute 한다 — 레지스트리가 없으면 같은 의도의 주문이 계속 쌓인다.
+        side 구분 없이 막으면 미체결 BUY 가 ExitExecutor 손절 SELL 을
+        게이트보다 먼저 차단한다(실재현). 반대 방향은 통과.
+
+        같은 방향이어도 (a) TTL 경과 (b) 더 공격적 재지정가 이면
+        재대사 타이머를 기다리지 않고 여기서 취소 시도한다.
+        working_order_ttl_sec=60 인데 sweep 만 reconcile_sec(기본 300)에
+        묶이면 손절 재시도가 60~360초 밀리고, 가격이 더 빠져도 새 주문이
+        안 나간다. 취소 실패 시에는 여전히 거부(이중 주문 방지).
         """
         if not self.block_on_working_order or self.store is None:
             return False
         try:
-            if not self.store.has_working_order(order.symbol):
-                return False
+            rows = self.store.get_working_orders(
+                order.symbol, side=order.side, settled=False)
         except Exception as e:
             log.warning("미체결 조회 실패(통과) %s: %s", order.symbol, e)
             return False
-        self.last_reject_reason = "동일 종목 미체결 주문 존재"
-        log.info("[거부] %s %s — 미체결 주문 대기 중", order.side, order.symbol)
+        if not rows:
+            return False
+        if self._try_release_same_side_working(order, rows):
+            try:
+                if not self.store.has_working_order(order.symbol, side=order.side):
+                    return False
+            except Exception as e:
+                log.warning("미체결 재조회 실패(통과) %s: %s", order.symbol, e)
+                return False
+        self.last_reject_reason = "동일 종목·방향 미체결 주문 존재"
+        log.info("[거부] %s %s — 같은 방향 미체결 대기 중", order.side, order.symbol)
+        self.last_result = ExecuteResult.rejected(self.last_reject_reason, **base_kw)
+        return True
+
+    def _try_release_same_side_working(self, order: Order, rows: list) -> bool:
+        """TTL 경과·공격 재지정가 working 을 execute 경로에서 즉시 취소."""
+        if self.client is None or self.account_seq is None:
+            return False
+        now = time.time()
+        released = False
+        for row in rows:
+            age = now - float(row.get("placed_at") or now)
+            ttl_due = (self.working_order_ttl_sec >= 0
+                       and age >= self.working_order_ttl_sec)
+            aggressive = _more_aggressive(
+                order.side, float(order.price), float(row.get("price") or 0.0))
+            if not ttl_due and not aggressive:
+                continue
+            why = "ttl" if ttl_due else "aggressive_replace"
+            log.info("[LIVE] 미체결 즉시 해제 시도(%s) id=%s %s %s @ %s → 새 %s",
+                     why, row["order_id"], row["side"], row["symbol"],
+                     row.get("price"), order.price)
+            if self._cancel_and_confirm(row["order_id"], row):
+                released = True
+        return released
+
+    def _cancel_opposing_working(self, order: Order) -> None:
+        """반대 방향 미체결 취소(SELL→BUY). 실패해도 본 주문은 막지 않는다."""
+        if order.side != "SELL" or self.store is None:
+            return
+        if self.client is None or self.account_seq is None:
+            return
+        try:
+            rows = self.store.get_working_orders(
+                order.symbol, side="BUY", settled=False)
+        except Exception as e:
+            log.warning("반대편 미체결 조회 실패 %s: %s", order.symbol, e)
+            return
+        for row in rows:
+            log.info("[LIVE] 청산 전 반대편 BUY 취소 id=%s %s x%s @ %s",
+                     row["order_id"], row["symbol"], row["qty"], row.get("price"))
+            if not self._cancel_and_confirm(row["order_id"], row):
+                log.warning("[LIVE] 반대편 BUY 취소 실패 — SELL 은 계속 id=%s",
+                            row["order_id"])
+
+    def _reject_inflight(self, order: Order, base_kw: dict) -> bool:
+        """in-flight 거부(같은 방향만). True 이면 last_result 설정됨."""
+        self._prune_expired_reservations()    # 만료 회수 후 판정
+        cur = self._inflight.get(order.symbol)
+        if cur is None:
+            return False
+        if str(cur.side).upper() != str(order.side).upper():
+            # 미체결 폴링 중 BUY 가 손절 SELL 을 막지 않게.
+            return False
+        self.last_reject_reason = "동일 종목 주문 처리 중(in-flight)"
+        log.info("[거부] %s %s — in-flight", order.side, order.symbol)
         self.last_result = ExecuteResult.rejected(self.last_reject_reason, **base_kw)
         return True
 
@@ -510,16 +593,6 @@ class Broker:
         except Exception as e:
             log.warning("미체결 레지스트리 갱신 실패(무시): %s", e)
 
-    def _reject_inflight(self, order: Order, base_kw: dict) -> bool:
-        """in-flight 거부. True 이면 last_result 설정됨."""
-        self._prune_expired_reservations()    # 만료 회수 후 판정
-        if order.symbol not in self._inflight:
-            return False
-        self.last_reject_reason = "동일 종목 주문 처리 중(in-flight)"
-        log.info("[거부] %s %s — in-flight", order.side, order.symbol)
-        self.last_result = ExecuteResult.rejected(self.last_reject_reason, **base_kw)
-        return True
-
     def _begin_execute_locked(self, order: Order, reason: str,
                               base_kw: dict) -> dict | None:
         """락 안: 게이트·주문 접수까지. 라이브 prep(I/O)은 execute()에서 락 밖 선행."""
@@ -529,6 +602,9 @@ class Broker:
             return None
         if self._reject_working_order(order, base_kw):
             return None
+        # 손절 SELL: 같은 종목 미체결 BUY 는 통과만으론 부족 — 잔여 매수가
+        # 체결되면 청산 직후 다시 롱이 된다. best-effort 취소(실패해도 SELL 진행).
+        self._cancel_opposing_working(order)
 
         decision = self.gate.check(order, self.account,
                                    reserved=self._active_reservations())
@@ -601,7 +677,8 @@ class Broker:
             self._emit("live_order", order, payload)
             # 부분체결은 잔량이 아직 살아 있다 — 레지스트리에 남겨 재발주를 막고
             # 만료 시 취소한다. 지금까지는 성공 반환 후 잔량을 잊었다.
-            if status in _PENDING and filled_qty < float(order.qty):
+            # UNKNOWN(조회 실패)도 잔량 추적 — 아니면 inflight 해제 후 J1/J2 공백.
+            if status in _TRACK_WORKING and filled_qty < float(order.qty):
                 self._register_working_order(order, order_id, status,
                                              filled_qty, reason,
                                              avg_px=avg_px, fee=fee)
@@ -611,8 +688,9 @@ class Broker:
                 status=status, order_id=order_id, side=order.side)
             return self.last_result
 
+        # UNKNOWN 도 표에 남긴다. 이벤트는 조회 실패를 드러내 live_order_error.
         kind = "live_order_pending" if status in _PENDING else "live_order_error"
-        if status in _PENDING:
+        if status in _TRACK_WORKING:
             self._register_working_order(order, order_id, status, 0.0, reason)
         log.warning("[LIVE] 미체결 id=%s status=%s — 원장 무변(주기 재대사가 반영): %s %s x%s",
                     order_id, status, order.side, order.symbol, order.qty)
@@ -827,7 +905,8 @@ class Broker:
         """주문을 폴링해 (체결수량, 평균체결가, 수수료+세금, status).
 
         종결(FILLED/거부/취소) 또는 체결분 발생 시 조기 종료. 조회 실패가 반복되면
-        (0, None, 0, 'UNKNOWN') — 호출측이 원장 무변으로 처리하고 주기 재대사에 맡긴다.
+        (0, None, 0, 'UNKNOWN') — 호출측은 원장 무변 + working_orders 등록으로
+        J1/J2 를 유지하고, 상태 확정은 sweep/주기 재대사에 맡긴다.
         """
         last: dict | None = None
         status = "UNKNOWN"
