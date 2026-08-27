@@ -1,4 +1,4 @@
-"""라이브 실주문 왕복 스모크 테스트 — 사람이 직접 돌리는 감독 검증 도구.
+"""라이브 실주문 왕복 스모크 테스트 — 사람이 직접 돌리는 배포 검증 도구.
 
   python scripts/live_smoke.py --check                # 잔고/매수여력/보유 조회(읽기 전용)
   python scripts/live_smoke.py --buy 005930           # 무엇을 할지 출력만(주문 안 함)
@@ -6,8 +6,8 @@
   python scripts/live_smoke.py --sell 005930 --confirm# 1주 시장가 매도(실돈!)
 
 주의:
-  - 이 스크립트는 Broker/하드게이트를 **경유하지 않는다**. 오직 토스 API 스펙 왕복
-    검증용이며, 수량은 항상 1주로 **하드코딩**(인자로 늘릴 수 없음 — 안전).
+  - Broker 실행 경로를 타지 않지만, --confirm 시 **DRY_RUN / HALT / RiskGate** 는
+    반드시 통과해야 한다(우회 금지). 수량은 항상 1주 하드코딩.
   - 토스는 client 당 토큰 1개 정책이라 watch 와 동시에 돌리면 토큰이 충돌한다.
     실행 전 watch 를 멈춘다. 끝나면 다시 상주.
   - 401 invalid-token 이 한 번 떠도 TossClient 가 자동복구하니 놀라지 말 것.
@@ -21,8 +21,11 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+from src import paths as _paths
 from src.config import load_config
 from src.logging_setup import setup_logging, get_logger
+from src.paper_account import PaperAccount
+from src.risk_gate import Order, RiskGate
 from src.toss_client import TossClient, TossAPIError
 
 log = get_logger("live_smoke")
@@ -71,6 +74,44 @@ def _print_holdings(client: TossClient, seq) -> None:
         log.warning("보유 조회 실패: %s", e)
 
 
+def _infer_market(symbol: str) -> str:
+    s = str(symbol or "").strip()
+    if s.isdigit() and len(s) == 6:
+        return "KR"
+    return "US"
+
+
+def _guard_confirm(cfg, symbol: str, side: str, price: float) -> str | None:
+    """--confirm 실주문 전 안전 가드. 거부 사유 문자열, 통과면 None.
+
+    DRY_RUN·HALT·RiskGate 를 우회하지 않는다(사고 표면 차단).
+    """
+    if bool(getattr(cfg, "dry_run", True)):
+        return ("DRY_RUN 활성(.env DRY_RUN 또는 config run.dry_run) "
+                "— 실주문 거부. 끄려면 DRY_RUN=false 와 yaml dry_run: false")
+    risk_cfg = (cfg.raw.get("risk") or {})
+    gate = RiskGate(risk_cfg)
+    if gate.is_globally_halted():
+        return f"킬스위치 활성(HALT) — {gate._halt_path()}"
+    market = _infer_market(symbol)
+    if side.upper() == "BUY" and gate.is_market_paused(market):
+        return f"시장 pause 활성(HALT.{market})"
+    paper_path = _paths.resolve("paper", configured="data/paper_account.json")
+    try:
+        capital = risk_cfg.get("capital") or {}
+        acct = PaperAccount(
+            cash={"KR": float(capital.get("KR") or 0),
+                  "US": float(capital.get("US") or 0)},
+            state_path=paper_path)
+    except Exception as e:
+        return f"원장 로드 실패 — RiskGate 검사 불가: {e}"
+    order = Order(symbol, market, side.upper(), float(QTY), float(price))
+    decision = gate.check(order, acct)
+    if not decision.approved:
+        return f"RiskGate 거부 — {decision.reason}"
+    return None
+
+
 def cmd_check(client: TossClient, cfg) -> int:
     seq, accts = _resolve_seq(client, cfg)
     cfg_seq = (cfg.raw.get("broker", {}) or {}).get("account_seq")
@@ -109,6 +150,14 @@ def cmd_order(client: TossClient, cfg, symbol: str, side: str, confirm: bool,
     if not confirm:
         print("  --confirm 없음 → 주문을 내지 않고 종료(무엇을 할지 출력만).")
         return 0
+    gate_px = float(price or px or 0)
+    if gate_px <= 0:
+        print("  [중단] 가격 미확보 — RiskGate/주문 불가.")
+        return 1
+    blocked = _guard_confirm(cfg, symbol, side, gate_px)
+    if blocked:
+        print(f"  [중단] {blocked}")
+        return 1
     print(f"  >>> 실주문 전송: {side} {symbol} x{QTY} {order_type}"
           + (f" @ {price:g}" if price else "") + " ...")
     try:

@@ -133,6 +133,9 @@ class Broker:
         # 직전 execute 가 거부된 사유(한글). 성공 시 "". 저널/이벤트가 thesis 대신 기록.
         self.last_reject_reason: str = ""
         self.last_result: ExecuteResult | None = None
+        # 재대사가 실계좌 buying_power 로 cash 를 덮은 시각. 그 이전 미체결 BUY 는
+        # 이미 BP 에 홀드돼 있어 _working_reservations 에서 빼면 이중 차감(과차단).
+        self._cash_reconciled_at: float | None = None
 
     # 게이트/러너가 참조하는 계좌 상태 위임
     def position(self, symbol: str) -> Position:
@@ -337,6 +340,9 @@ class Broker:
         접수된 주문은 증권사가 현금을 홀드하지만 로컬 원장 cash 는 그대로다.
         다음 재대사가 buying_power 를 실계좌 값으로 덮기 전까지, 다른 종목 주문이
         그 현금을 다시 쓸 수 있다. in-flight 로 이미 잡힌 종목은 중복 제외.
+
+        재대사 **이후** 접수분(placed_at > _cash_reconciled_at)만 예약한다 — 그 이전
+        미체결은 이미 실계좌 BP 에 홀드돼 cash 덮기에 반영됐으므로 또 빼면 과차단.
         """
         if self.store is None:
             return []
@@ -346,11 +352,15 @@ class Broker:
             return []
         out: list[Reservation] = []
         now = time.time()
+        since = self._cash_reconciled_at
         for row in rows:
             # abandon 대상은 예약에서 제외(직전 prune 이 지웠어도 경합 대비).
             if self._should_abandon_working(row, now):
                 continue
             if row["symbol"] in self._inflight:
+                continue
+            placed = float(row["placed_at"] or 0.0)
+            if since is not None and placed <= since:
                 continue
             remaining = float(row["qty"]) - float(row["filled_qty"] or 0.0)
             if remaining <= 0:
@@ -358,7 +368,7 @@ class Broker:
             out.append(Reservation(
                 symbol=row["symbol"], market=row["market"], side=row["side"],
                 qty=remaining, price=float(row["price"]),
-                order_id=row["order_id"], placed_at=float(row["placed_at"] or 0.0)))
+                order_id=row["order_id"], placed_at=placed))
         return out
 
     def reconcile(self, reconcile_fn: Callable[[PaperAccount], Any],
@@ -388,7 +398,11 @@ class Broker:
                           expect_gen, self._activity_gen)
                 return {"deferred": True, "reason": "stale_snapshot",
                         "expect_gen": expect_gen, "activity_gen": self._activity_gen}
-            return reconcile_fn(self.account)
+            result = reconcile_fn(self.account)
+            # deferred 가 아닌 적용분만 — cash 가 실계좌 BP 기준이 됐음을 표시.
+            if not (isinstance(result, dict) and result.get("deferred")):
+                self._cash_reconciled_at = time.time()
+            return result
 
     def _ledger_already_has_fill(self, order: Order, filled_qty: float,
                                  qty_before: float | None) -> bool:
@@ -532,17 +546,20 @@ class Broker:
         (c) 때문에 원장 미반영 체결분이 남은 종결 주문은 삭제하지 않고 settled_at
         만 찍는다. 재대사가 실체결가로 소비한 뒤 지운다. 소비되지 않은 채 오래
         남으면 attribution_ttl 로 버리고 unattributed_fill 을 남긴다.
+
+        매도 주문 조회가 한 건이라도 실패하면 ``block_reconcile=True`` — 재대사가
+        보유 감소를 먼저 흡수하면 settled 출처가 없어 손익이 영구 구멍 난다.
         """
         if self.store is None or self.client is None or self.account_seq is None:
-            return {"skipped": True}
+            return {"skipped": True, "block_reconcile": False}
         try:
             rows = self.store.get_working_orders()
         except Exception as e:
             log.warning("미체결 목록 조회 실패: %s", e)
-            return {"error": str(e)}
+            return {"error": str(e), "block_reconcile": True}
         out = {"checked": 0, "settled": 0, "canceled": 0, "cancel_failed": 0,
                "working": 0, "awaiting_attribution": 0, "dropped": 0,
-               "abandoned": 0}
+               "abandoned": 0, "fetch_failed": 0, "block_reconcile": False}
         now = time.time()
         for row in rows:
             oid = row["order_id"]
@@ -560,6 +577,10 @@ class Broker:
                     out["abandoned"] += 1
                 else:
                     out["working"] += 1
+                    out["fetch_failed"] += 1
+                    # SELL 체결가를 못 찍은 채 holdings 를 덮으면 귀속 대상(감소)이 사라진다.
+                    if str(row.get("side") or "").upper() == "SELL":
+                        out["block_reconcile"] = True
                 continue
             status, filled, avg, fee = _parse_execution(info)
             self._store_call(self.store.update_working_order, oid, status=status,

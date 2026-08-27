@@ -102,12 +102,18 @@ def evaluate(now: float, hb_age: float | None, market_open: bool = True,
              brain_mode: str = "ok", reset_at: float | None = None,
              mode_reason: str = "",
              bridge_armed: bool | None = None,
-             quota_kind: str | None = None) -> list[str]:
+             quota_kind: str | None = None,
+             hb_ok: bool | None = None,
+             hb_polled: int | None = None,
+             hb_markets_open: list | None = None) -> list[str]:
     """순수 판정 — 경보 사유 리스트(빈 리스트=정상).
 
     brain_errors_recent / last_brain_done_age 는 하위호환으로 받지만 **무시**한다
     (슬라이딩 창 플리핑 제거). market_open 도 뇌 모드 경보를 막지 않는다.
     bridge_armed=False 이고 mode=bridge 이면 미무장 조기 경보.
+
+    hb_ok/hb_polled: 하트비트 JSON. 장중(markets_open 비어있지 않음)인데
+    polled=0 또는 ok=False 면 가짜 초록을 경보로 올린다.
     """
     del brain_errors_recent, last_brain_done_age, market_open  # 명시적 미사용
     reasons: list[str] = []
@@ -115,6 +121,12 @@ def evaluate(now: float, hb_age: float | None, market_open: bool = True,
         reasons.append("데몬 하트비트 없음 — 감시 루프 미가동")
     elif hb_age > HB_STALE_SEC:
         reasons.append(f"데몬 하트비트 끊김 {hb_age:.0f}s (>{HB_STALE_SEC}s) — 죽음/행 의심")
+    else:
+        mkts = list(hb_markets_open or [])
+        if hb_ok is False or (mkts and (hb_polled or 0) <= 0):
+            reasons.append(
+                f"장중 시세 폴링 실패(polled={hb_polled if hb_polled is not None else '?'}"
+                f", markets={','.join(mkts) or '?'}) — 하트비트만 살아 있음")
 
     mode = brain_mode or "ok"
     if auth_expired and mode == "ok":
@@ -142,16 +154,19 @@ def _bridge_inbox_and_max_age() -> tuple[Path, float]:
     return Path(inbox), max_age
 
 
-def _read_heartbeat_age(now: float) -> float | None:
+def _read_heartbeat(now: float) -> tuple[float | None, dict]:
+    """(age, payload). 파일이 없으면 (None, {})."""
     try:
-        # import 시 고정 경로 금지 — 컷오버 후 state/ 우선은 resolve 가 담당.
-        # (모듈 상수 HEARTBEAT 는 대시보드 등 표시용; 경보 판정은 매회 resolve)
         hb = _paths.resolve("watch_hb", configured="data/watch.heartbeat")
         d = json.loads(hb.read_text(encoding="utf-8"))
-        return now - float(d.get("ts", 0))
+        return now - float(d.get("ts", 0)), d if isinstance(d, dict) else {}
     except (OSError, ValueError, TypeError):
-        return None
+        return None, {}
 
+
+def _read_heartbeat_age(now: float) -> float | None:
+    age, _ = _read_heartbeat(now)
+    return age
 
 def _load_brain_mode() -> dict:
     return bm.load_mode(_paths.resolve("brain_mode", configured="data/brain_mode.json"))
@@ -193,17 +208,21 @@ def _ntfy_topic() -> str:
     return env_topic or cfg_topic
 
 
-def _push(title: str, message: str) -> None:
+def _push(title: str, message: str) -> bool:
+    """ntfy POST. 2xx 만 성공. 4xx/5xx·예외는 False — 호출측이 dedupe 를 밀면 영구무음."""
     topic = _ntfy_topic()
     if not topic:
-        return
+        return False
     try:
         safe_title = title.encode("ascii", "replace").decode("ascii")
-        requests.post(f"https://ntfy.sh/{topic}",
-                      data=message.encode("utf-8"),
-                      headers={"Title": safe_title}, timeout=5)
+        r = requests.post(f"https://ntfy.sh/{topic}",
+                          data=message.encode("utf-8"),
+                          headers={"Title": safe_title}, timeout=5)
+        if 200 <= int(r.status_code) < 300:
+            return True
+        return False
     except Exception:
-        pass
+        return False
 
 
 def _push_title_for(reasons: list[str], mode: str) -> str:
@@ -213,7 +232,7 @@ def _push_title_for(reasons: list[str], mode: str) -> str:
         return "Argus brain circuit"
     if mode == "auth_needed" or any("인증" in r for r in reasons):
         return "Argus auth"
-    if any("하트비트" in r for r in reasons):
+    if any("하트비트" in r for r in reasons) or any("폴링 실패" in r for r in reasons):
         return "Argus daemon"
     return "Argus alert"
 
@@ -247,21 +266,26 @@ def _push_live_orders(now: float) -> None:
         con.close()
     if not rows:
         return
-    max_ts = since
+    # 성공한 이벤트만 커서로 전진 — 실패분을 성공으로 찍어 영구 스킵하지 않는다.
+    advanced_to = since
     for ts, kind, symbol, payload in rows:
-        max_ts = max(max_ts, ts)
         try:
             p = json.loads(payload) if payload else {}
         except (ValueError, TypeError):
             p = {}
         if kind == "live_order":
-            _push("Argus 체결",
-                  f"[LIVE] {p.get('side','?')} {symbol} x{p.get('qty','?')} "
-                  f"@ {p.get('price','?')} id={p.get('order_id','?')}")
+            ok = _push("Argus 체결",
+                       f"[LIVE] {p.get('side','?')} {symbol} x{p.get('qty','?')} "
+                       f"@ {p.get('price','?')} id={p.get('order_id','?')}")
         else:
-            _push("Argus 주문실패", f"[LIVE-ERR] {symbol}: {p.get('error','?')}")
-    _save_push_state({"last_order_ts": max_ts})
-
+            ok = _push("Argus 주문실패", f"[LIVE-ERR] {symbol}: {p.get('error','?')}")
+        if not ok:
+            break
+        advanced_to = max(advanced_to, float(ts))
+    if advanced_to > since:
+        st = _load_push_state()
+        st["last_order_ts"] = advanced_to
+        _save_push_state(st)
 
 def _load_prev() -> dict:
     try:
@@ -278,7 +302,7 @@ def _log(event: str, reasons: list[str], **extra) -> None:
 
 def main() -> int:
     now = time.time()
-    hb_age = _read_heartbeat_age(now)
+    hb_age, hb = _read_heartbeat(now)
     market_open = is_open("KR") or is_open("US")
     mode_state = _load_brain_mode()
     mode = str(mode_state.get("mode") or "ok")
@@ -295,6 +319,11 @@ def main() -> int:
         cfg_raw = None
     gauge = budget_gauge(mode_state, now=now, cfg=cfg_raw)
     qk = gauge.get("quota_kind") or mode_state.get("quota_kind")
+    hb_ok = hb.get("ok") if hb else None
+    if isinstance(hb_ok, bool) or hb_ok is None:
+        pass
+    else:
+        hb_ok = bool(hb_ok)
     reasons = evaluate(
         now, hb_age, market_open,
         auth_expired=auth_expired,
@@ -303,6 +332,9 @@ def main() -> int:
         mode_reason=str(mode_state.get("reason") or ""),
         bridge_armed=armed,
         quota_kind=qk if isinstance(qk, str) else None,
+        hb_ok=hb_ok,
+        hb_polled=int(hb["polled"]) if hb.get("polled") is not None else None,
+        hb_markets_open=list(hb.get("markets_open") or []) if hb else None,
     )
     next_actions = actions_for(reasons, brain_mode=mode)
     budget_line = format_budget_push_line(gauge)
@@ -311,9 +343,24 @@ def main() -> int:
     was_active = bool(prev.get("active"))
     prev_mode = prev.get("brain_mode") or "ok"
     prev_reasons = list(prev.get("reasons") or [])
+    prev_push_ok = prev.get("push_ok", True)
 
     if reasons:
         since = prev.get("since") if was_active else now
+        should_fire = ((not was_active) or (prev_mode != mode)
+                       or (prev_reasons != reasons) or (not prev_push_ok))
+        push_ok = True
+        if should_fire:
+            _log("FIRED", reasons, brain_mode=mode, actions=next_actions,
+                 budget=gauge)
+            if _ntfy_topic():
+                push_ok = _push(
+                    _push_title_for(reasons, mode),
+                    format_push_body(reasons, next_actions, budget_line=budget_line))
+            else:
+                push_ok = False
+        else:
+            push_ok = bool(prev_push_ok)
         payload = {
             "active": True, "since": since, "reasons": reasons, "ts": now,
             "brain_mode": mode, "reset_at": reset_at,
@@ -321,14 +368,9 @@ def main() -> int:
             "bridge_armed": armed,
             "actions": next_actions,
             "budget": gauge,
+            "push_ok": push_ok,
         }
         ALERT.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
-        should_fire = (not was_active) or (prev_mode != mode) or (prev_reasons != reasons)
-        if should_fire:
-            _log("FIRED", reasons, brain_mode=mode, actions=next_actions,
-                 budget=gauge)
-            _push(_push_title_for(reasons, mode),
-                  format_push_body(reasons, next_actions, budget_line=budget_line))
         print("[alert] ACTIVE:", " | ".join(reasons))
         if gauge.get("line"):
             print("[alert] 예산:", gauge["line"])
@@ -337,24 +379,27 @@ def main() -> int:
         if not _ntfy_topic():
             print("[alert] ⚠ 푸시 통로 없음(NTFY_TOPIC 미설정) — 이 경보는 무음입니다. "
                   ".env 에 NTFY_TOPIC=<임의문자열> 를 넣고 폰 ntfy 앱에서 같은 토픽을 구독하세요.")
+        elif should_fire and not push_ok:
+            print("[alert] ⚠ 푸시 실패 — 다음 주기에 재시도(dedupe 보류)")
     else:
         ALERT.write_text(json.dumps({
             "active": False, "ts": now, "brain_mode": mode,
             "market_open": market_open,
             "bridge_armed": armed,
             "budget": gauge,
+            "push_ok": True,
         }, ensure_ascii=False), encoding="utf-8")
         if was_active:
             _log("CLEARED", [], brain_mode=mode)
             # 진짜 복구만 — 휴장으로 꺼진 것처럼 보이게 하지 않음(모드 ok 일 때만 여기 옴)
-            _push("Argus brain OK", "뇌 정상 재개")
+            if _ntfy_topic():
+                _push("Argus brain OK", "뇌 정상 재개")
         print("[alert] ok" + (" (휴장)" if not market_open else ""))
         if gauge.get("line"):
             print("[alert] 예산:", gauge["line"])
 
     _push_live_orders(now)
     return 0
-
 
 if __name__ == "__main__":
     from src.cli.legacy import warn_legacy_script

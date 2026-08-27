@@ -20,12 +20,15 @@ def test_push_posts_when_topic_set(monkeypatch):
     monkeypatch.setattr(ac, "_ntfy_topic", lambda: "mytopic")
     calls = []
 
+    class _Resp:
+        status_code = 200
+
     def fake_post(url, data=None, headers=None, timeout=None):
         calls.append({"url": url, "data": data, "headers": headers})
-        return None
+        return _Resp()
 
     monkeypatch.setattr(ac.requests, "post", fake_post)
-    ac._push("Argus 체결", "본문 한글 메시지")
+    assert ac._push("Argus 체결", "본문 한글 메시지") is True
     assert len(calls) == 1
     assert calls[0]["url"] == "https://ntfy.sh/mytopic"
     assert "본문" in calls[0]["data"].decode("utf-8")     # 한글은 본문(utf-8)에
@@ -43,7 +46,7 @@ def test_push_live_orders_reads_events(tmp_path, monkeypatch):
     monkeypatch.setattr(ac, "_PUSH_STATE", tmp_path / "push_state.json")
     monkeypatch.setattr(ac, "_ntfy_topic", lambda: "mytopic")
     pushed = []
-    monkeypatch.setattr(ac, "_push", lambda title, msg: pushed.append((title, msg)))
+    monkeypatch.setattr(ac, "_push", lambda title, msg: (pushed.append((title, msg)) or True))
     ac._push_live_orders(0)
     assert any("005930" in m and "ORD1" in m for _, m in pushed)     # 체결 픽업
     assert any("000660" in m for _, m in pushed)                     # 에러 픽업

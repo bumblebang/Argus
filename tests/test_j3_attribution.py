@@ -329,6 +329,51 @@ def test_settled_fill_kept_within_ttl(tmp_path):
     assert len(store.get_working_orders()) == 1
 
 
+def test_sweep_fail_then_recover_attributes_pnl(tmp_path):
+    """SWEEP 1회 실패 → 재대사 연기 → 다음 주기 정산·귀속. 선흡수하면 손익 영구 손실.
+
+    수정 전: fetch 실패 후에도 재대사가 holdings 감소를 먹어 settled 출처가 헛돌았다.
+    """
+    store = Store(tmp_path / "t.db")
+    acct = _acct(tmp_path)
+    _seed(store, acct, qty=10, avg=70_000)
+    store.upsert_working_order(order_id="O1", symbol="005930", market="KR",
+                               side="SELL", qty=10, price=71_000,
+                               status="PENDING", filled_qty=0)
+
+    class _Flaky:
+        def __init__(self):
+            self.n = 0
+            self.detail = {"status": "FILLED",
+                           "execution": {"filledQuantity": 10,
+                                         "averageFilledPrice": 72_000,
+                                         "commission": 90, "tax": 10}}
+
+        def get_order(self, account_seq, order_id):
+            self.n += 1
+            if self.n == 1:
+                raise RuntimeError("api down")
+            return self.detail
+
+    client = _Flaky()
+    broker = _broker(tmp_path, store, client, working_order_ttl_sec=-1.0)
+    broker.account = acct
+
+    sw1 = broker.sweep_working_orders()
+    assert sw1["block_reconcile"] is True and sw1["fetch_failed"] == 1
+    # 타이머가 여기서 return — 재대사하면 감소만 흡수되고 아래 귀속이 실패한다.
+    assert acct.position("005930").qty == 10.0
+
+    sw2 = broker.sweep_working_orders()
+    assert sw2["block_reconcile"] is False and sw2["settled"] == 1
+    assert sw2["awaiting_attribution"] == 1
+
+    res = apply_reconcile_from_live(acct, store, _holdings([]), markets=("KR",))
+    assert res["attributed"]["005930"]["qty"] == 10.0
+    assert res["attributed"]["005930"]["price"] == 72_000.0
+    assert acct.realized_pnl["KR"] == 19_900.0
+
+
 def test_settled_row_not_counted_as_reservation(tmp_path):
     """귀속 대기분은 이미 체결된 주문 — 현금을 다시 잡으면 과차단."""
     store = Store(tmp_path / "t.db")

@@ -383,15 +383,30 @@ def _start_reconcile_timer(broker, gateway, store, cfg, markets,
             log.warning("capital 동기화 오류(무시): %s", e)
 
     def _once():
+        sw: dict = {}
         try:
             # 재대사보다 먼저 — 종결된 미체결 주문을 지우고 만료분을 취소한 뒤
             # holdings 를 읽어야 방금 취소한 주문의 잔량이 스냅샷에 안 섞인다.
             sw = broker.sweep_working_orders()
             if (sw.get("canceled") or sw.get("cancel_failed") or sw.get("settled")
-                    or sw.get("dropped") or sw.get("abandoned")):
+                    or sw.get("dropped") or sw.get("abandoned")
+                    or sw.get("block_reconcile") or sw.get("fetch_failed")):
                 store.log_event("working_orders", None, sw)
         except Exception as e:
             log.warning("미체결 정산 오류(무시): %s", e)
+            sw = {"error": str(e), "block_reconcile": True}
+        # 매도 체결가 출처(sweep) 없이 재대사하면 감소만 흡수되고 손익이 영구 손실.
+        if sw.get("block_reconcile"):
+            log.warning("재대사 연기 — sweep 미완(매도 조회 실패 fetch_failed=%s)",
+                        sw.get("fetch_failed"))
+            try:
+                store.log_event("reconcile_deferred", None, {
+                    "reason": "sweep_incomplete",
+                    "fetch_failed": sw.get("fetch_failed"),
+                    "error": sw.get("error")})
+            except Exception as e:
+                log.warning("재대사 연기 이벤트 기록 실패(무시): %s", e)
+            return
         try:
             # fetch 직전 gen — 조회 중 주문이 시작·끝나면 apply 시 stale_snapshot 으로 연기
             gen = broker.activity_generation()
@@ -599,7 +614,8 @@ def run_from_args(args) -> int:
 
     # 단일 인스턴스 락 — 오펀/중복 기동 시 토스 토큰 경합(→401)·claude 동시 스폰 경합 방지.
     lock = SingleInstance(_paths.resolve("watch_pid"),
-                          lockfile=_paths.resolve("watch_lock"))
+                          lockfile=_paths.resolve("watch_lock"),
+                          also_lockfiles=[_paths.ROOT / "data" / "watch.pid.lock"])
     try:
         lock.acquire()
     except AlreadyRunning as e:

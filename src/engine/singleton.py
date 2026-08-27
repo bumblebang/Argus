@@ -93,17 +93,35 @@ class SingleInstance:
         lock.release()
 
     컨텍스트 매니저(`with SingleInstance(path): ...`)로도 쓸 수 있다.
+
+    also_lockfiles: 구 코드가 잡던 파생 락 등 **추가 경로**도 함께 잡아,
+    레이아웃/버전이 다른 데몬과 서로 다른 락을 쥐고 이중 기동하는 구멍을 막는다.
     """
 
     def __init__(self, pidfile: str | os.PathLike,
-                 lockfile: str | os.PathLike | None = None):
+                 lockfile: str | os.PathLike | None = None,
+                 also_lockfiles: list[str | os.PathLike] | None = None):
         self.pidfile = Path(pidfile)
         # 락 경로를 pidfile 에서 파생시키면, pidfile 이 레이아웃 전환으로 이동하는
         # 순간 락 파일도 같이 바뀌어 **서로 다른 락을 잡은 두 인스턴스**가 생긴다.
         # 호출측이 고정 경로(paths.resolve("watch_lock"))를 넘길 수 있게 한다.
         self.lockfile = (Path(lockfile) if lockfile is not None
                          else self.pidfile.with_name(self.pidfile.name + ".lock"))
+        extras: list[Path] = []
+        seen = {self.lockfile.resolve()}
+        for raw in (also_lockfiles or []):
+            p = Path(raw)
+            try:
+                key = p.resolve()
+            except OSError:
+                key = p
+            if key in seen:
+                continue
+            seen.add(key)
+            extras.append(p)
+        self._also_lockfiles = extras
         self._fh = None
+        self._extra_fhs: list = []
         self._acquired = False
 
     def _read_pid(self) -> int | None:
@@ -112,16 +130,38 @@ class SingleInstance:
         except (OSError, ValueError):
             return None
 
-    def acquire(self) -> "SingleInstance":
-        self.pidfile.parent.mkdir(parents=True, exist_ok=True)
-        self.lockfile.parent.mkdir(parents=True, exist_ok=True)
-        fh = open(self.lockfile, "a+")
+    def _try_lock(self, path: Path):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fh = open(path, "a+")
         try:
             _lock_nb(fh)
         except OSError:
             fh.close()
             raise AlreadyRunning(self._read_pid() or -1)
+        return fh
+
+    def acquire(self) -> "SingleInstance":
+        self.pidfile.parent.mkdir(parents=True, exist_ok=True)
+        fh = self._try_lock(self.lockfile)
+        extra_fhs = []
+        try:
+            for path in self._also_lockfiles:
+                extra_fhs.append(self._try_lock(path))
+        except AlreadyRunning:
+            _unlock(fh)
+            try:
+                fh.close()
+            except OSError:
+                pass
+            for efh in extra_fhs:
+                _unlock(efh)
+                try:
+                    efh.close()
+                except OSError:
+                    pass
+            raise
         self._fh = fh
+        self._extra_fhs = extra_fhs
         self._acquired = True
         # 관측용 pid(락 파일과 별개, 락 없음 → 워치독이 자유롭게 읽음).
         try:
@@ -133,6 +173,13 @@ class SingleInstance:
     def release(self) -> None:
         if not self._acquired:
             return
+        for efh in self._extra_fhs:
+            _unlock(efh)
+            try:
+                efh.close()
+            except OSError:
+                pass
+        self._extra_fhs = []
         if self._fh is not None:
             _unlock(self._fh)
             try:
@@ -154,3 +201,13 @@ class SingleInstance:
     def __exit__(self, *exc) -> bool:
         self.release()
         return False
+
+
+def legacy_watch_lockfiles(root: Path | None = None) -> list[Path]:
+    """구 코드가 잡던 파생 락 경로들 — 신 코드가 같이 잡아 이중 기동을 막는다."""
+    from src import paths as _paths
+    base = Path(root) if root is not None else _paths.ROOT
+    return [
+        base / "data" / "watch.pid.lock",
+        base / "data" / "state" / "watch.pid.lock",  # 중복은 SingleInstance 가 걸러냄
+    ]

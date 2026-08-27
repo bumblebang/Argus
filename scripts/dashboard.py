@@ -1269,7 +1269,10 @@ def _gather() -> dict:
     # 차트용 open 행은 close 전에 복사(스냅샷은 아래에서 읽음)
     data["_open_for_chart"] = [x for x in (data.get("positions") or [])
                                if x.get("state") == "open"]
-    con.close()
+    try:
+        con.close()
+    except Exception:
+        pass
     # market_state 는 한 번만 읽어 fx·sentiment 를 함께 뽑는다.
     try:
         ms = json.loads(MARKET_STATE.read_text(encoding="utf-8")) or {}
@@ -1307,24 +1310,30 @@ def _gather() -> dict:
     if "value_watchlist" not in data:
         data["value_watchlist"] = _read_value_watchlist()
     data["value_decisions"] = _read_value_decisions()
-    # 측정층(그림자·캘리브레이션·매니저) — 실패해도 대시보드는 계속
+    # 측정층(그림자·캘리브레이션·매니저) — 실패해도 대시보드는 계속.
+    # Store 는 readonly — migrate/open-dedupe 쓰기로 라이브 DB 를 건드리지 않는다.
+    _st = None
     try:
         from src.engine.store import Store
         from src.shadow_ledger import shadow_stats
         from src.calibration import conviction_calibration
         from src.attribution import manager_epochs
-        _st = Store(DB)
+        _st = Store(DB, readonly=True)
         data["instrumentation"] = {
             "shadow": shadow_stats(_st, since_days=90),
             "calibration": conviction_calibration(_st, since_days=90),
             "manager_epochs": manager_epochs(_st, since_days=30),
             "recent_pending": [dict(r) for r in _st.get_pending_shadow_positions()[:8]],
         }
-        _st.close()
     except Exception:
         data["instrumentation"] = None
+    finally:
+        if _st is not None:
+            try:
+                _st.close()
+            except Exception:
+                pass
     return data
-
 
 def _safe_json(s) -> dict:
     try:
@@ -1723,13 +1732,20 @@ table.trades td.num{font-variant-numeric:tabular-nums;font-family:ui-monospace,C
 """
 
 
-def _status_dot(age, market_open) -> str:
+def _status_dot(age, market_open, *, hb: dict | None = None) -> str:
+    """하트비트 점. age 뿐 아니라 장중 polled/ok 도 본다(가짜 초록 방지)."""
     if age is None or age > 300:
+        return '<span class="dot bad"></span>'
+    hb = hb or {}
+    mkts = list(hb.get("markets_open") or [])
+    polled = hb.get("polled")
+    ok = hb.get("ok")
+    poll_bad = (ok is False) or (bool(mkts) and polled is not None and int(polled) <= 0)
+    if poll_bad:
         return '<span class="dot bad"></span>'
     if age > 90 and market_open:
         return '<span class="dot warn"></span>'
     return '<span class="dot ok"></span>'
-
 
 def _fmt(n, dp=0) -> str:
     try:
@@ -2515,11 +2531,21 @@ def _today_html(d: dict) -> str:
     market_open = (ksess != "closed") or (ussess != "closed")
     age = d["hb_age"]; hb = d["hb"] or {}
     names = d.get("names", {})
-    daemon_txt = "정상" if (age is not None and age <= 300) else "응답없음"
+    mkts = list(hb.get("markets_open") or [])
+    polled = hb.get("polled")
+    poll_bad = (hb.get("ok") is False) or (
+        bool(mkts) and polled is not None and int(polled) <= 0)
+    if age is None or age > 300:
+        daemon_txt = "응답없음"
+    elif poll_bad:
+        daemon_txt = "폴링실패"
+    else:
+        daemon_txt = "정상"
     lbd = d.get("last_brain_done")
     p = ['<div class="tabpage page-today">', "<div class=grid>"]
-    p.append(f"<div class=card><div class=k>데몬</div><div class=v>{_status_dot(age, market_open)}{daemon_txt} "
-             f"<small>{'%.0fs'%age if age is not None else '–'}</small></div></div>")
+    p.append(f"<div class=card><div class=k>데몬</div><div class=v>{_status_dot(age, market_open, hb=hb)}{daemon_txt} "
+             f"<small>{'%.0fs'%age if age is not None else '–'}"
+             f"{'' if polled is None else f' · polled={polled}'}</small></div></div>")
     p.append("<div class=card><div class=k>장</div>"
              f"<div class=v style='font-size:14px;line-height:1.9'>"
              f"국내 {_session_badge(ksess)}<br>해외 {_session_badge(ussess)}</div></div>")
