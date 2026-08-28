@@ -81,6 +81,33 @@ def test_day_buy_exempt_from_dossier_rule(tmp_path):
     assert res.executed[0]["status"] == "armed" and armed == ["005930"]
 
 
+def test_close_scan_buy_exempt_from_dossier(tmp_path):
+    res, broker = _cycle(
+        tmp_path, _buy(horizon="close_scan"), dossier_fn=lambda s: False,
+        wake_reason="gap_rebound_scan",
+        features_by_sym={"005930": {"pool": "gap_decline", "source": "gap_rebound"}})
+    assert res.executed[0]["status"] == "filled"
+    assert broker.account.position("005930").qty > 0
+
+
+def test_gap_scan_coerces_swing_to_close_scan(tmp_path):
+    res, broker = _cycle(
+        tmp_path, _buy(horizon="swing"), dossier_fn=lambda s: False,
+        wake_reason="gap_rebound_scan",
+        features_by_sym={"005930": {"pool": "gap_decline"}})
+    assert res.executed[0]["status"] == "filled"
+    assert res.decision.proposals[0].horizon == "close_scan"
+
+
+def test_gap_scan_rejects_day_horizon(tmp_path):
+    res, broker = _cycle(
+        tmp_path, _buy(horizon="day"), dossier_fn=lambda s: False,
+        wake_reason="gap_rebound_scan",
+        features_by_sym={"005930": {"pool": "gap_decline"}})
+    assert res.executed[0]["status"] == "wrong_horizon"
+    assert broker.account.position("005930").qty == 0
+
+
 def test_no_dossier_fn_keeps_old_behavior(tmp_path):
     res, _ = _cycle(tmp_path, _buy())                            # dossier_fn 미주입
     assert res.executed[0]["status"] == "filled"                 # 하위호환

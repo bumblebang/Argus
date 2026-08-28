@@ -31,8 +31,10 @@ from ..market_hours import current_session, is_tradable, near_session_end, marke
 from .gateway import TossGateway
 from .store import Store
 from . import triggers as T
-from .exit_policy import ExitPolicyConfig, time_stop_trigger, thesis_inval_trigger
+from .exit_policy import (ExitPolicyConfig, time_stop_trigger, thesis_inval_trigger,
+                          close_scan_exit_trigger)
 from .wake_request import consume_brain_wake
+from . import extra_wake_state as ews
 
 log = get_logger("engine.loop")
 
@@ -134,6 +136,12 @@ class WatchConfig:
         default_factory=lambda: dict(DEFAULT_BRAIN_SESSIONS))
     # 지정 시각(KST HH:MM) 1회 각성. {market: (HH:MM,...)}. 기본={}=비활성(기존 동작).
     extra_wakes: dict[str, tuple[str, ...]] = field(default_factory=dict)
+    # extra 발화 dedup 영속 파일. 빈 문자열이면 paths extra_wake_state 기본.
+    extra_wake_state_path: str = ""
+    # 재기동 직후 N초 동안 extra 전부 억제(폭주 방지). 0=비활성.
+    extra_wake_grace_sec: float = 120.0
+    # HH:MM 이후 이 many 분까지만 발화 — 창 지나면 그날 catch-up 안 함.
+    extra_wake_window_min: float = 5.0
     # Athena 등 외부 배치가 남기는 각성 요청 파일. 빈 문자열이면 비활성.
     wake_request_path: str = "data/brain_wake_request.json"
     # 트레일링 스톱(목표가 도달 시 전량 청산 대신 이익 태우기). 최상위 trailing 블록에서 읽는다.
@@ -208,6 +216,9 @@ class WatchConfig:
             # 최상위가 아니라 watch 하위 — brain_interval_sec 등 다른 뇌 설정과 같이 둔다).
             brain_sessions=brain_sessions_from_raw(raw),
             extra_wakes=cls._parse_session_map(w.get("extra_wakes"), {}),
+            extra_wake_state_path=str(w.get("extra_wake_state_path", d.extra_wake_state_path) or ""),
+            extra_wake_grace_sec=float(w.get("extra_wake_grace_sec", d.extra_wake_grace_sec)),
+            extra_wake_window_min=float(w.get("extra_wake_window_min", d.extra_wake_window_min)),
             wake_request_path=str(w.get("wake_request_path", d.wake_request_path) or ""),
             # 트레일링은 watch 블록이 아니라 최상위 trailing 블록에서 읽는다(trading_sessions 와 동일).
             trailing=cls._parse_trailing(raw),
@@ -364,7 +375,7 @@ class TickResult:
 
 
 # 코드(빠른손)가 즉시 처리하는 청산 트리거 — 뇌를 거치지 않는다.
-_EXIT_KINDS = {"stop_hit", "target_hit", "time_stop"}
+_EXIT_KINDS = {"stop_hit", "target_hit", "time_stop", "close_scan_exit"}
 
 
 class WatchLoop:
@@ -372,6 +383,7 @@ class WatchLoop:
                  markets: Iterable[str] = ("KR", "US"),
                  config: WatchConfig | None = None,
                  on_wake: Callable[[str, list], None] | None = None,
+                 on_pool_refresh: Callable[[str, str, str], None] | None = None,
                  executor: Callable[[str, str, float, object], bool] | None = None,
                  strategy_runner=None,
                  entry_executor=None,
@@ -386,6 +398,7 @@ class WatchLoop:
         self.markets = tuple(markets)
         self.cfg = config or WatchConfig()
         self.on_wake = on_wake
+        self.on_pool_refresh = on_pool_refresh
         self.executor = executor          # 손절/익절 코드 청산기(symbol,market,price,trigger)->bool
         self.strategy_runner = strategy_runner   # 보유분 전략기반 청산 실행기(.evaluate(pos,market))
         self.entry_executor = entry_executor     # armed 종목 전략기반 진입 실행기(.evaluate(armed,market))
@@ -401,7 +414,9 @@ class WatchLoop:
         self._last_brain_wake = 0.0    # 주기 각성 타이머(개장 첫 틱에 바로 1회 발화)
         self._rr = 0                   # per_tick 상한 라운드로빈 오프셋(기아 방지)
         self._last_session: dict[str, str] = {}     # 세션 경계 리셋용: 시장→직전 틱 세션명
-        self._extra_fired: dict[tuple[str, str], str] = {}  # 지정시각 각성 dedup: (market,HH:MM)->발화한 거래일
+        self._extra_fired: dict[tuple[str, str], str] = ews.load_fired(
+            self.cfg.extra_wake_state_path or None)
+        self._extra_grace_until = 0.0   # run_forever 기동 시 grace_until 설정
         # 유동성 illiquid 집합(시간외 체결정지 종목). 이 루프 스레드가 매 틱 갱신하고
         # 뇌 워커(별도 스레드)가 illiquid_snapshot() 으로 읽는다 → 순회 중 크기 변경
         # (RuntimeError) 을 막으려면 양쪽 다 락을 거쳐야 한다.
@@ -616,6 +631,16 @@ class WatchLoop:
         """정기 각성 시계를 지금으로. Athena 훅·08:00 extra 가 시간 그리드를 맞춘다."""
         self._last_brain_wake = self._now()
 
+    def _call_on_wake(self, reason: str, triggers: list, *,
+                      at: str | None = None, market: str | None = None) -> None:
+        """on_wake 콜백 — BrainWorker.wake(at=,market=) 지원 시 메타 전달."""
+        if not self.on_wake:
+            return
+        try:
+            self.on_wake(reason, triggers, at=at, market=market)
+        except TypeError:
+            self.on_wake(reason, triggers)
+
     # ── 한 틱: 폴링 → 트리거 평가 → 정밀 → 로깅 ──────────────
     def run_once(self) -> TickResult:
         res = TickResult()
@@ -738,6 +763,11 @@ class WatchLoop:
                         ts = time_stop_trigger(positions[sym], cfg=ep, now=now_ts)
                         if ts:
                             trigs.append(ts)
+                    cs = close_scan_exit_trigger(
+                        positions[sym], market=market, now=now_ts,
+                        sessions=self.cfg.trading_sessions.get(market))
+                    if cs:
+                        trigs.append(cs)
                     # thesis 무효화(price/flow/time) — flow_streak 은 market_state.flows
                     from ..thesis_watch import flow_streak_from_market_state
                     fstr = flow_streak_from_market_state(ms_full, sym)
@@ -893,32 +923,54 @@ class WatchLoop:
         # 지정 시각 1회 각성: 세션 주기와 별개로 그 시각(KST)이 지나면 그 거래일 1회만.
         # 같은 틱에서 이미 깼으면(외부 요청·periodic·트리거) 건너뛴다(LLM 이중 호출 방지).
         # 열린 시장에서만 평가 -> 휴장일엔 open_markets 가 비어 이 블록 자체가 안 돈다.
-        if self.on_wake and not res.woke:
+        if (self.on_wake or self.on_pool_refresh) and not res.woke:
             now_kst = datetime.fromtimestamp(now_ts, tz=_KST)
             for m in open_markets:
                 for hhmm in self.cfg.extra_wakes.get(m, ()):
                     try:
-                        target = datetime.strptime(hhmm, "%H:%M").time()
+                        datetime.strptime(hhmm, "%H:%M")
                     except ValueError:
                         log.warning("extra_wakes 시각 형식 오류(무시) %s: %s", m, hhmm)
                         continue
-                    if now_kst.time() < target:
-                        continue
                     day = market_day(m, now_kst)
-                    key = (m, hhmm)
-                    if self._extra_fired.get(key) == day:
+                    if not ews.should_fire_extra(
+                            market=m, hhmm=hhmm, trading_day=day,
+                            fired=self._extra_fired, now_ts=now_ts,
+                            grace_until=self._extra_grace_until,
+                            window_min=self.cfg.extra_wake_window_min):
                         continue
+                    key = (m, hhmm)
                     self._extra_fired[key] = day
+                    ews.save_fired(self._extra_fired,
+                                   path=self.cfg.extra_wake_state_path or None,
+                                   now_fn=self._now)
+                    wake_reason = ews.reason_for_extra(m, hhmm)
+                    if ews.is_pool_only_reason(wake_reason):
+                        self.store.log_event("pool_refresh", None,
+                                             {"reason": wake_reason, "market": m,
+                                              "at": hhmm})
+                        if self.on_pool_refresh:
+                            try:
+                                self.on_pool_refresh(m, hhmm, wake_reason)
+                            except Exception as e:
+                                log.error("풀 refresh 콜백 실패: %s", e)
+                                self.store.log_event("error", None,
+                                                     {"where": "on_pool_refresh",
+                                                      "err": str(e)})
+                        break
                     res.woke = True
                     self._mark_brain_wake()
                     self.store.log_event("wake", None,
-                                         {"reason": "extra", "market": m, "at": hhmm})
+                                         {"reason": wake_reason, "market": m, "at": hhmm})
                     try:
-                        self.on_wake("extra", [])
+                        self._call_on_wake(wake_reason, [], at=hhmm, market=m)
                     except Exception as e:
                         log.error("지정시각 각성 콜백 실패: %s", e)
                         self.store.log_event("error", None,
                                              {"where": "on_wake_extra", "err": str(e)})
+                    break  # 틱당 extra 1회 — 다음 슬롯은 다음 틱
+                if res.woke:
+                    break
         return res
 
     # ── 상시 루프 ─────────────────────────────────────────────
@@ -928,6 +980,11 @@ class WatchLoop:
         stop_event(threading.Event 호환) 가 set 되면 종료. max_ticks 로 횟수 제한(테스트).
         """
         ticks = 0
+        grace = float(self.cfg.extra_wake_grace_sec or 0)
+        if grace > 0:
+            self._extra_grace_until = self._now() + grace
+        else:
+            self._extra_grace_until = 0.0
         self.store.log_event("loop_start", None,
                              {"markets": list(self.markets), "cfg": vars(self.cfg)})
         try:

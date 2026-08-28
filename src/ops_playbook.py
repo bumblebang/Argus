@@ -19,6 +19,10 @@ def actions_for(reasons: list[str], *, brain_mode: str = "ok") -> list[str]:
         add("데몬 확인: heartbeat age·pythonw·http://127.0.0.1:8787")
         add("죽었으면 포그라운드: python scripts/watch.py --ticks 1 로 stderr 확인")
 
+    if any("장 상태 불일치" in r or "세션 캐시" in r for r in reasons):
+        add("watch 재기동 또는 gateway.refresh_market_sessions — data/market_sessions.json 확인")
+        add("US: FINNHUB_API_KEY·Yahoo marketState vs 토스 calendar 대조")
+
     if any("인증" in r for r in reasons) or mode == "auth_needed":
         add("scripts\\claude_login.bat 로 재로그인 후 다음 사이클 대기")
 

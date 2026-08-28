@@ -92,12 +92,17 @@ def fetch_stock_info(client, symbols) -> dict[str, dict]:
             sym = r.get("symbol") or r.get("code")
             if not sym:
                 continue
+            detail = r.get("koreanMarketDetail") or {}
+            nxt = r.get("nxtSupported")
+            if nxt is None and isinstance(detail, dict):
+                nxt = detail.get("nxtSupported")
             out[sym] = {
                 "securityType": r.get("securityType"),
                 "status": r.get("status"),
                 "isCommonShare": r.get("isCommonShare"),
                 "name": r.get("name"),
                 "market": r.get("market"),
+                "nxtSupported": nxt,
             }
     return out
 

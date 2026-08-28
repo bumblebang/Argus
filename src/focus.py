@@ -277,10 +277,43 @@ def _priority_rank(p: str) -> int:
     return {"high": 0, "medium": 1, "low": 2}.get(p, 9)
 
 
+def _gap_rebound_lens(wake: dict | None) -> dict | None:
+    """gap_rebound_scan / nxt_gap_scan 각성 시 KR 갭반등 렌즈."""
+    if not isinstance(wake, dict):
+        return None
+    reason = str(wake.get("reason") or "")
+    if reason not in ("gap_rebound_scan", "nxt_gap_scan"):
+        return None
+    at = wake.get("at") or ""
+    hint = (
+        "KR 갭반등 close_scan. 당일 intraday_ret_pct<=-5% 과매도 overnight 후보. "
+        "이 수치 단독 BUY 금지 — dossier·fundamentals·공시 shock 없음·bear_case 필수. "
+        "horizon=close_scan(1박). stabilizing.ok 필수 아님. "
+        "day+19:55 청산과 혼동 금지."
+    )
+    if reason == "nxt_gap_scan":
+        hint += " NXT 애프터 유동성·스프레드·체결 확인."
+    else:
+        hint += " 정규-only 마감 전 창(15:20)."
+    return {
+        "id": "gap_rebound",
+        "kind": "close_scan",
+        "dday": None,
+        "label": "KR 갭반등(NXT)" if reason == "nxt_gap_scan" else "KR 갭반등",
+        "priority": "high",
+        "read": ["regime.KR", "sentiment.fear_kr", "flows_market",
+                 "candidates.intraday_ret_pct", "candidates.dossier",
+                 "candidates.flows", "candidates.news"],
+        "hint": hint,
+        "at": at,
+    }
+
+
 def build_focus(market_state: dict | None = None, *,
                 candidates: list[dict] | None = None,
                 positions: list[dict] | None = None,
                 macro_events: list[dict] | None = None,
+                wake: dict | None = None,
                 today: date | None = None) -> dict:
     """사실층 → focus{asof,lenses,summary}.
 
@@ -289,6 +322,10 @@ def build_focus(market_state: dict | None = None, *,
     today = today or _today()
     ms = market_state or {}
     lenses: list[dict] = []
+
+    gr = _gap_rebound_lens(wake)
+    if gr:
+        lenses.append(gr)
 
     events = macro_events if macro_events is not None else load_macro_events()
     for ev in events:
@@ -343,6 +380,8 @@ def build_focus(market_state: dict | None = None, *,
             parts.append("시장 공매도")
         elif ln.get("id") == "positioning":
             parts.append("신용·공매도 급변")
+        elif ln.get("id") == "gap_rebound":
+            parts.append(str(ln.get("label") or "KR 갭반등"))
         else:
             parts.append(str(ln.get("label") or ln.get("id")))
 

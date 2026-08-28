@@ -9,10 +9,13 @@ drawdown_pct/stabilizing 은 "공포에 사되 떨어지는 칼은 피한다"의
 
 gap_pct/open/prev_close 는 간밤 미장·환율이 이 종목 시가에 얼마나 반영됐는지 읽는
 로그형 데이터(당일 시가 vs 전일 종가).
+
+intraday_ret_pct 는 당일 시가 대비 현재가(또는 당일 종가) — 장중 과매도 참고.
+갭반등 close_scan 전용 pre-filter 플로어(-5%)는 코드가 적용, 단독 매수 신호는 아니다.
 """
 from __future__ import annotations
 
-from typing import Callable
+from typing import Callable, Iterable
 
 import pandas as pd
 
@@ -24,6 +27,37 @@ from ..security_filter import is_buy_ineligible
 from .tools import recommend_strategy
 
 log = get_logger("agents.features")
+
+GAP_SCAN_REASONS = frozenset({"gap_rebound_scan", "nxt_gap_scan"})
+GAP_REBOUND_INTRADAY_FLOOR = -5.0
+
+
+def _passes_intraday_floor(c: dict, floor: float) -> bool:
+    """intraday_ret_pct 우선, 없으면 풀 랭킹 fluctuation/decline_pct 로 1차 컷."""
+    ir = c.get("intraday_ret_pct")
+    if isinstance(ir, (int, float)) and ir <= floor:
+        return True
+    for key in ("decline_pct", "fluctuation"):
+        v = c.get(key)
+        if isinstance(v, (int, float)) and v <= floor:
+            return True
+    return False
+
+
+def filter_gap_rebound_candidates(candidates: list[dict], *,
+                                  held: Iterable[str] | None = None,
+                                  floor: float = GAP_REBOUND_INTRADAY_FLOOR) -> list[dict]:
+    """갭반등 scan: 보유는 유지, 신규 후보는 intraday_ret_pct<=floor 만."""
+    keep = {str(s) for s in (held or [])}
+    out: list[dict] = []
+    for c in candidates:
+        sym = str(c.get("symbol") or "")
+        if sym in keep:
+            out.append(c)
+            continue
+        if _passes_intraday_floor(c, floor):
+            out.append(c)
+    return out
 
 
 def _gap_fields(df: pd.DataFrame | None) -> dict:
@@ -44,6 +78,32 @@ def _gap_fields(df: pd.DataFrame | None) -> dict:
         return {}
     return {"gap_pct": round((op / prev - 1) * 100, 2),
             "open": round(op, 2), "prev_close": round(prev, 2)}
+
+
+def _intraday_ret_fields(df: pd.DataFrame | None, price: float | None = None) -> dict:
+    """당일 시가 대비 현재가(또는 일봉 종가) → {intraday_ret_pct, intraday_open}.
+
+    일봉 마지막 봉의 open 이 당일 시가. price 가 있으면 라이브가 우선(장중).
+    """
+    if df is None or len(df) < 1:
+        return {}
+    if "open" not in df.columns:
+        return {}
+    op = df["open"].iloc[-1]
+    if pd.isna(op):
+        return {}
+    op = float(op)
+    if not op:
+        return {}
+    px = price
+    if px is None and "close" in df.columns:
+        cl = df["close"].iloc[-1]
+        if not pd.isna(cl):
+            px = float(cl)
+    if px is None or not px:
+        return {}
+    return {"intraday_ret_pct": round((px / op - 1) * 100, 2),
+            "intraday_open": round(op, 2)}
 
 
 def assemble(items: list[dict], market_state: dict,
@@ -84,6 +144,24 @@ def assemble(items: list[dict], market_state: dict,
             feat["rank"] = it["rank"]
         if it.get("trading_amount") is not None:
             feat["trading_amount"] = it["trading_amount"]
+        if it.get("fluctuation") is not None:
+            try:
+                feat["fluctuation"] = round(float(it["fluctuation"]), 2)
+            except (TypeError, ValueError):
+                pass
+        if it.get("decline_pct") is not None:
+            try:
+                feat["decline_pct"] = round(float(it["decline_pct"]), 2)
+            except (TypeError, ValueError):
+                pass
+        if it.get("source"):
+            feat["source"] = it["source"]
+        if it.get("nxt_supported") is not None:
+            feat["nxt_supported"] = it["nxt_supported"]
+        if it.get("added_at") is not None:
+            feat["added_at"] = it["added_at"]
+        if it.get("layer"):
+            feat["layer"] = it["layer"]
         if sym in positioning:
             feat["positioning"] = positioning[sym]
         if it.get("sector"):
@@ -96,6 +174,14 @@ def assemble(items: list[dict], market_state: dict,
             raw = fetch_raw(sym, market) if fetch_raw else None
             df = candles_to_df(raw) if raw else None
             feat.update(_gap_fields(df))   # 시가 갭(간밤 흐름의 반영 정도)
+            if df is not None and len(df) >= 1:
+                live_px = None
+                if "close" in df.columns:
+                    try:
+                        live_px = float(df["close"].iloc[-1])
+                    except (TypeError, ValueError):
+                        live_px = None
+                feat.update(_intraday_ret_fields(df, live_px))
             if df is not None and "volume" in df.columns and len(df) >= 1:
                 vol = df["volume"].iloc[-1]
                 try:

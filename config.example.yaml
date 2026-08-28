@@ -70,15 +70,18 @@ watch:
   stop_buffer_pct: 0.005
   stale_quote_sec: 600
   brain_backend: "cli"       # cli | live | dry
-  brain_interval_sec: 3600   # 프리 08:00부터 1시간. Athena 훅 + extra 08:00
+  brain_interval_sec: 0        # 정각 스케줄은 extra_wakes 전용(상대 주기 끔)
   brain_cooldown_sec: 300
   circuit_fail_threshold: 2
-  # 미장 정기각성: 방향4-B = regular 만. 재개 전엔 US: [].
   brain_sessions:
-    KR: [premarket, regular]
-    US: [regular]
+    KR: [premarket, regular, aftermarket]   # 19:50 nxt_gap_scan
+    US: [premarket, regular]   # 17:00 프리 extra
   extra_wakes:
-    KR: ["08:00", "15:30"]
+    KR: ["08:00", "09:00", "11:00", "13:00", "15:15", "15:20", "19:50"]  # 15:15 pool / 15:20 gap_rebound_scan
+    US: ["17:00", "22:30", "00:30", "02:30", "04:30"]   # KST, EDT 기준(썸머타임 ±1h 수동)
+  extra_wake_state_path: "data/state/extra_wake_fired.json"
+  extra_wake_grace_sec: 120     # 재기동 직후 extra 억제
+  extra_wake_window_min: 5       # HH:MM 후 5분 창 — 지나면 그날 catch-up 안 함
   wake_request_path: "data/state/brain_wake_request.json"
   session_end_exit_min: 5
   dashboard: true
@@ -223,6 +226,10 @@ agents:
     ondemand_news: false
     focus_headline_limit: 40
     compact_json: true
+    enrich_fundamentals: true
+    enrich_flows: true
+    gap_enrich_max: 25
+    patch_missing_fundamentals_max: 5
   max_tokens: 8000
   thinking: true
   claude_command: "claude"
@@ -313,6 +320,13 @@ day_pool:
   duration_live: "realtime"
   duration_fallback: "1d"
   strategy: "volatility_breakout"
+
+gap_decline_pool:
+  enabled: true
+  markets: ["KR"]
+  liquidity_top: 300
+  decline_top: 100
+  strategy: "rsi_reversion"
 
 universe:
   KR:

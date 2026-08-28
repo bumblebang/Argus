@@ -77,11 +77,22 @@ SYSTEM = """\
 
 이번 각성(wake — 있으면 '왜 지금 깨웠는지'):
 - wake.reason 예: periodic(정기)·wake_triggers(가격/국면 트리거)·disclosure(공시)·
-  earnings_result(실적)·movers(유니버스 무버)·extra(애프터 1회) 등.
+  earnings_result(실적)·movers(유니버스 무버)·extra(지정시각)·gap_rebound_scan(15:20
+  KR 갭반등)·nxt_gap_scan(19:50 NXT 갭반등) 등.
 - wake.triggers[] 에 종목·kind(vol_spike/regime_flip/… )·reason·payload 가 실리면
   **그 종목·사건을 우선** 재평가하라. 특히 보유 thesis 유효성·공시/실적 충격을 먼저 보고,
   무관한 후보에 새 매수를 급하게 늘리지 마라.
 - wake 가 없거나 reason=periodic 이면 평소 유니버스 재평가로 보면 된다.
+
+KR 갭반등 렌즈(gap_rebound / gap_rebound_scan / nxt_gap_scan):
+- 목표: 당일 장중 과매도(intraday_ret_pct<=-5%) → overnight close_scan → 익일 시가/갭 반등.
+  day+session_end(19:55) 청산과 혼동 금지.
+- intraday_ret_pct 는 pre-filter 통과용 참고. 이 수치만으로 BUY 금지.
+- stabilizing.ok 필수 아님(아직 떨어지는 중일 수 있음). 대신 오늘 중대 공시/실적 shock
+  없음 + dossier·fundamentals·bear_case로 구조적 급락 배제.
+- 진입존은 현재가 근처(갭 추격 아님). **horizon=close_scan**(swing 아님). 익일 gap_pct>0 이면 익절 검토.
+  코드가 익일 세션에 close_scan_exit 청산.
+- pool=gap_decline·source=gap_rebound 후보는 close_scan 전용 트랙이다.
 
 미장 → 한국장 배경(KR 종목을 판단할 때):
 - 한국장은 간밤 미국장 위에서 열린다. market.markets 의 SP500·NASDAQ 등락, USDKRW
@@ -94,6 +105,8 @@ SYSTEM = """\
   열렸는지다(open=당일 시가, prev_close=전일 종가). 간밤 미장 방향과 함께 보면 그
   흐름이 이 종목 가격에 **얼마나 이미 반영됐는지**를 보여주는 참고 데이터다 — 진입가·
   손절폭·비중을 정할 때 반영분을 감안하고, 필요하면 thesis 에 수치로 인용하라.
+- candidates[].intraday_ret_pct 는 당일 시가 대비 현재가(장중 과매도 정도). 갭반등
+  close_scan 에서만 pre-filter(-5%)에 쓰이며, 단독 매수 조건이 아니다.
 - 기계적으로 '미장이 올랐으니 BUY' 로 가지 마라. 방향은 종목의 근거로 결정하고, 미장은
   그 판단이 놓인 배경이다.
 - KR 종목을 판단할 때는 market.macro_kr(한국은행 기준금리·국고채/CD 금리·물가·고용·

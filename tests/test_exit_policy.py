@@ -7,6 +7,7 @@ import yaml
 
 from src.engine.exit_policy import (
     ExitPolicyConfig,
+    close_scan_exit_trigger,
     days_held,
     horizon_of,
     parse_exit_policy,
@@ -87,6 +88,39 @@ def test_horizon_from_strategy_class():
 def test_days_held():
     now = 1_000_000.0
     assert days_held({"opened_at": now - 86400}, now) == 1.0
+
+
+def test_time_stop_skips_close_scan_horizon():
+    cfg = ExitPolicyConfig(enabled=True, max_days={"swing": 20, "position": 120})
+    now = time.time()
+    pos = {
+        "symbol": "X",
+        "qty": 1,
+        "strategy": "rsi_reversion",
+        "opened_at": now - 5 * 86400,
+        "meta": {"horizon": "close_scan"},
+    }
+    assert time_stop_trigger(pos, cfg=cfg, now=now) is None
+
+
+def test_close_scan_exit_next_trading_day(monkeypatch):
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    kst = ZoneInfo("Asia/Seoul")
+    opened = datetime(2026, 8, 27, 15, 25, tzinfo=kst).timestamp()
+    now = datetime(2026, 8, 28, 9, 5, tzinfo=kst).timestamp()
+    pos = {
+        "symbol": "085620",
+        "qty": 1,
+        "opened_at": opened,
+        "meta": {"horizon": "close_scan"},
+    }
+    monkeypatch.setattr("src.market_hours.market_day", lambda m, dt: dt.strftime("%Y-%m-%d"))
+    monkeypatch.setattr("src.market_hours.is_tradable", lambda *a, **k: True)
+    monkeypatch.setattr("src.market_hours.current_session", lambda *a, **k: "regular")
+    t = close_scan_exit_trigger(pos, market="KR", now=now)
+    assert t is not None and t.kind == "close_scan_exit"
 
 
 def test_watch_config_parses_exit_policy():

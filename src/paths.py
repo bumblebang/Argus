@@ -31,6 +31,7 @@ CANONICAL: dict[str, str] = {
     "db": "data/bot.db",
     "decisions": "data/decisions.jsonl",
     "brain_mode": "data/brain_mode.json",
+    "extra_wake_state": "data/extra_wake_fired.json",
     "bridge_script": "scripts/bridge_tick.py",
 }
 
@@ -50,6 +51,7 @@ LAYOUT: dict[str, str] = {
     "db": "data/state/bot.db",
     "decisions": "data/ledgers/decisions.jsonl",
     "brain_mode": "data/state/brain_mode.json",
+    "extra_wake_state": "data/state/extra_wake_fired.json",
     "bridge_script": "scripts/bridge_tick.py",
 }
 

@@ -67,6 +67,21 @@ def test_cooldown_skips(tmp_path):
     assert bw.runs == 2
 
 
+def test_gap_scan_bypasses_cooldown(tmp_path):
+    """15:20/19:50 갭반등은 brain_cooldown_sec 에 막히지 않는다."""
+    store = Store(tmp_path / "t.db")
+    now = [1000.0]
+    calls = []
+    bw = BrainWorker(lambda wake=None: calls.append(wake) or "ok",
+                     store=store, cooldown_sec=300, now_fn=lambda: now[0])
+    bw.wake("periodic", [])
+    assert bw.run_pending() is True
+    now[0] += 30
+    bw.wake("gap_rebound_scan", [], at="15:20", market="KR")
+    assert bw.run_pending() is True
+    assert bw.runs == 2 and calls[-1]["reason"] == "gap_rebound_scan"
+
+
 def test_exception_is_swallowed_and_logged(tmp_path):
     store = Store(tmp_path / "t.db")
     def boom():

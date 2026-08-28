@@ -105,8 +105,10 @@ def test_build_context_includes_focus_and_flows_market():
 def test_prompts_mention_focus():
     from src.agents.decision_agent import SYSTEM
     from src.agents.athena import ATHENA_SYSTEM
+    from src.agents.validation_agent import SYSTEM as VAL
     assert "focus" in SYSTEM and "오늘의 렌즈" in SYSTEM
     assert "focus" in ATHENA_SYSTEM and "오늘의 렌즈" in ATHENA_SYSTEM
+    assert "gap_rebound_scan" in VAL and "안정화 필수는 적용하지 마라" in VAL
 
 
 def test_lens_priority_sorts_high_first():
@@ -119,3 +121,20 @@ def test_lens_priority_sorts_high_first():
     )
     assert out["lenses"][0]["id"] == "fomc"
     assert out["lenses"][0]["priority"] == "high"
+
+
+def test_gap_rebound_lens_on_wake():
+    wake = {"reason": "gap_rebound_scan", "at": "15:20", "market": "KR"}
+    out = build_focus({}, wake=wake)
+    ids = [ln["id"] for ln in out["lenses"]]
+    assert "gap_rebound" in ids
+    gr = next(ln for ln in out["lenses"] if ln["id"] == "gap_rebound")
+    assert gr["priority"] == "high"
+    assert "-5%" in gr["hint"]
+    assert "close_scan" in gr["hint"]
+    assert "KR 갭반등" in out["summary"]
+
+
+def test_no_gap_lens_on_extra_wake():
+    out = build_focus({}, wake={"reason": "extra", "at": "08:00"})
+    assert "gap_rebound" not in [ln["id"] for ln in out["lenses"]]

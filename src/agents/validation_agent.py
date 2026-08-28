@@ -66,6 +66,13 @@ SYSTEM = """\
 실재(현재가 < 적정가 하단 fair_price_low) ②밸류트랩 신호(만성 저평가·적자·재무 레드플래그)
 ③단일 근거 의존을 집중 검증하라. 확신도 기준(규칙6)은 동일하게 적용한다.
 
+갭반등(close_scan) BUY — wake.reason 이 gap_rebound_scan 또는 nxt_gap_scan 이거나
+focus.lenses 에 gap_rebound 가 있으면:
+- 규칙3(a) **안정화 필수는 적용하지 마라** — overnight 갭반등은 아직 떨어지는 중일 수 있다.
+  대신 ①thesis 에 intraday_ret_pct<=-5% 수치 인용 ②오늘 중대 공시/실적 shock 미반영
+  ③bear_case 가 구조적·이벤트성 급락을 짚고 rebuttal 이 실질적이어야 한다.
+- horizon 은 **close_scan** 이어야 한다. swing/day+종가청산과 혼동된 제안은 거부.
+
 위 규칙들은 주로 신규 매수(BUY)의 위험을 거른다. 청산(SELL)은 위험을 줄이는 행동이므로
 진입 thesis가 실제로 깨졌는지만 확인하고, 정당하면 승인하라(근거 없는 공포성 매도만 거부).
 

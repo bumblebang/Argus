@@ -11,11 +11,12 @@ from ..config import AppConfig
 from ..logging_setup import get_logger
 from ..risk import RiskManager, risk_manager_from_cfg
 from ..broker import Broker
-from .features import assemble
+from .features import assemble, filter_gap_rebound_candidates, GAP_SCAN_REASONS
 from .context import build_context
 from .conviction import attach_event_features
 from ..lessons import build_symbol_lessons
 from ..datasources.earnings import with_fresh_dday
+from ..datasources.nxt_universe import filter_items_for_gap_scan, nxt_supported_map
 from ..focus import attach_macro_tags, build_focus
 from .cycle import run_cycle, CycleResult
 from .value_trade import value_trade_cfg
@@ -95,9 +96,18 @@ class CycleRunner:
         """{market: [item,...]} → 후보 flat 목록([{symbol,name,market}...])."""
         return [{"symbol": it["symbol"], "name": it.get("name", it["symbol"]),
                  "market": market,
-                 "pool": it.get("pool") or ("day" if it.get("layer") == "day" else "swing"),
+                 "pool": it.get("pool") or ("day" if it.get("layer") == "day"
+                                            else "gap_decline" if it.get("layer") == "gap_decline"
+                                            else "swing"),
                  "sector": it.get("sector"),
-                 "rank": it.get("rank"), "trading_amount": it.get("trading_amount")}
+                 "source": it.get("source"),
+                 "layer": it.get("layer"),
+                 "rank": it.get("rank"),
+                 "trading_amount": it.get("trading_amount"),
+                 "fluctuation": it.get("fluctuation"),
+                 "decline_pct": it.get("decline_pct"),
+                 "nxt_supported": it.get("nxt_supported"),
+                 "added_at": it.get("added_at")}
                 for market, lst in (universe or {}).items() for it in (lst or [])
                 if isinstance(it, dict) and it.get("symbol")]
 
@@ -322,6 +332,13 @@ class CycleRunner:
             stale = self.illiquid_fn()
             if stale:
                 items = [i for i in items if i["symbol"] not in stale]
+        wake_reason = str((wake or {}).get("reason") or "")
+        if wake_reason in GAP_SCAN_REASONS:
+            nxt = nxt_supported_map(i["symbol"] for i in items if i.get("market") == "KR")
+            before = len(items)
+            items = filter_items_for_gap_scan(items, wake_reason, nxt)
+            if len(items) < before:
+                log.info("갭반등 NXT split %s %d→%d", wake_reason, before, len(items))
         agents_cfg = self.cfg.raw.get("agents", {})
         scfg = serve.serve_cfg(agents_cfg)
         held = serve.held_symbols(self.account.positions)
@@ -330,6 +347,24 @@ class CycleRunner:
         candidates, price_lookup = assemble(items, ms, self.fetch_candles,
                                             enrich_strategy=True,
                                             base_rates=self._base_rates())
+        if wake_reason in GAP_SCAN_REASONS:
+            before = len(candidates)
+            candidates = filter_gap_rebound_candidates(candidates, held=held)
+            if len(candidates) < before:
+                log.info("갭반등 pre-filter %d→%d (floor<=-5%%)", before, len(candidates))
+        scfg_enrich = serve.serve_cfg(agents_cfg)
+        from ..candidate_enrich import enrich_candidates
+        enrich_stats = enrich_candidates(
+            candidates, ms,
+            gap_scan=(wake_reason in GAP_SCAN_REASONS),
+            enrich_fundamentals=bool(scfg_enrich.get("enrich_fundamentals", True)),
+            enrich_flows=bool(scfg_enrich.get("enrich_flows", True)),
+            gap_enrich_max=int(scfg_enrich.get("gap_enrich_max", 25)),
+            patch_missing_max=int(scfg_enrich.get("patch_missing_fundamentals_max", 5)),
+        )
+        if any(enrich_stats.values()):
+            log.info("후보 enrich fundamentals=%d flows=%d",
+                     enrich_stats.get("fundamentals", 0), enrich_stats.get("flows", 0))
         ondemand_n = 0
         if tier == "focus" and scfg.get("ondemand_flows"):
             try:
@@ -364,7 +399,8 @@ class CycleRunner:
         attach_macro_tags(candidates, sector_map_from_universe(self.cfg))
         portfolio = self._portfolio(earnings)
         focus = build_focus(ms, candidates=candidates,
-                            positions=portfolio.get("positions") or [])
+                            positions=portfolio.get("positions") or [],
+                            wake=wake)
         llm = self.llm_factory(candidates)
         val_llm = self.val_llm_factory(candidates) if self.val_llm_factory else llm
         constraints = {"capital": self.cfg.risk.get("capital", {}),
@@ -442,7 +478,8 @@ class CycleRunner:
                         dossier_brief_fn=(self._dossier_brief if self.store else None),
                         features_by_sym=feat_map,
                         market_fn=self.market_of,
-                        store=self.store)
+                        store=self.store,
+                        wake_reason=wake_reason)
         self._record(res)
         if self.store:
             from ..shadow_ledger import book_blocked, book_soft_pending

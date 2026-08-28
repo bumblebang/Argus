@@ -161,8 +161,7 @@ def fetch_recent_filings(symbols: list[str], user_agent: str, *,
                 })
                 kept += 1
         except Exception as e:
-            from ..http_sanitize import redact_secrets
-            log.warning("[%s] EDGAR submissions 실패: %s", ticker, redact_secrets(str(e)))
+            log.warning("[%s] EDGAR submissions 실패: %s", ticker, e)
         if spacing_sec and i < len(symbols) - 1:
             time.sleep(spacing_sec)
     return out

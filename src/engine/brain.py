@@ -8,6 +8,7 @@
   - 단일실행(single-flight): 한 번에 한 사이클만. 도중에 들어온 wake 는 합쳐서(coalesce)
     끝난 뒤 최대 한 번만 더 돈다(중복 폭주 방지).
   - 쿨다운(cooldown_sec): 직전 사이클 종료 후 이 시간 안에 온 wake 는 무시(과호출 방지).
+    예외: gap_rebound_scan / nxt_gap_scan — 벽시계 슬롯 놓침 방지.
   - 단일 프로세스·단일 Gateway 원칙 유지(토스 토큰 1개) — 워커도 같은 Gateway 를 쓰는
     cycle_fn 을 받으므로 RateLimiter 가 감시 폴링과 캔들 호출을 함께 직렬화한다.
   - 예외는 삼켜 로깅(워커 스레드가 죽지 않게).
@@ -21,11 +22,20 @@ import time
 from pathlib import Path
 from typing import Callable
 
+from ..agents.features import GAP_SCAN_REASONS
 from ..agents.llm import BrainQuotaError, is_bridge_armed
 from ..logging_setup import get_logger
 from . import brain_mode as bm
 
 log = get_logger("engine.brain")
+
+
+def _cooldown_exempt(reason: str) -> bool:
+    """갭반등 벽시계 슬롯은 쿨다운으로 놓치면 그날 기회가 사라진다."""
+    r = str(reason or "")
+    if not r:
+        return False
+    return any(tok.strip() in GAP_SCAN_REASONS for tok in r.split("+"))
 
 
 class BrainWorker:
@@ -70,13 +80,18 @@ class BrainWorker:
         self._bridge_fail_streak = 0
 
     # 감시 루프가 호출(on_wake 콜백). 신호만 세팅하고 즉시 반환(논블로킹).
-    def wake(self, reason: str = "", triggers: list | None = None) -> None:
+    def wake(self, reason: str = "", triggers: list | None = None, *,
+             at: str | None = None, market: str | None = None) -> None:
         """대기 중 wake 가 있으면 덮어쓰지 않고 reason/triggers 를 합친다(재료 유실 방지)."""
         from ..agents.serve_policy import merge_wake_pending
         serialized = _serialize_triggers(triggers)
         with self._lock:
             self._pending = merge_wake_pending(
                 self._pending, reason or "", serialized)
+            if at:
+                self._pending["at"] = at
+            if market:
+                self._pending["market"] = market
         self._wake.set()
 
     def start(self) -> None:
@@ -138,7 +153,10 @@ class BrainWorker:
         테스트에서 스레드 없이 직접 호출할 수 있게 분리.
         """
         now = self._now()
-        if self.cooldown_sec and (now - self._last_done) < self.cooldown_sec:
+        with self._lock:
+            pending_reason = str((self._pending or {}).get("reason") or "")
+        if (self.cooldown_sec and (now - self._last_done) < self.cooldown_sec
+                and not _cooldown_exempt(pending_reason)):
             self.skipped += 1
             self._log(f"{self.kind_prefix}_skip", {"reason": "cooldown",
                                      "since_last": round(now - self._last_done, 1)})

@@ -19,7 +19,9 @@ from __future__ import annotations
 from typing import Any, Iterable
 
 # 정기 각성 — shortlist 미적용(현행 전량).
-SCAN_REASONS = frozenset({"periodic", "extra", "athena_done", ""})
+SCAN_REASONS = frozenset({
+    "periodic", "extra", "athena_done", "gap_rebound_scan", "nxt_gap_scan", "",
+})
 
 # 이벤트 — 기본 focus. 설정 agents.serve.focus_reasons 로 덮어쓸 수 있다.
 DEFAULT_FOCUS_REASONS = frozenset({
@@ -34,6 +36,8 @@ _REASON_PRIORITY: dict[str, int] = {
     "wake_triggers": 80,
     "act_triggers": 75,
     "movers": 70,
+    "gap_rebound_scan": 65,
+    "nxt_gap_scan": 65,
     "extra": 20,
     "periodic": 10,
     "athena_done": 5,
@@ -59,6 +63,10 @@ def serve_cfg(agents_cfg: dict | None) -> dict:
             if raw.get("focus_headline_limit") is not None else None),
         "focus_reasons": fr,
         "compact_json": bool(raw.get("compact_json", True)),
+        "enrich_fundamentals": bool(raw.get("enrich_fundamentals", True)),
+        "enrich_flows": bool(raw.get("enrich_flows", True)),
+        "gap_enrich_max": int(raw.get("gap_enrich_max", 25)),
+        "patch_missing_fundamentals_max": int(raw.get("patch_missing_fundamentals_max", 5)),
     }
 
 
