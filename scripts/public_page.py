@@ -51,8 +51,8 @@ from src import paths as _paths  # noqa: E402
 from src.logging_setup import setup_logging, get_logger  # noqa: E402
 # 데이터를 들고 있지 않은 순수 렌더 헬퍼만 재사용한다(_gather 계열은 절대 쓰지 않는다).
 from scripts.dashboard import (  # noqa: E402
-    BENCH, CSS, _bench_ret_pct, _fear_html, _fmt, _hms, _load_names, _name,
-    _stance_badge, sort_dossiers,
+    BENCH, CSS, _armed_panel_html, _bench_ret_pct, _fear_html, _fmt, _hms, _load_names,
+    _name, _stance_badge, build_armed_plan, sort_dossiers,
 )
 
 log = get_logger("public_page")
@@ -179,10 +179,33 @@ def _bench_ret_cached(market: str, since: datetime) -> float | None:
         return None
 
 
+def _armed_meta_fields(raw) -> dict:
+    """armed meta 에서 공개 가능한 필드만 평탄화(meta 키 자체는 싣지 않는다)."""
+    try:
+        meta = json.loads(raw) if isinstance(raw, str) else (raw or {})
+    except (ValueError, TypeError):
+        meta = {}
+    if not isinstance(meta, dict):
+        return {}
+    out: dict = {}
+    if meta.get("horizon"):
+        out["horizon"] = meta["horizon"]
+    if meta.get("source"):
+        out["source"] = meta["source"]
+    ez = meta.get("entry_zone")
+    if isinstance(ez, dict):
+        out["entry_zone"] = ez
+    params = meta.get("params")
+    if isinstance(params, dict):
+        out["strategy_params"] = params
+    return out
+
+
 def _collect_positions(cur) -> tuple[list[dict], list[dict]]:
-    """보유(open)·진입대기(armed) — qty·meta 는 SELECT 문에 넣지 않는다."""
+    """보유(open)·진입대기(armed) — 수량은 공개하지 않는다."""
     rows = [dict(r) for r in cur.execute(
-        "select symbol,market,state,strategy,avg_price,stop_price,target_price "
+        "select symbol,market,state,strategy,avg_price,stop_price,target_price,"
+        "meta,thesis,opened_at "
         "from positions where state in ('open','armed') order by state,symbol")]
     px = _prices(cur, [str(r["symbol"]) for r in rows])
     held, armed = [], []
@@ -197,6 +220,10 @@ def _collect_positions(cur) -> tuple[list[dict], list[dict]]:
             item["ret_pct"] = _ret_pct(item["avg_price"], item["last_price"])
             held.append(item)
         else:
+            item["state"] = "armed"
+            item.update(_armed_meta_fields(r.get("meta")))
+            item["thesis"] = r["thesis"]
+            item["opened_at"] = _num(r["opened_at"])
             armed.append(item)
     return held, armed
 
@@ -307,11 +334,7 @@ def gather_public(now: float | None = None) -> dict:
         cur = con.cursor()
         d["holdings"], d["armed"] = _collect_positions(cur)
         d["dossiers"] = _collect_dossiers(cur, now)
-        # 진입존은 원장에 없다 — 도시에에서 심볼로 물어온다(진입대기 표시용).
-        zone = {x["symbol"]: (x["entry_low"], x["entry_high"]) for x in d["dossiers"]}
-        for a in d["armed"]:
-            lo, hi = zone.get(a["symbol"], (None, None))
-            a["entry_low"], a["entry_high"] = lo, hi
+        d["pos_px"] = _prices(cur, [str(a["symbol"]) for a in d["armed"]])
         # market_view(브레인 시황 코멘트)는 **의도적으로 수집하지 않는다.** 아래 참조.
         d["decisions"] = [
             {"ts": _num(r["ts"]), "symbol": str(r["symbol"] or ""), "action": r["action"],
@@ -459,24 +482,14 @@ def _zone(x: dict, dp: int) -> str:
 
 
 def _armed_html(d: dict) -> str:
-    """진입대기 — 아직 안 산 것들의 계획(진입존·손절·목표)."""
-    names = d.get("names") or {}
-    rows = d.get("armed") or []
-    p = ["<div class=sec>진입대기</div><div class=panel>"]
-    if not rows:
-        p.append("<span class=muted>대기 없음.</span></div>")
-        return "".join(p)
-    p.append("<table><tr><th>종목명</th><th>시장</th><th>전략</th><th>진입존</th>"
-             "<th>손절</th><th>목표</th></tr>")
-    for x in rows:
-        mk = x.get("market")
-        p.append(f"<tr><td>{_sym(x, names)}</td><td>{escape(str(mk or '–'))}</td>"
-                 f"<td class=muted>{escape(str(x.get('strategy') or '–'))}</td>"
-                 f"<td class=mono>{_zone(x, _dp(mk))}</td>"
-                 f"<td class=mono>{_price(x.get('stop_price'), mk)}</td>"
-                 f"<td class=mono>{_price(x.get('target_price'), mk)}</td></tr>")
-    p.append("</table></div>")
-    return "".join(p)
+    """진입대기 — 트랙·진입방식·조건·현재가(대시보드와 동일 렌더)."""
+    payload = {
+        "names": d.get("names") or {},
+        "pos_px": d.get("pos_px") or {},
+        "dossiers": d.get("dossiers") or [],
+        "positions": [{"state": "armed", **x} for x in (d.get("armed") or [])],
+    }
+    return _armed_panel_html(payload)
 
 
 def _dossier_html(d: dict) -> str:

@@ -68,8 +68,8 @@ def test_render_shows_whitelisted_content():
     assert "노바렉스" in h and "value" in h
     assert "+3.07%" in h
     assert "13,680" in h and "14,100" in h and "10,957" in h and "15,490" in h
-    # 진입대기: 진입존
-    assert "삼성전자" in h and "65,000~67,000" in h
+    # 진입대기: 도시에 존 (카드 그리드)
+    assert "삼성전자" in h and "65,000" in h and "67,000" in h
     # 도시에: stance 뱃지 · rr · 확신도 · 나이
     assert "class=b-bull" in h and "2.40" in h and "0.71" in h and "12h" in h
     # 성과: 거래수·승률·평균수익률·알파
@@ -228,7 +228,7 @@ def test_gather_public_collects_whitelist(fake_db):
     assert h["avg_price"] == 13680 and h["last_price"] == 14100
     assert h["ret_pct"] == pytest.approx((14100 - 13680) / 13680 * 100)
     assert [x["symbol"] for x in d["armed"]] == ["005930"]
-    assert d["armed"][0]["entry_low"] == 65000        # 도시에에서 진입존을 물어온다
+    # 진입존은 렌더 시 도시에 조인 — gather 단계엔 armed 에 중복 보관하지 않는다
     assert d["dossiers"][0]["stance"] == "bullish"
     assert d["decisions"][0]["verdict"] == "vetoed"
     assert d["regime"]["KR"]["label"] == "risk_off"
