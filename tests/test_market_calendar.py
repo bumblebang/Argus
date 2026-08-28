@@ -64,17 +64,20 @@ def test_fetch_sessions_kr_holiday_empty():
     assert out["sessions"] == []
 
 
-# ── refresh_sessions: 하루 1회(오늘 캐시 있으면 client 미호출) ─────────────
-def test_refresh_skips_when_cached_today(tmp_path, monkeypatch):
+# ── refresh_sessions: 유효 캐시면 client 미호출 ─────────────
+def test_refresh_skips_when_cached_valid(tmp_path, monkeypatch):
     monkeypatch.setattr(mc, "CACHE_PATH", tmp_path / "market_sessions.json")
-    resp = {"KR": {"today": {"date": "2026-07-14", "integrated": {
-        "regularMarket": {"startTime": _iso(2026, 7, 14, 9),
-                          "endTime": _iso(2026, 7, 14, 15, 30)}}}}}
+    today = datetime.now(KST).date()
+    y, mo, d = today.year, today.month, today.day
+    iso = today.isoformat()
+    resp = {"KR": {"today": {"date": iso, "integrated": {
+        "regularMarket": {"startTime": _iso(y, mo, d, 9),
+                          "endTime": _iso(y, mo, d, 15, 30)}}}}}
     client = _FakeClient(resp)
     mc.refresh_sessions(client, ("KR",))
-    assert client.calls == 1  # 첫 호출
+    assert client.calls == 1
     mc.refresh_sessions(client, ("KR",))
-    assert client.calls == 1  # 오늘 이미 받음 → 재호출 스킵
+    assert client.calls == 1  # 거래일·세션 유효 → 재호출 스킵
 
 
 def test_refresh_refetches_when_cache_stale(tmp_path, monkeypatch):
@@ -133,12 +136,32 @@ def test_current_session_missing_cache_falls_back(tmp_path, monkeypatch):
     assert mh.current_session("KR", _kst(2026, 7, 14, 18)) == "closed"
 
 
-def test_current_session_stale_cache_falls_back(tmp_path, monkeypatch):
+def test_current_session_wrong_date_falls_back(tmp_path, monkeypatch):
     path = tmp_path / "market_sessions.json"
-    # 캐시는 있으나 fetched 가 어제(07-13) → 날짜 불일치 → is_open 폴백
-    _write_cache(path, fetched=_kst(2026, 7, 13, 7))
+    # date 가 거래일과 다르면 캐시 무시 → is_open 폴백
+    import json
+    cache = {"KR": {"market": "KR", "date": "2026-07-13", "fetched": _kst(2026, 7, 14, 7),
+                    "sessions": [
+                        {"name": "aftermarket", "start": _kst(2026, 7, 13, 15, 30),
+                         "end": _kst(2026, 7, 13, 20)},
+                    ]}}
+    path.write_text(json.dumps(cache), encoding="utf-8")
     monkeypatch.setattr(mh, "_SESSIONS_CACHE", path)
-    # 07-14 17:00 은 캐시상 aftermarket 이지만 stale → 폴백 is_open(False) → closed
     assert mh.current_session("KR", _kst(2026, 7, 14, 17)) == "closed"
-    # 07-14 11:00 정규장 → 폴백 is_open True → regular
     assert mh.current_session("KR", _kst(2026, 7, 14, 11)) == "regular"
+
+
+def test_current_session_us_survives_kst_midnight(tmp_path, monkeypatch):
+    """US 정규장 첫 90분(22:30~00:00 KST) — KST 자정 넘어도 세션표 date 로 유효."""
+    path = tmp_path / "market_sessions.json"
+    import json
+    cache = {"US": {"market": "US", "date": "2026-07-14", "fetched": _kst(2026, 7, 14, 9),
+                    "sessions": [
+                        {"name": "regular", "start": _kst(2026, 7, 14, 22, 30),
+                         "end": _kst(2026, 7, 15, 5, 0)},
+                    ]}}
+    path.write_text(json.dumps(cache), encoding="utf-8")
+    monkeypatch.setattr(mh, "_SESSIONS_CACHE", path)
+    ts = _kst(2026, 7, 15, 0, 30)  # KST 다음날 00:30, US 7/14 정규장 중
+    assert mh.current_session("US", ts) == "regular"
+    assert mh.is_tradable("US", ("regular",), ts) is True

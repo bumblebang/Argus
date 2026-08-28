@@ -114,9 +114,15 @@ def _migrate_blockers() -> list[str]:
     장중이거나 watch 가 살아 있으면 원장/DB 를 실행 중인 프로세스 밑에서 빼게 된다."""
     blockers: list[str] = []
     from src import market_hours, paths as p
+    from src.session_policy import market_tradable, trading_sessions_from_raw
     from src.engine.singleton import AlreadyRunning, SingleInstance
 
-    open_now = [m for m in ("KR", "US") if market_hours.is_open(m)]
+    try:
+        from src.config import load_config
+        tsess = trading_sessions_from_raw(load_config().raw)
+    except Exception:
+        tsess = None
+    open_now = [m for m in ("KR", "US") if market_tradable(m, tsess)]
     if open_now:
         blockers.append(f"장중({', '.join(open_now)}) — 장 마감 후 재시도")
 

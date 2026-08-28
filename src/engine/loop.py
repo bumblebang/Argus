@@ -36,10 +36,13 @@ from .wake_request import consume_brain_wake
 
 log = get_logger("engine.loop")
 
-# 거래 허용 세션 기본값 — 설정(config trading_sessions)이 없으면 정규장 전용(기존 동작).
-_DEFAULT_TRADING_SESSIONS: dict[str, tuple[str, ...]] = {"KR": ("regular",), "US": ("regular",)}
-# 정기각성(brain_interval_sec)이 도는 세션 기본값 — 설정 없으면 정규장 전용(기존 동작).
-_DEFAULT_BRAIN_SESSIONS: dict[str, tuple[str, ...]] = {"KR": ("regular",), "US": ("regular",)}
+from ..session_policy import (
+    DEFAULT_BRAIN_SESSIONS,
+    DEFAULT_TRADING_SESSIONS,
+    brain_sessions_from_raw,
+    parse_session_map,
+    trading_sessions_from_raw,
+)
 
 _KST = ZoneInfo("Asia/Seoul")   # extra_wakes(지정시각 각성) HH:MM 판정용
 
@@ -124,11 +127,11 @@ class WatchConfig:
     stale_quote_sec: float = 0.0       # 시간외 세션 체결정지 판정 임계(초). 0=비활성(기존 동작)
     # 시장별 거래 허용 세션(market_hours.current_session 기준). 기본=정규장 전용(기존 동작).
     trading_sessions: dict[str, tuple[str, ...]] = field(
-        default_factory=lambda: dict(_DEFAULT_TRADING_SESSIONS))
+        default_factory=lambda: dict(DEFAULT_TRADING_SESSIONS))
     # 정기각성이 도는 시장별 세션. 기본=정규장 전용(기존 동작). 프리장을 열면 그 세션에서도
     # brain_interval_sec 주기로 뇌가 재평가한다(NXT 프리마켓처럼 실가격이 형성되는 구간용).
     brain_sessions: dict[str, tuple[str, ...]] = field(
-        default_factory=lambda: dict(_DEFAULT_BRAIN_SESSIONS))
+        default_factory=lambda: dict(DEFAULT_BRAIN_SESSIONS))
     # 지정 시각(KST HH:MM) 1회 각성. {market: (HH:MM,...)}. 기본={}=비활성(기존 동작).
     extra_wakes: dict[str, tuple[str, ...]] = field(default_factory=dict)
     # Athena 등 외부 배치가 남기는 각성 요청 파일. 빈 문자열이면 비활성.
@@ -147,29 +150,11 @@ class WatchConfig:
     @staticmethod
     def _parse_session_map(block: Any,
                            default: dict[str, tuple[str, ...]]) -> dict[str, tuple[str, ...]]:
-        """{market: [값,...]} 블록 파싱 공통 로직(trading_sessions/brain_sessions/extra_wakes 공유).
-
-        block 이 dict 가 아니면 default 그대로. 문자열 1개도 허용(리스트로 승격), 리스트가
-        아니면 빈 튜플(그 시장은 비활성 — 오타로 뭔가 켜지는 쪽보다 안전), 시장키는 대문자.
-        """
-        out = dict(default)
-        if isinstance(block, dict):
-            for m, names in block.items():
-                if isinstance(names, str):
-                    names = [names]
-                if not isinstance(names, (list, tuple)):
-                    names = []
-                out[str(m).upper()] = tuple(str(s).strip() for s in names if str(s).strip())
-        return out
+        return parse_session_map(block, default)
 
     @staticmethod
     def _parse_sessions(raw: dict) -> dict[str, tuple[str, ...]]:
-        """config 최상위 trading_sessions 블록 → {market: (세션명,...)}.
-
-        블록이 없거나 그 시장이 없으면 정규장 전용(기존 동작).
-        """
-        block = (raw or {}).get("trading_sessions")
-        return WatchConfig._parse_session_map(block, _DEFAULT_TRADING_SESSIONS)
+        return trading_sessions_from_raw(raw)
 
     @staticmethod
     def _parse_trailing(raw: dict) -> dict:
@@ -221,7 +206,7 @@ class WatchConfig:
             trading_sessions=cls._parse_sessions(raw),
             # 정기각성 세션·지정시각 각성은 watch 블록 안에서 읽는다(trading_sessions 와 달리
             # 최상위가 아니라 watch 하위 — brain_interval_sec 등 다른 뇌 설정과 같이 둔다).
-            brain_sessions=cls._parse_session_map(w.get("brain_sessions"), _DEFAULT_BRAIN_SESSIONS),
+            brain_sessions=brain_sessions_from_raw(raw),
             extra_wakes=cls._parse_session_map(w.get("extra_wakes"), {}),
             wake_request_path=str(w.get("wake_request_path", d.wake_request_path) or ""),
             # 트레일링은 watch 블록이 아니라 최상위 trailing 블록에서 읽는다(trading_sessions 와 동일).

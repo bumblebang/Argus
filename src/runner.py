@@ -12,7 +12,7 @@ import yaml
 
 from .config import AppConfig, ROOT
 from .logging_setup import get_logger
-from . import market_hours
+from .session_policy import market_tradable, trading_sessions_from_raw
 from .broker import Broker
 from .risk import RiskManager, risk_manager_from_cfg
 from .risk_gate import Order
@@ -123,7 +123,7 @@ class TradingBot:
         market, symbol, strat = t["market"], t["symbol"], t["strategy"]
         if market not in self.cfg.run.get("trade_markets", ["KR", "US"]):
             return
-        if not market_hours.is_open(market):
+        if not market_tradable(market, trading_sessions_from_raw(self.cfg.raw)):
             return
 
         # 토스 캔들은 symbol 으로 시장이 결정됨(KRX 6자리/US 티커). market 파라미터 없음.

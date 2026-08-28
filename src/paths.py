@@ -203,3 +203,53 @@ def ensure_parent(key: str, *, root: Path | None = None,
     path = resolve(key, root=root, configured=configured)
     path.parent.mkdir(parents=True, exist_ok=True)
     return path
+
+
+def halt_pause_candidates(market: str, *, root: Path | None = None,
+                          configured: str | Path | None = None) -> list[Path]:
+    """HALT.{KR|US} 후보 경로 — resolve(halt) 옆 + LAYOUT·레거시 양쪽."""
+    m = str(market).upper()
+    suffix = f".{m}"
+    base = resolve("halt", root=root, configured=configured)
+    b = ROOT if root is None else Path(root)
+    legacy = b / CANONICAL["halt"]
+    layout = b / LAYOUT["halt"]
+    raw: list[Path] = [
+        base.with_name(base.name + suffix),
+        layout.with_name(layout.name + suffix),
+        legacy.with_name(legacy.name + suffix),
+    ]
+    seen: set[str] = set()
+    out: list[Path] = []
+    for c in raw:
+        k = str(c)
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append(c)
+    return out
+
+
+def resolve_halt_pause(market: str, *, root: Path | None = None,
+                       configured: str | Path | None = None) -> Path:
+    """존재하는 HALT.{KR|US} 를 반환. 없으면 resolve(halt) 옆 기본 경로."""
+    for c in halt_pause_candidates(market, root=root, configured=configured):
+        try:
+            if c.exists():
+                return c.resolve()
+        except OSError:
+            continue
+    base = resolve("halt", root=root, configured=configured)
+    return base.with_name(f"{base.name}.{str(market).upper()}")
+
+
+def halt_pause_exists(market: str, *, root: Path | None = None,
+                      configured: str | Path | None = None) -> bool:
+    """HALT.{KR|US} 가 레거시·LAYOUT 어디에 있든 존재하면 True."""
+    for c in halt_pause_candidates(market, root=root, configured=configured):
+        try:
+            if c.exists():
+                return True
+        except OSError:
+            continue
+    return False

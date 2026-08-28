@@ -403,6 +403,20 @@ def test_market_pause_blocks_buy_allows_sell(tmp_path):
     assert d_sell.approved
 
 
+def test_market_pause_finds_legacy_halt_us(tmp_path, monkeypatch):
+    """data/HALT.US 레거시 경로도 인식 — resolve(halt)=data/state/HALT 여도."""
+    monkeypatch.setattr("src.paths.ROOT", tmp_path)
+    legacy = tmp_path / "data" / "HALT.US"
+    legacy.parent.mkdir(parents=True, exist_ok=True)
+    legacy.write_text("pause", encoding="utf-8")
+    gate = _gate(tmp_path, max_position_pct=1.0, max_order_notional={},
+                 kill_switch_file=str(tmp_path / "data" / "state" / "HALT"))
+    acct = _acct(tmp_path)
+    assert gate.is_market_paused("US")
+    d = gate.check(Order("AAPL", "US", "BUY", 1, 100), acct)
+    assert not d.approved and "pause" in d.reason
+
+
 def test_global_halt_blocks_sell_too(tmp_path):
     (tmp_path / "HALT").write_text("halt", encoding="utf-8")
     gate, acct = _gate(tmp_path), _acct(tmp_path)

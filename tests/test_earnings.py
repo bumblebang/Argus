@@ -264,8 +264,8 @@ def test_earnings_fn_없으면_기존동작(tmp_path):
 # ── 임박 시 폴링 창 ────────────────────────────────────────────────
 def test_interval_임박이면_장외에도_active(tmp_path, monkeypatch):
     store = Store(tmp_path / "t.db")
-    monkeypatch.setattr(dmod, "is_open", lambda m, now=None: False)
-    monkeypatch.setattr(dmod, "within_after_close", lambda m, h, now=None: False)
+    monkeypatch.setattr(dmod, "market_monitoring_active",
+                        lambda market, **kw: False)
 
     w = _watcher(store, [], imminent_fn=lambda: True)
     assert w.interval() == 10.0                          # 임박 → 장외에도 촘촘히
@@ -276,9 +276,8 @@ def test_interval_임박이면_장외에도_active(tmp_path, monkeypatch):
 def test_interval_임박이면_마감후창_확장(tmp_path, monkeypatch):
     store = Store(tmp_path / "t.db")
     seen = []
-    monkeypatch.setattr(dmod, "is_open", lambda m, now=None: False)
-    monkeypatch.setattr(dmod, "within_after_close",
-                        lambda m, h, now=None: seen.append(h) or False)
+    monkeypatch.setattr(dmod, "market_monitoring_active",
+                        lambda market, **kw: seen.append(kw.get("after_close_hours")) or False)
     _watcher(store, [], imminent_fn=lambda: True, imminent_after_close_hours=4.0).interval()
     _watcher(store, [], imminent_fn=lambda: False).interval()
     assert seen == [4.0, 2.0]                            # 임박일만 4시간 창
@@ -319,8 +318,8 @@ def test_dday_는_저장값이_아니라_오늘기준_재계산(tmp_path):
 
 def test_interval_imminent_fn_예외는_삼킴(tmp_path, monkeypatch):
     store = Store(tmp_path / "t.db")
-    monkeypatch.setattr(dmod, "is_open", lambda m, now=None: False)
-    monkeypatch.setattr(dmod, "within_after_close", lambda m, h, now=None: False)
+    monkeypatch.setattr(dmod, "market_monitoring_active",
+                        lambda market, **kw: False)
 
     def boom():
         raise RuntimeError("캘린더 깨짐")

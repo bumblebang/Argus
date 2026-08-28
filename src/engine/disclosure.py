@@ -18,7 +18,7 @@ import time
 from typing import Callable, Iterable
 
 from ..logging_setup import get_logger
-from ..market_hours import is_open, within_after_close
+from ..session_policy import market_monitoring_active
 
 log = get_logger("engine.disclosure")
 
@@ -89,6 +89,7 @@ class DisclosureWatcher:
                  actuals_fn: Callable[[str], dict | None] | None = None,
                  imminent_fn: Callable[[], bool] | None = None,
                  imminent_after_close_hours: float = 4.0,
+                 trading_sessions: dict[str, tuple[str, ...]] | None = None,
                  now_fn: Callable[[], float] = time.time,
                  sleep_fn: Callable[[float], None] = time.sleep) -> None:
         self.store = store
@@ -102,6 +103,7 @@ class DisclosureWatcher:
         self.actuals_fn = actuals_fn
         self.imminent_fn = imminent_fn
         self.imminent_after_close_hours = float(imminent_after_close_hours)
+        self.trading_sessions = trading_sessions
         self._now = now_fn
         self._sleep = sleep_fn
         self._seen: set[str] = set()
@@ -128,7 +130,8 @@ class DisclosureWatcher:
         """
         imminent = self._imminent()
         hours = self.imminent_after_close_hours if imminent else self.after_close_hours
-        if is_open("KR") or within_after_close("KR", hours):
+        if market_monitoring_active("KR", trading_sessions=self.trading_sessions,
+                                   after_close_hours=hours, now=self._now()):
             return self.poll_active_sec
         return self.poll_active_sec if imminent else self.poll_idle_sec
 

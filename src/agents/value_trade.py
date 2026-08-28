@@ -32,7 +32,7 @@ from ..config import AppConfig, ROOT
 from ..focus import build_focus, attach_krx_fields
 from ..lessons import build_symbol_lessons
 from ..logging_setup import get_logger
-from ..market_hours import is_open
+from ..session_policy import market_value_due, value_sessions_from_raw
 from ..value_scan import load_watchlist, WATCHLIST
 
 log = get_logger("agents.value_trade")
@@ -530,16 +530,14 @@ class ValueRunner:
 
     # ── due 시장 판정 ────────────────────────────────────────────
     def _due_markets(self, cfg_v: dict, state: dict, now: float) -> list[str]:
-        """오늘(KST) 아직 안 돈 & 현재 장중인 시장."""
+        """오늘(KST) 아직 안 돈 & value_trade.sessions(기본 정규장) 허용 시장."""
         today = _kst_date(now)
-        now_dt = datetime.fromtimestamp(now, tz=timezone.utc)
+        value_sessions = value_sessions_from_raw(self.cfg.raw)
         due = []
         for m in cfg_v["markets"]:
             if state.get(m) == today:
                 continue
-            # 밸류 트랙은 정규장 전용(시간외 확장 대상 아님) — 하루 1회 장기 진입 판단이라
-            # 얇은 시간외 호가에 들어갈 이유가 없다.
-            if not is_open(m, now_dt):
+            if not market_value_due(m, value_sessions, now):
                 continue
             due.append(m)
         return due

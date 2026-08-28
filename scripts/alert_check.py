@@ -46,7 +46,8 @@ for _s in (sys.stdout, sys.stderr):
 
 from src.agents.llm import is_bridge_armed  # noqa: E402
 from src.engine import brain_mode as bm  # noqa: E402
-from src.market_hours import is_open  # noqa: E402
+from src.market_hours import is_tradable  # noqa: E402
+from src.session_policy import any_market_tradable, trading_sessions_from_raw  # noqa: E402
 from src.ops_playbook import actions_for, format_push_body  # noqa: E402
 from src import paths as _paths  # noqa: E402
 
@@ -105,7 +106,8 @@ def evaluate(now: float, hb_age: float | None, market_open: bool = True,
              quota_kind: str | None = None,
              hb_ok: bool | None = None,
              hb_polled: int | None = None,
-             hb_markets_open: list | None = None) -> list[str]:
+             hb_markets_open: list | None = None,
+             expects_polling: bool = False) -> list[str]:
     """순수 판정 — 경보 사유 리스트(빈 리스트=정상).
 
     brain_errors_recent / last_brain_done_age 는 하위호환으로 받지만 **무시**한다
@@ -127,6 +129,9 @@ def evaluate(now: float, hb_age: float | None, market_open: bool = True,
             reasons.append(
                 f"장중 시세 폴링 실패(polled={hb_polled if hb_polled is not None else '?'}"
                 f", markets={','.join(mkts) or '?'}) — 하트비트만 살아 있음")
+        elif expects_polling and not mkts:
+            reasons.append(
+                "거래 세션인데 markets_open 비어 있음 — 감시 루프 미동작 의심")
 
     mode = brain_mode or "ok"
     if auth_expired and mode == "ok":
@@ -303,7 +308,16 @@ def _log(event: str, reasons: list[str], **extra) -> None:
 def main() -> int:
     now = time.time()
     hb_age, hb = _read_heartbeat(now)
-    market_open = is_open("KR") or is_open("US")
+    tsess: dict[str, tuple[str, ...]] = {}
+    try:
+        from src.config import load_config
+        from src.session_policy import any_market_tradable, trading_sessions_from_raw
+        tsess = trading_sessions_from_raw(load_config().raw)
+    except Exception:
+        from src.session_policy import DEFAULT_TRADING_SESSIONS
+        tsess = dict(DEFAULT_TRADING_SESSIONS)
+    expects_polling = any_market_tradable(["KR", "US"], tsess)
+    market_open = expects_polling
     mode_state = _load_brain_mode()
     mode = str(mode_state.get("mode") or "ok")
     reset_at = mode_state.get("reset_at")
@@ -335,6 +349,7 @@ def main() -> int:
         hb_ok=hb_ok,
         hb_polled=int(hb["polled"]) if hb.get("polled") is not None else None,
         hb_markets_open=list(hb.get("markets_open") or []) if hb else None,
+        expects_polling=expects_polling,
     )
     next_actions = actions_for(reasons, brain_mode=mode)
     budget_line = format_budget_push_line(gauge)

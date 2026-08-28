@@ -113,7 +113,7 @@ def test_migrate_apply_blocked_during_market_hours(monkeypatch, tmp_path):
     monkeypatch.setattr(p, "resolve",
                         lambda key, **kw: (tmp_path / "w.lock" if key == "watch_lock"
                                            else tmp_path / "w.pid"))
-    monkeypatch.setattr("src.market_hours.is_open", lambda m, now=None: m == "KR")
+    monkeypatch.setattr("src.session_policy.market_tradable", lambda m, s=None, now=None: m == "KR")
     blockers = doctor._migrate_blockers()
     assert any("장중" in b for b in blockers)
 
@@ -126,5 +126,5 @@ def test_migrate_apply_allowed_when_idle_and_closed(monkeypatch, tmp_path):
     monkeypatch.setattr(p, "resolve",
                         lambda key, **kw: (tmp_path / "w.lock" if key == "watch_lock"
                                            else tmp_path / "w.pid"))
-    monkeypatch.setattr("src.market_hours.is_open", lambda m, now=None: False)
+    monkeypatch.setattr("src.session_policy.market_tradable", lambda m, s=None, now=None: False)
     assert doctor._migrate_blockers() == []

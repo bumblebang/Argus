@@ -50,7 +50,9 @@ from src.engine.slice_refresher import SliceRefresher, start_slice_refresher_thr
 from src.engine.universe_refresher import (UniverseRefresher,
                                           start_universe_refresher_thread)
 from src.universe_roll import core_refresh, mover_scan
-from src.market_hours import is_open, is_tradable, calendar_covers
+from src.session_policy import (make_tradable_fn, market_value_due, trading_sessions_from_raw,
+                                value_sessions_from_raw)
+from src.market_hours import is_tradable, calendar_covers
 from src.live_slice import build_fast_slice, apply_fast_slice
 from src.datasources.dart import fetch_recent_disclosures, fetch_earnings_actuals
 from src.datasources.earnings import dday_of, fetch_us_results
@@ -252,6 +254,7 @@ def _start_value_timer(worker, cfg, markets) -> threading.Event:
     """
     vt = value_trade_cfg(cfg)
     windows = vt["windows"]
+    value_sessions = value_sessions_from_raw(cfg.raw)
     stop = threading.Event()
     woken: dict[str, str] = {}          # market -> 마지막 wake KST 날짜(중복 wake 방지)
 
@@ -259,9 +262,10 @@ def _start_value_timer(worker, cfg, markets) -> threading.Event:
         while not stop.wait(60):
             try:
                 now = datetime.now(_KST)
+                now_ts = now.timestamp()
                 today, hhmm = now.strftime("%Y%m%d"), now.strftime("%H:%M")
                 for m in markets:
-                    if m not in windows or not is_open(m):
+                    if m not in windows or not market_value_due(m, value_sessions, now_ts):
                         continue
                     if hhmm >= windows[m] and woken.get(m) != today:
                         worker.wake("value_daily")
@@ -508,7 +512,8 @@ def _build_disclosure_watcher(cfg, store, brain,
         actuals_fn=((lambda rcept_no: fetch_earnings_actuals(dart_key, rcept_no))
                     if wcfg.get("earnings_actuals", True) else None),
         imminent_fn=imminent_fn,
-        imminent_after_close_hours=float(wcfg.get("imminent_after_close_hours", 4)))
+        imminent_after_close_hours=float(wcfg.get("imminent_after_close_hours", 4)),
+        trading_sessions=trading_sessions_from_raw(cfg.raw))
 
 
 def _build_earnings_watcher(cfg, store, brain,
@@ -595,7 +600,8 @@ def _build_edgar_watcher(cfg, store, brain,
         poll_active_sec=float(wcfg.get("edgar_poll_sec_active", 120)),
         poll_idle_sec=float(wcfg.get("edgar_poll_sec_idle", 900)),
         after_close_hours=float(wcfg.get("edgar_after_close_hours",
-                                         wcfg.get("active_after_close_hours", 2))))
+                                         wcfg.get("active_after_close_hours", 2))),
+        trading_sessions=trading_sessions_from_raw(cfg.raw))
 
 
 def run_from_args(args) -> int:
@@ -775,7 +781,9 @@ def run_from_args(args) -> int:
 
         refresher = SliceRefresher(lambda: build_fast_slice(cfg, breadth_fn=_breadth_fn),
                                    apply_fast_slice,
-                                   markets=markets, refresh_sec=refresh_sec)
+                                   markets=markets, refresh_sec=refresh_sec,
+                                   is_open_fn=make_tradable_fn(
+                                       watch_config.trading_sessions))
         _st, slice_stop = start_slice_refresher_thread(refresher)
         _ma20_path = ROOT / "data" / "ma20.json"
         log.info("빠른 슬라이스 갱신기 기동 — 장중 %.0fs, markets=%s, 실시간 브레드스=%s",
@@ -801,7 +809,8 @@ def run_from_args(args) -> int:
             core_preopen_min=rolling_cfg.get("core_preopen_min"),
             interval_min=float(rolling_cfg.get("interval_min", 60)),
             on_added=_on_added if movers_on else None,
-            core_weekdays=weekdays)
+            core_weekdays=weekdays,
+            is_open_fn=make_tradable_fn(watch_config.trading_sessions))
         _ut, uni_stop = start_universe_refresher_thread(uni_refresher)
         log.info("롤링 유니버스 갱신기 기동 — preopen=%s, 코어요일=%s, 무버=%s, markets=%s",
                  uni_refresher.core_preopen_min, weekdays,

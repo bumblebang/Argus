@@ -20,8 +20,17 @@ def test_evaluate_idle_zero_poll_ok():
     """휴장(markets_open=[]) polled=0 은 정상."""
     import alert_check as ac
     r = ac.evaluate(1_000_000.0, hb_age=2.0, market_open=False, brain_mode="ok",
-                    hb_ok=True, hb_polled=0, hb_markets_open=[])
+                    hb_ok=True, hb_polled=0, hb_markets_open=[],
+                    expects_polling=False)
     assert r == []
+
+
+def test_evaluate_tradable_but_no_markets_open():
+    import alert_check as ac
+    r = ac.evaluate(1_000_000.0, hb_age=2.0, market_open=True, brain_mode="ok",
+                    hb_ok=True, hb_polled=0, hb_markets_open=[],
+                    expects_polling=True)
+    assert any("markets_open" in x for x in r)
 
 
 def test_push_rejects_http_error(monkeypatch):

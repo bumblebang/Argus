@@ -146,14 +146,13 @@ class RiskGate:
 
     def _market_pause_path(self, market: str) -> Path:
         """전역 HALT 옆 HALT.{KR|US}. 전역은 BUY/SELL 전부, 마켓 pause 는 BUY만."""
-        base = self._halt_path()
-        return base.with_name(f"{base.name}.{str(market).upper()}")
+        return _paths.resolve_halt_pause(market, configured=self.kill_switch_file)
 
     def is_globally_halted(self) -> bool:
         return self._halt_path().exists()
 
     def is_market_paused(self, market: str) -> bool:
-        return self._market_pause_path(market).exists()
+        return _paths.halt_pause_exists(market, configured=self.kill_switch_file)
 
     def pause_status(self) -> str:
         """대시 배지용: ALL | KR | US | KR+US | none."""

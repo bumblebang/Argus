@@ -153,12 +153,11 @@ def test_armed_us_also_wakes(tmp_path):
 def test_interval_adaptive(tmp_path, monkeypatch):
     store = Store(tmp_path / "t.db")
     w = _watcher(store, [])
-    monkeypatch.setattr(emod, "is_open", lambda m, now=None: True)
+    monkeypatch.setattr(emod, "market_monitoring_active",
+                        lambda market, **kw: True)
     assert w.interval() == 120.0
-    monkeypatch.setattr(emod, "is_open", lambda m, now=None: False)
-    monkeypatch.setattr(emod, "within_after_close", lambda m, h, now=None: True)
-    assert w.interval() == 120.0
-    monkeypatch.setattr(emod, "within_after_close", lambda m, h, now=None: False)
+    monkeypatch.setattr(emod, "market_monitoring_active",
+                        lambda market, **kw: False)
     assert w.interval() == 900.0
 
 

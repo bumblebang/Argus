@@ -102,21 +102,41 @@ def _same_kst_day(epoch: float | None) -> bool:
         return False
 
 
+def _needs_refresh(market: str, cached: dict | None) -> bool:
+    """세션표 재조회 필요 여부 — KST fetched 하루 1회 대신 거래일·유효성 기준."""
+    if not isinstance(cached, dict):
+        return True
+    from ..market_hours import _cache_valid
+    return not _cache_valid(market, cached, time.time())
+
+
 def refresh_sessions(client, markets=("KR", "US")) -> dict:
     """각 시장 세션표를 받아 캐시 갱신 후 전체 캐시를 반환.
 
-    오늘(KST) 이미 받았으면(fetched 가 오늘) 재호출 스킵(하루 1회 원칙 — 어제 것이면
-    갱신). 실패한 시장은 로깅 후 스킵하고 다른 시장은 계속한다. 자주 불러도 안전.
+    거래일(date)이 바뀌거나 캐시가 현재 시각에 유효하지 않으면 재호출한다(US 정규장
+    22:30 KST 개장·KST 자정 경계 포함). 실패한 시장은 로깅 후 스킵하고 다른 시장은 계속.
     """
     cache = load_sessions()
     changed = False
     for market in markets:
         m = market.upper()
         cached = cache.get(m)
-        if isinstance(cached, dict) and _same_kst_day(cached.get("fetched")):
-            continue  # 오늘 이미 받음 — 재호출 스킵
+        if isinstance(cached, dict) and not _needs_refresh(m, cached):
+            continue
         try:
             entry = fetch_sessions(client, m)
+            names = [s["name"] for s in entry.get("sessions", [])]
+            if not names:
+                log.warning("%s 세션표 빈 응답 — 기존 캐시 유지", m)
+                continue
+            if "regular" not in names:
+                log.warning("%s regular 세션 누락 — 1회 재조회", m)
+                try:
+                    retry = fetch_sessions(client, m)
+                    if retry.get("sessions"):
+                        entry = retry
+                except Exception as e:
+                    log.warning("%s 세션표 재조회 실패: %s", m, e)
         except Exception as e:
             log.warning("%s 세션표 조회 실패(스킵): %s", m, e)
             continue

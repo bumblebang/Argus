@@ -59,6 +59,17 @@ def test_p2_resolve_skips_empty_inbox_dir_for_populated_legacy(tmp_path):
     assert paths.resolve("inbox", root=tmp_path) == leg.resolve()
 
 
+def test_p2_halt_pause_legacy_dual_search(tmp_path):
+    """HALT.US 는 data/state/HALT 옆 + 레거시 data/HALT.US 둘 다 찾는다."""
+    from src import paths
+
+    legacy = tmp_path / "data" / "HALT.US"
+    legacy.parent.mkdir(parents=True)
+    legacy.write_text("pause", encoding="utf-8")
+    assert paths.halt_pause_exists("US", root=tmp_path, configured="data/state/HALT")
+    assert paths.resolve_halt_pause("US", root=tmp_path, configured="data/state/HALT") == legacy.resolve()
+
+
 def test_p2_resolve_configured_wins_if_exists(tmp_path):
     from src import paths
 

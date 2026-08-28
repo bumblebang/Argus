@@ -115,6 +115,15 @@ def market_day(market: str, now: datetime | None = None) -> str:
     return now.date().isoformat()
 
 
+def trading_date(market: str, ts: float | None = None) -> str:
+    """해당 시장 타임존 기준 거래일(ISO). 세션표 date 필드와 대조한다."""
+    if market not in _SESSIONS:
+        return market_day(market)
+    ts_val = datetime.now(_KST).timestamp() if ts is None else float(ts)
+    tzname = _SESSIONS[market][0]
+    return datetime.fromtimestamp(ts_val, ZoneInfo(tzname)).date().isoformat()
+
+
 def _now_epoch(now: datetime | None) -> float:
     if now is None:
         return datetime.now(_KST).timestamp()
@@ -167,25 +176,38 @@ def near_session_end(market: str, minutes: int = 5, now: datetime | None = None,
 
 
 # ── 세션 인지(프리마켓/정규장/애프터마켓) ────────────────────────────────
-def _fresh_today(fetched, ts: float) -> bool:
-    """캐시의 fetched(epoch)와 조회 시각 ts(epoch)가 같은 KST 날짜인지(신선도 판정)."""
-    if not fetched:
+def _cache_valid(market: str, entry: dict, ts: float) -> bool:
+    """세션 캐시가 ts 시점에 신뢰 가능한지 — entry.date·세션 구간으로 판정.
+
+    fetched(KST) 날짜만 보던 구 로직은 US 정규장 첫 90분(22:30~00:00 KST)에 캐시를
+    버려 미장 폴링이 죽었다. 거래일(date)과 epoch 구간이 맞으면 KST 자정 이후에도 유효.
+    """
+    if not isinstance(entry, dict):
         return False
-    try:
-        return (datetime.fromtimestamp(float(fetched), _KST).date()
-                == datetime.fromtimestamp(ts, _KST).date())
-    except (ValueError, TypeError, OSError, OverflowError):
+    date = entry.get("date")
+    if not date:
         return False
+    if str(date) == trading_date(market, ts):
+        return True
+    sessions = entry.get("sessions")
+    if isinstance(sessions, list):
+        for s in sessions:
+            try:
+                if float(s["start"]) <= ts < float(s["end"]):
+                    return True
+            except (KeyError, TypeError, ValueError):
+                continue
+    return False
 
 
 def _today_sessions(market: str, ts: float) -> list | None:
-    """오늘 캐시의 sessions 리스트. 없거나 날짜가 다르면 None."""
+    """오늘 캐시의 sessions 리스트. 없거나 거래일이 맞지 않으면 None."""
     try:
         cache = json.loads(_SESSIONS_CACHE.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
     entry = cache.get(market.upper()) if isinstance(cache, dict) else None
-    if not isinstance(entry, dict) or not _fresh_today(entry.get("fetched"), ts):
+    if not isinstance(entry, dict) or not _cache_valid(market, entry, ts):
         return None
     sessions = entry.get("sessions")
     return sessions if isinstance(sessions, list) else None
@@ -211,8 +233,8 @@ def current_session(market: str, now: float | None = None) -> str:
     """현재(또는 now epoch)가 어느 세션인지 반환: premarket/regular/aftermarket/
     daymarket/closed.
 
-    data/market_sessions.json 캐시(epoch 구간)로 판정한다. 캐시가 없거나 오늘(KST)
-    것이 아니거나 파싱에 실패하면 기존 is_open 으로 폴백('regular'/'closed'). 대시보드가
+    data/market_sessions.json 캐시(epoch 구간)로 판정한다. 캐시가 없거나 거래일(date)이
+    맞지 않거나 파싱에 실패하면 기존 is_open 으로 폴백('regular'/'closed'). 대시보드가
     매 요청 호출하므로 절대 예외를 던지지 않는다.
     """
     ts = datetime.now(_KST).timestamp() if now is None else float(now)

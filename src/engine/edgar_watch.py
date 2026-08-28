@@ -16,7 +16,7 @@ from typing import Callable, Iterable
 
 from ..datasources.edgar import is_material_filing
 from ..logging_setup import get_logger
-from ..market_hours import is_open, within_after_close
+from ..session_policy import market_monitoring_active, trading_sessions_from_raw
 
 log = get_logger("engine.edgar_watch")
 
@@ -37,6 +37,7 @@ class EdgarWatcher:
                  on_wake: Callable[[str, list], None] | None = None,
                  poll_active_sec: float = 120.0, poll_idle_sec: float = 900.0,
                  after_close_hours: float = 2.0,
+                 trading_sessions: dict[str, tuple[str, ...]] | None = None,
                  now_fn: Callable[[], float] = time.time,
                  sleep_fn: Callable[[float], None] = time.sleep) -> None:
         self.store = store
@@ -46,6 +47,7 @@ class EdgarWatcher:
         self.poll_active_sec = float(poll_active_sec)
         self.poll_idle_sec = float(poll_idle_sec)
         self.after_close_hours = float(after_close_hours)
+        self.trading_sessions = trading_sessions
         self._now = now_fn
         self._sleep = sleep_fn
         self._seen: set[str] = set()
@@ -53,8 +55,10 @@ class EdgarWatcher:
         self.polls = 0
 
     def interval(self) -> float:
-        """US 장중·마감 후 창은 active, 그 외 idle."""
-        if is_open("US") or within_after_close("US", self.after_close_hours):
+        """US 거래 세션·마감 후 창은 active, 그 외 idle."""
+        if market_monitoring_active("US", trading_sessions=self.trading_sessions,
+                                   after_close_hours=self.after_close_hours,
+                                   now=self._now()):
             return self.poll_active_sec
         return self.poll_idle_sec
 

@@ -25,7 +25,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
-from src.market_hours import is_open, current_session  # noqa: E402
+from src.market_hours import is_open, current_session, is_tradable  # noqa: E402
 from src.engine.singleton import _pid_alive  # noqa: E402
 from src.agents.value_trade import compute_sleeve  # noqa: E402
 from src import paths as _paths  # noqa: E402
@@ -275,6 +275,300 @@ def zone_status(price, entry_low, entry_high, invalidation=None,
     if px < lo:
         return "below"
     return None
+
+
+_HORIZON_KO = {"day": "데이", "swing": "스윙", "position": "장투"}
+_STRATEGY_MODE_KO = {
+    "volatility_breakout": "돌파",
+    "rsi_reversion": "반등 신호",
+    "breakout_pullback": "풀백 신호",
+    "pullback_reversal": "눌림 반전",
+    "golden_cross": "골든크로스",
+}
+
+
+def _price_dp(market) -> int:
+    return 2 if str(market or "").upper() == "US" else 0
+
+
+def _breakout_target(symbol: str, market: str, params: dict) -> float | None:
+    """변동성 돌파 목표가 — 로컬 일봉 캐시만 읽는다(네트워크 없음)."""
+    try:
+        import pandas as pd
+        from src.datasources.history import CACHE, to_yahoo
+
+        ysym = to_yahoo(str(symbol), str(market or "KR"))
+        files = sorted(CACHE.glob(f"{ysym}_1d_*.csv"))
+        if not files:
+            files = sorted(CACHE.glob(f"{symbol}_1d_*.csv"))
+        if not files:
+            return None
+        df = pd.read_csv(files[-1])
+        df.columns = [str(c).lower() for c in df.columns]
+        if len(df) < 2:
+            return None
+        prev, today = df.iloc[-2], df.iloc[-1]
+        k = float((params or {}).get("k", 0.5))
+        rng = float(prev["high"]) - float(prev["low"])
+        return float(today["open"]) + rng * k
+    except Exception:
+        return None
+
+
+def _condense_armed_thesis(text: str, *, max_len: int = 56) -> tuple[str, str]:
+    """진입근거 요약 — (한 줄, 원문). 도시에 보일러플레이트·중복 존 표현 제거."""
+    import re
+
+    full = str(text or "").strip()
+    if not full:
+        return "–", ""
+    s = full
+    for prefix in ("[CURSOR_FALLBACK]", "[agent]", "[DRY]"):
+        if s.upper().startswith(prefix.upper()):
+            s = s[len(prefix):].strip()
+    s = s.splitlines()[0].strip()
+    s = re.sub(
+        r"신선한\s+bullish\s+도시에\([^)]*\)\s*(?:가\s*)?",
+        "", s, flags=re.IGNORECASE)
+    s = re.sub(r"\(id\s*[=:]?\s*\d+[^)]*\)", "", s, flags=re.IGNORECASE)
+    s = re.sub(r"\bage\s*[\d.]+h\b", "", s, flags=re.IGNORECASE)
+    s = re.sub(r"\brr\s*[\d.]+", "", s, flags=re.IGNORECASE)
+    s = re.sub(r"\bconviction\s*[\d.]+", "", s, flags=re.IGNORECASE)
+    s = re.sub(r"진입존\s*[\d,]+[~\-–]\s*[\d,]+[^.]*\.?\s*", "", s)
+    s = re.sub(r"돌파선\s*[\d,]+", "", s)
+    s = re.sub(r"^[\d,~\-–\s]+을?\s*제시[.]?\s*", "", s)
+    s = re.sub(r"^[,.·\s]+", "", s)
+    for sep in (". ", " — ", " - ", ", "):
+        if sep in s:
+            part = s.split(sep, 1)[0].strip()
+            if len(part) >= 12:
+                s = part + ("." if sep == ". " else "")
+                break
+    s = " ".join(s.split())
+    if len(s) > max_len:
+        s = s[: max_len - 1].rstrip() + "…"
+    return (s or "–"), full
+
+
+def _armed_row(label: str, value: str) -> dict:
+    return {"label": label, "value": value or "–"}
+
+
+def build_armed_plan(position: dict, *, price=None, dossier: dict | None = None) -> dict:
+    """진입대기 1건 요약 — 트랙·진입방식·조건·현재가·갭.
+
+    반환: track, mode, entry_kind, entry_rows, entry_line, current_line, gap_line,
+          status_label, status_cls, rationale, rationale_full, zone(optional).
+    """
+    meta_raw = position.get("meta")
+    meta = _safe_json(meta_raw) if isinstance(meta_raw, str) else (meta_raw or {})
+    if not isinstance(meta, dict):
+        meta = {}
+    if position.get("horizon"):
+        meta["horizon"] = position["horizon"]
+    if position.get("source"):
+        meta["source"] = position["source"]
+    if position.get("entry_zone"):
+        meta["entry_zone"] = position["entry_zone"]
+    if position.get("strategy_params"):
+        meta["params"] = position["strategy_params"]
+    market = str(position.get("market") or "KR")
+    dp = _price_dp(market)
+    horizon = str(meta.get("horizon") or "day")
+    strategy = str(position.get("strategy") or "")
+    source = str(meta.get("source") or "")
+
+    track_bits: list[str] = []
+    if source == "value" or strategy in ("value", "value_trade"):
+        track_bits.append("밸류")
+    track_bits.append(_HORIZON_KO.get(horizon, horizon))
+    track = " · ".join(track_bits)
+
+    try:
+        px = float(price) if price is not None else None
+    except (TypeError, ValueError):
+        px = None
+
+    zone_key = None
+    entry_kind = "signal"
+    mode = "전략 신호"
+    entry_line = "–"
+    entry_rows: list[dict] = []
+    gap_line = ""
+    status_label = "신호 대기"
+    status_cls = "fl-wait"
+
+    zone_meta = meta.get("entry_zone")
+    if isinstance(zone_meta, dict) and zone_meta.get("low") is not None:
+        entry_kind = "zone"
+        lo, hi = zone_meta.get("low"), zone_meta.get("high")
+        inv = zone_meta.get("invalidation")
+        tgt = zone_meta.get("target")
+        mode = "존 진입"
+        entry_line = f"{_fmt(lo, dp)}~{_fmt(hi, dp)}"
+        entry_rows.append(_armed_row("진입", f"{_fmt(lo, dp)} ~ {_fmt(hi, dp)}"))
+        if inv is not None:
+            entry_line += f" · 무효 {_fmt(inv, dp)}"
+            entry_rows.append(_armed_row("무효", _fmt(inv, dp)))
+        if tgt is not None:
+            entry_line += f" · 목표 {_fmt(tgt, dp)}"
+            entry_rows.append(_armed_row("목표", _fmt(tgt, dp)))
+        zone_key = zone_status(px, lo, hi, inv) if px is not None else None
+        if zone_key == "in":
+            status_label, status_cls = "존 안", "fl-ok"
+            gap_line = "체결 조건 충족"
+        elif zone_key == "above":
+            status_label, status_cls = "존 위", "fl-wait"
+            mode = "존 재진입"
+            if px is not None and hi is not None:
+                gap_line = f"+{_fmt((float(px) - float(hi)) / float(hi) * 100, 1)}% 위"
+        elif zone_key == "below":
+            status_label, status_cls = "존 아래", "fl-wait"
+            if px is not None and lo is not None:
+                gap_line = f"진입존까지 {_fmt(float(lo) - float(px), dp)}"
+        elif zone_key == "invalidated":
+            status_label, status_cls = "무효화", "fl-cut"
+    elif strategy == "volatility_breakout":
+        entry_kind = "breakout"
+        mode = "돌파"
+        params = meta.get("params") if isinstance(meta.get("params"), dict) else {}
+        target = _breakout_target(str(position.get("symbol") or ""), market, params)
+        if target is not None:
+            entry_line = f"돌파선 {_fmt(target, dp)}"
+            entry_rows.append(_armed_row("돌파선", _fmt(target, dp)))
+            if px is not None:
+                gap = px - target
+                gap_pct = gap / target * 100 if target else 0
+                gap_line = f"{_fmt(gap, dp)} ({gap_pct:+.1f}%)"
+                if px >= target:
+                    status_label, status_cls = "돌파 충족", "fl-ok"
+                else:
+                    status_label = "돌파 대기"
+        else:
+            entry_line = "돌파선(일봉 캐시 없음)"
+            entry_rows.append(_armed_row("돌파선", "캐시 없음"))
+    else:
+        mode = _STRATEGY_MODE_KO.get(strategy, "전략 신호")
+        dos = dossier if isinstance(dossier, dict) else None
+        if dos and dos.get("entry_low") is not None and dos.get("entry_high") is not None:
+            entry_kind = "zone"
+            lo, hi = dos.get("entry_low"), dos.get("entry_high")
+            inv, tgt = dos.get("invalidation"), dos.get("target")
+            entry_line = f"도시에 존 {_fmt(lo, dp)}~{_fmt(hi, dp)}"
+            entry_rows.append(_armed_row("진입", f"{_fmt(lo, dp)} ~ {_fmt(hi, dp)}"))
+            if inv is not None:
+                entry_rows.append(_armed_row("무효", _fmt(inv, dp)))
+            if tgt is not None:
+                entry_rows.append(_armed_row("목표", _fmt(tgt, dp)))
+            zone_key = zone_status(px, lo, hi, inv) if px else None
+            if zone_key == "in":
+                status_label, status_cls = "존 안", "fl-ok"
+            elif zone_key == "above":
+                status_label, mode = "존 위", "존 재진입"
+            elif zone_key == "below":
+                status_label = "존 아래"
+
+    current_line = _fmt(px, dp) if px is not None else "–"
+    rationale, rationale_full = _condense_armed_thesis(position.get("thesis"))
+    mode_chip = "armed-chip-zone" if entry_kind == "zone" else (
+        "armed-chip-breakout" if entry_kind == "breakout" else "armed-chip-signal")
+    track_chip = "armed-chip-day" if horizon == "day" else (
+        "armed-chip-swing" if horizon == "swing" else (
+            "armed-chip-position" if horizon == "position" else "chip"))
+    if source == "value" or strategy in ("value", "value_trade"):
+        track_chip = "armed-chip-value"
+    return {
+        "track": track,
+        "mode": mode,
+        "entry_kind": entry_kind,
+        "entry_rows": entry_rows,
+        "entry_line": entry_line,
+        "current_line": current_line,
+        "gap_line": gap_line,
+        "status_label": status_label,
+        "status_cls": status_cls,
+        "rationale": rationale,
+        "rationale_full": rationale_full,
+        "thesis_short": rationale,
+        "track_chip": track_chip,
+        "mode_chip": mode_chip,
+        "zone": zone_key,
+    }
+
+
+def _armed_grid_rows(rows: list[dict]) -> str:
+    if not rows:
+        return ""
+    parts = []
+    for row in rows:
+        parts.append(
+            f"<div class='armed-kv'><span class=k>{escape(str(row.get('label') or ''))}</span>"
+            f"<span class='mono v'>{escape(str(row.get('value') or '–'))}</span></div>")
+    return "".join(parts)
+
+
+_TRACK_CHIP_MAP = {"데이": "armed-chip-day", "스윙": "armed-chip-swing",
+                   "장투": "armed-chip-position", "밸류": "armed-chip-value"}
+
+
+def _armed_card_html(x: dict, plan: dict, names: dict) -> str:
+    """진입대기 카드 1장."""
+    track_parts = [p.strip() for p in str(plan.get("track") or "").split("·") if p.strip()]
+    chips = []
+    for tp in track_parts:
+        cls = _TRACK_CHIP_MAP.get(tp, "chip")
+        chips.append(f"<span class='{cls} armed-chip'>{escape(tp)}</span>")
+    mode_cls = escape(str(plan.get("mode_chip") or "chip"))
+    chips.append(f"<span class='{mode_cls} armed-chip'>{escape(str(plan.get('mode') or '–'))}</span>")
+    st_cls = escape(str(plan.get("status_cls") or "fl-wait"))
+    chips.append(f"<span class='{st_cls} armed-chip'>{escape(str(plan.get('status_label') or '–'))}</span>")
+
+    left_rows = list(plan.get("entry_rows") or [])
+    if not left_rows and plan.get("entry_line") and plan.get("entry_line") != "–":
+        left_rows = [_armed_row("조건", str(plan.get("entry_line")))]
+    right_rows = [_armed_row("현재", str(plan.get("current_line") or "–"))]
+    gap = str(plan.get("gap_line") or "").strip()
+    if gap:
+        right_rows.append(_armed_row("갭", gap))
+
+    rat = escape(str(plan.get("rationale") or "–"))
+    rat_full = escape(str(plan.get("rationale_full") or ""))
+    tip = f" title=\"{rat_full}\"" if rat_full and rat_full != rat else ""
+
+    return (
+        f"<div class=armed-card>"
+        f"<div class=armed-hd>"
+        f"<span class=armed-nm>{_pos_name(x, names)}</span>"
+        f"<span class=armed-chips>{''.join(chips)}</span>"
+        f"<span class='armed-ts mono'>{_fmt_ts(x.get('opened_at'))}</span>"
+        f"</div>"
+        f"<div class=armed-body>"
+        f"<div class=armed-col>{_armed_grid_rows(left_rows)}</div>"
+        f"<div class=armed-col>{_armed_grid_rows(right_rows)}</div>"
+        f"</div>"
+        f"<div class=armed-rationale><span class=k>근거</span>"
+        f"<span class=armed-rat{tip}>{rat}</span></div>"
+        f"</div>"
+    )
+
+
+def _armed_panel_html(d: dict) -> str:
+    """진입대기 패널 — 종목별 카드."""
+    names = d.get("names", {})
+    px = d.get("pos_px") or {}
+    dos_by_sym = {str(x.get("symbol") or ""): x for x in (d.get("dossiers") or [])}
+    armed = [x for x in (d.get("positions") or []) if x.get("state") == "armed"]
+    p = ["<div class=sec>진입대기</div><div class=panel>"]
+    if not armed:
+        p.append("<span class=muted>대기 없음.</span></div>")
+        return "".join(p)
+    p.append("<div class=armed-list>")
+    for x in armed:
+        sym = str(x.get("symbol") or "")
+        plan = build_armed_plan(x, price=px.get(sym), dossier=dos_by_sym.get(sym))
+        p.append(_armed_card_html(x, plan, names))
+    p.append("</div></div>")
+    return "".join(p)
 
 
 def _after_dossier(ts, dossier: dict) -> bool:
@@ -1106,8 +1400,14 @@ def _latest_prices(cur, symbols: list[str]) -> dict:
 def _gather() -> dict:
     now = time.time()
     cut = now - WINDOW_SEC
+    tsess = _load_trading_sessions()
+    kr_tradable = is_tradable("KR", tsess.get("KR"))
+    us_tradable = is_tradable("US", tsess.get("US"))
     data: dict = {"now": now, "kr_session": current_session("KR"),
-                  "us_session": current_session("US")}
+                  "us_session": current_session("US"),
+                  "kr_tradable": kr_tradable, "us_tradable": us_tradable,
+                  "expects_polling": kr_tradable or us_tradable,
+                  "trading_sessions": tsess}
     hb = _read_heartbeat()
     data["hb"] = hb
     data["hb_age"] = (now - hb["ts"]) if hb else None
@@ -1604,6 +1904,30 @@ table.trades td.num{font-variant-numeric:tabular-nums;font-family:ui-monospace,C
   box-shadow:0 8px 24px rgba(0,0,0,.45);white-space:pre-wrap;word-break:keep-all;
 }
 .tr-thesis:hover .tr-tip{display:block;}
+/* 진입대기 카드 */
+.armed-list{display:flex;flex-direction:column;gap:10px;}
+.armed-card{background:#0b1220;border:1px solid #243349;border-radius:10px;padding:12px 14px;}
+.armed-hd{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:10px;}
+.armed-nm{font-weight:700;font-size:14px;color:#e6e9ef;flex:0 0 auto;}
+.armed-chips{display:flex;flex-wrap:wrap;gap:6px;flex:1 1 auto;align-items:center;}
+.armed-chip{white-space:nowrap;}
+.armed-chip-day{padding:1px 8px;border-radius:20px;font-size:11px;font-weight:600;background:#1a2740;color:#5aa9ff;}
+.armed-chip-swing{padding:1px 8px;border-radius:20px;font-size:11px;font-weight:600;background:#2a2240;color:#c9a3ff;}
+.armed-chip-position{padding:1px 8px;border-radius:20px;font-size:11px;font-weight:600;background:#1c2a33;color:#7fd1ff;}
+.armed-chip-value{padding:1px 8px;border-radius:20px;font-size:11px;font-weight:600;background:#12341f;color:#7bd88f;}
+.armed-chip-zone{padding:1px 8px;border-radius:20px;font-size:11px;font-weight:600;background:#12341f;color:#3ddc84;}
+.armed-chip-breakout{padding:1px 8px;border-radius:20px;font-size:11px;font-weight:600;background:#332a10;color:#ffcf6b;}
+.armed-chip-signal{padding:1px 8px;border-radius:20px;font-size:11px;font-weight:600;background:#232a36;color:#9aa4b2;}
+.armed-ts{margin-left:auto;font-size:11px;color:#8b94a3;white-space:nowrap;}
+.armed-body{display:grid;grid-template-columns:1fr 1fr;gap:10px 18px;}
+@media(max-width:640px){.armed-body{grid-template-columns:1fr;}}
+.armed-col{display:flex;flex-direction:column;gap:4px;}
+.armed-kv{display:flex;justify-content:space-between;gap:10px;font-size:12px;line-height:1.5;}
+.armed-kv .k{color:#8b94a3;flex:0 0 auto;}
+.armed-kv .v{color:#cdd4e0;text-align:right;}
+.armed-rationale{margin-top:10px;padding-top:8px;border-top:1px solid #1c2433;display:flex;gap:10px;font-size:11px;line-height:1.45;}
+.armed-rationale .k{color:#8b94a3;flex:0 0 auto;}
+.armed-rat{color:#9aa4b2;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;cursor:default;}
 .pos{color:#3ddc84;} .neg{color:#ff5c63;}
 .muted{color:#6b7280;}
 .foot{margin-top:26px;color:#5a6373;font-size:11px;text-align:center;}
@@ -1732,7 +2056,20 @@ table.trades td.num{font-variant-numeric:tabular-nums;font-family:ui-monospace,C
 """
 
 
-def _status_dot(age, market_open, *, hb: dict | None = None) -> str:
+def _load_trading_sessions() -> dict[str, tuple[str, ...]]:
+    """config trading_sessions — session_policy SSOT."""
+    try:
+        import yaml
+        from src.session_policy import trading_sessions_from_raw
+        raw = yaml.safe_load(CONFIG.read_text(encoding="utf-8")) or {}
+        return trading_sessions_from_raw(raw)
+    except Exception:
+        from src.session_policy import DEFAULT_TRADING_SESSIONS
+        return dict(DEFAULT_TRADING_SESSIONS)
+
+
+def _status_dot(age, market_open, *, hb: dict | None = None,
+                expects_polling: bool = False) -> str:
     """하트비트 점. age 뿐 아니라 장중 polled/ok 도 본다(가짜 초록 방지)."""
     if age is None or age > 300:
         return '<span class="dot bad"></span>'
@@ -1741,6 +2078,9 @@ def _status_dot(age, market_open, *, hb: dict | None = None) -> str:
     polled = hb.get("polled")
     ok = hb.get("ok")
     poll_bad = (ok is False) or (bool(mkts) and polled is not None and int(polled) <= 0)
+    # 세션 배지는 열려도 루프가 안 돌면(데이마켓·캐시 불일치 등) 빨간 점.
+    if expects_polling and not mkts and age <= 120:
+        poll_bad = True
     if poll_bad:
         return '<span class="dot bad"></span>'
     if age > 90 and market_open:
@@ -1865,11 +2205,17 @@ _SESSION_LABEL = {"premarket": "프리마켓", "regular": "정규장", "aftermar
                   "daymarket": "데이마켓", "closed": "휴장"}
 
 
-def _session_badge(sess: str) -> str:
-    """세션 배지: 운영중이면 강조(초록 b-bull), 휴장이면 흐리게(회색 b-neut)."""
+def _session_badge(sess: str, *, tradable: bool | None = None) -> str:
+    """세션 배지: 거래 허용 세션이면 초록, 비거래 세션(데이마켓 등)은 주황, 휴장은 회색."""
     s = str(sess or "closed").lower()
     lab = _SESSION_LABEL.get(s, s or "?")
-    cls = "b-neut" if s == "closed" else "b-bull"
+    if s == "closed":
+        cls = "b-neut"
+    elif tradable is False:
+        cls = "b-warn"
+        lab = f"{lab}(미거래)"
+    else:
+        cls = "b-bull"
     return f"<span class={cls}>{escape(lab)}</span>"
 
 
@@ -2528,13 +2874,17 @@ def _today_html(d: dict) -> str:
     now = d["now"]
     ksess = d.get("kr_session", "closed")
     ussess = d.get("us_session", "closed")
-    market_open = (ksess != "closed") or (ussess != "closed")
+    kr_tradable = bool(d.get("kr_tradable"))
+    us_tradable = bool(d.get("us_tradable"))
+    expects_polling = bool(d.get("expects_polling"))
+    market_open = kr_tradable or us_tradable
     age = d["hb_age"]; hb = d["hb"] or {}
-    names = d.get("names", {})
     mkts = list(hb.get("markets_open") or [])
     polled = hb.get("polled")
     poll_bad = (hb.get("ok") is False) or (
         bool(mkts) and polled is not None and int(polled) <= 0)
+    if expects_polling and not mkts and age is not None and age <= 120:
+        poll_bad = True
     if age is None or age > 300:
         daemon_txt = "응답없음"
     elif poll_bad:
@@ -2542,13 +2892,15 @@ def _today_html(d: dict) -> str:
     else:
         daemon_txt = "정상"
     lbd = d.get("last_brain_done")
+    names = d.get("names", {})
     p = ['<div class="tabpage page-today">', "<div class=grid>"]
-    p.append(f"<div class=card><div class=k>데몬</div><div class=v>{_status_dot(age, market_open, hb=hb)}{daemon_txt} "
+    p.append(f"<div class=card><div class=k>데몬</div><div class=v>{_status_dot(age, market_open, hb=hb, expects_polling=expects_polling)}{daemon_txt} "
              f"<small>{'%.0fs'%age if age is not None else '–'}"
              f"{'' if polled is None else f' · polled={polled}'}</small></div></div>")
     p.append("<div class=card><div class=k>장</div>"
              f"<div class=v style='font-size:14px;line-height:1.9'>"
-             f"국내 {_session_badge(ksess)}<br>해외 {_session_badge(ussess)}</div></div>")
+             f"국내 {_session_badge(ksess, tradable=kr_tradable)}<br>"
+             f"해외 {_session_badge(ussess, tradable=us_tradable)}</div></div>")
     p.append(f"<div class=card><div class=k>틱</div><div class='v mono'>{hb.get('ticks','–')}</div></div>")
     p.append(f"<div class=card><div class=k>마지막 완주</div><div class='v mono'>{_hms(lbd) if lbd else '–'}</div></div>")
     p.append(_brain_health_card(d))
@@ -2556,6 +2908,9 @@ def _today_html(d: dict) -> str:
 
     # 시장 심리(공포·탐욕) — 데이터 없으면 통째로 생략
     p.append(_fear_html(d))
+
+    # 진입대기 — 브레인 판단보다 위(무엇을 기다리는지 먼저 보이게)
+    p.append(_armed_panel_html(d))
 
     # 마지막 브레인 판단
     lc = d.get("last_cycle")
@@ -2584,30 +2939,6 @@ def _today_html(d: dict) -> str:
                      f"<td class=mono>{conv_s}</td>"
                      f"<td><span class={vcls}>{escape(vd or '–')}</span></td></tr>")
         p.append("</table>")
-    p.append("</div>")
-
-    # ※ 보유 포지션 표는 여기 있었으나 상단 '보유 종목(실계좌 + 봇 운용계획)' 으로 합쳤다 —
-    #   같은 보유를 두 번 보여주면서 전략·손절·목표만 아래에 있던 구조였다. 진입대기는
-    #   보유가 아니라 '아직 안 산 것'이라 성격이 달라 여기 남긴다.
-    pos = d.get("positions", [])
-    px = d.get("pos_px", {})
-    armed = [x for x in pos if x.get("state") == "armed"]
-
-    # 진입대기(armed)
-    p.append("<div class=sec>진입대기</div><div class=panel>")
-    if armed:
-        p.append("<table><tr><th>종목명</th><th>시장</th><th>전략</th><th>등록시각</th><th>도시에</th></tr>")
-        for x in armed:
-            meta = _safe_json(x.get("meta"))
-            has_dos = "✓" if meta.get("dossier_id") else "–"
-            dcls = "pos" if meta.get("dossier_id") else "muted"
-            p.append(f"<tr><td>{_pos_name(x, names)}</td><td>{escape(str(x.get('market') or '–'))}</td>"
-                     f"<td>{escape(str(x.get('strategy') or '–'))}</td>"
-                     f"<td class=mono>{_fmt_ts(x.get('opened_at'))}</td>"
-                     f"<td class='{dcls}'>{has_dos}</td></tr>")
-        p.append("</table>")
-    else:
-        p.append("<span class=muted>대기 없음.</span>")
     p.append("</div>")
 
     # 오늘 공시

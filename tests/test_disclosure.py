@@ -108,12 +108,11 @@ def test_armed_symbol_also_wakes(tmp_path):
 def test_interval_adaptive(tmp_path, monkeypatch):
     store = Store(tmp_path / "t.db")
     w = _watcher(store, [])
-    monkeypatch.setattr(dmod, "is_open", lambda m, now=None: True)
+    monkeypatch.setattr(dmod, "market_monitoring_active",
+                        lambda market, **kw: True)
     assert w.interval() == 10.0
-    monkeypatch.setattr(dmod, "is_open", lambda m, now=None: False)
-    monkeypatch.setattr(dmod, "within_after_close", lambda m, h, now=None: True)
-    assert w.interval() == 10.0                               # 마감 후 러시도 10초
-    monkeypatch.setattr(dmod, "within_after_close", lambda m, h, now=None: False)
+    monkeypatch.setattr(dmod, "market_monitoring_active",
+                        lambda market, **kw: False)
     assert w.interval() == 60.0
 
 
