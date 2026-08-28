@@ -31,6 +31,8 @@ from src.config import load_config, ROOT
 from src import paths as _paths
 from src.day_pool import (day_pool_cfg, load_day_pool, merge_swing_and_day,
                           refresh_all_day_pools)
+from src.gap_decline_pool import (gap_decline_pool_cfg, load_gap_decline_pool,
+                                  merge_all_pools, refresh_all_gap_decline_pools)
 from src.logging_setup import setup_logging, get_logger
 from src.engine.singleton import SingleInstance, AlreadyRunning
 from src.engine.store import Store
@@ -103,6 +105,28 @@ def _refresh_day_pool(gateway, cfg) -> None:
     refresh_all_day_pools(fetch, cfg)
 
 
+def _refresh_gap_decline_pool(cfg) -> None:
+    """15:15 등 — Naver 거래대금→하락률 정렬 gap_decline_pool 갱신."""
+    if not gap_decline_pool_cfg(cfg).get("enabled", True):
+        return
+    from src.datasources.discovery import top_by_trading_value
+
+    def fetch_top(market, count=100, pool=100, **_kw):
+        return top_by_trading_value(market, count=count, pool=pool)
+
+    refresh_all_gap_decline_pools(fetch_top, cfg)
+
+
+def _on_pool_refresh(market: str, hhmm: str, reason: str, *, cfg, gateway) -> None:
+    if reason == "gap_pool_refresh" and market == "KR":
+        _refresh_gap_decline_pool(cfg)
+        # NXT split 정확도 — 유니버스 심볼 stock_info 캐시는 별도 배치.
+        try:
+            _refresh_day_pool(gateway, cfg)
+        except Exception as e:
+            log.warning("gap_pool_refresh 중 day_pool 동반 실패(무시): %s", e)
+
+
 def _build_brain(cfg, gateway, store, args, broker, risk, universe_fn=None,
                  open_markets_fn=None, illiquid_fn=None) -> BrainWorker | None:
     """act 트리거 시 LLM 사이클을 비동기로 돌릴 BrainWorker 구성. --no-brain 이면 None.
@@ -156,6 +180,12 @@ def _build_brain(cfg, gateway, store, args, broker, risk, universe_fn=None,
             _refresh_day_pool(gateway, cfg)
         except Exception as e:
             log.warning("day_pool 리프레시 실패(기존 유지): %s", e)
+        wake_reason = str((wake or {}).get("reason") or "")
+        if wake_reason in ("gap_rebound_scan", "nxt_gap_scan"):
+            try:
+                _refresh_gap_decline_pool(cfg)
+            except Exception as e:
+                log.warning("gap_decline_pool 리프레시 실패(기존 유지): %s", e)
         return runner.run(wake=wake)
 
     cooldown = float(wcfg.get("brain_cooldown_sec", 300))
@@ -692,7 +722,11 @@ def main() -> int:
     # loop 는 brain 을 on_wake 로 받아야 해서 아래에서 만들어진다 → 지연 참조 홀더로 연결.
     loop_ref: list = []
     def combined_universe():
-        return merge_swing_and_day(provider.markets(), load_day_pool())
+        return merge_all_pools(
+            provider.markets(), load_day_pool(), load_gap_decline_pool())
+
+    def pool_refresh_cb(market, hhmm, reason):
+        _on_pool_refresh(market, hhmm, reason, cfg=cfg, gateway=gateway)
 
     brain = _build_brain(cfg, gateway, store, args, broker, risk,
                          universe_fn=combined_universe,
@@ -710,6 +744,7 @@ def main() -> int:
                      lambda: build_watchlist(cfg, store, universe=combined_universe()),
                      markets=markets, config=watch_config,
                      on_wake=(brain.wake if brain else None), executor=executor,
+                     on_pool_refresh=pool_refresh_cb,
                      strategy_runner=strategy_runner, entry_executor=entry_executor,
                      on_prices=broker.set_marks,   # 미실현 손익을 게이트가 보게(락 안)
                      heartbeat_path=heartbeat)

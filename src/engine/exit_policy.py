@@ -100,7 +100,7 @@ def time_stop_trigger(pos: dict, *, cfg: ExitPolicyConfig,
     if strat and strat in cfg.exclude_strategies:
         return None
     hz = horizon_of(pos)
-    if not hz or hz == "day":
+    if not hz or hz in ("day", "close_scan"):
         return None
     max_d = cfg.max_days.get(hz, 0)
     if max_d <= 0:
@@ -112,6 +112,38 @@ def time_stop_trigger(pos: dict, *, cfg: ExitPolicyConfig,
         "time_stop", sym, "act",
         f"시간손절 보유 {held:.1f}일 >= {max_d}일 ({hz})",
         {"days_held": round(held, 2), "max_days": max_d, "horizon": hz},
+    )
+
+
+def close_scan_exit_trigger(pos: dict, *, market: str = "KR", now: float,
+                            sessions: tuple[str, ...] | None = None) -> T.Trigger | None:
+    """close_scan(갭반등) 익일 세션 개시 후 청산."""
+    if horizon_of(pos) != "close_scan":
+        return None
+    sym = pos.get("symbol")
+    if not sym or float(pos.get("qty") or 0) <= 0:
+        return None
+    opened = pos.get("opened_at")
+    if opened is None:
+        return None
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    from ..market_hours import market_day, is_tradable, current_session
+
+    kst = ZoneInfo("Asia/Seoul")
+    now_dt = datetime.fromtimestamp(float(now), tz=kst)
+    opened_dt = datetime.fromtimestamp(float(opened), tz=kst)
+    if market_day(market, now_dt) <= market_day(market, opened_dt):
+        return None
+    if not is_tradable(market, sessions, now_dt):
+        return None
+    sess = current_session(market, now_dt, sessions)
+    if sess not in ("premarket", "regular"):
+        return None
+    return T.Trigger(
+        "close_scan_exit", sym, "act",
+        "close_scan 익일 청산(갭반등 1박)",
+        {"horizon": "close_scan", "session": sess},
     )
 
 

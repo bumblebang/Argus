@@ -17,7 +17,7 @@ class Proposal(BaseModel):
     market: Literal["KR", "US"]
     side: Literal["BUY", "SELL", "HOLD"]
     conviction: float = Field(ge=0.0, le=1.0, description="확신도 0~1")
-    horizon: Literal["day", "swing", "position"] = "swing"
+    horizon: Literal["day", "swing", "position", "close_scan"] = "swing"
     target_weight: float = Field(
         ge=0.0, le=1.0,
         description="스키마 호환용(사이징 미사용 — 코드가 base_position_pct 로 정함)")
@@ -62,7 +62,7 @@ class DossierOutput(BaseModel):
     """
     stance: Literal["bullish", "neutral", "bearish"]
     thesis: str = Field(description="핵심 결론 2~4문장(왜 사/관망/피하나)")
-    horizon: Literal["day", "swing", "position"] = "swing"
+    horizon: Literal["day", "swing", "position", "close_scan"] = "swing"
     entry_low: float | None = Field(default=None, description="진입 존 하단")
     entry_high: float | None = Field(default=None, description="진입 존 상단")
     invalidation: float | None = Field(default=None,

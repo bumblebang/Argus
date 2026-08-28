@@ -228,7 +228,9 @@ def test_extra_0800_fires_even_if_athena_just_woke(tmp_path, monkeypatch):
     cfg = WatchConfig(brain_interval_sec=3600,
                       trading_sessions={"KR": ("regular", "premarket")},
                       brain_sessions={"KR": ("premarket", "regular")},
-                      extra_wakes={"KR": ("08:00",)})
+                      extra_wakes={"KR": ("08:00",)},
+                      extra_wake_state_path=str(tmp_path / "ew.json"),
+                      extra_wake_grace_sec=0)
     now = [_kst_epoch(2026, 7, 22, 8, 0)]
     woke = []
     loop = WatchLoop(gw, store, _wl_kr("005930"), markets=("KR",), config=cfg,
@@ -271,16 +273,20 @@ def test_watch_config_reads_new_blocks():
 
 
 def test_example_config_yaml_brain_budget_schedule():
-    """공개 example: KR 프리+정규 1h, US regular(방향4-B), 08:00/15:30 extra."""
+    """공개 example: extra 벽시계 스케줄, brain_interval=0, US premarket."""
     import yaml
     from pathlib import Path
     raw = yaml.safe_load(
         (Path(__file__).resolve().parents[1] / "config.example.yaml").read_text(encoding="utf-8"))
     cfg = WatchConfig.from_config(raw)
-    assert cfg.brain_sessions["KR"] == ("premarket", "regular")
-    assert cfg.brain_sessions["US"] == ("regular",)
-    assert cfg.brain_interval_sec == 3600
-    assert cfg.extra_wakes.get("KR") == ("08:00", "15:30")
+    assert cfg.brain_sessions["KR"] == ("premarket", "regular", "aftermarket")
+    assert cfg.brain_sessions["US"] == ("premarket", "regular")
+    assert cfg.brain_interval_sec == 0
+    assert cfg.extra_wakes.get("KR") == (
+        "08:00", "09:00", "11:00", "13:00", "15:15", "15:20", "19:50")
+    assert cfg.extra_wakes.get("US") == ("17:00", "22:30", "00:30", "02:30", "04:30")
+    assert cfg.extra_wake_grace_sec == 120
+    assert cfg.extra_wake_window_min == 5
     assert "brain_wake_request" in (cfg.wake_request_path or "")
     assert cfg.stale_quote_sec == 600
     assert set(cfg.trading_sessions["KR"]) >= {"regular", "premarket", "aftermarket"}

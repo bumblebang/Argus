@@ -60,6 +60,36 @@ def test_gap_is_json_serializable():
     assert '"gap_pct": 3.0' in json.dumps(feat, ensure_ascii=False)
 
 
+def test_intraday_ret_down_five_percent():
+    """당일 시가 100 → 종가 95 → intraday -5%."""
+    feat = _assemble_one([(100.0, 100.0)] * 30 + [(100.0, 95.0)])
+    assert feat["intraday_ret_pct"] == -5.0
+    assert feat["intraday_open"] == 100.0
+
+
+def test_filter_gap_rebound_keeps_held():
+    from src.agents.features import filter_gap_rebound_candidates
+    cands = [
+        {"symbol": "A", "intraday_ret_pct": -2.0},
+        {"symbol": "B", "intraday_ret_pct": -6.0},
+        {"symbol": "C", "intraday_ret_pct": -7.0},
+    ]
+    out = filter_gap_rebound_candidates(cands, held=["A"])
+    syms = {c["symbol"] for c in out}
+    assert syms == {"A", "B", "C"}
+
+
+def test_filter_gap_rebound_fluctuation_fallback():
+    """캔들 실패로 intraday 없을 때 풀 fluctuation 으로 -5% 컷."""
+    from src.agents.features import filter_gap_rebound_candidates
+    cands = [
+        {"symbol": "A", "fluctuation": -6.0},
+        {"symbol": "B", "fluctuation": -3.0},
+    ]
+    out = filter_gap_rebound_candidates(cands)
+    assert [c["symbol"] for c in out] == ["A"]
+
+
 # ── Athena 쪽 재사용 ───────────────────────────────────────────────
 def _df(n=120, base=100.0):
     rng = np.random.default_rng(3)
@@ -95,6 +125,9 @@ def test_decision_prompt_has_overnight_us_background():
 
     assert "미장 → 한국장 배경" in DEC
     assert "gap_pct" in DEC and "prev_close" in DEC
+    assert "intraday_ret_pct" in DEC
+    assert "gap_rebound_scan" in DEC
+    assert "horizon=close_scan" in DEC
     assert "SP500" in DEC and "USDKRW" in DEC
     assert "기계적으로 '미장이 올랐으니 BUY' 로 가지 마라" in DEC
 

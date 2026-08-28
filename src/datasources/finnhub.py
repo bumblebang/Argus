@@ -64,8 +64,7 @@ def fetch_company_news(api_key: str, symbol: str, per: int = 3, days: int = 5,
         r.raise_for_status()
         data = r.json()
     except Exception as e:
-        from ..http_sanitize import redact_secrets
-        log.warning("[%s] 종목뉴스 조회 실패: %s", symbol, redact_secrets(str(e)))
+        log.warning("[%s] 종목뉴스 조회 실패: %s", symbol, e)
         return []
     if not isinstance(data, list):
         return []
@@ -122,8 +121,7 @@ class FinnhubNewsSource(DataSource):
             for d in self._get("/news", {"category": "general"})[:self.max_general]:
                 items.append(self._item(d))
         except Exception as e:
-            from ..http_sanitize import redact_secrets
-            log.warning("일반 뉴스 실패: %s", redact_secrets(str(e)))
+            log.warning("일반 뉴스 실패: %s", e)
 
         frm = (date.today() - timedelta(days=self.days)).isoformat()
         to = date.today().isoformat()
@@ -132,8 +130,7 @@ class FinnhubNewsSource(DataSource):
                 for d in self._get("/company-news", {"symbol": sym, "from": frm, "to": to})[:self.per_symbol]:
                     items.append(self._item(d, sym))
             except Exception as e:
-                from ..http_sanitize import redact_secrets
-                log.warning("[%s] 종목뉴스 실패: %s", sym, redact_secrets(str(e)))
+                log.warning("[%s] 종목뉴스 실패: %s", sym, e)
             if self.spacing and i < len(self.symbols) - 1:
                 time.sleep(self.spacing)
         log.info("Finnhub 뉴스 %d건", len(items))

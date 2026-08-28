@@ -9,6 +9,7 @@
        circuit_open  -> 뇌 회로차단(브릿지 미준비/실패)
        auth_needed   -> 인증 만료(재로그인 필요)
   B2. bridge 모드 + bridge.heartbeat 미무장     -> circuit 위험(조기 경보)
+  B3. 장 상태 교차검증(정규장) — 토스 캐시 vs US Finnhub/Yahoo, KR 정규장 달력
   C. (레거시 폴백) DB 최근 인증 에러 — mode 파일 없을 때
 
 푸시/대시보드 '다음:' 액션은 src.ops_playbook.
@@ -46,7 +47,7 @@ for _s in (sys.stdout, sys.stderr):
 
 from src.agents.llm import is_bridge_armed  # noqa: E402
 from src.engine import brain_mode as bm  # noqa: E402
-from src.market_hours import is_tradable  # noqa: E402
+from src.market_status_crosscheck import crosscheck_reasons  # noqa: E402
 from src.session_policy import any_market_tradable, trading_sessions_from_raw  # noqa: E402
 from src.ops_playbook import actions_for, format_push_body  # noqa: E402
 from src import paths as _paths  # noqa: E402
@@ -246,7 +247,9 @@ def _push_title_for(reasons: list[str], mode: str) -> str:
         return "Argus brain circuit"
     if mode == "auth_needed" or any("인증" in r for r in reasons):
         return "Argus auth"
-    if any("하트비트" in r for r in reasons) or any("폴링 실패" in r for r in reasons):
+    if (any("하트비트" in r for r in reasons)
+            or any("폴링 실패" in r for r in reasons)
+            or any("장 상태 불일치" in r or "세션 캐시" in r for r in reasons)):
         return "Argus daemon"
     return "Argus alert"
 
@@ -361,6 +364,7 @@ def main() -> int:
         hb_should_be_open=list(hb.get("should_be_open") or []) if hb else None,
         expects_polling=expects_polling if not hb.get("should_be_open") else False,
     )
+    reasons.extend(crosscheck_reasons(now))
     next_actions = actions_for(reasons, brain_mode=mode)
     budget_line = format_budget_push_line(gauge)
 

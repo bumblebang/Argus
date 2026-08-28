@@ -17,6 +17,7 @@ from .schemas import DecisionOutput, ValidationOutput
 from .conviction import (
     apply_buy_conviction, size_weight, min_lot_adjust, skip_position_headroom,
 )
+from .features import GAP_SCAN_REASONS
 from ..logging_setup import get_logger
 from ..risk_gate import Order
 from .. import paths as _paths
@@ -53,6 +54,33 @@ class CycleResult:
     manager: dict | None = None     # model/prompt_hash 매니저 정체성
 
 
+def _close_scan_candidate(symbol: str, features_by_sym: dict | None) -> bool:
+    """gap_decline 풀·gap_rebound 소스 — close_scan 트랙 후보."""
+    f = (features_by_sym or {}).get(symbol) or {}
+    return (f.get("pool") == "gap_decline" or f.get("source") == "gap_rebound")
+
+
+def _apply_close_scan_horizon(p, *, wake_reason: str,
+                              features_by_sym: dict | None) -> str | None:
+    """갭반등 close_scan 트랙 BUY 의 horizon 정규화. 거부 시 status 문자열."""
+    if p.side != "BUY":
+        return None
+    gap_wake = wake_reason in GAP_SCAN_REASONS
+    gap_pool = _close_scan_candidate(p.symbol, features_by_sym)
+    if not gap_wake and not gap_pool:
+        return None
+    hz = (p.horizon or "swing").lower()
+    if hz == "day":
+        return "wrong_horizon"
+    if hz == "close_scan":
+        return None
+    if gap_wake:
+        log.warning("[close_scan 교정] %s: horizon %s → close_scan", p.symbol, hz)
+        p.horizon = "close_scan"
+        return None
+    return "wrong_horizon"
+
+
 def run_cycle(*, context_json: str, decision_agent, validation_agent, broker, risk,
               price_lookup: dict[str, float],
               journal_path: str | Path = "data/decisions.jsonl",
@@ -67,7 +95,8 @@ def run_cycle(*, context_json: str, decision_agent, validation_agent, broker, ri
               store=None,
               allow_add: bool = False,
               tranche_weights: dict[str, float] | None = None,
-              budget_caps: dict[str, float] | None = None) -> CycleResult:
+              budget_caps: dict[str, float] | None = None,
+              wake_reason: str = "") -> CycleResult:
     """결정→검증→집행. 데이트레(horizon='day') BUY 는 즉시 체결 대신 arm_fn 으로 라우팅.
 
     arm_fn(proposal, price)->bool 이 주어지면 day BUY 는 진입대기(armed)로 등록하고
@@ -151,6 +180,14 @@ def run_cycle(*, context_json: str, decision_agent, validation_agent, broker, ri
                                  "reason": "가격 미확보"})
                 continue
 
+            hz_err = _apply_close_scan_horizon(
+                p, wake_reason=str(wake_reason or ""),
+                features_by_sym=features_by_sym)
+            if hz_err:
+                executed.append({"symbol": p.symbol, "action": p.side, "status": hz_err,
+                                 "reason": "갭반등은 horizon=close_scan 전용(day/swing 금지)"})
+                continue
+
             # 데이트레 BUY: 코드 자율 진입(armed). 뇌는 종목/전략/파라미터만 배정.
             if p.side == "BUY" and arm_fn and (p.horizon or "").lower() == "day":
                 armed = bool(arm_fn(p, price))
@@ -160,16 +197,17 @@ def run_cycle(*, context_json: str, decision_agent, validation_agent, broker, ri
                 continue
 
             # 도시에 우선 원칙: 스윙/장투 신규매수는 신선 bullish 도시에 필수(코드 하드가드).
+            # close_scan(갭반등)·day 는 별도 트랙 — dossier 면제.
+            _hz = (p.horizon or "swing").lower()
             if (p.side == "BUY" and dossier_fn
-                    and (p.horizon or "swing").lower() != "day" and not dossier_fn(p.symbol)):
+                    and _hz not in ("day", "close_scan") and not dossier_fn(p.symbol)):
                 executed.append({"symbol": p.symbol, "action": "BUY", "status": "no_dossier",
                                  "reason": "신선한 bullish 도시에 없음 — 스윙/장투 신규매수 차단"})
                 continue
 
-            # 갭 진입 가드(스윙/장투 BUY): 진입은 오직 진입존 안에서만. 갭상승/존이탈은 시장가
-            # 추격 대신 존 재진입 대기(arm)로 라우팅하고, thesis 깨진 자리(무효화가 하회)는 거부.
+            # 갭 진입 가드(스윙/장투 BUY): close_scan·day 제외
             levels = (zone_fn(p.symbol) if (zone_fn and p.side == "BUY"
-                                            and (p.horizon or "swing").lower() != "day") else None)
+                                            and _hz not in ("day", "close_scan")) else None)
             if levels:
                 lo, hi = levels["entry_low"], levels["entry_high"]
                 inval = levels["invalidation"]
