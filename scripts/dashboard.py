@@ -833,9 +833,14 @@ def _trade_stats(paper: dict | None, fx: float | None = None) -> dict | None:
     wins = sum(1 for t in closed if t["net"] > 0)
     rbm = paper.get("realized_pnl", {}); sc = paper.get("start_cash", {})
     realized_krw = seed_krw = ret_total = None
-    if fx:
-        realized_krw = sum(v * (fx if m == "US" else 1) for m, v in rbm.items())
-        seed_krw = sum(v * (fx if m == "US" else 1) for m, v in sc.items())
+    has_us = any(m == "US" for m in rbm) or any(m == "US" for m in sc)
+    fx_ok = fx is not None and float(fx) > 0
+    if has_us and not fx_ok:
+        pass
+    elif fx_ok or not has_us:
+        fx_v = float(fx) if fx_ok else 1.0
+        realized_krw = sum(v * (fx_v if m == "US" else 1) for m, v in rbm.items())
+        seed_krw = sum(v * (fx_v if m == "US" else 1) for m, v in sc.items())
         ret_total = (realized_krw / seed_krw * 100) if seed_krw else None
     return {
         "closed": closed, "n": n, "wins": wins, "losses": n - wins, "entries": entries,
@@ -897,11 +902,16 @@ def _store_trade_stats(closed_pos: list[dict] | None, *,
                  if x.get("state") == "open" and float(x.get("qty") or 0) > 0)
     sc = (paper or {}).get("start_cash") or {}
     realized_krw = seed_krw = ret_total = None
-    fx_v = float(fx) if fx else 1.0
-    realized_krw = sum(v * (fx_v if m == "US" else 1.0) for m, v in realized_by_m.items())
-    if sc:
-        seed_krw = sum(float(v or 0) * (fx_v if m == "US" else 1.0) for m, v in sc.items())
-        ret_total = (realized_krw / seed_krw * 100) if seed_krw else None
+    has_us = any(m == "US" for m in realized_by_m) or any(m == "US" for m in sc)
+    fx_ok = fx is not None and float(fx) > 0
+    if has_us and not fx_ok:
+        pass  # portfolio_books 와 동일 — US+FX 없으면 합산/수익률 거부
+    else:
+        fx_v = float(fx) if fx_ok else 1.0
+        realized_krw = sum(v * (fx_v if m == "US" else 1.0) for m, v in realized_by_m.items())
+        if sc:
+            seed_krw = sum(float(v or 0) * (fx_v if m == "US" else 1.0) for m, v in sc.items())
+            ret_total = (realized_krw / seed_krw * 100) if seed_krw else None
     return {
         "closed": closed_rows, "n": n, "wins": wins, "losses": n - wins,
         "entries": n + open_n,
@@ -2074,12 +2084,16 @@ def _status_dot(age, market_open, *, hb: dict | None = None,
     if age is None or age > 300:
         return '<span class="dot bad"></span>'
     hb = hb or {}
+    should = hb.get("should_be_open")
+    should_poll = bool(should) if should is not None else expects_polling
     mkts = list(hb.get("markets_open") or [])
     polled = hb.get("polled")
     ok = hb.get("ok")
     poll_bad = (ok is False) or (bool(mkts) and polled is not None and int(polled) <= 0)
-    # 세션 배지는 열려도 루프가 안 돌면(데이마켓·캐시 불일치 등) 빨간 점.
-    if expects_polling and not mkts and age <= 120:
+    # should_be_open(하트비트 SSOT) 또는 구 hb 폴백(expects_polling).
+    if should_poll and not mkts and age <= 120:
+        poll_bad = True
+    if should_poll and polled is not None and int(polled) <= 0 and age <= 120:
         poll_bad = True
     if poll_bad:
         return '<span class="dot bad"></span>'
@@ -2879,11 +2893,15 @@ def _today_html(d: dict) -> str:
     expects_polling = bool(d.get("expects_polling"))
     market_open = kr_tradable or us_tradable
     age = d["hb_age"]; hb = d["hb"] or {}
+    should = hb.get("should_be_open")
+    should_poll = bool(should) if should is not None else expects_polling
     mkts = list(hb.get("markets_open") or [])
     polled = hb.get("polled")
     poll_bad = (hb.get("ok") is False) or (
         bool(mkts) and polled is not None and int(polled) <= 0)
-    if expects_polling and not mkts and age is not None and age <= 120:
+    if should_poll and not mkts and age is not None and age <= 120:
+        poll_bad = True
+    if should_poll and polled is not None and int(polled) <= 0 and age is not None and age <= 120:
         poll_bad = True
     if age is None or age > 300:
         daemon_txt = "응답없음"

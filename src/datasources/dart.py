@@ -42,7 +42,11 @@ def fetch_recent_disclosures(api_key: str, *, date_yyyymmdd: str | None = None,
         "crtfc_key": api_key, "bgn_de": day, "end_de": day,
         "page_no": 1, "page_count": count,
     }, timeout=timeout)
-    r.raise_for_status()
+    try:
+        r.raise_for_status()
+    except requests.HTTPError:
+        from ..http_sanitize import response_error_brief
+        raise requests.HTTPError(response_error_brief(r), response=r) from None
     body = r.json()
     if body.get("status") != "000":          # '013'=조회 결과 없음(휴일 등) — 정상 취급
         if body.get("status") != "013":

@@ -149,7 +149,7 @@ def _parse_holdings_items(items: list) -> tuple[dict, dict]:
             if qty <= 0:
                 continue
             avg = _num(it.get("averagePurchasePrice")) or 0.0
-            market = it.get("marketCountry") or "KR"
+            market = str(it.get("marketCountry") or "KR").upper()
             positions[sym] = Position(symbol=sym, qty=qty, avg_price=avg)
             symbol_market[sym] = market
         except Exception as e:
@@ -170,7 +170,7 @@ def _items_to_synced(items: list) -> list[dict]:
             "symbol": sym,
             "qty": qty,
             "avg": _num(it.get("averagePurchasePrice")) or 0.0,
-            "market": it.get("marketCountry") or "KR",
+            "market": str(it.get("marketCountry") or "KR").upper(),
         })
     return synced
 

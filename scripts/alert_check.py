@@ -107,6 +107,7 @@ def evaluate(now: float, hb_age: float | None, market_open: bool = True,
              hb_ok: bool | None = None,
              hb_polled: int | None = None,
              hb_markets_open: list | None = None,
+             hb_should_be_open: list | None = None,
              expects_polling: bool = False) -> list[str]:
     """순수 판정 — 경보 사유 리스트(빈 리스트=정상).
 
@@ -114,8 +115,9 @@ def evaluate(now: float, hb_age: float | None, market_open: bool = True,
     (슬라이딩 창 플리핑 제거). market_open 도 뇌 모드 경보를 막지 않는다.
     bridge_armed=False 이고 mode=bridge 이면 미무장 조기 경보.
 
-    hb_ok/hb_polled: 하트비트 JSON. 장중(markets_open 비어있지 않음)인데
-    polled=0 또는 ok=False 면 가짜 초록을 경보로 올린다.
+    hb_ok/hb_polled/hb_should_be_open: 하트비트 JSON. should_be_open 비어있지 않은데
+    polled=0·markets_open 비어있음·ok=False 면 가짜 초록을 경보로 올린다.
+    expects_polling 은 구 하트비트(should_be_open 없음) 폴백용.
     """
     del brain_errors_recent, last_brain_done_age, market_open  # 명시적 미사용
     reasons: list[str] = []
@@ -125,11 +127,18 @@ def evaluate(now: float, hb_age: float | None, market_open: bool = True,
         reasons.append(f"데몬 하트비트 끊김 {hb_age:.0f}s (>{HB_STALE_SEC}s) — 죽음/행 의심")
     else:
         mkts = list(hb_markets_open or [])
-        if hb_ok is False or (mkts and (hb_polled or 0) <= 0):
+        should = list(hb_should_be_open or [])
+        poll_fail = (
+            hb_ok is False
+            or (should and ((hb_polled or 0) <= 0 or not mkts))
+            or (mkts and (hb_polled or 0) <= 0)
+        )
+        if poll_fail:
             reasons.append(
-                f"장중 시세 폴링 실패(polled={hb_polled if hb_polled is not None else '?'}"
+                f"장중 시세 폴링 실패(should={','.join(should) or '?'}"
+                f", polled={hb_polled if hb_polled is not None else '?'}"
                 f", markets={','.join(mkts) or '?'}) — 하트비트만 살아 있음")
-        elif expects_polling and not mkts:
+        elif expects_polling and not should and not mkts:
             reasons.append(
                 "거래 세션인데 markets_open 비어 있음 — 감시 루프 미동작 의심")
 
@@ -349,7 +358,8 @@ def main() -> int:
         hb_ok=hb_ok,
         hb_polled=int(hb["polled"]) if hb.get("polled") is not None else None,
         hb_markets_open=list(hb.get("markets_open") or []) if hb else None,
-        expects_polling=expects_polling,
+        hb_should_be_open=list(hb.get("should_be_open") or []) if hb else None,
+        expects_polling=expects_polling if not hb.get("should_be_open") else False,
     )
     next_actions = actions_for(reasons, brain_mode=mode)
     budget_line = format_budget_push_line(gauge)

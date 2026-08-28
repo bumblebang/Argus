@@ -98,12 +98,15 @@ def is_material_filing(form: str | None, items: str | list | None
 def fetch_recent_filings(symbols: list[str], user_agent: str, *,
                          cache_dir: str | Path = "data",
                          spacing_sec: float = 0.15,
-                         recent_limit: int = 25) -> list[dict]:
+                         recent_limit: int = 25,
+                         since_date: str | None = None) -> list[dict]:
     """보유/유니버스 심볼의 최근 8-K/6-K 목록(표준형).
 
+    since_date(YYYY-MM-DD, 미국 현지) 이전 filing 은 스킵·조기 종료 — 심볼별 전체
+    이력을 훑지 않는다(DART list.json 오늘치 1콜과 대칭). None 이면 필터 없음(하위호환).
+
     반환 항목: accession, symbol, form, items, filing_date, report_nm, corp_name,
-    empty_items. 비중대(7.01/9.01만 등)는 넣지 않는다. items 비어 있는 8-K 는
-    empty_items=True 로 남겨 워처가 보유만 wake 하게 한다.
+    empty_items. 비중대(7.01/9.01만 등)는 넣지 않는다.
     """
     if not symbols:
         return []
@@ -138,6 +141,9 @@ def fetch_recent_filings(symbols: list[str], user_agent: str, *,
             for j in range(n):
                 if kept >= recent_limit:
                     break
+                fdate = dates[j] if j < len(dates) else ""
+                if since_date and fdate and fdate < since_date:
+                    break
                 form = forms[j]
                 items_raw = items_arr[j] if j < len(items_arr) else ""
                 label, empty = is_material_filing(form, items_raw)
@@ -155,7 +161,8 @@ def fetch_recent_filings(symbols: list[str], user_agent: str, *,
                 })
                 kept += 1
         except Exception as e:
-            log.warning("[%s] EDGAR submissions 실패: %s", ticker, e)
+            from ..http_sanitize import redact_secrets
+            log.warning("[%s] EDGAR submissions 실패: %s", ticker, redact_secrets(str(e)))
         if spacing_sec and i < len(symbols) - 1:
             time.sleep(spacing_sec)
     return out

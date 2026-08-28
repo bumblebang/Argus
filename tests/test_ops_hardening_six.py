@@ -29,8 +29,16 @@ def test_evaluate_tradable_but_no_markets_open():
     import alert_check as ac
     r = ac.evaluate(1_000_000.0, hb_age=2.0, market_open=True, brain_mode="ok",
                     hb_ok=True, hb_polled=0, hb_markets_open=[],
-                    expects_polling=True)
-    assert any("markets_open" in x for x in r)
+                    hb_should_be_open=["US"])
+    assert any("폴링 실패" in x for x in r)
+
+
+def test_evaluate_uses_hb_should_be_open_over_legacy():
+    import alert_check as ac
+    r = ac.evaluate(1_000_000.0, hb_age=2.0, brain_mode="ok",
+                    hb_ok=False, hb_polled=0, hb_markets_open=[],
+                    hb_should_be_open=["KR", "US"])
+    assert any("should=KR,US" in x or "should=KR" in x for x in r)
 
 
 def test_push_rejects_http_error(monkeypatch):
@@ -124,14 +132,50 @@ def test_live_smoke_blocks_halt(tmp_path):
 
 
 def test_heartbeat_ok_false_on_tick_error(tmp_path):
+    from types import SimpleNamespace
     from src.engine.loop import TickResult, WatchLoop
-    from src.engine.store import Store
-    # minimal stub — only _beat
     class _L:
         heartbeat_path = tmp_path / "hb.json"
         _ticks = 1
+        markets = ["KR"]
+        cfg = SimpleNamespace(trading_sessions={"KR": ("regular",)})
         def _now(self):
             return 1000.0
     WatchLoop._beat(_L(), TickResult(markets_open=["KR"], polled=0), tick_error=True)
     d = json.loads((tmp_path / "hb.json").read_text(encoding="utf-8"))
     assert d["ok"] is False and d["tick_error"] is True and d["polled"] == 0
+    assert "should_be_open" in d
+
+
+def test_heartbeat_ok_false_when_should_poll_but_idle(tmp_path, monkeypatch):
+    import src.engine.loop as loopmod
+    monkeypatch.setattr(loopmod, "is_tradable",
+                        lambda m, allowed=None, now=None: m == "KR")
+    class _L:
+        heartbeat_path = tmp_path / "hb.json"
+        _ticks = 3
+        markets = ["KR", "US"]
+        cfg = loopmod.WatchConfig(trading_sessions={"KR": ("regular",)})
+        def _now(self):
+            return 1000.0
+    loopmod.WatchLoop._beat(_L(), loopmod.TickResult(markets_open=[], polled=0))
+    d = json.loads((tmp_path / "hb.json").read_text(encoding="utf-8"))
+    assert d["should_be_open"] == ["KR"]
+    assert d["markets_open"] == []
+    assert d["ok"] is False
+
+
+def test_heartbeat_ok_true_when_closed(tmp_path, monkeypatch):
+    import src.engine.loop as loopmod
+    monkeypatch.setattr(loopmod, "is_tradable", lambda *a, **k: False)
+    class _L:
+        heartbeat_path = tmp_path / "hb.json"
+        _ticks = 1
+        markets = ["KR", "US"]
+        cfg = loopmod.WatchConfig()
+        def _now(self):
+            return 1000.0
+    loopmod.WatchLoop._beat(_L(), loopmod.TickResult(markets_open=[], polled=0))
+    d = json.loads((tmp_path / "hb.json").read_text(encoding="utf-8"))
+    assert d["should_be_open"] == []
+    assert d["ok"] is True

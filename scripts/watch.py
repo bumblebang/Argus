@@ -580,12 +580,18 @@ def _build_edgar_watcher(cfg, store, brain,
             return set()
 
     def fetch() -> list:
+        from datetime import datetime, timedelta
+        from zoneinfo import ZoneInfo
         symbols = sorted(universe_us() | held_armed_us())
         if not symbols:
             return []
+        lookback = int(wcfg.get("edgar_lookback_days", 3))
+        since = (datetime.now(ZoneInfo("America/New_York")).date()
+                 - timedelta(days=lookback)).isoformat()
         return fetch_recent_filings(
             symbols, ua, cache_dir=ROOT / "data",
-            spacing_sec=float(wcfg.get("edgar_spacing_sec", 0.15)))
+            spacing_sec=float(wcfg.get("edgar_spacing_sec", 0.15)),
+            since_date=since)
 
     return EdgarWatcher(
         store, fetch, universe_us, on_wake=(brain.wake if brain else None),

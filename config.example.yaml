@@ -257,6 +257,7 @@ watcher:
   edgar: true
   edgar_poll_sec_active: 120
   edgar_poll_sec_idle: 900
+  edgar_lookback_days: 3
   edgar_after_close_hours: 2
 
 athena:

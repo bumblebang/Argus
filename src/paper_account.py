@@ -57,6 +57,7 @@ class PaperAccount:
         # 당일 시가(SoD) equity — 일손실·DD 분모. 장중 재스냅 금지(영속).
         self._sod_day: dict[str, str] = {}
         self._sod_equity: dict[str, float] = {}
+        self._last_fill_day: dict[str, str] = {}   # 시장별 마지막 체결 거래일(장중 SoD 판정)
         self.marks: dict[str, float] = {}   # 실시간 평가가(감시 루프가 갱신, 비영속)
         self.journal: list[Fill] = []
         self._load()
@@ -108,15 +109,18 @@ class PaperAccount:
     def ensure_sod_equity(self, market: str) -> float:
         """당일 시가 equity. 날짜가 바뀌면 현재 equity(>0)로 한 번만 스냅·영속.
 
-        장중(세션≠closed) 최초 스냅은 거부한다. 원장 유실·컨테이너 재기동 직후
-        이미 깎인 equity 를 SoD 로 찍으면 일손실 델타가 0 으로 리셋되어 게이트가
-        무력화된다. 거부 시 sod=0 을 당일로 고정 → 게이트는 capital 폴백.
+        장중(세션≠closed) 최초 스냅은 **당일 체결이 이미 있으면** 거부한다 — 재기동
+        mid-day 에 깎인 equity 를 SoD 로 찍어 일손실 델타가 0 으로 리셋되는 것을 막는다.
+        US 프리/정규 첫 틱(당일 체결 없음)은 허용 — KR-only 폴링 구간만으로는 US 거래일
+        SoD 창이 0분이 되는 문제(프리마켓~정규 진입)를 피한다.
+        거부 시 sod=0 → 게이트 capital 폴백.
         """
         day = market_day(market)
         if self._sod_day.get(market) == day:
             return float(self._sod_equity.get(market, 0.0) or 0.0)
-        if current_session(market) != "closed":
-            log.error("[SoD] 장중 최초 스냅 거부(%s) — capital 폴백(일손실 리셋 방지)",
+        session = current_session(market)
+        if session != "closed" and self._last_fill_day.get(market) == day:
+            log.error("[SoD] 장중 최초 스냅 거부(%s, 당일 체결 있음) — capital 폴백",
                       market)
             self._sod_day[market] = day
             self._sod_equity[market] = 0.0
@@ -265,6 +269,7 @@ class PaperAccount:
         f = Fill(ts=datetime.now(timezone.utc).isoformat(), symbol=symbol, market=market,
                  side=side, qty=qty, price=exec_price, fee=fee, reason=reason)
         self.journal.append(f)
+        self._last_fill_day[market] = market_day(market)
         self._save()
         return f
 
@@ -294,10 +299,9 @@ class PaperAccount:
                  market=market, side="SELL", qty=qty, price=exec_price, fee=fee,
                  reason=reason or "reconcile_attribution")
         self.journal.append(f)
+        self._last_fill_day[market] = day
         self._save()
         return f
-
-    # ── 영속화 ───────────────────────────────────────────
     def _load(self) -> None:
         """저장된 원장 복원. 깨진 파일에 죽지 않는다.
 
@@ -336,6 +340,7 @@ class PaperAccount:
                 self._sod_equity[str(k)] = float(v)
             except (TypeError, ValueError):
                 continue
+        self._last_fill_day = {str(k): str(v) for k, v in (data.get("last_fill_day") or {}).items()}
         self.symbol_market = data.get("symbol_market", {})
         for sym, p in data.get("positions", {}).items():
             self.positions[sym] = Position(symbol=sym, qty=p["qty"], avg_price=p["avg_price"])
@@ -351,6 +356,7 @@ class PaperAccount:
             "pnl_day": self._pnl_day,
             "sod_day": dict(self._sod_day),
             "sod_equity": dict(self._sod_equity),
+            "last_fill_day": dict(self._last_fill_day),
             "symbol_market": self.symbol_market,
             "positions": {s: {"qty": p.qty, "avg_price": p.avg_price}
                           for s, p in self.positions.items() if p.is_open},

@@ -60,6 +60,26 @@ def _num(v: Any) -> float | None:
         return None
 
 
+def _field(obj: Any, *keys: str) -> Any:
+    """dict 또는 객체에서 첫 매칭 필드. dict 가 아니면 getattr — AttributeError 없음."""
+    if obj is None:
+        return None
+    if isinstance(obj, dict):
+        for k in keys:
+            v = obj.get(k)
+            if v is not None:
+                return v
+        return None
+    for k in keys:
+        try:
+            v = getattr(obj, k)
+        except AttributeError:
+            continue
+        if v is not None:
+            return v
+    return None
+
+
 def _parse_execution(info: dict | None) -> tuple[str, float, float | None, float]:
     """주문 조회 응답 -> (status, 누적체결수량, 누적평균체결가, 누적 수수료+세금)."""
     ex = (info or {}).get("execution") or {}
@@ -855,7 +875,12 @@ class Broker:
             sellable = None
             try:
                 resp = self.client.get_sellable(self.account_seq, order.symbol) or {}
-                sellable = _num(resp.get("sellableQuantity"))
+                sellable = _num(_field(resp, "sellableQuantity"))
+                if sellable is None and resp:
+                    keys = list(resp.keys()) if isinstance(resp, dict) else type(resp).__name__
+                    log.warning(
+                        "[LIVE] 매도가능 응답에 sellableQuantity 없음 — 원장 수량으로 진행"
+                        "(%s keys=%s)", order.symbol, keys)
             except Exception as e:
                 log.warning("[LIVE] 매도가능 수량 조회 실패 — 원장 수량으로 진행(%s): %s",
                             order.symbol, e)
@@ -928,7 +953,7 @@ class Broker:
         if not isinstance(levels, (list, tuple)):
             return None                       # 형태가 예상과 다르면 가드 미적용(통과)
         for lv in levels:
-            px = _num(lv.get("price")) if isinstance(lv, dict) else None
+            px = _num(_field(lv, "price"))
             if px and px > 0:
                 return px
         return None
@@ -950,9 +975,17 @@ class Broker:
         levels = ob.get("asks" if order.side == "BUY" else "bids") or []
         parsed: list[tuple[float, float]] = []
         for lv in levels:
-            px, vol = _num(lv.get("price")), _num(lv.get("volume"))
+            px, vol = _num(_field(lv, "price")), _num(_field(lv, "volume"))
             if px and px > 0 and vol and vol > 0:
                 parsed.append((px, vol))
+        if not parsed and levels:
+            sample = levels[0]
+            sk = (list(sample.keys()) if isinstance(sample, dict)
+                  else type(sample).__name__)
+            log.warning(
+                "[LIVE] 호가 레벨 파싱 실패(price/volume) → 견적가 폴백"
+                " %s %s sample_keys=%s",
+                order.symbol, order.side, sk)
         if not parsed:
             return None
         best = parsed[0][0]

@@ -99,12 +99,20 @@ def main() -> int:
         log(f"[watchdog] heartbeat stale {age:.0f}s > {STALE_SEC}s -> restart")
         restart(); return 0
     # age 는 신선해도 장중 polled=0 이면 가짜 초록 — 재기동은 안 하고 경보만(alert_check).
+    should = list(hb.get("should_be_open") or [])
     mkts = list(hb.get("markets_open") or [])
     polled = int(hb.get("polled") or 0)
     ok = hb.get("ok")
-    if ok is False or (mkts and polled <= 0):
+    poll_unhealthy = (
+        ok is False
+        or (should and polled <= 0)
+        or (should and not mkts)
+        or (mkts and polled <= 0)
+    )
+    if poll_unhealthy:
         log(f"[watchdog] heartbeat fresh {age:.0f}s but poll unhealthy "
-            f"(ok={ok}, polled={polled}, markets={mkts}) — no restart, alert-check 담당")
+            f"(ok={ok}, should={should}, polled={polled}, markets={mkts}) "
+            f"— no restart, alert-check 담당")
         return 0
     log(f"[watchdog] heartbeat fresh {age:.0f}s -> ok")
     return 0
