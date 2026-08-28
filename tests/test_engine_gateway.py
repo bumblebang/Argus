@@ -79,3 +79,19 @@ def test_candle_no_cache_when_ttl_zero():
     g.candles("005930", "1m", 5)
     g.candles("005930", "1m", 5)
     assert client.calls == 2                      # 매번 실호출
+
+
+def test_cancel_order_delegates_with_lock():
+    class _CancelClient:
+        def __init__(self):
+            self.calls = []
+
+        def cancel_order(self, account_seq, order_id):
+            self.calls.append((account_seq, order_id))
+            return {"orderId": order_id, "status": "CANCELED"}
+
+    client = _CancelClient()
+    g = TossGateway(client)
+    out = g.cancel_order(1, "ORD-99")
+    assert out["status"] == "CANCELED"
+    assert client.calls == [(1, "ORD-99")]

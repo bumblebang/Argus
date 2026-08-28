@@ -112,6 +112,10 @@ class TossGateway:
         with self._lock:
             return self.client.get_order(account_seq, order_id)
 
+    def cancel_order(self, account_seq: int | str, order_id: str) -> dict:
+        with self._lock:
+            return self.client.cancel_order(account_seq, order_id)
+
     def get_sellable(self, account_seq: int | str, symbol: str) -> dict:
         with self._lock:
             return self.client.get_sellable(account_seq, symbol)
