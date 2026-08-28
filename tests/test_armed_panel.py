@@ -1,12 +1,14 @@
 """진입대기 패널 — 카드 UI·돌파선·존 표시."""
 import json
 
+import scripts.dashboard as dashmod
 from scripts.dashboard import (
     _armed_panel_html, _condense_armed_thesis, _today_html, build_armed_plan,
 )
 
 
-def test_build_armed_plan_breakout():
+def test_build_armed_plan_breakout(monkeypatch):
+    monkeypatch.setattr(dashmod, "_breakout_target", lambda sym, mkt, params: 210_000.0)
     pos = {
         "symbol": "066570", "market": "KR", "strategy": "volatility_breakout",
         "state": "armed",
@@ -23,7 +25,21 @@ def test_build_armed_plan_breakout():
     assert plan["entry_rows"][0]["label"] == "돌파선"
     assert "돌파선" in plan["entry_line"]
     assert plan["current_line"] == "200,500"
-    assert plan["status_label"] in ("돌파 대기", "돌파 충족")
+    assert plan["status_label"] == "돌파 대기"
+
+
+def test_build_armed_plan_breakout_no_cache(monkeypatch):
+    """CI 등 일봉 캐시 없음 — 돌파 모드이나 상태는 신호 대기."""
+    monkeypatch.setattr(dashmod, "_breakout_target", lambda sym, mkt, params: None)
+    pos = {
+        "symbol": "066570", "market": "KR", "strategy": "volatility_breakout",
+        "state": "armed",
+        "meta": {"horizon": "day", "params": {"k": 0.6}},
+    }
+    plan = build_armed_plan(pos, price=200_500.0)
+    assert plan["entry_kind"] == "breakout"
+    assert plan["entry_rows"][0]["value"] == "캐시 없음"
+    assert plan["status_label"] == "신호 대기"
 
 
 def test_build_armed_plan_zone():
