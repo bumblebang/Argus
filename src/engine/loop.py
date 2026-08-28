@@ -319,6 +319,39 @@ def _rotated(lst: list, offset: int) -> list:
     return lst[off:] + lst[:off]
 
 
+def _interleave_by_market(items: list[tuple], markets: tuple[str, ...], limit: int) -> list:
+    """시장별 버킷을 TRADE_MARKETS 순서로 라운드로빈 — KR/US 겹침 시 US 기아 방지."""
+    if limit <= 0 or not items:
+        return []
+    buckets: dict[str, list] = {m: [] for m in markets}
+    extra: dict[str, list] = {}
+    for it in items:
+        m = it[0]
+        if m in buckets:
+            buckets[m].append(it)
+        else:
+            extra.setdefault(m, []).append(it)
+    order = [m for m in markets if buckets.get(m)]
+    order += [m for m in extra if m not in order]
+    for m, lst in extra.items():
+        buckets.setdefault(m, []).extend(lst)
+    out: list = []
+    idx = 0
+    guard = limit * max(len(order), 1) * 20 + len(items)
+    while len(out) < limit and idx < guard:
+        progressed = False
+        for m in order:
+            if len(out) >= limit:
+                break
+            if buckets.get(m):
+                out.append(buckets[m].pop(0))
+                progressed = True
+        if not progressed:
+            break
+        idx += 1
+    return out
+
+
 @dataclass
 class TickResult:
     polled: int = 0                    # 가격 폴링된 종목 수
@@ -442,11 +475,16 @@ class WatchLoop:
         try:
             self.heartbeat_path.parent.mkdir(parents=True, exist_ok=True)
             # 장중인데 폴링 0 또는 틱 예외면 ok=False — age 만 보면 가짜 초록이 된다.
+            now_ts = self._now()
+            should_be_open = [m for m in self.markets
+                              if is_tradable(m, self.cfg.trading_sessions.get(m), now_ts)]
             markets = list(res.markets_open or [])
             polled = int(res.polled or 0)
-            ok = (not tick_error) and (not markets or polled > 0)
+            should_poll = bool(should_be_open)
+            ok = (not tick_error) and (not should_poll or polled > 0)
             self.heartbeat_path.write_text(json.dumps({
-                "ts": self._now(), "ticks": self._ticks,
+                "ts": now_ts, "ticks": self._ticks,
+                "should_be_open": should_be_open,
                 "markets_open": markets, "polled": polled,
                 "ok": ok, "tick_error": bool(tick_error),
             }), encoding="utf-8")
@@ -775,7 +813,9 @@ class WatchLoop:
         # 각성 후보 = 코드청산이 아닌 트리거(기회 신호: vol_spike/관심가/손절근접 등).
         # 손절/익절은 이미 코드가 처리했으니 뇌를 깨우지 않는다.
         wake_triggers: list[T.Trigger] = []
-        for market, sym, trigs in imminent[: self.cfg.precision_per_tick]:
+        prec_pool = _interleave_by_market(
+            imminent, self.markets, max(self.cfg.precision_per_tick, len(imminent)))
+        for market, sym, trigs in _rotated(prec_pool, self._rr)[: self.cfg.precision_per_tick]:
             try:
                 candles = self.gw.candles(sym, interval="1m", count=20)
             except Exception as e:  # 정밀 폴링 실패는 틱 전체를 죽이지 않는다.

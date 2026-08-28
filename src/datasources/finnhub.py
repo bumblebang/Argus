@@ -64,7 +64,8 @@ def fetch_company_news(api_key: str, symbol: str, per: int = 3, days: int = 5,
         r.raise_for_status()
         data = r.json()
     except Exception as e:
-        log.warning("[%s] 종목뉴스 조회 실패: %s", symbol, e)
+        from ..http_sanitize import redact_secrets
+        log.warning("[%s] 종목뉴스 조회 실패: %s", symbol, redact_secrets(str(e)))
         return []
     if not isinstance(data, list):
         return []
@@ -97,7 +98,11 @@ class FinnhubNewsSource(DataSource):
     def _get(self, path: str, params: dict) -> list:
         params = dict(params, token=self.api_key)
         r = requests.get(BASE + path, params=params, timeout=15)
-        r.raise_for_status()
+        try:
+            r.raise_for_status()
+        except requests.HTTPError:
+            from ..http_sanitize import response_error_brief
+            raise requests.HTTPError(response_error_brief(r), response=r) from None
         data = r.json()
         return data if isinstance(data, list) else []
 
@@ -117,7 +122,8 @@ class FinnhubNewsSource(DataSource):
             for d in self._get("/news", {"category": "general"})[:self.max_general]:
                 items.append(self._item(d))
         except Exception as e:
-            log.warning("일반 뉴스 실패: %s", e)
+            from ..http_sanitize import redact_secrets
+            log.warning("일반 뉴스 실패: %s", redact_secrets(str(e)))
 
         frm = (date.today() - timedelta(days=self.days)).isoformat()
         to = date.today().isoformat()
@@ -126,7 +132,8 @@ class FinnhubNewsSource(DataSource):
                 for d in self._get("/company-news", {"symbol": sym, "from": frm, "to": to})[:self.per_symbol]:
                     items.append(self._item(d, sym))
             except Exception as e:
-                log.warning("[%s] 종목뉴스 실패: %s", sym, e)
+                from ..http_sanitize import redact_secrets
+                log.warning("[%s] 종목뉴스 실패: %s", sym, redact_secrets(str(e)))
             if self.spacing and i < len(self.symbols) - 1:
                 time.sleep(self.spacing)
         log.info("Finnhub 뉴스 %d건", len(items))

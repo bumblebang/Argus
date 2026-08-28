@@ -112,16 +112,26 @@ def test_equity_gain_does_not_mask_realized_loss(tmp_path):
 
 
 def test_midday_first_sod_snap_refused(tmp_path, monkeypatch):
-    """장중 최초 기동: 현재 equity 를 SoD 로 찍지 않는다(일손실 리셋 방지)."""
+    """장중 + 당일 체결 있음: SoD 스냅 거부(일손실 리셋 방지)."""
     monkeypatch.setattr("src.paper_account.current_session",
                         lambda m, now=None: "regular")
-    gate, acct = _gate(tmp_path), _acct(tmp_path, cash=940_000)  # 이미 -6%
+    gate, acct = _gate(tmp_path), _acct(tmp_path, cash=940_000)
+    acct.apply_fill("005930", "KR", "BUY", 1, 70000, 0.0, "seed")
     assert acct.ensure_sod_equity("KR") == 0.0
     assert acct.sod_equity_delta("KR") is None
     # capital 폴백(1M×5%=50k). 실현 -60k 면 차단.
     _set_realized_today(acct, "KR", -60_000)
     d = gate.check(_order(), acct)
     assert not d.approved and "일 손실" in d.reason
+
+
+def test_us_first_sod_allowed_when_no_fill_yet(tmp_path, monkeypatch):
+    """US 프리/정규 첫 틱·당일 체결 없음 → SoD 허용(KR-only 창만으로는 못 찍던 케이스)."""
+    monkeypatch.setattr("src.paper_account.current_session",
+                        lambda m, now=None: "premarket" if m == "US" else "closed")
+    acct = PaperAccount(cash={"KR": 0, "US": 500_000}, fee_rate={"KR": 0.0, "US": 0.0},
+                        slippage_bps={"KR": 0.0, "US": 0.0}, state_path=tmp_path / "us.json")
+    assert acct.ensure_sod_equity("US") == 500_000.0
 
 
 def test_deposit_does_not_mask_bypass_loss(tmp_path):

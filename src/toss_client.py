@@ -232,6 +232,10 @@ class TossClient:
     def get_sellable(self, account_seq: int | str, symbol: str) -> dict:
         return self._request("sellable", params={"symbol": symbol}, account_seq=account_seq)
 
+    def orderbook(self, symbol: str) -> dict:
+        """GET /api/v1/orderbook — 매수/매도 호가. 레벨: {price, volume} 문자열."""
+        return self._request("orderbook", params={"symbol": symbol}) or {}
+
     # ── 시세 ──────────────────────────────────────────────
     def get_candle_page(self, symbol: str, interval: str = "1d", count: int = 60,
                         adjusted: bool = True, before: str | None = None) -> dict:

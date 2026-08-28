@@ -165,7 +165,6 @@ def test_live_sell_clamped_to_sellable(tmp_path):
     assert client.calls[0]["side"] == "SELL"
 
 
-# ── 1f) SELL: 매도가능 0 → 미발사 ────────────────────────────────────────
 def test_live_sell_sellable_zero_skips(tmp_path):
     store = Store(tmp_path / "t.db")
     client = _MockClient(resp={"orderId": "S0"},
@@ -269,3 +268,51 @@ def test_live_kill_switch_blocks_order(tmp_path):
     ok = b.execute(Order("005930", "KR", "BUY", 1, 70000.0), "test")
     assert not ok
     assert len(client.calls) == 0                       # 게이트가 먼저 막아 미발사
+
+
+def test_live_orderbook_wrong_volume_key_falls_back_to_quote(tmp_path, caplog):
+    """volume 키 불일치 시 견적가 폴백 + 경고(조용한 미체결 방지용 관측)."""
+    store = Store(tmp_path / "t.db")
+    client = _MockClient(
+        resp={"orderId": "OB1"},
+        orderbook={"asks": [{"price": "70100", "qty": "50"}], "bids": []},
+        order_detail=_filled(1, 70000),
+    )
+    b = _live_broker(tmp_path, client, store=store)
+    ok = b.execute(Order("005930", "KR", "BUY", 1, 70000.0), "test")
+    assert ok
+    assert client.calls[0]["price"] == 70000.0          # 견적가 유지
+    assert any("호가 레벨 파싱 실패" in r.message for r in caplog.records)
+
+
+def test_live_sellable_wrong_key_no_silent_clamp(tmp_path, caplog):
+    """sellableQuantity 결측 시 클램프 없이 진행 + 경고."""
+    store = Store(tmp_path / "t.db")
+    client = _MockClient(
+        resp={"orderId": "S2"},
+        orderbook={"asks": [], "bids": [{"price": "70000", "volume": "100"}]},
+        sellable={"sellableQty": "2"},                   # 잘못된 키
+        order_detail=_filled(10, 70000),
+    )
+    b = _live_broker(tmp_path, client, store=store,
+                     positions={"005930": (10, 60000.0, "KR")})
+    ok = b.execute(Order("005930", "KR", "SELL", 10, 70000.0), "test")
+    assert ok
+    assert client.calls[0]["qty"] == 10                # 원장 10주 그대로
+    assert any("sellableQuantity 없음" in r.message for r in caplog.records)
+
+
+def test_live_orderbook_object_level_parses_price(tmp_path):
+    """레벨이 dict 가 아닌 객체도 price/volume getattr 로 파싱."""
+    from types import SimpleNamespace
+    store = Store(tmp_path / "t.db")
+    lv = SimpleNamespace(price="70200", volume="10")
+    client = _MockClient(
+        resp={"orderId": "OB2"},
+        orderbook={"asks": [lv], "bids": []},
+        order_detail=_filled(1, 70200),
+    )
+    b = _live_broker(tmp_path, client, store=store)
+    ok = b.execute(Order("005930", "KR", "BUY", 1, 70000.0), "test")
+    assert ok
+    assert client.calls[0]["price"] == 70200.0

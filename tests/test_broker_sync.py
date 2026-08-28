@@ -161,6 +161,15 @@ def test_sync_parses_string_numbers_and_skips_bad_qty(tmp_path):
     assert summary["synced"] == 1
 
 
+def test_sync_normalizes_market_country_upper(tmp_path):
+    """marketCountry 소문자도 KR/US 로 정규화 — live_markets·익스포저 게이트 일치."""
+    from src.broker_sync import _parse_holdings_items
+    items = [{"symbol": "AAPL", "marketCountry": "us", "quantity": "3",
+              "averagePurchasePrice": "150"}]
+    pos, mkt = _parse_holdings_items(items)
+    assert mkt["AAPL"] == "US"
+
+
 # (d) 페이퍼 모드면 watch 배선이 sync 안 함(호출 카운트 0) ────────────────
 def test_should_sync_gates_on_broker_mode(tmp_path):
     from src.agents.pipeline import build_paper_core
