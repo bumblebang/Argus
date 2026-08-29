@@ -15,6 +15,7 @@ from .wiring import (
     build_paper_core,
     select_backend,
     synth_candles,
+    history_candles_1y,
     dry_llm_factory,
     earnings_near,
     resolve_strategy,
@@ -22,6 +23,7 @@ from .wiring import (
     position_plan,
     build_cursor_bridge,
     build_live_llm,
+    build_brain_llm_factories,
 )
 
 __all__ = [
@@ -34,6 +36,7 @@ __all__ = [
     "build_paper_core",
     "select_backend",
     "synth_candles",
+    "history_candles_1y",
     "dry_llm_factory",
     "earnings_near",
     "resolve_strategy",
@@ -41,4 +44,5 @@ __all__ = [
     "position_plan",
     "build_cursor_bridge",
     "build_live_llm",
+    "build_brain_llm_factories",
 ]

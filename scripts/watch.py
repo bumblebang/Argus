@@ -62,7 +62,9 @@ from src.engine.brain import BrainWorker
 from src.engine.execution import ExitExecutor, EntryExecutor
 from src.engine.strategy_runner import StrategyRunner
 from src.agents.pipeline import (CycleRunner, select_backend, build_live_llm,
-                                 synth_candles, dry_llm_factory, build_paper_core,
+                                 build_brain_llm_factories,
+                                 synth_candles, history_candles_1y, dry_llm_factory,
+                                 build_paper_core,
                                  entry_stop_target)
 from src.agents.llm import ClaudeCLIClient
 from src.agents.value_trade import ValueRunner, value_trade_cfg
@@ -132,7 +134,7 @@ def _build_brain(cfg, gateway, store, args, broker, risk, universe_fn=None,
     """act 트리거 시 LLM 사이클을 비동기로 돌릴 BrainWorker 구성. --no-brain 이면 None.
 
     백엔드: --dry/--cli/--live 우선, 없으면 config watch.brain_backend(기본 cli=구독무료).
-    캔들은 Gateway 로(단일 토스 통로). broker/risk 는 코드 청산과 공유.
+    뇌 피처 일봉은 Yahoo 1y(history_candles_1y, 밸류와 동일 캐시). broker/risk 는 코드 청산과 공유.
     """
     if args.no_brain:
         log.info("brain 비활성(--no-brain) — 감시+코드청산만 수행.")
@@ -144,33 +146,26 @@ def _build_brain(cfg, gateway, store, args, broker, risk, universe_fn=None,
     dry, use_cli, subscription = select_backend(dry=(bk == "dry"), cli=(bk == "cli"),
                                                 live=(bk == "live"), api_key=api_key)
     val_llm_factory = None
+    decision_llm_fn = None
     if dry:
         log.warning("brain backend=DRY (MockLLM, 합성가격) — 검증용. 실거래판단 아님.")
         llm_factory, fetch = dry_llm_factory, synth_candles
     else:
-        acfg = cfg.raw.get("agents", {})
         try:
-            llm = build_live_llm(cfg, use_cli=use_cli, subscription=subscription,
-                                 api_key=api_key)
-            # 검증 전용 모델(선택): 결정과 다른 티어로 독립성 확보. 미설정이면 결정과 공유.
-            val_model = (acfg.get("claude_val_model") if use_cli
-                         else acfg.get("val_model"))
-            val_llm = llm
-            if val_model:
-                val_llm = build_live_llm(cfg, use_cli=use_cli, subscription=subscription,
-                                         api_key=api_key, model_override=val_model)
+            llm_factory, val_llm_factory, decision_llm_fn, llm_meta = (
+                build_brain_llm_factories(cfg, use_cli=use_cli,
+                                          subscription=subscription, api_key=api_key))
         except Exception as e:
             log.error("brain LLM 초기화 실패 → 감시만 진행: %s", e)
             return None
-        llm_factory = lambda cands: llm
-        val_llm_factory = (lambda cands: val_llm) if val_llm is not llm else None
-        fetch = lambda s, m: gateway.candles(s, "1d", 30)
-        dec_m = (acfg.get("claude_model") if use_cli else acfg.get("model")) or "default"
-        log.info("brain backend=%s (결정=%s, 검증=%s)",
+        fetch = history_candles_1y
+        log.info("brain backend=%s (결정=opus:%s/sonnet:%s wake라우팅, 검증=%s, candles=yahoo_1y)",
                  "cli(구독)" if use_cli else ("api-key" if api_key else "api-oauth"),
-                 dec_m, (val_model or dec_m))
+                 llm_meta["decision_opus"], llm_meta["decision_sonnet"],
+                 llm_meta["validation"])
     runner = CycleRunner(cfg, llm_factory=llm_factory, fetch_candles=fetch, store=store,
                          broker=broker, risk=risk, val_llm_factory=val_llm_factory,
+                         decision_llm_fn=decision_llm_fn,
                          universe_fn=universe_fn,    # 뇌도 런타임 유니버스를 매 사이클 재독
                          open_markets_fn=open_markets_fn,   # 닫힌 시장 후보 제외(opt-in)
                          illiquid_fn=illiquid_fn)    # 시간외 체결정지 종목 후보 제외(opt-in)

@@ -19,9 +19,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.config import load_config
 from src.logging_setup import setup_logging, get_logger
-from src.engine.gateway import TossGateway
 from src.agents.pipeline import (CycleRunner, select_backend, build_live_llm,
-                                 synth_candles, dry_llm_factory)
+                                 synth_candles, history_candles_1y, dry_llm_factory)
 
 log = get_logger("agent_cycle")
 
@@ -48,7 +47,7 @@ def main() -> int:
     if subscription:
         log.warning("API OAuth(ant 프로필) 사용. 크레딧 필요. 크레딧 0이면 --cli 권장.")
 
-    # 백엔드별 LLM 팩토리 + 캔들 소스(dry=합성, live=TossClient). 배선은 CycleRunner 가 담당.
+    # 백엔드별 LLM 팩토리 + 캔들 소스(dry=합성, live=Yahoo 1y — 밸류와 동일).
     if dry:
         fetch_raw = synth_candles
         llm_factory = dry_llm_factory
@@ -56,8 +55,7 @@ def main() -> int:
         live_llm = build_live_llm(cfg, use_cli=use_cli, subscription=subscription,
                                   api_key=api_key)
         llm_factory = lambda cands: live_llm
-        gateway = TossGateway.from_config(cfg)
-        fetch_raw = lambda s, m: gateway.candles(s, "1d", 30)
+        fetch_raw = history_candles_1y
 
     runner = CycleRunner(cfg, llm_factory=llm_factory, fetch_candles=fetch_raw)
 

@@ -269,6 +269,102 @@ def _save_push_state(state: dict) -> None:
         pass
 
 
+_EXIT_REASON_KO = {
+    "stop_hit": "손절",
+    "target_hit": "목표가 도달",
+    "session_end": "종가 청산",
+    "time_stop": "시간손절",
+    "brain": "뇌 판단",
+    "partial_exit": "부분 청산",
+    "exit": "청산",
+}
+_SIDE_KO = {"BUY": "매수", "SELL": "매도"}
+
+
+def _load_symbol_names() -> dict[str, str]:
+    """대시보드와 같은 캐시 소스 — 심볼→종목명. 실패해도 빈 dict."""
+    m: dict[str, str] = {}
+
+    def _put(sym, name, *, overwrite: bool = False) -> None:
+        s = str(sym or "").strip()
+        n = str(name or "").strip()
+        if not s or not n:
+            return
+        if overwrite or s not in m:
+            m[s] = n
+
+    for fn in ("base_universe_KR.txt", "base_universe_US.txt"):
+        try:
+            for line in (ROOT / "data" / fn).read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                parts = line.split(",", 1)
+                if len(parts) == 2:
+                    _put(parts[0], parts[1])
+        except OSError:
+            pass
+    try:
+        info = json.loads((ROOT / "data" / "stock_info_cache.json").read_text(encoding="utf-8")) or {}
+        for sym, v in info.items() if isinstance(info, dict) else []:
+            row = (v or {}).get("info") if isinstance(v, dict) else None
+            if isinstance(row, dict):
+                _put(sym, row.get("name"), overwrite=True)
+    except (OSError, ValueError, TypeError):
+        pass
+    try:
+        import yaml
+        u = yaml.safe_load((ROOT / "data" / "universe.yaml").read_text(encoding="utf-8")) or {}
+        for lst in u.values():
+            for it in (lst or []):
+                if isinstance(it, dict) and it.get("symbol"):
+                    _put(it["symbol"], it.get("name"), overwrite=True)
+    except Exception:
+        pass
+    return m
+
+
+def _display_name(symbol: str, names: dict[str, str]) -> str:
+    s = str(symbol or "").strip()
+    return names.get(s) or s or "?"
+
+
+def _order_why(p: dict) -> str:
+    """exit_reason·broker reason → 사람이 읽는 근거 한 줄."""
+    er = str(p.get("exit_reason") or "").strip()
+    raw = str(p.get("reason") or "").strip()
+    if er:
+        label = _EXIT_REASON_KO.get(er, er)
+        if er.startswith("strategy:"):
+            label = f"전략신호 ({er.split(':', 1)[1]})"
+        if raw and raw not in (er, f"[exit] {er}") and not raw.startswith(f"[exit] {er}"):
+            extra = raw[7:].strip() if raw.startswith("[exit] ") else raw
+            if extra and extra != er:
+                return f"{label} — {extra}"
+        return label
+    if not raw:
+        return ""
+    if raw.startswith("[exit] "):
+        kind = raw[7:].strip()
+        return _EXIT_REASON_KO.get(kind, kind)
+    return raw
+
+
+def _format_live_order_msg(kind: str, symbol: str, p: dict, names: dict[str, str]) -> str:
+    name = _display_name(symbol, names)
+    why = _order_why(p)
+    if kind == "live_order":
+        side = str(p.get("side") or "?").upper()
+        side_ko = _SIDE_KO.get(side, side)
+        body = (f"[LIVE] {side_ko} {name} x{p.get('qty', '?')} "
+                f"@ {p.get('price', '?')}")
+    else:
+        body = f"[LIVE-ERR] {name}: {p.get('error', '?')}"
+    if why:
+        body += f"\n근거: {why}"
+    return body
+
+
 def _push_live_orders(now: float) -> None:
     if not _ntfy_topic() or not DB.exists():
         return
@@ -283,6 +379,7 @@ def _push_live_orders(now: float) -> None:
         con.close()
     if not rows:
         return
+    names = _load_symbol_names()
     # 성공한 이벤트만 커서로 전진 — 실패분을 성공으로 찍어 영구 스킵하지 않는다.
     advanced_to = since
     for ts, kind, symbol, payload in rows:
@@ -290,12 +387,9 @@ def _push_live_orders(now: float) -> None:
             p = json.loads(payload) if payload else {}
         except (ValueError, TypeError):
             p = {}
-        if kind == "live_order":
-            ok = _push("Argus 체결",
-                       f"[LIVE] {p.get('side','?')} {symbol} x{p.get('qty','?')} "
-                       f"@ {p.get('price','?')} id={p.get('order_id','?')}")
-        else:
-            ok = _push("Argus 주문실패", f"[LIVE-ERR] {symbol}: {p.get('error','?')}")
+        msg = _format_live_order_msg(kind, symbol, p, names)
+        title = "Argus 체결" if kind == "live_order" else "Argus 주문실패"
+        ok = _push(title, msg)
         if not ok:
             break
         advanced_to = max(advanced_to, float(ts))

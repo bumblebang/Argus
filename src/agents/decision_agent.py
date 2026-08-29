@@ -48,6 +48,9 @@ SYSTEM = """\
   거래량 동반 반등)를 thesis 에 수치로 대라. 낙폭만 있고 안정화가 없으면 아직 이르다 —
   HOLD 하고 도시에 진입존에서 기다려라(코드가 armed 로 대기시킨다. 지금 안 사도 기회는
   존에서 다시 온다).
+- 차트 위치 참고 — pct_from_52w_high/low(52주 고·저 대비 %), ret_60d_pct(60일 수익률),
+  vs_sma60_pct·vs_sma120_pct(중·장기 이평 대비 %). 고점 근처 추격 vs 저점 근처 공포 매수
+  판단에 쓰되 단독 신호는 아니다.
 - 공포가 깊을수록 **태도는 덜 회피적으로, 종목 선별과 손절 규율은 더 엄격하게** 가라.
   재무가 부실하거나 thesis 가 깨진 종목의 낙폭은 기회가 아니라 경고다.
 - fear_greed.components(put_call_options·stock_price_breadth·safe_haven_demand·

@@ -236,6 +236,15 @@ agents:
   claude_model: "opus"
   claude_val_model: "opus"
   claude_fallback_model: "sonnet"
+  # 결정 LLM wake 라우팅: 아래 opus 슬롯·reason 만 opus, 나머지(이벤트·extra·periodic) sonnet. 검증=claude_val_model 고정.
+  brain_decision:
+    enabled: true
+    opus_model: "opus"
+    sonnet_model: "sonnet"
+    opus_reasons: ["athena_done", "gap_rebound_scan"]
+    opus_extra_slots:
+      KR: ["08:00", "09:00"]
+      US: ["22:30"]
   claude_timeout: 600
   cursor_bridge:
     enabled: false
