@@ -5,13 +5,13 @@ from src.agents.brain_model_policy import decision_tier, pick_decision_llm
 def test_opus_athena_and_gap_rebound():
     assert decision_tier({"reason": "athena_done"}) == "opus"
     assert decision_tier({"reason": "gap_rebound_scan"}) == "opus"
+    assert decision_tier({"reason": "nxt_gap_scan"}) == "opus"
 
 
 def test_sonnet_events_and_other_extra():
     assert decision_tier({"reason": "disclosure"}) == "sonnet"
     assert decision_tier({"reason": "wake_triggers"}) == "sonnet"
     assert decision_tier({"reason": "extra", "at": "11:00", "market": "KR"}) == "sonnet"
-    assert decision_tier({"reason": "nxt_gap_scan"}) == "sonnet"
     assert decision_tier({"reason": "periodic"}) == "sonnet"
 
 

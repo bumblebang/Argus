@@ -176,6 +176,14 @@ def test_preopen_stale_cache_falls_back_to_pool_order(_redirect_ranking_cache, m
     assert [r["symbol"] for r in out] == ["005930", "000660"]   # 풀(시총) 원순서
 
 
+def test_no_cache_fallback_when_disabled(_redirect_ranking_cache):
+    top_by_trading_value("KR", count=3, min_price=2000, fetch_fn=_fake_fetch)
+    out = top_by_trading_value("KR", count=3, min_price=2000,
+                               fetch_fn=_fake_fetch_preopen,
+                               allow_cache_fallback=False)
+    assert out == []
+
+
 # ── US 발굴(Yahoo most_actives → 거래대금 정렬) ──────────────
 def _fake_us_actives(pool=50):
     return [

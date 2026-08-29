@@ -54,10 +54,25 @@ class CycleResult:
     manager: dict | None = None     # model/prompt_hash 매니저 정체성
 
 
+def _fresh_gap_pool_member(f: dict, *, market: str = "KR") -> bool:
+    """당일 pool_date 가 있는 gap_decline/gap_rebound 만 active 갭 트랙."""
+    if f.get("pool") != "gap_decline" and f.get("source") != "gap_rebound":
+        return False
+    pd = f.get("pool_date")
+    if not pd:
+        return False
+    try:
+        from ..market_hours import trading_date
+        mkt = str(f.get("market") or market or "KR").upper()
+        return str(pd) == trading_date(mkt)
+    except Exception:
+        return False
+
+
 def _close_scan_candidate(symbol: str, features_by_sym: dict | None) -> bool:
-    """gap_decline 풀·gap_rebound 소스 — close_scan 트랙 후보."""
+    """오늘 pool_date gap_decline 풀 — close_scan 트랙 후보."""
     f = (features_by_sym or {}).get(symbol) or {}
-    return (f.get("pool") == "gap_decline" or f.get("source") == "gap_rebound")
+    return _fresh_gap_pool_member(f)
 
 
 def _apply_close_scan_horizon(p, *, wake_reason: str,
@@ -67,18 +82,22 @@ def _apply_close_scan_horizon(p, *, wake_reason: str,
         return None
     gap_wake = wake_reason in GAP_SCAN_REASONS
     gap_pool = _close_scan_candidate(p.symbol, features_by_sym)
-    if not gap_wake and not gap_pool:
-        return None
     hz = (p.horizon or "swing").lower()
+    if not gap_wake:
+        if gap_pool or hz == "close_scan":
+            return "wrong_horizon"
+        return None
+    if not gap_pool:
+        if hz == "close_scan":
+            return "wrong_horizon"
+        return None
     if hz == "day":
         return "wrong_horizon"
     if hz == "close_scan":
         return None
-    if gap_wake:
-        log.warning("[close_scan 교정] %s: horizon %s → close_scan", p.symbol, hz)
-        p.horizon = "close_scan"
-        return None
-    return "wrong_horizon"
+    log.warning("[close_scan 교정] %s: horizon %s → close_scan", p.symbol, hz)
+    p.horizon = "close_scan"
+    return None
 
 
 def run_cycle(*, context_json: str, decision_agent, validation_agent, broker, risk,

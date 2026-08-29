@@ -241,7 +241,7 @@ agents:
     enabled: true
     opus_model: "opus"
     sonnet_model: "sonnet"
-    opus_reasons: ["athena_done", "gap_rebound_scan"]
+    opus_reasons: ["athena_done", "gap_rebound_scan", "nxt_gap_scan"]
     opus_extra_slots:
       KR: ["08:00", "09:00"]
       US: ["22:30"]

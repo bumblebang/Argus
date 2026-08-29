@@ -206,6 +206,8 @@ def assemble(items: list[dict], market_state: dict,
             feat["nxt_supported"] = it["nxt_supported"]
         if it.get("added_at") is not None:
             feat["added_at"] = it["added_at"]
+        if it.get("pool_date"):
+            feat["pool_date"] = it["pool_date"]
         if it.get("layer"):
             feat["layer"] = it["layer"]
         if sym in positioning:
