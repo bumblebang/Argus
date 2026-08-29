@@ -131,13 +131,15 @@ def close_scan_exit_trigger(pos: dict, *, market: str = "KR", now: float,
     from ..market_hours import market_day, is_tradable, current_session
 
     kst = ZoneInfo("Asia/Seoul")
-    now_dt = datetime.fromtimestamp(float(now), tz=kst)
+    now_ts = float(now)
+    now_dt = datetime.fromtimestamp(now_ts, tz=kst)
     opened_dt = datetime.fromtimestamp(float(opened), tz=kst)
     if market_day(market, now_dt) <= market_day(market, opened_dt):
         return None
-    if not is_tradable(market, sessions, now_dt):
+    # is_tradable/current_session 은 epoch(float)만 받는다 — datetime 넘기면 TypeError.
+    if not is_tradable(market, sessions, now_ts):
         return None
-    sess = current_session(market, now_dt, sessions)
+    sess = current_session(market, now_ts)
     if sess not in ("premarket", "regular"):
         return None
     return T.Trigger(

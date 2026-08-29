@@ -85,7 +85,8 @@ def test_close_scan_buy_exempt_from_dossier(tmp_path):
     res, broker = _cycle(
         tmp_path, _buy(horizon="close_scan"), dossier_fn=lambda s: False,
         wake_reason="gap_rebound_scan",
-        features_by_sym={"005930": {"pool": "gap_decline", "source": "gap_rebound"}})
+        features_by_sym={"005930": {"pool": "gap_decline", "source": "gap_rebound",
+                                    "pool_date": "2026-08-29", "market": "KR"}})
     assert res.executed[0]["status"] == "filled"
     assert broker.account.position("005930").qty > 0
 
@@ -94,7 +95,8 @@ def test_gap_scan_coerces_swing_to_close_scan(tmp_path):
     res, broker = _cycle(
         tmp_path, _buy(horizon="swing"), dossier_fn=lambda s: False,
         wake_reason="gap_rebound_scan",
-        features_by_sym={"005930": {"pool": "gap_decline"}})
+        features_by_sym={"005930": {"pool": "gap_decline", "pool_date": "2026-08-29",
+                                    "market": "KR"}})
     assert res.executed[0]["status"] == "filled"
     assert res.decision.proposals[0].horizon == "close_scan"
 
@@ -103,7 +105,62 @@ def test_gap_scan_rejects_day_horizon(tmp_path):
     res, broker = _cycle(
         tmp_path, _buy(horizon="day"), dossier_fn=lambda s: False,
         wake_reason="gap_rebound_scan",
-        features_by_sym={"005930": {"pool": "gap_decline"}})
+        features_by_sym={"005930": {"pool": "gap_decline", "pool_date": "2026-08-29",
+                                    "market": "KR"}})
+    assert res.executed[0]["status"] == "wrong_horizon"
+    assert broker.account.position("005930").qty == 0
+
+
+def test_close_scan_horizon_rejected_off_gap_track(tmp_path):
+    """periodic 등 — horizon=close_scan 만으로 도시레 면제 우회 금지."""
+    res, broker = _cycle(
+        tmp_path, _buy(horizon="close_scan"), dossier_fn=lambda s: False,
+        wake_reason="periodic",
+        features_by_sym={"005930": {"pool": "universe"}})
+    assert res.executed[0]["status"] == "wrong_horizon"
+    assert broker.account.position("005930").qty == 0
+
+
+def test_gap_pool_tag_does_not_block_swing_on_periodic(tmp_path):
+    """전일 pool_date — active 갭 트랙 아님 → periodic 스윙 허용."""
+    res, broker = _cycle(
+        tmp_path, _buy(horizon="swing"), dossier_fn=lambda s: True,
+        wake_reason="periodic",
+        features_by_sym={"005930": {"pool": "gap_decline", "source": "gap_rebound",
+                                  "pool_date": "2026-08-28", "market": "KR"}})
+    assert res.executed[0]["status"] == "filled"
+    assert broker.account.position("005930").qty > 0
+
+
+def test_fresh_gap_pool_blocks_swing_on_periodic(tmp_path):
+    """당일 pool_date 갭풀 — gap scan 외 스윙 BUY 금지."""
+    res, broker = _cycle(
+        tmp_path, _buy(horizon="swing"), dossier_fn=lambda s: True,
+        wake_reason="periodic",
+        features_by_sym={"005930": {"pool": "gap_decline", "source": "gap_rebound",
+                                  "pool_date": "2026-08-29", "market": "KR"}})
+    assert res.executed[0]["status"] == "wrong_horizon"
+    assert broker.account.position("005930").qty == 0
+
+
+def test_fresh_gap_pool_blocks_position_and_day_on_extra(tmp_path):
+    for hz in ("position", "day", "close_scan"):
+        res, broker = _cycle(
+            tmp_path, _buy(horizon=hz), dossier_fn=lambda s: True,
+            wake_reason="extra",
+            features_by_sym={"005930": {"pool": "gap_decline", "pool_date": "2026-08-29",
+                                        "market": "KR"}})
+        assert res.executed[0]["status"] == "wrong_horizon", hz
+        assert broker.account.position("005930").qty == 0
+
+
+def test_fresh_gap_pool_blocks_swing_overlap_tag_on_periodic(tmp_path):
+    """pool=swing 이라도 당일 갭풀 overlay 면 periodic BUY 차단."""
+    res, broker = _cycle(
+        tmp_path, _buy(horizon="swing"), dossier_fn=lambda s: True,
+        wake_reason="periodic",
+        features_by_sym={"005930": {"pool": "swing", "pool_date": "2026-08-29",
+                                    "source": "gap_rebound", "market": "KR"}})
     assert res.executed[0]["status"] == "wrong_horizon"
     assert broker.account.position("005930").qty == 0
 

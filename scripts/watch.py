@@ -114,7 +114,8 @@ def _refresh_gap_decline_pool(cfg) -> None:
     from src.datasources.discovery import top_by_trading_value
 
     def fetch_top(market, count=100, pool=100, **_kw):
-        return top_by_trading_value(market, count=count, pool=pool)
+        return top_by_trading_value(
+            market, count=count, pool=pool, allow_cache_fallback=False)
 
     refresh_all_gap_decline_pools(fetch_top, cfg)
 

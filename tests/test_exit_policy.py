@@ -103,7 +103,8 @@ def test_time_stop_skips_close_scan_horizon():
     assert time_stop_trigger(pos, cfg=cfg, now=now) is None
 
 
-def test_close_scan_exit_next_trading_day(monkeypatch):
+def test_close_scan_exit_next_trading_day():
+    """익일 세션 — epoch 경로로 TypeError 없이 close_scan_exit 발화."""
     from datetime import datetime
     from zoneinfo import ZoneInfo
 
@@ -116,11 +117,26 @@ def test_close_scan_exit_next_trading_day(monkeypatch):
         "opened_at": opened,
         "meta": {"horizon": "close_scan"},
     }
-    monkeypatch.setattr("src.market_hours.market_day", lambda m, dt: dt.strftime("%Y-%m-%d"))
-    monkeypatch.setattr("src.market_hours.is_tradable", lambda *a, **k: True)
-    monkeypatch.setattr("src.market_hours.current_session", lambda *a, **k: "regular")
-    t = close_scan_exit_trigger(pos, market="KR", now=now)
+    t = close_scan_exit_trigger(
+        pos, market="KR", now=now, sessions=("premarket", "regular"))
     assert t is not None and t.kind == "close_scan_exit"
+    assert t.payload.get("session") in ("premarket", "regular")
+
+
+def test_close_scan_exit_same_day_no_trigger():
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+
+    kst = ZoneInfo("Asia/Seoul")
+    ts = datetime(2026, 8, 28, 15, 25, tzinfo=kst).timestamp()
+    pos = {
+        "symbol": "085620",
+        "qty": 1,
+        "opened_at": ts,
+        "meta": {"horizon": "close_scan"},
+    }
+    assert close_scan_exit_trigger(
+        pos, market="KR", now=ts, sessions=("premarket", "regular")) is None
 
 
 def test_watch_config_parses_exit_policy():

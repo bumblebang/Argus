@@ -4,7 +4,7 @@
 """
 from __future__ import annotations
 
-_DEFAULT_OPUS_REASONS = frozenset({"athena_done", "gap_rebound_scan"})
+_DEFAULT_OPUS_REASONS = frozenset({"athena_done", "gap_rebound_scan", "nxt_gap_scan"})
 _DEFAULT_OPUS_EXTRA_SLOTS = {"KR": ("08:00", "09:00"), "US": ("22:30",)}
 
 

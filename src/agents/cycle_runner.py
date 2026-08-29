@@ -110,7 +110,8 @@ class CycleRunner:
                  "fluctuation": it.get("fluctuation"),
                  "decline_pct": it.get("decline_pct"),
                  "nxt_supported": it.get("nxt_supported"),
-                 "added_at": it.get("added_at")}
+                 "added_at": it.get("added_at"),
+                 "pool_date": it.get("pool_date")}
                 for market, lst in (universe or {}).items() for it in (lst or [])
                 if isinstance(it, dict) and it.get("symbol")]
 
@@ -320,6 +321,10 @@ class CycleRunner:
         items = self._items_from(self.universe_fn()) if self.universe_fn else self.items
         # 열린 시장 필터(opt-in): 주어졌을 때만 닫힌 시장 후보를 제외한다.
         # Athena 종료 훅(07:30)은 프리 전이므로 후보를 비우면 안 된다 — 오늘 살 시장만 남긴다.
+        wake_reason = str((wake or {}).get("reason") or "")
+        if wake_reason not in GAP_SCAN_REASONS:
+            items = [i for i in items
+                     if str(i.get("pool") or "") != "gap_decline"]
         if self.open_markets_fn is not None:
             reason = str((wake or {}).get("reason") or "")
             if reason == "athena_done":
@@ -335,7 +340,6 @@ class CycleRunner:
             stale = self.illiquid_fn()
             if stale:
                 items = [i for i in items if i["symbol"] not in stale]
-        wake_reason = str((wake or {}).get("reason") or "")
         if wake_reason in GAP_SCAN_REASONS:
             nxt = nxt_supported_map(i["symbol"] for i in items if i.get("market") == "KR")
             before = len(items)
@@ -355,6 +359,16 @@ class CycleRunner:
             candidates = filter_gap_rebound_candidates(candidates, held=held)
             if len(candidates) < before:
                 log.info("갭반등 pre-filter %d→%d (floor<=-5%%)", before, len(candidates))
+        from ..gap_decline_pool import fresh_gap_symbols, load_gap_decline_pool
+        _gap_raw = load_gap_decline_pool()
+        _gap_overlay = fresh_gap_symbols(_gap_raw, "KR")
+        if _gap_overlay:
+            for c in candidates:
+                sym = str(c.get("symbol") or "")
+                if c.get("market") == "KR" and sym in _gap_overlay:
+                    c["pool"] = "gap_decline"
+                    c["source"] = "gap_rebound"
+                    c["pool_date"] = _gap_overlay[sym]
         scfg_enrich = serve.serve_cfg(agents_cfg)
         from ..candidate_enrich import enrich_candidates
         enrich_stats = enrich_candidates(

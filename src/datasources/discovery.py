@@ -122,10 +122,12 @@ def fetch_ranking(naver_market: str, pool: int = 100) -> list[dict]:
 
 def top_by_trading_value(market: str = "KR", count: int = 20, pool: int = 100,
                          min_price: float = 0.0,
-                         fetch_fn=fetch_ranking) -> list[dict]:
+                         fetch_fn=fetch_ranking,
+                         allow_cache_fallback: bool = True) -> list[dict]:
     """거래대금 상위 종목 발굴. 반환: [{symbol,name,price,trading_value,fluctuation}] count개.
 
     fetch_fn 주입 가능(테스트 시 네트워크 대체).
+    allow_cache_fallback=False 이면 당일 라이브만(갭 풀 15:15 등 — 전일 캐시·시총 보충 금지).
     """
     rows: list[dict] = []
     for nm in _NAVER_MARKETS.get(market, [market]):
@@ -139,7 +141,7 @@ def top_by_trading_value(market: str = "KR", count: int = 20, pool: int = 100,
     if len(ranked) >= count:
         # 건강한 라이브 랭킹 → 전일 캐시로 축적(다음날 개장 전 코어가 전일 기준으로 씀).
         _save_ranking_cache("KR", ranked)
-    else:
+    elif allow_cache_fallback:
         # 개장 전 폴백: 새 거래일은 누적 거래대금 0. ①전일 캐시(진짜 전일 거래대금 순)
         # ②그래도 모자라면 시총 순(Naver 풀 원순서) — 최후 폴백.
         seen = {r["symbol"] for r in ranked}
@@ -157,6 +159,8 @@ def top_by_trading_value(market: str = "KR", count: int = 20, pool: int = 100,
                 log.info("발굴 KR 여전히 %d < %d — 시총 순 %d종목 보충(최후 폴백)",
                          len(ranked), count, min(len(fill), count - len(ranked)))
             ranked += fill
+    elif ranked:
+        log.info("발굴 KR 라이브 %d건(폴백 비활성, 요청 %d)", len(ranked), count)
     log.info("발굴 KR %d종목(거래대금 상위, pool=%d, 후보 %d)",
              min(count, len(ranked)), pool, len(ranked))
     return ranked[:count]
