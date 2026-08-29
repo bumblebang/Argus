@@ -22,6 +22,7 @@ from .cycle import run_cycle, CycleResult
 from .value_trade import value_trade_cfg
 from . import serve_policy as serve
 from . import DecisionAgent, ValidationAgent
+from .brain_model_policy import decision_tier
 from .wiring import (
     DATA, LLMFactory, FetchCandles,
     build_paper_core, sector_map_from_universe, earnings_near,
@@ -43,17 +44,19 @@ class CycleRunner:
                  fetch_candles: FetchCandles, store=None, broker: Broker | None = None,
                  risk: RiskManager | None = None,
                  val_llm_factory: LLMFactory | None = None,
+                 decision_llm_fn: Callable[[dict | None], object] | None = None,
                  universe_fn: Callable[[], dict] | None = None,
                  open_markets_fn: Callable[[], list] | None = None,
                  illiquid_fn: Callable[[], set] | None = None,
                  journal_path: str | Path = "data/decisions.jsonl",
                  market_state_path: str | Path = DATA / "market_state.json",
-                 candle_interval: str = "1d", candle_count: int = 30) -> None:
+                 candle_interval: str = "1d", candle_count: int = 250) -> None:
         self.cfg = cfg
         self.llm_factory = llm_factory
         # 검증 전용 LLM 팩토리(선택). 없으면 결정과 같은 llm 공유(하위호환). 분리 시
         # 결정=상위 티어·검증=독립 티어로 "같은 편향 두 번 통과"를 막는다.
         self.val_llm_factory = val_llm_factory
+        self.decision_llm_fn = decision_llm_fn
         self.fetch_candles = fetch_candles
         self.store = store
         self.journal_path = _paths.resolve("decisions", configured=journal_path)
@@ -401,7 +404,8 @@ class CycleRunner:
         focus = build_focus(ms, candidates=candidates,
                             positions=portfolio.get("positions") or [],
                             wake=wake)
-        llm = self.llm_factory(candidates)
+        llm = (self.decision_llm_fn(wake) if self.decision_llm_fn
+               else self.llm_factory(candidates))
         val_llm = self.val_llm_factory(candidates) if self.val_llm_factory else llm
         constraints = {"capital": self.cfg.risk.get("capital", {}),
                        "max_position_pct": self.cfg.risk.get("max_position_pct", 0.2),
@@ -445,6 +449,9 @@ class CycleRunner:
                     "asof": asof,
                     "asof_age_sec": age,
                     "reason": (wake or {}).get("reason") if wake else None,
+                    "decision_tier": (
+                        decision_tier(wake, agents_cfg=self.cfg.raw.get("agents"))
+                        if self.decision_llm_fn else None),
                 })
             except Exception as e:
                 log.warning("brain_serve 관측 로깅 실패: %s", e)

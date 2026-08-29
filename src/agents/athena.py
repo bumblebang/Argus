@@ -21,9 +21,8 @@ import pandas as pd
 
 from ..baserate import analyze
 from ..focus import build_focus, attach_krx_fields
-from ..indicators import rsi, sma
 from ..logging_setup import get_logger
-from .features import _gap_fields
+from .features import technical_summary
 from .schemas import DossierOutput
 
 log = get_logger("agents.athena")
@@ -94,39 +93,6 @@ ATHENA_SYSTEM = """\
   금리 민감 업종이라면 evidence 에 수치로 인용하라.
 - 미국 종목이면 macro(FRED: 기준금리·국채·달러인덱스·실업·CPI 등)가 거시 배경이다.
   macro_kr 로 US 금리·물가를 대신하지 마라. 금리 민감이면 evidence 에 수치로 인용하라."""
-
-
-# ── 기술적 요약(코드 계산 — LLM 에 원시 캔들 대신 압축 수치를 준다) ──────
-def technical_summary(df: pd.DataFrame) -> dict:
-    """일봉 히스토리 → 위치/추세/모멘텀 요약. 도시에 컨텍스트의 뼈대."""
-    if df is None or len(df) < 60:
-        return {}
-    close = df["close"].astype(float)
-    last = float(close.iloc[-1])
-    hi52 = float(close.tail(252).max()) if len(close) >= 252 else float(close.max())
-    lo52 = float(close.tail(252).min()) if len(close) >= 252 else float(close.min())
-    vol = df["volume"].astype(float)
-
-    def _sma_gap(n: int) -> float | None:
-        if len(close) < n:
-            return None
-        return round((last / float(sma(close, n).iloc[-1]) - 1) * 100, 1)
-
-    return {
-        "price": round(last, 2),
-        "pct_from_52w_high": round((last / hi52 - 1) * 100, 1),
-        "pct_from_52w_low": round((last / lo52 - 1) * 100, 1),
-        "vs_sma20_pct": _sma_gap(20), "vs_sma60_pct": _sma_gap(60),
-        "vs_sma120_pct": _sma_gap(120),
-        "rsi14": round(float(rsi(close, 14).iloc[-1]), 1),
-        "ret_20d_pct": round((last / float(close.iloc[-20]) - 1) * 100, 1),
-        "ret_60d_pct": (round((last / float(close.iloc[-60]) - 1) * 100, 1)
-                        if len(close) >= 60 else None),
-        "volume_ratio_20v60": (round(float(vol.tail(20).mean())
-                                     / float(vol.tail(60).mean()), 2)
-                               if float(vol.tail(60).mean()) else None),
-        **_gap_fields(df),   # gap_pct/open/prev_close — 후보 피처와 같은 계산
-    }
 
 
 def build_research_context(symbol: str, name: str, market: str, *,

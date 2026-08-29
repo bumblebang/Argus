@@ -1,8 +1,8 @@
 """후보 종목 피처 조립 — market_state + 캔들 지표를 종목별로 묶는다.
 
 각 후보: {symbol,name,market,price,ma20,rsi,momentum_20d,drawdown_pct,drawdown_lookback,
-stabilizing,gap_pct,open,prev_close,volume,fundamentals,flows,news[]}. 가격/지표는 캔들에서
-계산(없으면 None). 결정 에이전트가 이 피처를 읽는다.
+pct_from_52w_high,pct_from_52w_low,vs_sma60_pct,vs_sma120_pct,ret_60d_pct,...}.
+가격/지표는 캔들에서 계산(없으면 None). 결정 에이전트가 이 피처를 읽는다.
 
 drawdown_pct/stabilizing 은 "공포에 사되 떨어지는 칼은 피한다"의 종목층 —
 낙폭이 클수록 싸지만, 20일선 위 + 20일 수익률 플러스(stabilizing.ok)여야 바닥이 잡힌 것.
@@ -104,6 +104,52 @@ def _intraday_ret_fields(df: pd.DataFrame | None, price: float | None = None) ->
         return {}
     return {"intraday_ret_pct": round((px / op - 1) * 100, 2),
             "intraday_open": round(op, 2)}
+
+
+# Athena 도시에·뇌 후보 공용 — 일봉 60봉+ 위치/추세 요약(원시 OHLCV 대신 스칼라).
+_LONG_HORIZON_KEYS = (
+    "pct_from_52w_high", "pct_from_52w_low",
+    "vs_sma20_pct", "vs_sma60_pct", "vs_sma120_pct",
+    "ret_60d_pct", "volume_ratio_20v60",
+)
+
+
+def technical_summary(df: pd.DataFrame) -> dict:
+    """일봉 히스토리 → 위치/추세/모멘텀 요약. 60봉 미만이면 {}."""
+    if df is None or len(df) < 60:
+        return {}
+    close = df["close"].astype(float)
+    last = float(close.iloc[-1])
+    hi52 = float(close.tail(252).max()) if len(close) >= 252 else float(close.max())
+    lo52 = float(close.tail(252).min()) if len(close) >= 252 else float(close.min())
+    vol = df["volume"].astype(float)
+
+    def _sma_gap(n: int) -> float | None:
+        if len(close) < n:
+            return None
+        return round((last / float(sma(close, n).iloc[-1]) - 1) * 100, 1)
+
+    return {
+        "price": round(last, 2),
+        "pct_from_52w_high": round((last / hi52 - 1) * 100, 1),
+        "pct_from_52w_low": round((last / lo52 - 1) * 100, 1),
+        "vs_sma20_pct": _sma_gap(20), "vs_sma60_pct": _sma_gap(60),
+        "vs_sma120_pct": _sma_gap(120),
+        "rsi14": round(float(rsi(close, 14).iloc[-1]), 1),
+        "ret_20d_pct": round((last / float(close.iloc[-20]) - 1) * 100, 1),
+        "ret_60d_pct": (round((last / float(close.iloc[-60]) - 1) * 100, 1)
+                        if len(close) >= 60 else None),
+        "volume_ratio_20v60": (round(float(vol.tail(20).mean())
+                                     / float(vol.tail(60).mean()), 2)
+                               if float(vol.tail(60).mean()) else None),
+        **_gap_fields(df),
+    }
+
+
+def _long_horizon_fields(df: pd.DataFrame | None) -> dict:
+    """technical_summary 에서 뇌 후보용 장기 필드만 추출(중복 price/rsi 제외)."""
+    tech = technical_summary(df) if df is not None else {}
+    return {k: tech[k] for k in _LONG_HORIZON_KEYS if tech.get(k) is not None}
 
 
 def assemble(items: list[dict], market_state: dict,
@@ -210,6 +256,7 @@ def assemble(items: list[dict], market_state: dict,
                     # bool() 필수 — numpy bool 이면 json.dumps 가 깨진다.
                     "ok": bool(price > feat["ma20"] and feat["momentum_20d"] > 0),
                 }
+                feat.update(_long_horizon_fields(df))
                 price_lookup[sym] = price
                 if enrich_strategy:   # 도구: 후보 캔들에 전략 적합도 랭킹
                     rec = recommend_strategy(df)

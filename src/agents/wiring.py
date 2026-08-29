@@ -160,6 +160,24 @@ def select_backend(*, dry: bool = False, cli: bool = False, live: bool = False,
     return True, False, False                 # 인증 없음 -> 자동 dry
 
 
+# ── 뇌 피처용 일봉: 밸류와 동일 Yahoo 1y 캐시 (토스 30봉 경로 대체) ────────
+def history_candles_1y(symbol: str, market: str) -> list[dict]:
+    """Yahoo 일봉 1년 → assemble 이 먹는 raw 리스트. max_age_hours=20 이면 사실상 하루 1회 갱신.
+
+    토스 gateway.candles(1d,30) 대신 쓴다. 긴 lookback(drawdown 60·향후 52w 등)에 충분하고,
+    data/history/*.csv 캐시라 유니버스 신규만 Yahoo 1콜.
+    """
+    from ..datasources.history import fetch_history
+    df = fetch_history(symbol, interval="1d", range_="1y", market=market,
+                       max_age_hours=20)
+    if df is None or getattr(df, "empty", True):
+        return []
+    cols = [c for c in ("time", "open", "high", "low", "close", "volume") if c in df.columns]
+    if not cols:
+        return []
+    return df[cols].to_dict(orient="records")
+
+
 # ── dry(인증 불필요) 헬퍼: 합성 캔들 + MockLLM. 배선/데모 검증용. ──────────
 def synth_candles(symbol: str, market: str) -> list[dict]:
     """결정적 난수로 30봉 합성 OHLCV. 토스 호출 없이 흐름을 돌려본다."""
@@ -390,4 +408,36 @@ def build_live_llm(cfg: AppConfig, *, use_cli: bool, subscription: bool,
                      thinking=bool(a.get("thinking", True)),
                      max_tokens=int(a.get("max_tokens", 8000)))
 
+
+def build_brain_llm_factories(cfg: AppConfig, *, use_cli: bool, subscription: bool,
+                              api_key: str | None):
+    """뇌 결정(opus/sonnet wake 라우팅) + 검증(opus 고정) LLM 팩토리.
+
+    반환: (llm_factory, val_llm_factory, decision_llm_fn, log_meta dict).
+    """
+    from .brain_model_policy import brain_decision_cfg, pick_decision_llm
+
+    acfg = cfg.raw.get("agents", {})
+    bcfg = brain_decision_cfg(acfg)
+    opus_m = (bcfg.get("opus_model")
+              or (acfg.get("claude_model") if use_cli else acfg.get("model")))
+    sonnet_m = (bcfg.get("sonnet_model")
+                or acfg.get("claude_fallback_model") or "sonnet")
+    val_model = (acfg.get("claude_val_model") if use_cli
+                 else acfg.get("val_model")) or opus_m
+
+    dec_opus = build_live_llm(cfg, use_cli=use_cli, subscription=subscription,
+                              api_key=api_key, model_override=opus_m)
+    dec_sonnet = build_live_llm(cfg, use_cli=use_cli, subscription=subscription,
+                                api_key=api_key, model_override=sonnet_m)
+    val_llm = build_live_llm(cfg, use_cli=use_cli, subscription=subscription,
+                             api_key=api_key, model_override=val_model)
+
+    decision_llm_fn = (lambda wake: pick_decision_llm(
+        wake, dec_opus, dec_sonnet, agents_cfg=acfg))
+    llm_factory = lambda cands: dec_opus
+    val_llm_factory = lambda cands: val_llm
+    meta = {"decision_opus": opus_m, "decision_sonnet": sonnet_m,
+            "validation": val_model, "tier_routing": bcfg.get("enabled", True)}
+    return llm_factory, val_llm_factory, decision_llm_fn, meta
 
