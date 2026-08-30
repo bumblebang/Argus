@@ -5,6 +5,7 @@
 그 배경을 아예 못 보므로 둘 다 고정한다.
 """
 import json
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
@@ -69,13 +70,47 @@ def test_intraday_ret_down_five_percent():
 
 def test_live_price_overrides_stale_close():
     """Yahoo 캐시 종가(100) 대신 live_prices(90) → intraday·price_lookup 반영."""
+    from src.agents.features import assemble
+    from src.market_hours import trading_date
+
+    today = trading_date("KR")
+    tz = ZoneInfo("Asia/Seoul")
+    rows = []
+    for i in range(31):
+        d = (pd.Timestamp(today, tz=tz) - pd.Timedelta(days=30 - i)).date().isoformat()
+        rows.append({"time": pd.Timestamp(d, tz=tz), "open": 100.0, "high": 101.0,
+                     "low": 99.0, "close": 100.0, "volume": 1000})
     items = [{"symbol": "005930", "name": "삼성전자", "market": "KR"}]
-    bars = [(100.0, 100.0)] * 30 + [(100.0, 100.0)]   # 마지막 봉 종가 100(전일처럼)
-    cands, px = assemble(items, {}, lambda s, m: _candles(bars),
+    cands, px = assemble(items, {}, lambda s, m: rows,
                          live_prices={"005930": 90.0})
     assert cands[0]["intraday_ret_pct"] == -10.0
     assert cands[0]["price"] == 90.0
     assert px["005930"] == 90.0
+
+
+def test_assemble_refreshes_stale_daily_before_patch(monkeypatch):
+    """20h TTL 어제 봉 캐시 — 패치 전 fresh 일봉으로 당일 시가 확보."""
+    from src.agents.features import assemble
+    from src.market_hours import trading_date
+
+    today = trading_date("KR")
+    tz = ZoneInfo("Asia/Seoul")
+    yday = (pd.Timestamp(today, tz=tz) - pd.Timedelta(days=1)).date().isoformat()
+
+    stale_rows = [{"time": pd.Timestamp(yday, tz=tz), "open": 100.0, "high": 100.0,
+                   "low": 90.0, "close": 95.0, "volume": 1000}]
+    fresh_rows = stale_rows + [{"time": pd.Timestamp(today, tz=tz), "open": 98.0,
+                                "high": 99.0, "low": 97.0, "close": 97.5, "volume": 500}]
+
+    monkeypatch.setattr(
+        "src.agents.wiring.history_candles_1y",
+        lambda sym, mkt, fresh=False: fresh_rows if fresh else stale_rows,
+    )
+    items = [{"symbol": "005930", "name": "삼성", "market": "KR"}]
+    cands, _ = assemble(items, {}, lambda s, m: stale_rows, live_prices={"005930": 92.0})
+    assert cands[0]["intraday_ret_pct"] == round((92.0 / 98.0 - 1) * 100, 2)
+    gs = cands[0].get("gap_shape") or {}
+    assert gs.get("gap_pct") == round((98.0 / 95.0 - 1) * 100, 2)
 
 
 def test_filter_gap_rebound_keeps_held():
@@ -142,6 +177,22 @@ def test_decision_prompt_has_overnight_us_background():
     assert "SP500" in DEC and "USDKRW" in DEC
     assert "기계적으로 '미장이 올랐으니 BUY' 로 가지 마라" in DEC
     assert "gap_shape" in DEC
+
+
+def test_gap_shape_intraday_after_open_is_open_to_price():
+    """intraday_after_open_pct = px/open-1 (gap_pct 이중 차감 금지)."""
+    from src.gap_rebound_features import gap_shape_fields
+
+    df = pd.DataFrame({
+        "open": [100.0, 97.0],
+        "high": [100.0, 97.2],
+        "low": [99.0, 96.0],
+        "close": [100.0, 96.1],
+        "volume": [1000, 1000],
+    })
+    gs = gap_shape_fields(df)["gap_shape"]
+    assert gs["gap_pct"] == -3.0
+    assert gs["intraday_after_open_pct"] == round((96.1 / 97.0 - 1) * 100, 2)
 
 
 def test_assemble_gap_shape_flags():

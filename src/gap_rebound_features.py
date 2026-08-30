@@ -50,7 +50,7 @@ def gap_shape_fields(df: pd.DataFrame | None, *, price: float | None = None) -> 
 
     shape: dict = {
         "gap_pct": round(gap_pct, 2),
-        "intraday_after_open_pct": round(intraday - gap_pct, 2),
+        "intraday_after_open_pct": round(intraday, 2),
         "close_loc": round(loc, 2) if loc is not None else None,
         "gap_down_deep": bool(gap_pct <= GAP_DOWN_DEEP_PCT),
         "close_near_day_low": bool(loc is not None and loc <= CLOSE_LOC_LOW_MAX),

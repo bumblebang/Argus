@@ -26,10 +26,13 @@ from .gap_rebound_features import (
     VOL_RATIO_SPIKE,
     day_close_loc,
 )
+from .eval.trade_defs import roundtrip_cost_pct
 from .security_filter import is_buy_ineligible
 
 PRIOR_PATH = ROOT / "data" / "gap_rebound_prior.json"
 PRIOR_MIN_N = 200
+# 국장 왕복 비용 하한(%p). cfg/paper 기본(≈0.28%%)과 max — 0 비용 착시 방지.
+KR_MIN_ROUNDTRIP_COST_PCT = 0.2
 
 _HISTORY = ROOT / "data" / "history"
 _CACHE_RE = re.compile(r"^(\d{6})\.(KS|KQ)_1d_(1y|2y|5y|6mo)\.csv$", re.I)
@@ -38,7 +41,7 @@ _RANGE_RANK = {"6mo": 1, "1y": 2, "2y": 3, "5y": 4}
 EVENT_COLS = [
     "date", "symbol", "name", "intraday_ret_pct", "daily_ret_pct",
     "trading_value", "decline_rank", "entry_px", "exit_open_px", "exit_close_px",
-    "ret_next_open_pct", "ret_next_close_pct", "gap_next_open_pct",
+    "ret_next_open_pct", "ret_next_close_pct",
 ]
 
 
@@ -114,6 +117,11 @@ def build_panel(files: dict[str, Path] | None = None,
     return panel
 
 
+def roundtrip_cost_pct_points(market: str = "KR", cfg: dict | None = None) -> float:
+    """왕복 비용(%p). trade_defs 기본값과 KR 하한(0.2%%) 중 큰 값."""
+    return max(roundtrip_cost_pct(market, cfg) * 100.0, KR_MIN_ROUNDTRIP_COST_PCT)
+
+
 def _eligible_symbols(symbols: Iterable[str], info_cache: dict | None) -> set[str]:
     out: set[str] = set()
     for sym in symbols:
@@ -164,12 +172,12 @@ def events_for_day(day: pd.DataFrame, *,
     pool["decline_rank"] = (
         pool["daily_ret_pct"].rank(method="first").astype(int)
     )
+    cost = roundtrip_cost_pct_points("KR")
     pool["entry_px"] = pool["close"]
     pool["exit_open_px"] = pool["next_open"]
     pool["exit_close_px"] = pool["next_close"]
-    pool["ret_next_open_pct"] = (pool["next_open"] / pool["close"] - 1) * 100
-    pool["ret_next_close_pct"] = (pool["next_close"] / pool["close"] - 1) * 100
-    pool["gap_next_open_pct"] = (pool["next_open"] / pool["close"] - 1) * 100
+    pool["ret_next_open_pct"] = (pool["next_open"] / pool["close"] - 1) * 100 - cost
+    pool["ret_next_close_pct"] = (pool["next_close"] / pool["close"] - 1) * 100 - cost
     pool["name"] = pool["symbol"]
     return pool[EVENT_COLS]
 
@@ -254,7 +262,6 @@ def summarize_by_bucket(events: pd.DataFrame, *,
             "avg_ret_close": round(grp["ret_next_close_pct"].mean(), 2),
             "med_ret_open": round(grp["ret_next_open_pct"].median(), 2),
             "med_ret_close": round(grp["ret_next_close_pct"].median(), 2),
-            "avg_gap_open": round(grp["gap_next_open_pct"].mean(), 2),
             "avg_intraday": round(grp["intraday_ret_pct"].mean(), 2),
             "avg_daily": round(grp["daily_ret_pct"].mean(), 2),
         })
@@ -382,6 +389,7 @@ def build_prior(events: pd.DataFrame, overall: dict | None = None, *,
         "caveats": caveats or [
             "Yahoo 일봉 프록시; 15:20=종가 근사",
             "거래대금=close*volume; 캐시 유니버스",
+            f"수익률=왕복비용 차감(≥{KR_MIN_ROUNDTRIP_COST_PCT:.1f}%p, fee*2+세+slip)",
         ],
         "overall": overall or summarize_overall(events),
         "conditions": prior_conds,

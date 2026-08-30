@@ -6,11 +6,14 @@
 from __future__ import annotations
 
 import time as _time
+from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import yaml
 
 from .config import AppConfig, ROOT
+from .market_hours import trading_date
 from .logging_setup import get_logger
 from .session_policy import market_tradable, trading_sessions_from_raw
 from .broker import Broker
@@ -54,8 +57,34 @@ def candles_to_df(raw: list[dict]) -> pd.DataFrame:
     return df
 
 
-def patch_live_price(df: pd.DataFrame, price: float | None) -> pd.DataFrame:
-    """마지막 봉의 종가를 실시간가로 갈아끼운다(고/저는 가격 포함하도록 보정).
+def _market_tz(market: str) -> ZoneInfo:
+    from .market_hours import _SESSIONS
+    tzname = _SESSIONS.get(market, ("Asia/Seoul",))[0]
+    return ZoneInfo(tzname)
+
+
+def last_bar_trading_date(df: pd.DataFrame | None, market: str = "KR") -> str | None:
+    """마지막 봉의 거래일(ISO). time 열 없으면 None(판정 불가)."""
+    if df is None or len(df) == 0 or "time" not in df.columns:
+        return None
+    t = df["time"].iloc[-1]
+    if pd.isna(t):
+        return None
+    ts = pd.Timestamp(t)
+    if ts.tzinfo is None:
+        ts = ts.tz_localize("UTC")
+    return ts.tz_convert(_market_tz(market)).date().isoformat()
+
+
+def patch_live_price(df: pd.DataFrame, price: float | None, *,
+                     market: str = "KR",
+                     append_if_new_day: bool = False) -> pd.DataFrame:
+    """마지막 봉의 종가를 실시간가로 갱신 — **당일 봉만** 패치.
+
+    TTL 일봉 캐시(20h)가 어제 15:20 봉인데 라이브가를 어제 봉 종가에 덮으면
+    어제 OHLC + 오늘 종가 혼합봉이 되어 intraday/gap_shape 가 깨진다.
+    time 이 있고 마지막 봉이 오늘 거래일이 아니면 패치하지 않는다.
+    append_if_new_day=True 면 당일 degenerate 봉을 append(시가=현재가 근사 — 차선).
 
     캔들은 TTL 캐시(수 초 지연)지만 매 틱 실시간가로 마지막봉을 패치하면, 전략 decide()가
     1초 단위로 현재가에 반응한다(데이트레 진입/청산 반응성). df 는 호출마다 새로 생성되므로
@@ -63,13 +92,25 @@ def patch_live_price(df: pd.DataFrame, price: float | None) -> pd.DataFrame:
     """
     if price is None or df is None or len(df) == 0 or "close" not in df.columns:
         return df
-    i = df.index[-1]
-    df.loc[i, "close"] = price
-    if "high" in df.columns and price > df.loc[i, "high"]:
-        df.loc[i, "high"] = price
-    if "low" in df.columns and price < df.loc[i, "low"]:
-        df.loc[i, "low"] = price
-    return df
+    out = df.copy()
+    bar_day = last_bar_trading_date(out, market)
+    today = trading_date(market)
+    if bar_day is not None and bar_day != today:
+        if not append_if_new_day:
+            return out
+        tz = _market_tz(market)
+        row = {"open": price, "high": price, "low": price, "close": price,
+               "volume": 0.0}
+        if "time" in out.columns:
+            row["time"] = pd.Timestamp(datetime.now(tz).date(), tzinfo=tz)
+        return pd.concat([out, pd.DataFrame([row])], ignore_index=True)
+    i = out.index[-1]
+    out.loc[i, "close"] = price
+    if "high" in out.columns and price > out.loc[i, "high"]:
+        out.loc[i, "high"] = price
+    if "low" in out.columns and price < out.loc[i, "low"]:
+        out.loc[i, "low"] = price
+    return out
 
 
 class TradingBot:
