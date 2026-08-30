@@ -45,6 +45,7 @@ W_DAY_OS = 0.08      # day + RSI<40 (프롬프트의 과매도=day 와 일치)
 W_INVAL = -0.20      # 무효화 하회 — 체결 거부 대상이라 사이징도 깎음
 W_DISC_LEGAL = -0.12 # 소송·횡령·상장폐지 등 — 매수 논리와 충돌
 W_DISC_DILUTE = -0.10  # 유상증자·CB·감자 — 희석
+W_EARN_MISS = -0.10  # 컨센서스 대비 -10%. 하회 가중(이미 가격에 반영)
 W_GAP_SHAPE = 0.06       # close_scan: 종가가 당일 레인지 하단
 W_GAP_SHAPE_BAD = -0.08  # close_scan: 장중 반등 흔적(close_loc 높음)
 W_GAP_DOWN = 0.05        # close_scan: 갭다운 >=2%
