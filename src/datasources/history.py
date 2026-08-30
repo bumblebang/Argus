@@ -78,7 +78,7 @@ def _fetch_yahoo(ysym: str, interval: str, range_: str) -> pd.DataFrame:
             continue
         if any(x is None for x in row[:4]):           # OHLC 결측 봉은 버린다
             continue
-        rows.append((pd.to_datetime(t, unit="s"), row[0], row[1], row[2], row[3],
+        rows.append((pd.to_datetime(t, unit="s", utc=True), row[0], row[1], row[2], row[3],
                      row[4] or 0))
     return pd.DataFrame(rows, columns=COLUMNS)
 

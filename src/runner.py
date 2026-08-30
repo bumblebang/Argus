@@ -64,16 +64,23 @@ def _market_tz(market: str) -> ZoneInfo:
 
 
 def last_bar_trading_date(df: pd.DataFrame | None, market: str = "KR") -> str | None:
-    """마지막 봉의 거래일(ISO). time 열 없으면 None(판정 불가)."""
+    """마지막 봉의 거래일(ISO). time 열 없으면 None(판정 불가).
+
+    naive 시각은 **시장 로컬**(KR→KST, US→ET)로 간주한다. UTC 로 localize 하면
+    KST 15:00+ 일봉·토스 캔들이 다음날로 밀린다. tz-aware 는 market TZ 로 변환.
+    """
     if df is None or len(df) == 0 or "time" not in df.columns:
         return None
     t = df["time"].iloc[-1]
     if pd.isna(t):
         return None
     ts = pd.Timestamp(t)
+    tz = _market_tz(market)
     if ts.tzinfo is None:
-        ts = ts.tz_localize("UTC")
-    return ts.tz_convert(_market_tz(market)).date().isoformat()
+        ts = ts.tz_localize(tz)
+    else:
+        ts = ts.tz_convert(tz)
+    return ts.date().isoformat()
 
 
 def patch_live_price(df: pd.DataFrame, price: float | None, *,

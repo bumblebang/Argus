@@ -45,6 +45,26 @@ def test_patch_none_or_empty_noop():
     assert len(patch_live_price(empty, 5.0)) == 0
 
 
+def test_last_bar_trading_date_naive_kst_afternoon():
+    """naive KST 15:30 — UTC 간주 시 다음날로 밀리는 회귀."""
+    today = trading_date("KR")
+    df = pd.DataFrame({
+        "time": [pd.Timestamp(f"{today} 15:30:00")],
+        "close": [100.0],
+    })
+    assert last_bar_trading_date(df, "KR") == today
+
+
+def test_last_bar_trading_date_utc_aware_yahoo():
+    """Yahoo utc=True 봉 — KST 같은 거래일."""
+    today = trading_date("KR")
+    df = pd.DataFrame({
+        "time": [pd.Timestamp(f"{today} 06:00:00", tz=ZoneInfo("UTC"))],
+        "close": [100.0],
+    })
+    assert last_bar_trading_date(df, "KR") == today
+
+
 def test_patch_skips_stale_daily_bar():
     """어제 봉 + 라이브가 → 어제 종가 유지(혼합봉 방지)."""
     yesterday = (datetime.now(_KST).date().toordinal() - 1)
