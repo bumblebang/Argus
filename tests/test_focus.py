@@ -123,8 +123,16 @@ def test_lens_priority_sorts_high_first():
     assert out["lenses"][0]["priority"] == "high"
 
 
-def test_gap_rebound_lens_on_wake():
+def test_gap_rebound_lens_on_wake(tmp_path, monkeypatch):
     wake = {"reason": "gap_rebound_scan", "at": "15:20", "market": "KR"}
+    prior = {
+        "asof": "2026-08-30",
+        "conditions": [{"id": "gap_down_deep", "label": "gap<=-2%",
+                        "n": 1000, "win_open_pct": 58.0, "avg_ret_open": 1.0}],
+        "overall": {"win_open_pct": 54.0},
+        "caveats": ["proxy"],
+    }
+    monkeypatch.setattr("src.focus.load_prior", lambda path=None: prior)
     out = build_focus({}, wake=wake)
     ids = [ln["id"] for ln in out["lenses"]]
     assert "gap_rebound" in ids
@@ -132,6 +140,9 @@ def test_gap_rebound_lens_on_wake():
     assert gr["priority"] == "high"
     assert "-5%" in gr["hint"]
     assert "close_scan" in gr["hint"]
+    assert "gap_shape" in gr["hint"]
+    assert gr.get("prior", {}).get("asof") == "2026-08-30"
+    assert "candidates.gap_shape" in gr["read"]
     assert "KR 갭반등" in out["summary"]
 
 

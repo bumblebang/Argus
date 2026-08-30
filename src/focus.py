@@ -16,6 +16,7 @@ from typing import Iterable
 from zoneinfo import ZoneInfo
 
 from .datasources.earnings import dday_of
+from .gap_rebound_backtest import load_prior, prior_hint_block
 from .logging_setup import get_logger
 
 log = get_logger("src.focus")
@@ -295,18 +296,34 @@ def _gap_rebound_lens(wake: dict | None) -> dict | None:
         hint += " NXT 애프터 유동성·스프레드·체결 확인."
     else:
         hint += " 정규-only 마감 전 창(15:20)."
-    return {
+    hint += (
+        " candidates.gap_shape(close_loc·gap_down_deep·vol_spike) 참고 — "
+        "단독 BUY 금지, prior·dossier와 교차."
+    )
+    prior = load_prior()
+    prior_hint = prior_hint_block(prior)
+    if prior_hint:
+        hint += prior_hint
+    lens = {
         "id": "gap_rebound",
         "kind": "close_scan",
         "dday": None,
         "label": "KR 갭반등(NXT)" if reason == "nxt_gap_scan" else "KR 갭반등",
         "priority": "high",
         "read": ["regime.KR", "sentiment.fear_kr", "flows_market",
-                 "candidates.intraday_ret_pct", "candidates.dossier",
-                 "candidates.flows", "candidates.news"],
+                 "candidates.intraday_ret_pct", "candidates.gap_shape",
+                 "candidates.dossier", "candidates.flows", "candidates.news"],
         "hint": hint,
         "at": at,
     }
+    if prior:
+        lens["prior"] = {
+            "asof": prior.get("asof"),
+            "overall": prior.get("overall"),
+            "conditions": prior.get("conditions"),
+            "caveats": prior.get("caveats"),
+        }
+    return lens
 
 
 def build_focus(market_state: dict | None = None, *,

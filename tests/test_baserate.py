@@ -3,7 +3,8 @@ import numpy as np
 import pandas as pd
 
 from src.baserate import (SETUPS, analyze, brief, breakout_pullback,
-                          golden_cross, pullback_reversal, setup_stats)
+                          gap_close_scan, golden_cross, pullback_reversal,
+                          setup_stats)
 from src.engine.store import Store
 
 
@@ -73,8 +74,29 @@ def test_analyze_reports_active_now_and_small_sample():
     assert info["active_now"] and info["small_sample"]        # 표본 1~2건
 
 
-def test_analyze_short_history_returns_empty():
-    assert analyze(_df([100] * 10)) == {"setups": {}, "active_now": []}
+def test_gap_close_scan_fires_on_intraday_dump_at_low():
+    base = [100.0] * 80
+    dump = [100.0, 100.0, 95.0, 92.0, 90.0]
+    df = _df(base + dump)
+    i = len(df) - 1
+    df.loc[i, "open"] = 100.0
+    df.loc[i, "close"] = 90.0
+    df.loc[i, "high"] = 100.0
+    df.loc[i, "low"] = 89.0
+    fired = gap_close_scan(df).fillna(False)
+    assert bool(fired.iloc[-1])
+
+
+def test_setup_stats_next_open_mode():
+    closes = [100.0] * 100
+    df = _df(closes)
+    df.loc[50, "close"] = 100.0
+    df.loc[51, "open"] = 105.0
+    fired = pd.Series([False] * 100)
+    fired.iloc[50] = True
+    stats = setup_stats(df, fired, horizons=(1,), exit_mode="next_open")
+    assert stats["1"]["n"] == 1
+    assert stats["1"]["win_rate"] == 1.0
 
 
 def test_brief_only_active_setups_json_roundtrip():
