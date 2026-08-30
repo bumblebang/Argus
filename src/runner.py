@@ -13,7 +13,7 @@ import pandas as pd
 import yaml
 
 from .config import AppConfig, ROOT
-from .market_hours import trading_date
+from .market_hours import trading_date, near_session_end
 from .logging_setup import get_logger
 from .session_policy import market_tradable, trading_sessions_from_raw
 from .broker import Broker
@@ -188,7 +188,7 @@ class TradingBot:
 
         # 종가 청산: 변동성 돌파 전략의 보유분은 장 마감 직전 청산
         if (pos.is_open and strat.params.get("exit_at_session_end")
-                and market_hours.near_session_end(market)):
+                and near_session_end(market)):
             self.broker.execute(Order(symbol, market, "SELL", pos.qty, price), "종가 청산",
                                 store=self.broker.store)
             return

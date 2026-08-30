@@ -88,6 +88,31 @@ def test_live_price_overrides_stale_close():
     assert px["005930"] == 90.0
 
 
+def test_assemble_omits_gap_fields_when_stale_persists(monkeypatch):
+    """fresh 후에도 당일 봉 없으면 intraday/gap_shape 생략 — 혼합봉 유출 방지."""
+    from src.agents.features import assemble
+    from src.market_hours import trading_date
+
+    today = trading_date("KR")
+    tz = ZoneInfo("Asia/Seoul")
+    yday = (pd.Timestamp(today, tz=tz) - pd.Timedelta(days=1)).date().isoformat()
+    stale_rows = [{"time": pd.Timestamp(yday, tz=tz), "open": 100.0, "high": 100.0,
+                   "low": 90.0, "close": 95.0, "volume": 1000}]
+
+    monkeypatch.setattr(
+        "src.agents.wiring.history_candles_1y",
+        lambda sym, mkt, fresh=False: stale_rows,
+    )
+    items = [{"symbol": "005930", "name": "삼성", "market": "KR"}]
+    cands, _ = assemble(items, {}, lambda s, m: stale_rows,
+                        live_prices={"005930": 88.0}, daily_fetch_fresh=True)
+    c = cands[0]
+    assert c.get("daily_bar_stale") is True
+    assert "intraday_ret_pct" not in c
+    assert "gap_shape" not in c
+    assert "gap_pct" not in c
+
+
 def test_assemble_refreshes_stale_daily_before_patch(monkeypatch):
     """20h TTL 어제 봉 캐시 — 패치 전 fresh 일봉으로 당일 시가 확보."""
     from src.agents.features import assemble

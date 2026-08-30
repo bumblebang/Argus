@@ -25,9 +25,33 @@ class _Resp:
         return self._p
 
 
-def _payload(ts, o, h, lo, c, v):
-    return {"chart": {"result": [{"timestamp": ts, "indicators": {"quote": [
-        {"open": o, "high": h, "low": lo, "close": c, "volume": v}]}}]}}
+def _payload(ts, o, h, lo, c, v, meta=None):
+    res = {"timestamp": ts, "indicators": {"quote": [
+        {"open": o, "high": h, "low": lo, "close": c, "volume": v}]}}
+    if meta:
+        res["meta"] = meta
+    return {"chart": {"result": [res]}}
+
+
+def test_fetch_history_supplements_today_from_meta(tmp_path, monkeypatch):
+    """당일 봉 누락 시 meta.regularMarket* 보충 — 15:20 갭스캔 창 밀림 방지."""
+    d0, d1, d2 = 1700000000, 1700086400, 1700173200
+    meta = {
+        "regularMarketTime": d2 + 23400,
+        "regularMarketPrice": 105.0,
+        "regularMarketOpen": 100.0,
+        "regularMarketDayHigh": 106.0,
+        "regularMarketDayLow": 99.0,
+        "regularMarketVolume": 5000,
+    }
+    payload = _payload([d0, d1], [100, 101], [103, 104], [99, 100],
+                       [102, 103], [10, 11], meta=meta)
+    monkeypatch.setattr(H.requests, "get", lambda *a, **k: _Resp(payload))
+    monkeypatch.setattr(H, "CACHE", tmp_path)
+    df = fetch_history("005930", "1d", "1mo")
+    assert len(df) == 3
+    assert df["close"].iloc[-1] == 105.0
+    assert df["open"].iloc[-1] == 100.0
 
 
 def test_fetch_history_parses_and_caches(tmp_path, monkeypatch):

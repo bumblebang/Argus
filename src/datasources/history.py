@@ -12,6 +12,7 @@
 """
 from __future__ import annotations
 
+from datetime import date, datetime, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -26,11 +27,15 @@ _UA = {"User-Agent": "Mozilla/5.0 argus"}
 YF = "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
 CACHE = ROOT / "data" / "history"
 
-# 사람이 쓰기 쉬운 별칭 → Yahoo 표기
+# people-readable aliases → Yahoo notation
 _INTERVAL_ALIAS = {"1h": "60m", "hourly": "60m", "daily": "1d",
                    "weekly": "1wk", "1w": "1wk", "monthly": "1mo"}
 
 COLUMNS = ["time", "open", "high", "low", "close", "volume"]
+
+
+def _utc_day(epoch) -> date:
+    return datetime.fromtimestamp(float(epoch), timezone.utc).date()
 
 
 def _kr_yahoo_suffix(symbol: str, info_cache: dict | None) -> str:
@@ -58,6 +63,43 @@ def to_yahoo(symbol: str, market: str = "KR", *,
     return f"{s}{_kr_yahoo_suffix(s, info_cache)}"
 
 
+def _supplement_daily_from_meta(res: dict, df: pd.DataFrame) -> pd.DataFrame:
+    """일봉: Yahoo 가 당일 봉을 빼거나 null 이면 meta.regularMarket* 로 한 봉 보충.
+
+    markets._closes_with_time 과 동일 계약 — 15:20 갭스캔 fresh fetch 가 어제까지만
+    오는 창 밀림을 막는다.
+    """
+    if df.empty:
+        return df
+    meta = res.get("meta") or {}
+    mt, mp = meta.get("regularMarketTime"), meta.get("regularMarketPrice")
+    if mt is None or mp is None:
+        return df
+    try:
+        last_ts = pd.Timestamp(df["time"].iloc[-1])
+        if last_ts.tzinfo is None:
+            last_ts = last_ts.tz_localize("UTC")
+        last_day = last_ts.tz_convert("UTC").date()
+        if _utc_day(mt) <= last_day:
+            return df
+        mp_f = float(mp)
+        mo = meta.get("regularMarketOpen")
+        mh = meta.get("regularMarketDayHigh")
+        ml = meta.get("regularMarketDayLow")
+        mv = meta.get("regularMarketVolume")
+        o = float(mo) if mo is not None else mp_f
+        h = float(mh) if mh is not None else max(o, mp_f)
+        lo = float(ml) if ml is not None else min(o, mp_f)
+        vol = float(mv) if mv is not None else 0.0
+        row = pd.DataFrame([{
+            "time": pd.to_datetime(int(mt), unit="s", utc=True),
+            "open": o, "high": h, "low": lo, "close": mp_f, "volume": vol,
+        }])
+        return pd.concat([df, row], ignore_index=True)
+    except (TypeError, ValueError, OSError):
+        return df
+
+
 def _fetch_yahoo(ysym: str, interval: str, range_: str) -> pd.DataFrame:
     url = YF.format(symbol=ysym.replace("^", "%5E"))
     r = requests.get(url, params={"range": range_, "interval": interval},
@@ -80,7 +122,10 @@ def _fetch_yahoo(ysym: str, interval: str, range_: str) -> pd.DataFrame:
             continue
         rows.append((pd.to_datetime(t, unit="s", utc=True), row[0], row[1], row[2], row[3],
                      row[4] or 0))
-    return pd.DataFrame(rows, columns=COLUMNS)
+    df = pd.DataFrame(rows, columns=COLUMNS)
+    if interval == "1d":
+        df = _supplement_daily_from_meta(res, df)
+    return df
 
 
 def fetch_history(symbol: str, interval: str = "1d", range_: str = "2y",
