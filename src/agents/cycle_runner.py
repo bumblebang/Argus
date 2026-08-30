@@ -394,7 +394,8 @@ class CycleRunner:
         candidates, price_lookup = assemble(items, ms, fetch_fn,
                                             enrich_strategy=True,
                                             base_rates=self._base_rates(),
-                                            live_prices=live_prices or None)
+                                            live_prices=live_prices or None,
+                                            daily_fetch_fresh=gap_scan)
         if wake_reason in GAP_SCAN_REASONS:
             before = len(candidates)
             candidates = filter_gap_rebound_candidates(candidates, held=held)

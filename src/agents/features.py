@@ -154,17 +154,54 @@ def _long_horizon_fields(df: pd.DataFrame | None) -> dict:
     return {k: tech[k] for k in _LONG_HORIZON_KEYS if tech.get(k) is not None}
 
 
+def _has_today_daily_bar(df: pd.DataFrame | None, market: str) -> bool:
+    """마지막 일봉이 오늘 거래일인지. time 없으면 True(판정 불가·1m 등)."""
+    bar_day = last_bar_trading_date(df, market)
+    if bar_day is None:
+        return True
+    return bar_day >= trading_date(market)
+
+
+def _prepare_daily_df(sym: str, market: str, df: pd.DataFrame | None,
+                      live_px: float | None, *,
+                      daily_fetch_fresh: bool) -> tuple[pd.DataFrame | None, bool]:
+    """라이브가 + 일봉 df → 패치 후 (df, gap/intraday 필드 사용 가능 여부).
+
+    daily_fetch_fresh=True 면 호출측이 이미 fresh Yahoo 를 썼으므로 stale 시 재조회 생략.
+    """
+    if df is None or live_px is None or live_px <= 0:
+        return df, True
+    if _has_today_daily_bar(df, market):
+        return patch_live_price(df, live_px, market=market), True
+    if not daily_fetch_fresh:
+        try:
+            from .wiring import history_candles_1y
+            fresh_raw = history_candles_1y(sym, market, fresh=True)
+            if fresh_raw:
+                df = candles_to_df(fresh_raw)
+        except Exception as e:
+            log.warning("[%s] stale 일봉 fresh 재조회 실패: %s", sym, e)
+    if _has_today_daily_bar(df, market):
+        return patch_live_price(df, live_px, market=market), True
+    bar_day = last_bar_trading_date(df, market)
+    log.warning("[%s] 당일 일봉 없음(bar_day=%s) — gap/intraday/gap_shape 생략",
+                sym, bar_day)
+    return df, False
+
+
 def assemble(items: list[dict], market_state: dict,
              fetch_raw: Callable[[str, str], list[dict]] | None,
              enrich_strategy: bool = False,
              base_rates: dict | None = None,
-             live_prices: dict[str, float] | None = None) -> tuple[list[dict], dict]:
+             live_prices: dict[str, float] | None = None,
+             daily_fetch_fresh: bool = False) -> tuple[list[dict], dict]:
     """items: [{symbol,name,market,...}]. fetch_raw(symbol,market)->캔들 리스트(None 가능).
     enrich_strategy=True 면 후보별 전략추천(도구 계산)을 strategy_fit 으로 덧붙인다.
     base_rates: {symbol: analyze 결과}(data/base_rates.json) — 지금 활성인 셋업의
     과거 승률/수익폭 압축본(brief)을 base_rates 피처로 붙인다(활성 없으면 생략).
     live_prices: {symbol: 현재가} — 토스 배치 시세. 있으면 마지막 봉 종가·price_lookup·
     intraday_ret_pct 가 라이브가 우선(Yahoo 캐시 종가 대체). 갭반등·수량 산정 필수.
+    daily_fetch_fresh: True 면 fetch_raw 가 이미 fresh Yahoo — stale 시 재조회 1회 생략.
     반환: (candidates, price_lookup{symbol:price})."""
     funds = (market_state or {}).get("fundamentals", {})
     flows = (market_state or {}).get("flows", {})
@@ -234,22 +271,17 @@ def assemble(items: list[dict], market_state: dict,
                         live_px = float(v)
                 except (TypeError, ValueError):
                     live_px = None
+            daily_ok = True
             if df is not None and live_px is not None and live_px > 0:
-                bar_day = last_bar_trading_date(df, market)
-                if bar_day is not None and bar_day < trading_date(market):
-                    # 20h TTL 캐시가 어제 봉 — 패치 전 Yahoo fresh 로 당일 봉 확보.
-                    try:
-                        from .wiring import history_candles_1y
-                        fresh_raw = history_candles_1y(sym, market, fresh=True)
-                        if fresh_raw:
-                            df = candles_to_df(fresh_raw)
-                    except Exception as e:
-                        log.debug("[%s] stale 일봉 fresh 재조회 실패: %s", sym, e)
-                df = patch_live_price(df, live_px, market=market)
-            feat.update(_gap_fields(df))   # 시가 갭(간밤 흐름의 반영 정도)
-            if df is not None and len(df) >= 1:
-                feat.update(_intraday_ret_fields(df, live_px))
-                feat.update(gap_shape_fields(df, price=live_px))
+                df, daily_ok = _prepare_daily_df(
+                    sym, market, df, live_px, daily_fetch_fresh=daily_fetch_fresh)
+                if not daily_ok:
+                    feat["daily_bar_stale"] = True
+            if daily_ok:
+                feat.update(_gap_fields(df))   # 시가 갭(간밤 흐름의 반영 정도)
+                if df is not None and len(df) >= 1:
+                    feat.update(_intraday_ret_fields(df, live_px))
+                    feat.update(gap_shape_fields(df, price=live_px))
             if df is not None and "volume" in df.columns and len(df) >= 1:
                 vol = df["volume"].iloc[-1]
                 try:

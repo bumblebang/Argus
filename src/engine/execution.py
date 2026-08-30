@@ -172,7 +172,7 @@ class EntryExecutor:
         strat = build_strategy(name, meta.get("params", {}))
         raw = self.gw.candles(sym, interval=strat.candle_interval,
                               count=strat.min_candles + _LOOKBACK_BUFFER)
-        df = patch_live_price(candles_to_df(raw), price)
+        df = patch_live_price(candles_to_df(raw), price, market=market)
         if len(df) < strat.min_candles:
             return {"action": "hold", "executed": False, "reason": "캔들 부족"}
 
