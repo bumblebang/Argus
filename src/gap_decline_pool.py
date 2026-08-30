@@ -9,7 +9,7 @@ from __future__ import annotations
 import os
 import time
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Iterable
 
 import yaml
 
@@ -90,6 +90,61 @@ def fresh_gap_symbols(data: dict | None, market: str = "KR", *,
         if isinstance(it, dict) and it.get("symbol"):
             out[str(it["symbol"])] = pd
     return out
+
+
+def items_for_gap_scan(wake_reason: str, *,
+                       universe_items: list[dict],
+                       held: Iterable[str] | None = None,
+                       gap_data: dict | None = None,
+                       now_fn=time.time) -> list[dict]:
+    """갭반등 각성용 후보 — 오늘 gap_decline_pool + 보유(풀 밖이어도 stub).
+
+    스윙·day_pool 은 제외. pool_date 가 오늘이 아니면 갭 풀 0 + 보유만.
+    NXT split 은 호출측 filter_items_for_gap_scan 과 짝을 이룬다(여기선 미적용).
+    """
+    data = gap_data if gap_data is not None else load_gap_decline_pool()
+    market = "KR"
+    gap_items: list[dict] = []
+    if is_gap_pool_fresh(data, market, now_fn=now_fn):
+        gap_items = [dict(it) for it in (data.get(market) or data.get("KR") or [])
+                     if isinstance(it, dict) and it.get("symbol")]
+    else:
+        pd = gap_pool_date(data, market)
+        log.warning("갭반등 %s — gap_decline_pool 미신선(pool_date=%s) → 보유만",
+                    wake_reason, pd or "없음")
+
+    by_sym = {str(it.get("symbol")): it for it in universe_items if it.get("symbol")}
+    chosen: list[dict] = []
+    seen: set[str] = set()
+    for it in gap_items:
+        sym = str(it["symbol"])
+        if sym in seen:
+            continue
+        seen.add(sym)
+        chosen.append(it)
+
+    for sym in held or []:
+        s = str(sym).strip()
+        if not s or s in seen:
+            continue
+        seen.add(s)
+        base = by_sym.get(s)
+        if base is not None:
+            row = dict(base)
+            row["force_include"] = True
+            chosen.append(row)
+        else:
+            chosen.append({
+                "symbol": s,
+                "name": s,
+                "market": market,
+                "force_include": True,
+                "serve_stub": True,
+            })
+    log.info("갭반등 %s 입력 %d종 (gap=%d held+=%d)",
+             wake_reason, len(chosen), len(gap_items),
+             len(chosen) - len(gap_items))
+    return chosen
 
 
 def merge_all_pools(swing: dict | None, day: dict | None,

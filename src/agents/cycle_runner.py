@@ -48,6 +48,7 @@ class CycleRunner:
                  universe_fn: Callable[[], dict] | None = None,
                  open_markets_fn: Callable[[], list] | None = None,
                  illiquid_fn: Callable[[], set] | None = None,
+                 price_fn: Callable[[list[str], str], dict[str, float]] | None = None,
                  journal_path: str | Path = "data/decisions.jsonl",
                  market_state_path: str | Path = DATA / "market_state.json",
                  candle_interval: str = "1d", candle_count: int = 250) -> None:
@@ -89,6 +90,7 @@ class CycleRunner:
         # 심볼을 제외한다 — 프리/애프터장에 거래가 없던 종목이 신규진입 후보로 뽑히는 것을
         # 막는다. 보유분 청산 판단은 portfolio 경유(_portfolio)라 이 필터와 무관.
         self.illiquid_fn = illiquid_fn
+        self.price_fn = price_fn
         # 밸류 시간 손절 임계일(0=비활성). 매 사이클 config 재파싱을 피해 기동 시 1회만 읽는다.
         self.value_time_stop_days = int(value_trade_cfg(cfg)["time_stop_days"])
         self.items = self._items_from(cfg.universe or {})
@@ -311,6 +313,33 @@ class CycleRunner:
             log.warning("earnings_calendar 로드 실패(생략): %s", e)
         return {}
 
+    def _batch_live_prices(self, items: list[dict]) -> dict[str, float]:
+        """토스 배치 현재가 → {symbol: price}. price_fn 없으면 {}."""
+        if not self.price_fn or not items:
+            return {}
+        from collections import defaultdict
+        by_mkt: dict[str, list[str]] = defaultdict(list)
+        for it in items:
+            sym = it.get("symbol")
+            if sym:
+                by_mkt[it.get("market", "KR")].append(sym)
+        out: dict[str, float] = {}
+        for mkt, syms in by_mkt.items():
+            try:
+                rows = self.price_fn(syms, mkt) or {}
+                for sym, px in rows.items():
+                    try:
+                        v = float(px)
+                    except (TypeError, ValueError):
+                        continue
+                    if v > 0:
+                        out[str(sym)] = v
+            except Exception as e:
+                log.warning("live price 배치 실패(%s, %d종): %s", mkt, len(syms), e)
+        if out:
+            log.info("live price %d/%d종 (gateway 배치)", len(out), len(items))
+        return out
+
     def run(self, wake: dict | None = None) -> CycleResult:
         ms = (json.loads(self.market_state_path.read_text(encoding="utf-8"))
               if self.market_state_path.exists() else {})
@@ -322,7 +351,13 @@ class CycleRunner:
         # 열린 시장 필터(opt-in): 주어졌을 때만 닫힌 시장 후보를 제외한다.
         # Athena 종료 훅(07:30)은 프리 전이므로 후보를 비우면 안 된다 — 오늘 살 시장만 남긴다.
         wake_reason = str((wake or {}).get("reason") or "")
-        if wake_reason not in GAP_SCAN_REASONS:
+        full_universe = items
+        held = serve.held_symbols(self.account.positions)
+        if wake_reason in GAP_SCAN_REASONS:
+            from ..gap_decline_pool import items_for_gap_scan
+            items = items_for_gap_scan(wake_reason, universe_items=full_universe,
+                                       held=held)
+        else:
             items = [i for i in items
                      if str(i.get("pool") or "") != "gap_decline"]
         if self.open_markets_fn is not None:
@@ -348,12 +383,18 @@ class CycleRunner:
                 log.info("갭반등 NXT split %s %d→%d", wake_reason, before, len(items))
         agents_cfg = self.cfg.raw.get("agents", {})
         scfg = serve.serve_cfg(agents_cfg)
-        held = serve.held_symbols(self.account.positions)
         items, tier = serve.select_candidates(
             items, wake, held=held, cfg=scfg)
-        candidates, price_lookup = assemble(items, ms, self.fetch_candles,
+        gap_scan = wake_reason in GAP_SCAN_REASONS
+        fetch_fn = self.fetch_candles
+        if gap_scan:
+            from .wiring import history_candles_1y
+            fetch_fn = lambda s, m: history_candles_1y(s, m, fresh=True)
+        live_prices = self._batch_live_prices(items)
+        candidates, price_lookup = assemble(items, ms, fetch_fn,
                                             enrich_strategy=True,
-                                            base_rates=self._base_rates())
+                                            base_rates=self._base_rates(),
+                                            live_prices=live_prices or None)
         if wake_reason in GAP_SCAN_REASONS:
             before = len(candidates)
             candidates = filter_gap_rebound_candidates(candidates, held=held)

@@ -6,6 +6,8 @@ from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
+import pytest
+
 from src.agents import (DecisionAgent, ValidationAgent, MockLLM, DecisionOutput,
                         Proposal, ValidationOutput, ValidationVerdict)
 from src.agents.cycle import CycleResult, run_cycle
@@ -20,6 +22,17 @@ from src.risk_gate import RiskGate
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "scripts"))
 import athena as athena_cli  # noqa: E402
+
+_GAP_POOL_DATE = "2026-08-29"
+
+
+@pytest.fixture
+def gap_pool_today(monkeypatch):
+    """pool_date fresh/stale 판정을 거래일에 무관하게 고정."""
+    monkeypatch.setattr(
+        "src.market_hours.trading_date",
+        lambda m, ts=None: _GAP_POOL_DATE,
+    )
 
 
 def _broker(tmp_path):
@@ -81,7 +94,7 @@ def test_day_buy_exempt_from_dossier_rule(tmp_path):
     assert res.executed[0]["status"] == "armed" and armed == ["005930"]
 
 
-def test_close_scan_buy_exempt_from_dossier(tmp_path):
+def test_close_scan_buy_exempt_from_dossier(tmp_path, gap_pool_today):
     res, broker = _cycle(
         tmp_path, _buy(horizon="close_scan"), dossier_fn=lambda s: False,
         wake_reason="gap_rebound_scan",
@@ -91,7 +104,7 @@ def test_close_scan_buy_exempt_from_dossier(tmp_path):
     assert broker.account.position("005930").qty > 0
 
 
-def test_gap_scan_coerces_swing_to_close_scan(tmp_path):
+def test_gap_scan_coerces_swing_to_close_scan(tmp_path, gap_pool_today):
     res, broker = _cycle(
         tmp_path, _buy(horizon="swing"), dossier_fn=lambda s: False,
         wake_reason="gap_rebound_scan",
@@ -101,7 +114,7 @@ def test_gap_scan_coerces_swing_to_close_scan(tmp_path):
     assert res.decision.proposals[0].horizon == "close_scan"
 
 
-def test_gap_scan_rejects_day_horizon(tmp_path):
+def test_gap_scan_rejects_day_horizon(tmp_path, gap_pool_today):
     res, broker = _cycle(
         tmp_path, _buy(horizon="day"), dossier_fn=lambda s: False,
         wake_reason="gap_rebound_scan",
@@ -121,7 +134,7 @@ def test_close_scan_horizon_rejected_off_gap_track(tmp_path):
     assert broker.account.position("005930").qty == 0
 
 
-def test_gap_pool_tag_does_not_block_swing_on_periodic(tmp_path):
+def test_gap_pool_tag_does_not_block_swing_on_periodic(tmp_path, gap_pool_today):
     """전일 pool_date — active 갭 트랙 아님 → periodic 스윙 허용."""
     res, broker = _cycle(
         tmp_path, _buy(horizon="swing"), dossier_fn=lambda s: True,
@@ -132,7 +145,7 @@ def test_gap_pool_tag_does_not_block_swing_on_periodic(tmp_path):
     assert broker.account.position("005930").qty > 0
 
 
-def test_fresh_gap_pool_blocks_swing_on_periodic(tmp_path):
+def test_fresh_gap_pool_blocks_swing_on_periodic(tmp_path, gap_pool_today):
     """당일 pool_date 갭풀 — gap scan 외 스윙 BUY 금지."""
     res, broker = _cycle(
         tmp_path, _buy(horizon="swing"), dossier_fn=lambda s: True,
@@ -143,7 +156,7 @@ def test_fresh_gap_pool_blocks_swing_on_periodic(tmp_path):
     assert broker.account.position("005930").qty == 0
 
 
-def test_fresh_gap_pool_blocks_position_and_day_on_extra(tmp_path):
+def test_fresh_gap_pool_blocks_position_and_day_on_extra(tmp_path, gap_pool_today):
     for hz in ("position", "day", "close_scan"):
         res, broker = _cycle(
             tmp_path, _buy(horizon=hz), dossier_fn=lambda s: True,
@@ -154,7 +167,7 @@ def test_fresh_gap_pool_blocks_position_and_day_on_extra(tmp_path):
         assert broker.account.position("005930").qty == 0
 
 
-def test_fresh_gap_pool_blocks_swing_overlap_tag_on_periodic(tmp_path):
+def test_fresh_gap_pool_blocks_swing_overlap_tag_on_periodic(tmp_path, gap_pool_today):
     """pool=swing 이라도 당일 갭풀 overlay 면 periodic BUY 차단."""
     res, broker = _cycle(
         tmp_path, _buy(horizon="swing"), dossier_fn=lambda s: True,

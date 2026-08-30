@@ -9,6 +9,14 @@ def test_to_yahoo_mapping():
     assert to_yahoo("^KS11", "KR") == "^KS11"         # 비숫자 -> 그대로
 
 
+def test_to_yahoo_kosdaq_from_stock_info():
+    from src.datasources.history import _kr_yahoo_suffix
+    cache = {"035720": {"info": {"market": "KOSDAQ", "status": "ACTIVE"}}}
+    assert to_yahoo("035720", "KR", info_cache=cache) == "035720.KQ"
+    assert _kr_yahoo_suffix("035720", cache) == ".KQ"
+    assert _kr_yahoo_suffix("005930", cache) == ".KS"
+
+
 class _Resp:
     def __init__(self, payload):
         self._p = payload

@@ -45,7 +45,10 @@ W_DAY_OS = 0.08      # day + RSI<40 (프롬프트의 과매도=day 와 일치)
 W_INVAL = -0.20      # 무효화 하회 — 체결 거부 대상이라 사이징도 깎음
 W_DISC_LEGAL = -0.12 # 소송·횡령·상장폐지 등 — 매수 논리와 충돌
 W_DISC_DILUTE = -0.10  # 유상증자·CB·감자 — 희석
-W_EARN_MISS = -0.10  # 컨센서스 대비 ≤ -10%. 상회 가산 없음(이미 가격에 있음)
+W_EARN_MISS = -0.10  # 컨센서스 대비 -10%. 하회 가중(이미 가격에 반영)
+W_GAP_SHAPE = 0.06       # close_scan: 종가가 당일 레인지 하단
+W_GAP_SHAPE_BAD = -0.08  # close_scan: 장중 반등 흔적(close_loc 높음)
+W_GAP_DOWN = 0.05        # close_scan: 갭다운 >=2%
 
 # 강도 스케일. unit_intensity(x, scale) 가 scale 에서 ≈0.76, 2×scale 에서 ≈0.96.
 STAB_RET_SCALE = 3.0     # 20일 수익률 +3% 가 분명한 안정화
@@ -341,6 +344,24 @@ def _setup_parts(features: dict) -> list[tuple[float, str]]:
     return [_part(W_SETUP * t, f"셋업 {name} 승률 {wr:.0%}")]
 
 
+def _gap_shape_parts(features: dict, horizon: str) -> list[tuple[float, str]]:
+    if (horizon or "").lower() != "close_scan":
+        return []
+    gs = features.get("gap_shape")
+    if not isinstance(gs, dict):
+        return []
+    out: list[tuple[float, str]] = []
+    if gs.get("close_near_day_low"):
+        out.append(_part(W_GAP_SHAPE, "종가 당일 레인지 하단"))
+    else:
+        loc = _f(gs.get("close_loc"))
+        if loc is not None and loc > 0.25:
+            out.append(_part(W_GAP_SHAPE_BAD, f"장중 반등 흔적 close_loc {loc:.2f}"))
+    if gs.get("gap_down_deep"):
+        out.append(_part(W_GAP_DOWN, "갭다운 2%+"))
+    return out
+
+
 def _signed(features: dict | None) -> list[tuple[float, str]]:
     if not isinstance(features, dict):
         return []
@@ -397,6 +418,9 @@ def score_buy(proposal, *, price: float | None, dossier: dict | None,
                 pass
 
     for delta, label in _signed(features):
+        v += delta
+        parts.append(label)
+    for delta, label in _gap_shape_parts(features or {}, hz):
         v += delta
         parts.append(label)
 

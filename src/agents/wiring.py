@@ -160,16 +160,18 @@ def select_backend(*, dry: bool = False, cli: bool = False, live: bool = False,
     return True, False, False                 # 인증 없음 -> 자동 dry
 
 
-# ── 뇌 피처용 일봉: 밸류와 동일 Yahoo 1y 캐시 (토스 30봉 경로 대체) ────────
-def history_candles_1y(symbol: str, market: str) -> list[dict]:
-    """Yahoo 일봉 1년 → assemble 이 먹는 raw 리스트. max_age_hours=20 이면 사실상 하루 1회 갱신.
+# ── 뇌 피처용 일봉: 밸류와 동일 Yahoo 1y 캐시 + 라이브가는 assemble(live_prices) ─
+def history_candles_1y(symbol: str, market: str, *, fresh: bool = False) -> list[dict]:
+    """Yahoo 일봉 1년 → assemble 이 먹는 raw 리스트.
 
-    토스 gateway.candles(1d,30) 대신 쓴다. 긴 lookback(drawdown 60·향후 52w 등)에 충분하고,
-    data/history/*.csv 캐시라 유니버스 신규만 Yahoo 1콜.
+    기본 max_age_hours=20(하루 1회 갱신). fresh=True 면 갭반등 슬롯용으로 캐시 무시·
+    Yahoo 재조회(당일 시가/전일 종가 확보). 현재가는 Yahoo가 아니라 gateway.poll_prices
+    배치를 live_prices 로 넘겨야 한다(토스 gateway.candles 대체 설계).
     """
     from ..datasources.history import fetch_history
+    max_age = 0 if fresh else 20
     df = fetch_history(symbol, interval="1d", range_="1y", market=market,
-                       max_age_hours=20)
+                       max_age_hours=max_age, refresh=fresh)
     if df is None or getattr(df, "empty", True):
         return []
     cols = [c for c in ("time", "open", "high", "low", "close", "volume") if c in df.columns]

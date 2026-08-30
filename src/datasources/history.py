@@ -33,15 +33,29 @@ _INTERVAL_ALIAS = {"1h": "60m", "hourly": "60m", "daily": "1d",
 COLUMNS = ["time", "open", "high", "low", "close", "volume"]
 
 
-def to_yahoo(symbol: str, market: str = "KR") -> str:
-    """KR 6자리 코드 → Yahoo 티커(.KS 기본). US/이미 티커면 그대로.
+def _kr_yahoo_suffix(symbol: str, info_cache: dict | None) -> str:
+    """stock_info 캐시 market 으로 .KS/.KQ 확정. 미스면 .KS(코스피 기본)."""
+    if not info_cache:
+        return ".KS"
+    entry = info_cache.get(symbol) or {}
+    info = entry.get("info") if isinstance(entry.get("info"), dict) else entry
+    mkt = str((info or {}).get("market") or "").upper()
+    if "KOSDAQ" in mkt or mkt in ("KSQ", "KQ"):
+        return ".KQ"
+    return ".KS"
 
-    KOSDAQ 은 .KQ 라서, KR 6자리는 우선 .KS 로 시도하고 데이터가 없으면 fetch 가 .KQ 로 폴백.
+
+def to_yahoo(symbol: str, market: str = "KR", *,
+             info_cache: dict | None = None) -> str:
+    """KR 6자리 코드 → Yahoo 티커. US/이미 티커면 그대로.
+
+    KR 은 data/stock_info_cache.json 의 market(KOSPI/KOSDAQ)으로 .KS/.KQ 를 확정한다.
+    캐시에 없으면 .KS — fetch_history 가 빈 결과일 때만 .KQ 폴백(레거시·미캐시 종목).
     """
     s = str(symbol).strip()
     if market == "US" or not s.isdigit():
         return s
-    return f"{s}.KS"
+    return f"{s}{_kr_yahoo_suffix(s, info_cache)}"
 
 
 def _fetch_yahoo(ysym: str, interval: str, range_: str) -> pd.DataFrame:
@@ -74,11 +88,16 @@ def fetch_history(symbol: str, interval: str = "1d", range_: str = "2y",
                   refresh: bool = False, max_age_hours: float | None = None) -> pd.DataFrame:
     """과거 캔들 DataFrame(OHLCV) 반환. 캐시 우선, 없으면 Yahoo 호출 후 캐시.
 
-    KR 6자리는 .KS 로 시도하고 빈 결과면 .KQ(코스닥) 로 한 번 더 시도한다.
+    KR 6자리는 stock_info 캐시로 .KS/.KQ 를 확정하고, 빈 결과면 .KQ/.KS 반대 접미사로
+    한 번 더 시도한다(캐시 미스·신규 상장 방어).
     max_age_hours 지정 시 캐시가 그보다 오래됐으면 재조회(없으면 캐시 무기한 — 기존 동작).
     """
     interval = _INTERVAL_ALIAS.get(interval, interval)
-    ysym = to_yahoo(symbol, market)
+    info_cache = None
+    if market == "KR":
+        from .stock_info import load_info_cache
+        info_cache = load_info_cache()
+    ysym = to_yahoo(symbol, market, info_cache=info_cache)
     cache = CACHE / f"{ysym}_{interval}_{range_}.csv"
     if use_cache and not refresh and cache.exists():
         import time as _time
@@ -89,8 +108,9 @@ def fetch_history(symbol: str, interval: str = "1d", range_: str = "2y",
 
     try:
         df = _fetch_yahoo(ysym, interval, range_)
-        if df.empty and market == "KR" and ysym.endswith(".KS"):
-            df = _fetch_yahoo(ysym[:-3] + ".KQ", interval, range_)   # 코스닥 폴백
+        if df.empty and market == "KR" and ysym.endswith((".KS", ".KQ")):
+            alt = ".KQ" if ysym.endswith(".KS") else ".KS"
+            df = _fetch_yahoo(ysym[:-3] + alt, interval, range_)   # stock_info 미스 폴백
     except requests.RequestException as e:
         log.warning("Yahoo 조회 실패 %s: %s", ysym, e)
         df = pd.DataFrame(columns=COLUMNS)

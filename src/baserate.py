@@ -14,6 +14,7 @@ from __future__ import annotations
 import pandas as pd
 
 from .indicators import rsi, sma
+from .gap_rebound_features import gap_close_scan_mask
 from .logging_setup import get_logger
 
 log = get_logger("baserate")
@@ -56,22 +57,33 @@ def golden_cross(df: pd.DataFrame) -> pd.Series:
     return cross | cross.shift(1).fillna(False)
 
 
+def gap_close_scan(df: pd.DataFrame) -> pd.Series:
+    """갭반등 close_scan: 장중 -5% & 종가가 당일 레인지 하단(프록시)."""
+    return gap_close_scan_mask(df)
+
+
 SETUPS = {
     "pullback_reversal": pullback_reversal,
     "breakout_pullback": breakout_pullback,
     "golden_cross": golden_cross,
+    "gap_close_scan": gap_close_scan,
 }
+
+# 익일 시가 청산 셋업 — setup_stats 의 exit_mode=next_open
+OVERNIGHT_OPEN_SETUPS = frozenset({"gap_close_scan"})
 
 
 # ── 통계 ───────────────────────────────────────────────────────────
 def setup_stats(df: pd.DataFrame, fired: pd.Series,
-                horizons: tuple[int, ...] = HORIZONS) -> dict:
+                horizons: tuple[int, ...] = HORIZONS,
+                *, exit_mode: str = "close") -> dict:
     """셋업 발동 시점들의 이후 N봉 수익률 분포. {h: {n, win_rate, avg_ret, med_ret}}.
 
-    같은 신호가 연속 봉에서 반복 발동하면 첫 봉만 센다(에피소드 dedup — 한 급락
-    구간이 표본 5개로 뻥튀기되는 것을 막는다). 마지막 지평 미도래 구간은 제외.
+    exit_mode=next_open 이면 종가 진입·익일 시가 청산(갭반등 close_scan). h=1만 의미 있음.
+    같은 신호가 연속 봉에서 반복 발동하면 첫 봉만 센다(에피소드 dedup).
     """
     close = df["close"].astype(float)
+    open_ = df["open"].astype(float) if "open" in df.columns else close
     # bool dtype 강제: object dtype 이면 ~ 가 비트반전(-1/-2=truthy)으로 동작해 dedup 이 깨진다.
     fired = fired.fillna(False).astype(bool)
     episode_start = fired & ~fired.shift(1, fill_value=False)
@@ -80,12 +92,20 @@ def setup_stats(df: pd.DataFrame, fired: pd.Series,
     for h in horizons:
         rets = []
         for i in idx:
-            j = i + h
-            if j >= len(close):
-                continue                       # 미래가 아직 없음 → 표본 제외
-            entry = close.iloc[i]
+            if exit_mode == "next_open":
+                j = i + h
+                if j >= len(open_):
+                    continue
+                entry = close.iloc[i]
+                exit_px = open_.iloc[j]
+            else:
+                j = i + h
+                if j >= len(close):
+                    continue
+                entry = close.iloc[i]
+                exit_px = close.iloc[j]
             if entry:
-                rets.append(close.iloc[j] / entry - 1)
+                rets.append(exit_px / entry - 1)
         n = len(rets)
         s = pd.Series(rets)
         out[str(h)] = {           # 키는 문자열 — JSON 왕복(배치 파일) 후에도 동일 접근
@@ -113,7 +133,11 @@ def analyze(df: pd.DataFrame, setups: dict | None = None) -> dict:
         except Exception as e:                 # 셋업 하나의 실패가 전체를 막지 않게
             log.warning("셋업 %s 계산 실패: %s", name, e)
             continue
-        stats = setup_stats(df, fired)
+        stats = setup_stats(
+            df, fired,
+            horizons=(1, 5, 10) if name in OVERNIGHT_OPEN_SETUPS else HORIZONS,
+            exit_mode="next_open" if name in OVERNIGHT_OPEN_SETUPS else "close",
+        )
         max_n = max((v["n"] for v in stats.values()), default=0)
         active = bool(fired.iloc[-1])
         result["setups"][name] = {"active_now": active, "stats": stats,
@@ -135,7 +159,7 @@ def brief(analysis: dict) -> dict | None:
     for name in active:
         info = analysis["setups"].get(name, {})
         stats = info.get("stats", {})
-        rep = stats.get("10") or next(iter(stats.values()), {})
+        rep = stats.get("1") or stats.get("10") or next(iter(stats.values()), {})
         out[name] = {"n": rep.get("n"), "win_rate": rep.get("win_rate"),
                      "avg_ret_pct": rep.get("avg_ret_pct"),
                      "small_sample": info.get("small_sample", True),

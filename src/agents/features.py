@@ -20,8 +20,9 @@ from typing import Callable, Iterable
 import pandas as pd
 
 from ..baserate import brief as baserate_brief
+from ..gap_rebound_features import gap_shape_fields
 from ..indicators import sma, rsi
-from ..runner import candles_to_df
+from ..runner import candles_to_df, patch_live_price
 from ..logging_setup import get_logger
 from ..security_filter import is_buy_ineligible
 from .tools import recommend_strategy
@@ -155,11 +156,14 @@ def _long_horizon_fields(df: pd.DataFrame | None) -> dict:
 def assemble(items: list[dict], market_state: dict,
              fetch_raw: Callable[[str, str], list[dict]] | None,
              enrich_strategy: bool = False,
-             base_rates: dict | None = None) -> tuple[list[dict], dict]:
+             base_rates: dict | None = None,
+             live_prices: dict[str, float] | None = None) -> tuple[list[dict], dict]:
     """items: [{symbol,name,market,...}]. fetch_raw(symbol,market)->캔들 리스트(None 가능).
     enrich_strategy=True 면 후보별 전략추천(도구 계산)을 strategy_fit 으로 덧붙인다.
     base_rates: {symbol: analyze 결과}(data/base_rates.json) — 지금 활성인 셋업의
     과거 승률/수익폭 압축본(brief)을 base_rates 피처로 붙인다(활성 없으면 생략).
+    live_prices: {symbol: 현재가} — 토스 배치 시세. 있으면 마지막 봉 종가·price_lookup·
+    intraday_ret_pct 가 라이브가 우선(Yahoo 캐시 종가 대체). 갭반등·수량 산정 필수.
     반환: (candidates, price_lookup{symbol:price})."""
     funds = (market_state or {}).get("fundamentals", {})
     flows = (market_state or {}).get("flows", {})
@@ -221,15 +225,20 @@ def assemble(items: list[dict], market_state: dict,
         try:
             raw = fetch_raw(sym, market) if fetch_raw else None
             df = candles_to_df(raw) if raw else None
+            live_px = None
+            if live_prices:
+                try:
+                    v = live_prices.get(sym)
+                    if v is not None:
+                        live_px = float(v)
+                except (TypeError, ValueError):
+                    live_px = None
+            if df is not None and live_px is not None and live_px > 0:
+                df = patch_live_price(df, live_px)
             feat.update(_gap_fields(df))   # 시가 갭(간밤 흐름의 반영 정도)
             if df is not None and len(df) >= 1:
-                live_px = None
-                if "close" in df.columns:
-                    try:
-                        live_px = float(df["close"].iloc[-1])
-                    except (TypeError, ValueError):
-                        live_px = None
                 feat.update(_intraday_ret_fields(df, live_px))
+                feat.update(gap_shape_fields(df, price=live_px))
             if df is not None and "volume" in df.columns and len(df) >= 1:
                 vol = df["volume"].iloc[-1]
                 try:
@@ -240,7 +249,7 @@ def assemble(items: list[dict], market_state: dict,
                     feat["volume"] = round(vol_f, 2)
             if df is not None and len(df) >= 20:
                 close = df["close"].astype(float)
-                price = float(close.iloc[-1])
+                price = live_px if live_px is not None and live_px > 0 else float(close.iloc[-1])
                 feat["price"] = round(price, 2)
                 feat["ma20"] = round(float(sma(close, 20).iloc[-1]), 2)
                 feat["rsi"] = round(float(rsi(close, 14).iloc[-1]), 1)

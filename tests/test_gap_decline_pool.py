@@ -5,10 +5,51 @@ from src.gap_decline_pool import (
     fresh_gap_symbols,
     gap_pool_date,
     is_gap_pool_fresh,
+    items_for_gap_scan,
     load_gap_decline_pool,
     merge_all_pools,
     refresh_gap_decline_pool,
 )
+
+
+def test_items_for_gap_scan_gap_plus_held():
+    import src.gap_decline_pool as gdp
+    orig = gdp.trading_date
+    gdp.trading_date = lambda m, ts=None: "2026-08-29"
+    try:
+        universe = [
+            {"symbol": "005930", "name": "삼성", "market": "KR", "pool": "swing"},
+            {"symbol": "000660", "name": "하이닉스", "market": "KR", "pool": "day"},
+        ]
+        gap = {
+            "_meta": {"pool_date": "2026-08-29"},
+            "KR": [
+                {"symbol": "085620", "name": "미래에셋생명", "pool": "gap_decline",
+                 "pool_date": "2026-08-29", "fluctuation": -10.0},
+            ],
+        }
+        out = items_for_gap_scan("gap_rebound_scan", universe_items=universe,
+                                 held=["005930"], gap_data=gap)
+        syms = [it["symbol"] for it in out]
+        assert syms == ["085620", "005930"]
+        assert "000660" not in syms
+        assert out[1].get("force_include")
+    finally:
+        gdp.trading_date = orig
+
+
+def test_items_for_gap_scan_stale_pool_held_only():
+    import src.gap_decline_pool as gdp
+    orig = gdp.trading_date
+    gdp.trading_date = lambda m, ts=None: "2026-08-29"
+    try:
+        gap = {"_meta": {"pool_date": "2026-08-28"},
+               "KR": [{"symbol": "085620", "pool_date": "2026-08-28"}]}
+        out = items_for_gap_scan("gap_rebound_scan", universe_items=[],
+                                 held=["005930"], gap_data=gap)
+        assert [it["symbol"] for it in out] == ["005930"]
+    finally:
+        gdp.trading_date = orig
 
 
 def test_merge_all_pools_adds_gap_only():

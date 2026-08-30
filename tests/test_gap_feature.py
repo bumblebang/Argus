@@ -67,6 +67,17 @@ def test_intraday_ret_down_five_percent():
     assert feat["intraday_open"] == 100.0
 
 
+def test_live_price_overrides_stale_close():
+    """Yahoo 캐시 종가(100) 대신 live_prices(90) → intraday·price_lookup 반영."""
+    items = [{"symbol": "005930", "name": "삼성전자", "market": "KR"}]
+    bars = [(100.0, 100.0)] * 30 + [(100.0, 100.0)]   # 마지막 봉 종가 100(전일처럼)
+    cands, px = assemble(items, {}, lambda s, m: _candles(bars),
+                         live_prices={"005930": 90.0})
+    assert cands[0]["intraday_ret_pct"] == -10.0
+    assert cands[0]["price"] == 90.0
+    assert px["005930"] == 90.0
+
+
 def test_filter_gap_rebound_keeps_held():
     from src.agents.features import filter_gap_rebound_candidates
     cands = [
@@ -130,6 +141,31 @@ def test_decision_prompt_has_overnight_us_background():
     assert "horizon=close_scan" in DEC
     assert "SP500" in DEC and "USDKRW" in DEC
     assert "기계적으로 '미장이 올랐으니 BUY' 로 가지 마라" in DEC
+    assert "gap_shape" in DEC
+
+
+def test_assemble_gap_shape_flags():
+    raw = [{"time": i, "open": 100.0, "high": 101.0, "low": 99.5,
+            "close": 100.0, "volume": 1000} for i in range(29)]
+    raw.append({"time": 29, "open": 97.0, "high": 97.2, "low": 96.0,
+                "close": 96.1, "volume": 1000})
+    items = [{"symbol": "005930", "name": "삼성", "market": "KR"}]
+    cands, _ = assemble(items, {}, lambda s, m: raw)
+    gs = cands[0].get("gap_shape") or {}
+    assert gs.get("gap_down_deep") is True
+    assert gs.get("close_near_day_low") is True
+
+
+def test_gap_shape_intraday_rebound_not_near_low():
+    # 장중 급락 후 종가 반등 — close_loc 높음
+    raw = [{"time": i, "open": 100.0, "high": 100.0, "low": 90.0,
+            "close": 95.0, "volume": 1000} for i in range(30)]
+    raw[-1] = {"time": 30, "open": 100.0, "high": 100.0, "low": 90.0,
+               "close": 98.0, "volume": 1000}
+    items = [{"symbol": "005930", "name": "삼성", "market": "KR"}]
+    cands, _ = assemble(items, {}, lambda s, m: raw)
+    gs = cands[0].get("gap_shape") or {}
+    assert gs.get("close_near_day_low") is False
 
 
 def test_athena_prompt_has_overnight_us_background():

@@ -96,6 +96,9 @@ KR 갭반등 렌즈(gap_rebound / gap_rebound_scan / nxt_gap_scan):
 - 진입존은 현재가 근처(갭 추격 아님). **horizon=close_scan**(swing 아님). 익일 gap_pct>0 이면 익절 검토.
   코드가 익일 세션에 close_scan_exit 청산.
 - pool=gap_decline·source=gap_rebound 후보는 close_scan 전용 트랙이다.
+- candidates[].gap_shape — close_loc(0=당일저가·1=고가), gap_down_deep(시가 갭<=-2%),
+  vol_spike(20일 거래량 2배+). 백테 prior 는 focus.lenses[gap_rebound].prior 에 있으면
+  참고만(프록시·얇은 표본 주의). 이 플래그·prior 단독 BUY 금지 — dossier·shock 배제가 우선.
 
 미장 → 한국장 배경(KR 종목을 판단할 때):
 - 한국장은 간밤 미국장 위에서 열린다. market.markets 의 SP500·NASDAQ 등락, USDKRW

@@ -166,7 +166,7 @@ def _build_brain(cfg, gateway, store, args, broker, risk, universe_fn=None,
             log.error("brain LLM 초기화 실패 → 감시만 진행: %s", e)
             return None
         fetch = history_candles_1y
-        log.info("brain backend=%s (결정=opus:%s/sonnet:%s wake라우팅, 검증=%s, candles=yahoo_1y)",
+        log.info("brain backend=%s (결정=opus:%s/sonnet:%s wake라우팅, 검증=%s, candles=yahoo_1y+live_px)",
                  "cli(구독)" if use_cli else ("api-key" if api_key else "api-oauth"),
                  llm_meta["decision_opus"], llm_meta["decision_sonnet"],
                  llm_meta["validation"])
@@ -175,7 +175,12 @@ def _build_brain(cfg, gateway, store, args, broker, risk, universe_fn=None,
                          decision_llm_fn=decision_llm_fn,
                          universe_fn=universe_fn,    # 뇌도 런타임 유니버스를 매 사이클 재독
                          open_markets_fn=open_markets_fn,   # 닫힌 시장 후보 제외(opt-in)
-                         illiquid_fn=illiquid_fn)    # 시간외 체결정지 종목 후보 제외(opt-in)
+                         illiquid_fn=illiquid_fn,    # 시간외 체결정지 종목 후보 제외(opt-in)
+                         price_fn=(lambda syms, m: {
+                             r["symbol"]: r["price"]
+                             for r in gateway.poll_prices(syms, record=False)
+                             if r.get("symbol") and r.get("price")
+                         }) if not dry else None)
 
     def cycle(wake=None):
         try:
