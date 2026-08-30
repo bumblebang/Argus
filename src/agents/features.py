@@ -22,7 +22,8 @@ import pandas as pd
 from ..baserate import brief as baserate_brief
 from ..gap_rebound_features import gap_shape_fields
 from ..indicators import sma, rsi
-from ..runner import candles_to_df, patch_live_price
+from ..runner import candles_to_df, last_bar_trading_date, patch_live_price
+from ..market_hours import trading_date
 from ..logging_setup import get_logger
 from ..security_filter import is_buy_ineligible
 from .tools import recommend_strategy
@@ -234,7 +235,17 @@ def assemble(items: list[dict], market_state: dict,
                 except (TypeError, ValueError):
                     live_px = None
             if df is not None and live_px is not None and live_px > 0:
-                df = patch_live_price(df, live_px)
+                bar_day = last_bar_trading_date(df, market)
+                if bar_day is not None and bar_day < trading_date(market):
+                    # 20h TTL 캐시가 어제 봉 — 패치 전 Yahoo fresh 로 당일 봉 확보.
+                    try:
+                        from .wiring import history_candles_1y
+                        fresh_raw = history_candles_1y(sym, market, fresh=True)
+                        if fresh_raw:
+                            df = candles_to_df(fresh_raw)
+                    except Exception as e:
+                        log.debug("[%s] stale 일봉 fresh 재조회 실패: %s", sym, e)
+                df = patch_live_price(df, live_px, market=market)
             feat.update(_gap_fields(df))   # 시가 갭(간밤 흐름의 반영 정도)
             if df is not None and len(df) >= 1:
                 feat.update(_intraday_ret_fields(df, live_px))

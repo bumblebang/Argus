@@ -8,6 +8,7 @@ from src.gap_rebound_backtest import (
     bucket_edges,
     build_prior,
     events_for_day,
+    roundtrip_cost_pct_points,
     summarize_by_bucket,
     summarize_conditional,
 )
@@ -34,6 +35,18 @@ def _day_frame() -> pd.DataFrame:
             "date": pd.Timestamp("2026-01-02"),
         })
     return pd.DataFrame(rows)
+
+
+def test_events_subtract_roundtrip_cost():
+    ev = events_for_day(_day_frame(), liq_top=10, decline_top=5,
+                        intraday_floor=-5.0,
+                        eligible={"A", "B", "C", "D", "E"})
+    assert not ev.empty
+    row = ev.iloc[0]
+    gross_open = (row["exit_open_px"] / row["entry_px"] - 1) * 100
+    cost = roundtrip_cost_pct_points("KR")
+    assert cost >= 0.2
+    assert abs(row["ret_next_open_pct"] - (gross_open - cost)) < 1e-9
 
 
 def test_events_respect_floor_and_decline_pool():

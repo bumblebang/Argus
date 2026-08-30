@@ -16,6 +16,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.config import ROOT
 from src.gap_rebound_backtest import (
+    KR_MIN_ROUNDTRIP_COST_PCT,
     PRIOR_PATH,
     build_panel,
     build_prior,
@@ -86,7 +87,8 @@ def main() -> int:
     print(f"조건: 거래대금 top {args.liq_top}"
           + (f" -> 하락 top {args.decline_top}" if not args.no_decline_pool else "")
           + f", intraday<={args.floor}%%, ETF 제외")
-    print("진입=당일 종가(15:20 근사), 청산=익일 시가/종가\n")
+    print("진입=당일 종가(15:20 근사), 청산=익일 시가/종가 "
+          f"(왕복비용 ≥{KR_MIN_ROUNDTRIP_COST_PCT:.1f}%p 차감)\n")
 
     if overall:
         print(
@@ -104,7 +106,7 @@ def main() -> int:
     print("구간별 (intraday_ret_pct):")
     _print_table(buckets, [
         "bucket", "n", "win_open_pct", "win_close_pct",
-        "avg_ret_open", "avg_ret_close", "med_ret_open", "avg_gap_open",
+        "avg_ret_open", "avg_ret_close", "med_ret_open",
         "avg_intraday", "avg_daily",
     ])
 
