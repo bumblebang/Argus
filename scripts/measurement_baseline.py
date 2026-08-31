@@ -39,12 +39,15 @@ def _postmortem_headline() -> dict:
     return {
         "present": True,
         "asof": doc.get("asof"),
-        "actual_closed": {k: actual.get(k) for k in ("n", "wins", "win_rate")},
+        "comparison_forbidden": bool(doc.get("comparison_forbidden")),
+        "comparison_note": doc.get("comparison_note"),
+        "actual_closed": {k: actual.get(k) for k in ("n", "wins", "win_rate", "definition")},
         "actual_rows_with_null_pnl": sum(1 for r in rows if r.get("pnl") is None),
         "counterfactual_overall": {
             h: {k: v.get(k) for k in ("n", "win_rate", "avg_ret_pct")}
             for h, v in cf_overall.items()
         },
+        "counterfactual_definition": (doc.get("counterfactual") or {}).get("definition"),
     }
 
 

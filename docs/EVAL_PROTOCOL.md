@@ -14,8 +14,8 @@
    `kill` / `pass` / `shadow_only` 로 갱신한다. 이 함수를 안 돌리면 레지스트리는
    **체크리스트**다 — 코드가 메인/게이트를 막아주리라 기대하지 마라.
 
-`can_promote` 는 리플레이/널 Δ 에 항상 False 이고, PROTECTED 변경 경로
-(`risk_gate` 적용·config 저장)에는 아직 배선되지 않았다. 자동 승격 CTA 는 없다.
+`can_promote` 는 리플레이/널 Δ 에 항상 False 이고, PROTECTED 변경은
+`scripts/check_protected_changes.py`(CI) 가 PR 에서 `eval_experiment:` 또는 `defect-fix:` 를 검사한다.
 
 ## 결함 수정 예외 (defect fix)
 
@@ -60,6 +60,20 @@ ok, why = can_promote(change="validation_rules", evidence_n=12,
 apply_kill_rules(metrics={"shadow.avg_ret_pct": -3.0}, n=40)
 # status=kill
 ```
+
+## CI (PROTECTED 변경)
+
+PR 에 `src/risk_gate.py`·`exit_policy`·`validation_agent`·`calibration`·`config.yaml` 의
+`risk`/`exit_policy`/`agents`/`value_trade` 블록 변경이 있으면:
+
+- **결함 수정:** PR 본문에 `defect-fix:` (재현 테스트 필수)
+- **전략 변경:** `eval_experiment: exp_...` + registry 에 `pass`/`running` + `touches` 일치
+
+```bash
+python scripts/check_protected_changes.py --base origin/main
+```
+
+로컬: `ARGUS_EVAL_EXPERIMENT_ID=exp_...` 또는 `ARGUS_EVAL_PR_BODY` 환경변수.
 
 ## 매니저 에포크
 

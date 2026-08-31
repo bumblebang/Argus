@@ -14,6 +14,8 @@ sys.path.insert(0, str(ROOT))
 
 from src import paths as _paths  # noqa: E402
 from src.engine.store import Store  # noqa: E402
+from src.config import load_config  # noqa: E402
+from src.eval.postmortem_cf import cf_stop_pct, forward_ret_pct_with_stop
 from src.eval.trade_defs import roundtrip_cost_pct, scored_trades  # noqa: E402
 
 DATA = ROOT / "data"
@@ -118,16 +120,15 @@ def collect(rows: list[dict], sleeve: str) -> tuple[list[dict], int]:
     return out, n_prop
 
 
-def load_daily(symbol: str) -> list[tuple[datetime, float]]:
-    """Load 1d close series from history CSV if present."""
+def load_daily(symbol: str) -> list[tuple[datetime, float, float]]:
+    """Load 1d (date, close, low) from history CSV if present."""
     candidates = sorted(DATA.glob(f"history/{symbol}.KS_1d_*.csv"))
     if not candidates:
         candidates = sorted(DATA.glob(f"history/{symbol}_1d_*.csv"))
     if not candidates:
         return []
-    # prefer 1y or longest
     path = candidates[-1]
-    rows: list[tuple[datetime, float]] = []
+    rows: list[tuple[datetime, float, float]] = []
     for i, line in enumerate(path.read_text(encoding="utf-8").splitlines()):
         if i == 0 and ("Date" in line or "date" in line):
             continue
@@ -136,14 +137,19 @@ def load_daily(symbol: str) -> list[tuple[datetime, float]]:
             continue
         try:
             d = datetime.fromisoformat(parts[0][:10]).replace(tzinfo=KST)
-            close = float(parts[4] if len(parts) > 5 else parts[-1])
-            # typical OHLCV: Date,Open,High,Low,Close,Volume
             if len(parts) >= 6:
-                close = float(parts[4])
-            rows.append((d, close))
+                low, close = float(parts[3]), float(parts[4])
+            else:
+                close = float(parts[-1])
+                low = close
+            rows.append((d, close, low))
         except ValueError:
             continue
     return rows
+
+
+def _cf_stop_pct(*, sleeve: str, horizon: str | None, cfg: dict) -> float:
+    return cf_stop_pct(sleeve=sleeve, horizon=horizon, cfg=cfg)
 
 
 def snap_price(con: sqlite3.Connection, symbol: str, ts: float,
@@ -167,29 +173,39 @@ def snap_forward(con: sqlite3.Connection, symbol: str, ts0: float,
     return float(row[0]) if row else None
 
 
-def daily_forward(series: list[tuple[datetime, float]], ts_epoch: float,
-                  days: int) -> tuple[float | None, float | None]:
+def _entry_and_forward_bars(
+        series: list[tuple[datetime, float, float]], ts_epoch: float,
+        days: int) -> tuple[float | None, list[tuple[float, float]]]:
+    """entry close + 이후 N거래일 (close, low) 리스트."""
     if not series or ts_epoch is None:
-        return None, None
+        return None, []
     t0 = datetime.fromtimestamp(ts_epoch, tz=KST)
-    # entry = last close on or before day
     entry = None
-    for d, c in series:
+    for d, c, _ in series:
         if d.date() <= t0.date():
             entry = c
         else:
             break
     if entry is None:
-        return None, None
-    # forward close N trading days later
-    after = [c for d, c in series if d.date() > t0.date()]
-    # 부족한 구간은 결측 — 짧은 히스토리로 d20을 마지막봉에 끼워 넣지 않음
+        return None, []
+    after = [(c, lo) for d, c, lo in series if d.date() > t0.date()]
     if len(after) < days:
+        return entry, []
+    return entry, after[:days]
+
+
+def daily_forward(series: list[tuple[datetime, float, float]], ts_epoch: float,
+                  days: int) -> tuple[float | None, float | None]:
+    entry, bars = _entry_and_forward_bars(series, ts_epoch, days)
+    if entry is None or not bars:
         return entry, None
-    return entry, after[days - 1]
+    return entry, bars[days - 1][0]
 
 
 def main() -> None:
+    cfg_path = ROOT / "config.yaml"
+    cfg = load_config(cfg_path).raw if cfg_path.exists() else {}
+
     brain_jl = _paths.resolve("decisions", configured="data/decisions.jsonl")
     brain, n_b = collect(load_jsonl(brain_jl), "brain")
     value, n_v = collect(load_jsonl(DATA / "value_decisions.jsonl"), "value")
@@ -239,21 +255,35 @@ def main() -> None:
         series = daily_cache[sym]
         entry_px = None
         fwd = {}
+        stop_pct = _cf_stop_pct(
+            sleeve=x.get("sleeve") or "brain",
+            horizon=x.get("horizon"),
+            cfg=cfg,
+        )
         if series:
-            cost = roundtrip_cost_pct(x.get("market") or "KR") * 100.0
+            cost = roundtrip_cost_pct(x.get("market") or "KR", cfg)
             for h in horizons:
-                e, f = daily_forward(series, x["ts_epoch"], h)
-                entry_px = e
-                if e and f:
-                    fwd[f"d{h}"] = round((f / e - 1) * 100 - cost, 3)
+                entry, bars = _entry_and_forward_bars(series, x["ts_epoch"], h)
+                entry_px = entry
+                if entry and bars:
+                    ret = forward_ret_pct_with_stop(
+                        entry=entry,
+                        bars=bars,
+                        days=h,
+                        stop_pct=stop_pct,
+                        cost_pct=cost,
+                    )
+                    if ret is not None:
+                        fwd[f"d{h}"] = ret
         else:
             entry_px = snap_price(con, sym, x["ts_epoch"])
             if entry_px:
-                cost = roundtrip_cost_pct(x.get("market") or "KR") * 100.0
+                cost = roundtrip_cost_pct(x.get("market") or "KR", cfg)
                 for h in horizons:
                     f = snap_forward(con, sym, x["ts_epoch"], float(h))
                     if f:
-                        fwd[f"d{h}"] = round((f / entry_px - 1) * 100 - cost, 3)
+                        # 스냅샷 경로: low 없음 — 종가만, 손절 미적용(보수적으로 종가만)
+                        fwd[f"d{h}"] = round((f / entry_px - 1) * 100 - cost * 100.0, 3)
         if not fwd:
             continue
         cf_rows.append({
@@ -323,9 +353,12 @@ def main() -> None:
         },
         "counterfactual": {
             "definition": "blocked BUY entry=prior daily close; "
-                          "win=forward close > entry after roundtrip_cost_pct; "
-                          "horizons=1/5/20 trading days. NOT comparable to actual_closed.",
+                          "horizons=1/5/20 trading days; "
+                          "roundtrip_cost_pct + 보수적 손절(일봉 low, horizon별). "
+                          "NOT comparable to actual_closed.",
             "cost_model": "fee*2 + sell_tax + slippage_bps*2 (paper.*)",
+            "stop_model": "day=5% swing=8% position=15% value=hard_stop_pct; "
+                          "low touch → stop exit. 스냅샷-only 경로는 손절 미적용.",
             "n_with_price": len(cf_rows),
             "overall": {f"d{h}": cf_stats(cf_rows, f"d{h}") for h in horizons},
             "by_bucket": cf_by_bucket,
