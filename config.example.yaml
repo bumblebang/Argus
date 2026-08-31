@@ -287,6 +287,14 @@ athena:
     # 방향4-A: US 도지어만(집행/brain_sessions.US 미개방). 태스크 17:10.
     US:
       - { start: "17:00", stop: "21:50" }
+  # Phase 2 — 존 근접 우선·이벤트 큐·레벨-only 갱신
+  phase2:
+    enabled: true
+    gap_pct: 4.0                    # 전일종가 대비 |등락| % (2%는 장중 오탐 많음)
+    invalidation_near_pct: 0.02      # 무효화가 위 2% 이내 → athena_queue
+    level_only_max_move_pct: 0.05    # 신선 bullish + 가격변동 5% 이내 → 레벨-only LLM
+    queue_cooldown_hours: 6          # 동일 reason 재큐 최소 간격
+    queue_since_hours: 24            # select_symbols 큐 소비 창
 
 screener:
   enabled: true
