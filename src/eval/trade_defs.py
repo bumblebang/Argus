@@ -3,7 +3,7 @@
 지금 청산 정의가 세 갈래다:
   get_closed_positions : state=closed AND pnl IS NOT NULL
   closed_trades        : state=closed AND qty>0
-  _gate_postmortem     : state=closed (필터 없음)
+  _gate_postmortem     : scored_trades (actual) + CF 별도 (J10)
 
 scored_trades 는 둘을 교집합하고 parent_id 로 묶어, 부분매도 slice 가
 거래 여러 건으로 세어지지 않게 한다. 캘리브·사후분석·그림자가 이걸 쓴다.

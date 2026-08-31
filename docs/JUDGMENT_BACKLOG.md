@@ -26,7 +26,7 @@
 | J12 | adopt(08-27) | `8e5fee5` 널 eligible=bullish | `test_eval_infra.py` |
 | J13 | adopt(08-27) | `3b367d0` apply_kill_rules | `test_instrumentation_layer.py` |
 
-**잔여(defer):** J13 — `can_promote`→PROTECTED 실변경·CI 미배선(의도). J10 — CF 비용·UI 분리.
+**잔여(defer):** 없음 — J13 `can_promote` CI·J10 CF·UI 분리 **완료(2026-08-31)**.
 
 ---
 
@@ -46,7 +46,7 @@
 | J10 | 게이트 사후분석이 실승률을 깎고 반사실과 나란히 비교 | **재현됨** (~43pp 왜곡) | P1 | **adopt(2026-08-27)** |
 | J11 | 그림자 채점 `has_open_since` 생존편향 + 비용 0 | **재현됨** (보유취소·손절채점) | P1 | **adopt(2026-08-27)** |
 | J12 | 널 게이트≠라이브(stance) → `delta_vs_gated` 오염 | **재현됨** (존재만 vs bullish) | P1 | **adopt(2026-08-27)** |
-| J13 | 사전등록이 미집행(킬/pass·배선 없음) | **감사확정** (코드 전수) | P1 | **adopt(2026-08-27)** · can_promote CI **defer** |
+| J13 | 사전등록이 미집행(킬/pass·배선 없음) | **감사확정** (코드 전수) | P1 | **adopt(2026-08-27)** · CI **완료(08-31)** |
 
 ---
 
@@ -755,7 +755,8 @@ actual_wins = sum(1 for r in closed if (r[3] or 0) > 0)  # pnl null → 0 → �
 
 ### 판단 체크
 
-- [x] **adopt(2026-08-27)** — `3ceb738` actual=scored_trades (CF 비용·UI 분리는 defer)
+- [x] **adopt(2026-08-27)** — `3ceb738` actual=scored_trades
+- [x] **defer 완료(2026-08-31)** — CF 손절(`postmortem_cf`)·대시보드 분리·`comparison_forbidden`
 
 ---
 
@@ -951,7 +952,7 @@ SELECT 1 FROM positions WHERE symbol=? AND state='open' AND opened_at >= ?
 ### 판단 체크
 
 - [x] **adopt(2026-08-27)** — `3b367d0` `apply_kill_rules` 구조화; `kill_if` 문자열 eval 폐기; 문서=수동 체크리스트
-- [ ] **defer** — `can_promote`→PROTECTED 실변경·CI (자동승격 원래 NO_PROMOTE)
+- [x] **defer 완료(2026-08-31)** — `protected_guard` + `scripts/check_protected_changes.py` CI
 
 ---
 

@@ -798,6 +798,18 @@ def _read_live_mode() -> bool:
         return False
 
 
+def _read_gate_postmortem() -> dict | None:
+    """data/gate_postmortem.json — 게이트 사후분석(J10). actual vs CF 직접 비교 금지."""
+    path = ROOT / "data" / "gate_postmortem.json"
+    if not path.exists():
+        return None
+    try:
+        doc = json.loads(path.read_text(encoding="utf-8"))
+        return doc if isinstance(doc, dict) else None
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
+
+
 def _trade_stats(paper: dict | None, fx: float | None = None) -> dict | None:
     """페이퍼 저널 FIFO 매칭(레거시). 라이브에선 BUY 누락 시 0원 청산이 생겨
     성과 탭은 `_store_trade_stats` 를 쓴다. 알파·테스트용으로 유지."""
@@ -1620,6 +1632,7 @@ def _gather() -> dict:
     if "value_watchlist" not in data:
         data["value_watchlist"] = _read_value_watchlist()
     data["value_decisions"] = _read_value_decisions()
+    data["gate_postmortem"] = _read_gate_postmortem()
     # 측정층(그림자·캘리브레이션·매니저) — 실패해도 대시보드는 계속.
     # Store 는 readonly — migrate/open-dedupe 쓰기로 라이브 DB 를 건드리지 않는다.
     _st = None
@@ -3216,6 +3229,50 @@ def _epoch_badges_html(badges: list[str]) -> str:
     return " ".join(f"<span class=chip>{escape(b)}</span>" for b in badges)
 
 
+def _gate_postmortem_html(pm: dict | None) -> str:
+    """성과 탭 — actual_closed / counterfactual 분리 (J10). 나란히 비교 금지."""
+    if not pm:
+        return ("<div class=sec>게이트 사후분석</div><div class=panel>"
+                "<span class=muted>data/gate_postmortem.json 없음 — "
+                "<code class=mono>python scripts/_gate_postmortem.py</code></span></div>")
+    p: list[str] = []
+    p.append("<div class=sec>게이트 사후분석 <span class=muted>(분리 표시)</span></div>"
+             "<div class=panel>")
+    note = pm.get("comparison_note") or ""
+    if pm.get("comparison_forbidden"):
+        p.append(f"<div class=sub style='margin:-4px 0 10px;color:#ffb454'>"
+                 f"&#9888; <b>비교 금지</b> — {escape(note)}</div>")
+    actual = pm.get("actual_closed") or {}
+    cf = pm.get("counterfactual") or {}
+    cf_d5 = (cf.get("overall") or {}).get("d5") or {}
+    wr_a = actual.get("win_rate")
+    wr_cf = cf_d5.get("win_rate")
+    wr_a_s = f"{wr_a * 100:.0f}%" if wr_a is not None else "–"
+    wr_cf_s = f"{wr_cf * 100:.0f}%" if wr_cf is not None else "–"
+    p.append("<div class=grid>")
+    p.append(f"<div class=card><div class=k>실제 체결 (actual_closed)</div>"
+             f"<div class='v mono'>{actual.get('n', 0)}건 · 승률 {wr_a_s}</div>"
+             f"<div class=sub style='margin-top:6px'>{escape(actual.get('definition') or '')}</div></div>")
+    p.append(f"<div class=card><div class=k>막힌 BUY 반사실 (d5)</div>"
+             f"<div class='v mono'>{cf_d5.get('n', 0)}건 · 승률 {wr_cf_s}</div>"
+             f"<div class=sub style='margin-top:6px'>{escape(cf.get('definition') or '')}</div>"
+             f"<div class=sub>{escape(cf.get('cost_model') or '')}<br>"
+             f"{escape(cf.get('stop_model') or '')}</div></div>")
+    p.append("</div>")
+    buckets = pm.get("blocked_buckets") or {}
+    if buckets:
+        p.append("<div class=sub>차단 사유 버킷</div><table>"
+                 "<tr><th>사유</th><th>건수</th></tr>")
+        for bk, cnt in list(buckets.items())[:10]:
+            p.append(f"<tr><td>{escape(str(bk))}</td><td class=mono>{cnt}</td></tr>")
+        p.append("</table>")
+    asof = pm.get("asof")
+    if asof:
+        p.append(f"<div class=sub style='margin-top:8px'>기준 {escape(str(asof))}</div>")
+    p.append("</div>")
+    return "".join(p)
+
+
 def _perf_html(d: dict) -> str:
     t = d.get("trades")
     names = d.get("names", {})
@@ -3424,6 +3481,8 @@ def _perf_html(d: dict) -> str:
                      f"<td class=mono>{ep_s}</td></tr>")
         p.append("</table>")
     p.append("</div>")
+
+    p.append(_gate_postmortem_html(d.get("gate_postmortem")))
 
     # 거래별 실현손익 (store 청산 — 전략별 성과와 동일 원천)
     p.append("<div class=sec>실현손익 (거래별)</div><div class=panel>")
