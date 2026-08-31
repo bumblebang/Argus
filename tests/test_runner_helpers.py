@@ -5,7 +5,7 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 
 from src.market_hours import trading_date
-from src.runner import last_bar_trading_date, patch_live_price
+from src.runner import last_bar_trading_date, order_price, patch_live_price
 
 _KST = ZoneInfo("Asia/Seoul")
 
@@ -91,3 +91,12 @@ def test_patch_append_if_new_day():
     assert len(out) == 2
     assert out["close"].iloc[-1] == 88.0
     assert last_bar_trading_date(out, "KR") == trading_date("KR")
+
+
+def test_order_price_prefers_live_when_patch_skips():
+    """patch skip(어제 봉)이어도 주문가는 라이브가 우선."""
+    yesterday = (datetime.now(_KST).date().toordinal() - 1)
+    yday = datetime.fromordinal(yesterday).date().isoformat()
+    df = _daily_df(yday, close=95.0)
+    assert order_price(88.0, df) == 88.0
+    assert order_price(None, df) == 95.0

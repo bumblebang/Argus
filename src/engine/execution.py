@@ -16,7 +16,7 @@ import time
 from ..logging_setup import get_logger
 from ..store_fill import fill_event_payload
 from ..risk_gate import Order
-from ..runner import candles_to_df, patch_live_price
+from ..runner import candles_to_df, order_price, patch_live_price
 from ..strategies import build_strategy, REGISTRY
 from ..strategies.base import Action, Position
 from ..agents.conviction import size_weight, min_lot_adjust, skip_position_headroom
@@ -180,19 +180,19 @@ class EntryExecutor:
         if sig.action != Action.BUY:
             return {"action": sig.action.value, "executed": False, "reason": sig.reason}
 
-        price = float(df["close"].iloc[-1])
+        exec_px = order_price(price, df)
         equity = _sizing_equity(self.risk, self.broker, market)
-        weight, min_qty = _entry_lot(meta, market, price, self.risk, sig.target_weight,
+        weight, min_qty = _entry_lot(meta, market, exec_px, self.risk, sig.target_weight,
                                     equity=equity)
         qty = self.risk.size_buy(
-            market, price, weight, min_qty=min_qty, base_equity=equity,
+            market, exec_px, weight, min_qty=min_qty, base_equity=equity,
             notional_cap=(None if skip_position_headroom(min_qty)
-                          else self._headroom(sym, market, price, equity)))
+                          else self._headroom(sym, market, exec_px, equity)))
         if qty <= 0:
             return {"action": "buy", "executed": False, "reason": "사이징 0"}
 
         res = self.broker.execute_with_mirror(
-            Order(sym, market, "BUY", qty, price),
+            Order(sym, market, "BUY", qty, exec_px),
             reason=f"[entry:{name}] {sig.reason}",
             store=self.store, armed_id=armed["id"], plan_fn=self.plan_fn)
         if not res:
@@ -204,10 +204,10 @@ class EntryExecutor:
         cancel_shadow_on_fill(self.store, sym)
         acct = self.broker.position(sym)
         self.store.log_event("entry", sym, fill_event_payload(
-            res, strategy=name, price=res.avg_price or price, qty=acct.qty,
+            res, strategy=name, price=res.avg_price or exec_px, qty=acct.qty,
             reason=sig.reason))
         log.info("코드 진입 %s filled=%s acct=%s @ %.2f (%s: %s)",
-                 sym, res.filled_qty, acct.qty, res.avg_price or price, name, sig.reason)
+                 sym, res.filled_qty, acct.qty, res.avg_price or exec_px, name, sig.reason)
         return {"action": "buy", "executed": True, "reason": sig.reason}
 
     def _evaluate_zone(self, armed: dict, market: str, price: float | None,

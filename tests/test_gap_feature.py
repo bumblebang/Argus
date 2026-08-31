@@ -113,6 +113,22 @@ def test_assemble_omits_gap_fields_when_stale_persists(monkeypatch):
     assert "gap_pct" not in c
 
 
+def test_has_today_daily_bar_rejects_future_bar():
+    """미래 봉은 당일 봉으로 인정하지 않는다(>= 버그 회귀)."""
+    from src.agents.features import _has_today_daily_bar
+    from src.market_hours import trading_date
+
+    today = trading_date("KR")
+    tz = ZoneInfo("Asia/Seoul")
+    tomorrow = (pd.Timestamp(today, tz=tz) + pd.Timedelta(days=1)).date().isoformat()
+    df = pd.DataFrame({"time": [pd.Timestamp(tomorrow, tz=tz)], "close": [100.0]})
+    assert _has_today_daily_bar(df, "KR") is False
+    assert _has_today_daily_bar(
+        pd.DataFrame({"time": [pd.Timestamp(today, tz=tz)], "close": [100.0]}),
+        "KR",
+    ) is True
+
+
 def test_assemble_refreshes_stale_daily_before_patch(monkeypatch):
     """20h TTL 어제 봉 캐시 — 패치 전 fresh 일봉으로 당일 시가 확보."""
     from src.agents.features import assemble
