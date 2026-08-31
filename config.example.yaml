@@ -230,6 +230,8 @@ agents:
     enrich_flows: true
     gap_enrich_max: 25
     patch_missing_fundamentals_max: 5
+    scan_enabled: true
+    scan_cap: 40
   max_tokens: 8000
   thinking: true
   claude_command: "claude"
@@ -280,6 +282,7 @@ athena:
   model: "sonnet"
   max_per_run: 30
   ttl_hours: 60
+  min_refresh_hours: 48
   timeout: 240
   windows:
     KR:
@@ -303,6 +306,15 @@ screener:
   candle_interval: "1d"
   lookback: 60
   exclude_warnings: true
+  liquidity_core:
+    enabled: true
+    light: true
+    core_size: 100
+    discover_pool: 300
+    default_strategy: ma_crossover
+    rank_by: discovery_tv
+    day_tag_top: 20
+    day_strategy: volatility_breakout
   min_price: { KR: 2000, US: 5 }
   max_price: { KR: 1000000, US: 2000 }
   min_avg_turnover: { KR: 5000000000, US: 50000000 }

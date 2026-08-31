@@ -29,7 +29,7 @@ import yaml
 
 from .config import ROOT, default_config_path
 from .logging_setup import get_logger
-from .screener import screen, compute_metrics, passes_filters
+from .screener import screen, liquidity_core_pick, liquidity_core_pick_light, compute_metrics, passes_filters
 from .gem_screen import gem_candidates
 from .datasources import discovery
 from .datasources.history import fetch_history
@@ -49,24 +49,70 @@ _DRY = False
 
 
 # ── 발굴(scripts/screen.py 에서 이동, CLI·데몬 공유) ──────────────────────
+def _liquidity_core_cfg(cfg) -> dict:
+    """screener.liquidity_core — 거래대금 풀 → 하드필터 → core_size."""
+    raw = cfg.raw if hasattr(cfg, "raw") else (cfg or {})
+    sc = (raw.get("screener") or {}) if isinstance(raw, dict) else {}
+    lc = sc.get("liquidity_core") or {}
+    return {
+        "enabled": bool(lc.get("enabled", False)),
+        "light": bool(lc.get("light", False)),
+        "core_size": int(lc.get("core_size", 100)),
+        "discover_pool": int(lc.get("discover_pool", 300)),
+        "default_strategy": str(lc.get("default_strategy", "ma_crossover")),
+        "rank_by": str(lc.get("rank_by", "avg_turnover")),
+        "day_tag_top": int(lc.get("day_tag_top", 0)),
+        "day_strategy": str(lc.get("day_strategy", "volatility_breakout")),
+    }
+
+
+def discover_trading_value_pool(cfg, market: str, pool: int, dry: bool
+                                ) -> tuple[list[tuple[str, str, str]],
+                                           dict[str, float], dict[str, float]]:
+    """거래대금 상위 pool 발굴. 반환: (candidates, symbol→trading_value, symbol→price)."""
+    criteria = cfg.raw.get("screener", {})
+    min_price = (criteria.get("min_price", {}) or {}).get(market, 0)
+    mkt = str(market).upper()
+    if dry:
+        if mkt == "KR":
+            rows = [{"symbol": f"00{i:04d}", "name": f"종목{i}",
+                     "trading_value": float(1_000_000_000 * (pool - i)),
+                     "price": 50_000.0}
+                    for i in range(pool)]
+        else:
+            rows = [{"symbol": f"SYM{i}", "name": f"SYM{i}",
+                     "trading_value": float(1_000_000_000 * (pool - i)),
+                     "price": 100.0}
+                    for i in range(pool)]
+    elif mkt == "KR":
+        # Naver: 시총 풀을 모은 뒤 accumulatedTradingValue 로 재정렬(당일/전일 거래대금).
+        rows = discovery.top_by_trading_value(
+            "KR", count=pool, pool=pool, min_price=min_price)
+    elif mkt == "US":
+        rows = discovery.top_us_by_trading_value(
+            count=pool, pool=pool, min_price=min_price)
+    else:
+        return [], {}, {}
+    cands = [(mkt, d["symbol"], d["name"]) for d in rows]
+    tv = {d["symbol"]: float(d.get("trading_value") or 0) for d in rows}
+    prices = {d["symbol"]: float(d.get("price") or 0) for d in rows}
+    return cands, tv, prices
+
+
 def discover_kr(cfg, count: int, dry: bool) -> list[tuple[str, str, str]]:
     """KR 후보 발굴(Naver 거래대금 상위). 반환: [(market, symbol, name)]."""
-    criteria = cfg.raw.get("screener", {})
-    min_price = (criteria.get("min_price", {}) or {}).get("KR", 0)
-    if dry:
-        return [("KR", f"00{i:04d}", f"종목{i}") for i in range(count)]
-    picks = discovery.top_by_trading_value("KR", count=count, min_price=min_price)
-    return [("KR", d["symbol"], d["name"]) for d in picks]
+    lc = _liquidity_core_cfg(cfg)
+    pool = lc["discover_pool"] if lc["enabled"] else count
+    cands, _, _ = discover_trading_value_pool(cfg, "KR", pool, dry)
+    return cands
 
 
 def discover_us(cfg, count: int, dry: bool) -> list[tuple[str, str, str]]:
-    """US 후보 발굴(Yahoo 거래량 상위 → 거래대금 정렬). Naver 는 KR 전용이라 US 는 Yahoo."""
-    criteria = cfg.raw.get("screener", {})
-    min_price = (criteria.get("min_price", {}) or {}).get("US", 0)
-    if dry:
-        return [("US", t, t) for t in ("AAPL", "MSFT", "NVDA", "AMZN")]
-    picks = discovery.top_us_by_trading_value(count=count, min_price=min_price)
-    return [("US", d["symbol"], d["name"]) for d in picks]
+    """US 후보 발굴(Yahoo most_actives → 거래대금 정렬)."""
+    lc = _liquidity_core_cfg(cfg)
+    pool = lc["discover_pool"] if lc["enabled"] else count
+    cands, _, _ = discover_trading_value_pool(cfg, "US", pool, dry)
+    return cands
 
 
 _DISCOVER = {"KR": discover_kr, "US": discover_us}
@@ -295,9 +341,23 @@ def core_refresh(cfg, market: str, store=None, *, now_fn=time.time) -> dict | No
         return None
     rolling = (cfg.raw.get("screener", {}) or {}).get("rolling", {}) or {}
     scale = float((rolling.get("picks_scale", {}) or {}).get(market, 1.0))
-    count = int((cfg.raw.get("screener", {}) or {}).get("count", 40))
+    screener_raw = cfg.raw.get("screener", {}) or {}
+    count = int(screener_raw.get("count", 40))
+    lc = _liquidity_core_cfg(cfg)
+    fetch = _fetch_fn(cfg, dry)
 
-    cands = disc(cfg, count, dry)
+    if lc["enabled"]:
+        pool = lc["discover_pool"]
+        cands, discovery_tv, discovery_prices = discover_trading_value_pool(
+            cfg, market, pool, dry)
+        log.info("[%s] core_refresh: liquidity_core pool=%d → core_size=%d%s",
+                 market, pool, lc["core_size"],
+                 " (light)" if lc.get("light") else "")
+    else:
+        cands = disc(cfg, count, dry)
+        discovery_tv = {}
+        discovery_prices = {}
+
     if not cands:
         log.warning("[%s] core_refresh: 후보 발굴 0 — 기존 유니버스 유지.", market)
         return None
@@ -307,9 +367,28 @@ def core_refresh(cfg, market: str, store=None, *, now_fn=time.time) -> dict | No
         log.warning("[%s] core_refresh: ETF/부적격 제외 후 후보 0 — 기존 유지.", market)
         return None
 
-    criteria = _scaled_criteria(cfg.raw.get("screener", {}) or {}, scale)
-    fetch = _fetch_fn(cfg, dry)
-    picks = screen(cands, fetch, criteria, exclude_fn=None)
+    criteria = screener_raw if lc["enabled"] else _scaled_criteria(screener_raw, scale)
+    if lc["enabled"]:
+        if lc.get("light"):
+            picks = liquidity_core_pick_light(
+                cands, criteria,
+                limit=lc["core_size"],
+                default_strategy=lc["default_strategy"],
+                discovery_tv=discovery_tv,
+                discovery_prices=discovery_prices,
+                day_tag_top=lc.get("day_tag_top", 0),
+                day_strategy=lc.get("day_strategy", "volatility_breakout"),
+            )
+        else:
+            picks = liquidity_core_pick(
+                cands, fetch, criteria,
+                limit=lc["core_size"],
+                default_strategy=lc["default_strategy"],
+                rank_by=lc["rank_by"],
+                discovery_tv=discovery_tv if lc["rank_by"] == "discovery_tv" else None,
+            )
+    else:
+        picks = screen(cands, fetch, criteria, exclude_fn=None)
     items = list(picks.get(market, []))
     # US 발굴/스크린 실패 → 정적(config) 폴백(수동/데몬 공통).
     if market == "US" and not items:
@@ -370,8 +449,17 @@ def core_refresh(cfg, market: str, store=None, *, now_fn=time.time) -> dict | No
     out = dict(existing)
     out[market] = new_items
     _atomic_write(out, OUT)
-    log.info("[%s] core_refresh: 선정 %d종목(scale=%.2f, 보존 %d) -> %s",
-             market, len(new_items), scale, retained, OUT)
+    if lc["enabled"] and lc.get("light"):
+        try:
+            from .strategy_scores import refresh_strategy_scores
+            refresh_strategy_scores(out, fetch, dry=dry)
+        except Exception as e:
+            log.warning("[%s] strategy_scores 배치 실패(유니버스는 저장됨): %s", market, e)
+    mode = (f"liquidity_core_light/{lc['core_size']}" if lc.get("light")
+            else f"liquidity_core/{lc['core_size']}" if lc["enabled"]
+            else f"picks/scale={scale:.2f}")
+    log.info("[%s] core_refresh: 선정 %d종목(%s, 보존 %d) -> %s",
+             market, len(new_items), mode, retained, OUT)
     return out
 
 

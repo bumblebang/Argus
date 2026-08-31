@@ -11,7 +11,7 @@
     온디맨드 — 콜 ≈ shortlist 크기, 토스 Gateway 미사용, market_state 파일 미오염.
 
 토큰:
-  - scan(정기: periodic/extra/athena_done): 후보 집합 현행 유지(캡 없음).
+  - scan(정기: periodic/extra/athena_done): scan shortlist(~scan_cap) — must(held∪armed∪bullish) + pad(scores).
   - focus(이벤트): day_pool 전량 제외가 본체 — 보유∪wake(+pad)만 뇌에 실.
 """
 from __future__ import annotations
@@ -67,6 +67,8 @@ def serve_cfg(agents_cfg: dict | None) -> dict:
         "enrich_flows": bool(raw.get("enrich_flows", True)),
         "gap_enrich_max": int(raw.get("gap_enrich_max", 25)),
         "patch_missing_fundamentals_max": int(raw.get("patch_missing_fundamentals_max", 5)),
+        "scan_enabled": bool(raw.get("scan_enabled", True)),
+        "scan_cap": int(raw.get("scan_cap", 40)),
     }
 
 
@@ -160,8 +162,75 @@ def _market_hint_from_wake(wake: dict | None, symbol: str) -> str:
     return "US"
 
 
+def select_scan_candidates(
+    items: list[dict],
+    *,
+    held: list[str] | None = None,
+    armed: list[str] | None = None,
+    bullish: list[str] | None = None,
+    scores: dict[str, dict] | None = None,
+    cfg: dict | None = None,
+) -> list[dict]:
+    """scan tier shortlist — must(held∪armed∪bullish∩universe) + pad(strategy_scores 순).
+
+    must 가 scan_cap 을 넘으면 must 전원 유지, pad 만 trim.
+    """
+    from ..strategy_scores import pad_score
+
+    c = cfg or serve_cfg(None)
+    cap = max(0, int(c.get("scan_cap", 40)))
+    by_sym = {str(it.get("symbol")): it for it in items if it.get("symbol") is not None}
+    uni_syms = set(by_sym)
+
+    must: list[str] = []
+    seen: set[str] = set()
+    for s in list(held or []) + list(armed or []):
+        if s and s not in seen:
+            seen.add(s)
+            must.append(s)
+    for s in bullish or []:
+        if s and s not in seen and s in uni_syms:
+            seen.add(s)
+            must.append(s)
+
+    chosen: list[dict] = []
+    chosen_syms: set[str] = set()
+    for s in must:
+        it = by_sym.get(s)
+        if it is not None:
+            row = dict(it)
+            row["serve_must"] = True
+            chosen.append(row)
+            chosen_syms.add(s)
+        else:
+            mkt = "KR" if s.isdigit() and len(s) == 6 else "US"
+            chosen.append({
+                "symbol": s, "name": s, "market": mkt,
+                "serve_must": True, "serve_stub": True, "force_include": True,
+            })
+            chosen_syms.add(s)
+
+    ranked_pad = sorted(
+        (s for s in by_sym if s not in chosen_syms),
+        key=lambda sym: pad_score(scores or {}, sym),
+        reverse=True,
+    )
+    if cap:
+        room = max(0, cap - len(chosen))
+    else:
+        room = len(ranked_pad)
+    for s in ranked_pad[:room]:
+        chosen.append(by_sym[s])
+        chosen_syms.add(s)
+
+    return chosen
+
+
 def select_candidates(items: list[dict], wake: dict | None, *,
                       held: list[str] | None = None,
+                      armed: list[str] | None = None,
+                      bullish: list[str] | None = None,
+                      scores: dict[str, dict] | None = None,
                       cfg: dict | None = None,
                       tier: str | None = None) -> tuple[list[dict], str]:
     """티어에 따라 items 를 그대로 또는 focus shortlist 로 반환.
@@ -174,6 +243,10 @@ def select_candidates(items: list[dict], wake: dict | None, *,
     c = cfg or serve_cfg(None)
     t = tier or classify_tier(wake, cfg=c)
     if t != "focus":
+        if t == "scan" and c.get("scan_enabled", True):
+            return select_scan_candidates(
+                items, held=held, armed=armed, bullish=bullish,
+                scores=scores, cfg=c), t
         return list(items), t
 
     must = []

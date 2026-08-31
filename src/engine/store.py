@@ -631,6 +631,23 @@ class Store:
                 " ORDER BY created_at DESC",
                 (now,)).fetchall()
 
+    def list_fresh_bullish_symbols(self, now: float | None = None) -> list[str]:
+        """유효기간 내 최신 도시에 stance=bullish 인 심볼(순서 유지·중복 제거)."""
+        out: list[str] = []
+        seen: set[str] = set()
+        for row in self.list_fresh_dossiers(now):
+            sym = str(row["symbol"] or "")
+            if not sym or sym in seen:
+                continue
+            try:
+                ev = json.loads(row["evidence"] or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                ev = {}
+            if ev.get("stance") == "bullish":
+                seen.add(sym)
+                out.append(sym)
+        return out
+
     def recent_events(self, kind: str, since: float,
                       limit: int = 20) -> list[sqlite3.Row]:
         """특정 종류의 최근 이벤트(최신순) — 예: 뇌 컨텍스트에 실을 최근 공시."""

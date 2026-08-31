@@ -359,14 +359,35 @@ def _earnings_results_by_symbol(store, since_hours: float = 36.0,
     return out
 
 
+def _min_refresh_hours(cfg) -> float:
+    """athena.min_refresh_hours — covered 갱신 최소 간격(0=비활성)."""
+    raw = getattr(cfg, "raw", cfg) if not isinstance(cfg, dict) else cfg
+    if not isinstance(raw, dict):
+        return 0.0
+    return float((raw.get("athena") or {}).get("min_refresh_hours", 0))
+
+
+def _covered_for_refresh(symbols: list[str], covered_at: dict[str, float], *,
+                         min_refresh_hours: float, now: float) -> list[str]:
+    """min_refresh_hours 안의 covered 는 순환 갱신에서 제외(보유·큐는 선행 단계)."""
+    if min_refresh_hours <= 0:
+        return list(symbols)
+    cutoff = now - min_refresh_hours * 3600
+    return [s for s in symbols if float(covered_at.get(s, 0)) <= cutoff]
+
+
 def select_symbols(cfg, store, market: str, limit: int | None = None, *,
                    market_state: dict | None = None,
-                   prices: dict[str, float] | None = None) -> list[dict]:
+                   prices: dict[str, float] | None = None,
+                   now_fn: Callable[[], float] = time.time) -> list[dict]:
     """리서치 우선순위: 보유 > 이벤트큐 > 공시 > 실적 > 미커버 > 존근접 covered.
 
     covered 회전은 존 근접(in→below→above→unknown) 우선, 동순위는 오래된 도시에 먼저.
+    min_refresh_hours(기본 config) 이내 covered 는 순환에서 스킵 — 보유·큐·공시·실적은 예외.
     """
     p2 = phase2_cfg(cfg)
+    min_refresh = _min_refresh_hours(cfg)
+    now = now_fn()
     uni = {it["symbol"]: it.get("name", it["symbol"])
            for it in (cfg.universe or {}).get(market, []) if it.get("symbol")}
     held = [dict(r) for r in store.get_open_positions()] + \
@@ -384,7 +405,9 @@ def select_symbols(cfg, store, market: str, limit: int | None = None, *,
     fresh_order += _disclosure_queued(store, market)              # 공시 재소환(KR/US)
     fresh_order += _earnings_result_queued(store, market)         # 실적결과 재소환
     fresh_order += [s for s in uni if s not in covered]           # 미커버
-    covered_syms = [s for s in uni if s in covered]
+    covered_syms = _covered_for_refresh(
+        [s for s in uni if s in covered], covered,
+        min_refresh_hours=min_refresh, now=now)
     fresh_order += sort_covered_by_zone(covered_syms, store, px, covered)
     from ..security_filter import is_buy_ineligible
     seen: set[str] = set()

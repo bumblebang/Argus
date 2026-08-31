@@ -190,9 +190,11 @@ def fetch_us_actives(pool: int = 50) -> list[dict]:
     return out
 
 
-def top_us_by_trading_value(count: int = 10, pool: int = 50, min_price: float = 0.0,
+def top_us_by_trading_value(count: int = 10, pool: int | None = None, min_price: float = 0.0,
                             fetch_fn=fetch_us_actives) -> list[dict]:
     """미국 거래대금(=거래량×가격) 상위 종목 발굴. KR top_by_trading_value 와 같은 반환형."""
+    if pool is None:
+        pool = max(count, 50)
     rows = [r for r in fetch_fn(pool=pool)
             if r["price"] >= min_price and r["trading_value"] > 0]
     rows.sort(key=lambda r: r["trading_value"], reverse=True)
