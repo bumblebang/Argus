@@ -76,11 +76,12 @@ def _supplement_daily_from_meta(res: dict, df: pd.DataFrame) -> pd.DataFrame:
     if mt is None or mp is None:
         return df
     try:
-        last_ts = pd.Timestamp(df["time"].iloc[-1])
-        if last_ts.tzinfo is None:
-            last_ts = last_ts.tz_localize("UTC")
-        last_day = last_ts.tz_convert("UTC").date()
-        if _utc_day(mt) <= last_day:
+        # markets._day(epoch) 과 동일 — Yahoo epoch UTC 거래일 비교
+        ts = pd.Timestamp(df["time"].iloc[-1])
+        if ts.tzinfo is None:
+            ts = ts.tz_localize("UTC")
+        last_epoch = int(ts.timestamp())
+        if _utc_day(mt) <= _utc_day(last_epoch):
             return df
         mp_f = float(mp)
         mo = meta.get("regularMarketOpen")

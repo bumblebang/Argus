@@ -159,7 +159,7 @@ def _has_today_daily_bar(df: pd.DataFrame | None, market: str) -> bool:
     bar_day = last_bar_trading_date(df, market)
     if bar_day is None:
         return True
-    return bar_day >= trading_date(market)
+    return bar_day == trading_date(market)
 
 
 def _prepare_daily_df(sym: str, market: str, df: pd.DataFrame | None,

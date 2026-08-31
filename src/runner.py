@@ -120,6 +120,13 @@ def patch_live_price(df: pd.DataFrame, price: float | None, *,
     return out
 
 
+def order_price(live: float | None, df: pd.DataFrame) -> float:
+    """주문·사이징 가격 — patch_live_price 가 skip 해도 라이브가 우선."""
+    if live is not None and live > 0:
+        return float(live)
+    return float(df["close"].iloc[-1])
+
+
 class TradingBot:
     def __init__(self, cfg: AppConfig, client, broker: Broker):
         self.cfg = cfg

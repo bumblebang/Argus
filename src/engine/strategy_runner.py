@@ -12,7 +12,7 @@ import json
 
 from ..logging_setup import get_logger
 from ..store_fill import fill_event_payload
-from ..runner import candles_to_df, patch_live_price
+from ..runner import candles_to_df, order_price, patch_live_price
 from ..risk_gate import Order
 from ..strategies import build_strategy, REGISTRY
 from ..strategies.base import Action, Position
@@ -61,10 +61,10 @@ class StrategyRunner:
         if sig.action != Action.SELL or position.qty <= 0:
             return {"action": sig.action.value, "executed": False, "reason": sig.reason}
 
-        price = float(df["close"].iloc[-1])
+        exec_px = order_price(price, df)
         exit_reason = f"strategy:{name}"
         res = self.broker.execute_with_mirror(
-            Order(sym, market, "SELL", position.qty, price),
+            Order(sym, market, "SELL", position.qty, exec_px),
             reason=f"[strategy:{name}] {sig.reason}",
             store=self.store, exit_reason=exit_reason)
         if not res:
@@ -73,7 +73,7 @@ class StrategyRunner:
                                                 "reason": why})
             return {"action": "sell", "executed": False, "reason": why}
         self.store.log_event("strategy_exit", sym, fill_event_payload(
-            res, strategy=name, price=res.avg_price or price, reason=sig.reason))
+            res, strategy=name, price=res.avg_price or exec_px, reason=sig.reason))
         log.info("전략청산 %s filled=%s @ %.2f (%s: %s)",
-                 sym, res.filled_qty, res.avg_price or price, name, sig.reason)
+                 sym, res.filled_qty, res.avg_price or exec_px, name, sig.reason)
         return {"action": "sell", "executed": True, "reason": sig.reason}
