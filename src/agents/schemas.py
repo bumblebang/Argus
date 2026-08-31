@@ -82,6 +82,25 @@ class DossierOutput(BaseModel):
         return v
 
 
+class DossierLevelOutput(BaseModel):
+    """Athena 레벨-only 갱신 출력 — thesis·evidence 는 기존 도시에와 병합."""
+    stance: Literal["bullish", "neutral", "bearish"]
+    entry_low: float | None = Field(default=None, description="진입 존 하단")
+    entry_high: float | None = Field(default=None, description="진입 존 상단")
+    invalidation: float | None = Field(default=None, description="무효화 가격")
+    target: float | None = Field(default=None, description="목표가")
+    conviction: float = Field(ge=0.0, le=1.0, description="확신도 0~1")
+    level_note: str | None = Field(default=None,
+                                   description="레벨 조정 이유 한 줄(없으면 null)")
+
+    @field_validator("entry_low", "entry_high", "invalidation", "target")
+    @classmethod
+    def _finite_level(cls, v: float | None) -> float | None:
+        if v is None or not math.isfinite(v):
+            return None
+        return v
+
+
 class ValueDossier(BaseModel):
     """저평가 스캔(밸류에이션) 1종목 결론 — '왜 싼가·해소 가능한가'가 핵심.
 

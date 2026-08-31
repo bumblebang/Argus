@@ -21,6 +21,7 @@ from src.attribution import strategy_stats
 from src.calibration import conviction_calibration
 from src.config import load_config
 from src.engine.store import Store
+from src.eval.dossier_quality import summarize_dossiers
 from src.shadow_ledger import shadow_stats
 
 DEFAULT_OUT = ROOT / "tests" / "golden" / "measurement_baseline.json"
@@ -51,8 +52,14 @@ def collect(store, cfg: dict, since_days: float) -> dict:
     cal = conviction_calibration(store, since_days=since_days)
     sh = shadow_stats(store, since_days=since_days, cfg=cfg)
     strat = strategy_stats(store, since_days=since_days)
+    ms_path = ROOT / "data" / "market_state.json"
+    dq = summarize_dossiers(
+        store, cfg=cfg, data_dir=ROOT / "data",
+        market_state_path=ms_path if ms_path.exists() else None,
+        label_days=since_days)
     return {
         "since_days": since_days,
+        "dossier_quality": dq,
         "calibration": {
             "n": cal.get("n"),
             "calibrated": cal.get("calibrated"),

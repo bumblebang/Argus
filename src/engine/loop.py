@@ -149,6 +149,8 @@ class WatchConfig:
     trailing: dict = field(default_factory=dict)
     # 공통 청산 바닥(v1: time_stop). 최상위 exit_policy 블록.
     exit_policy: "ExitPolicyConfig | None" = None
+    # Athena Phase 2 — 갭/무효화 임박 → athena_queue (athena.phase2 블록).
+    athena_phase2: dict = field(default_factory=dict)
 
     @staticmethod
     def _parse_exit_policy(raw: dict) -> "ExitPolicyConfig":
@@ -223,7 +225,13 @@ class WatchConfig:
             # 트레일링은 watch 블록이 아니라 최상위 trailing 블록에서 읽는다(trading_sessions 와 동일).
             trailing=cls._parse_trailing(raw),
             exit_policy=cls._parse_exit_policy(raw),
+            athena_phase2=cls._parse_athena_phase2(raw),
         )
+
+    @staticmethod
+    def _parse_athena_phase2(raw: dict) -> dict:
+        from ..agents.athena_phase2 import phase2_cfg
+        return phase2_cfg(raw or {})
 
 
 # watchlist_fn 반환형: {market: {"positions": [pos dict...], "candidates": [symbol...]}}
@@ -868,6 +876,18 @@ class WatchLoop:
                 except Exception as e:
                     log.error("각성 콜백 실패: %s", e)
                     self.store.log_event("error", None, {"where": "on_wake", "err": str(e)})
+
+        # Phase 2: 갭·무효화 임박 → Athena 재소환 큐(athena_queue).
+        if self.cfg.athena_phase2.get("enabled", True) and live_price:
+            try:
+                from ..agents.athena_phase2 import scan_athena_triggers
+                n = scan_athena_triggers(
+                    self.store, self.cfg.athena_phase2, live_price,
+                    market_state=ms_full, ma20=ma20, now=now_ts)
+                if n:
+                    self.store.log_event("athena_scan", None, {"enqueued": n})
+            except Exception as e:
+                log.warning("Athena 트리거 스캔 실패(무시): %s", e)
 
         # 이번 틱 실시간가 통지(계좌 마크 갱신 → 미실현 손익이 리스크 게이트에 보이게).
         if self.on_prices and live_price:

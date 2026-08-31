@@ -23,7 +23,12 @@ from ..baserate import analyze
 from ..focus import build_focus, attach_krx_fields
 from ..logging_setup import get_logger
 from .features import technical_summary
-from .schemas import DossierOutput
+from .schemas import DossierLevelOutput, DossierOutput
+from .athena_phase2 import (
+    ATHENA_LEVEL_SYSTEM, _athena_queued, build_level_context, merge_level_refresh,
+    phase2_cfg, prices_from_market_state, should_level_only, sort_covered_by_zone,
+    _parse_evidence,
+)
 
 log = get_logger("agents.athena")
 
@@ -230,6 +235,14 @@ class AthenaAgent:
                  out.conviction, out.thesis[:60])
         return out
 
+    def research_levels(self, context: dict) -> DossierLevelOutput:
+        out = self.llm.structured(ATHENA_LEVEL_SYSTEM,
+                                  json.dumps(context, ensure_ascii=False),
+                                  DossierLevelOutput)
+        log.info("[%s] level_refresh %s (conv %.2f)",
+                 context.get("symbol"), out.stance, out.conviction)
+        return out
+
 
 # ── 배치 실행 ──────────────────────────────────────────────────────
 def _disclosure_queued(store, market: str, since_hours: float = 24.0) -> list[str]:
@@ -346,12 +359,14 @@ def _earnings_results_by_symbol(store, since_hours: float = 36.0,
     return out
 
 
-def select_symbols(cfg, store, market: str, limit: int | None = None) -> list[dict]:
-    """리서치 우선순위: 보유/진입대기 > 공시 큐 > 실적결과 큐 > 도시레 없음 > 오래된 순.
+def select_symbols(cfg, store, market: str, limit: int | None = None, *,
+                   market_state: dict | None = None,
+                   prices: dict[str, float] | None = None) -> list[dict]:
+    """리서치 우선순위: 보유 > 이벤트큐 > 공시 > 실적 > 미커버 > 존근접 covered.
 
-    보유/armed 는 유니버스 밖이어도 포함한다(들고 있는 걸 모르는 게 최악). 공시·실적
-    큐는 재료 반영을 위해 미커버보다 먼저 재소환.
+    covered 회전은 존 근접(in→below→above→unknown) 우선, 동순위는 오래된 도시에 먼저.
     """
+    p2 = phase2_cfg(cfg)
     uni = {it["symbol"]: it.get("name", it["symbol"])
            for it in (cfg.universe or {}).get(market, []) if it.get("symbol")}
     held = [dict(r) for r in store.get_open_positions()] + \
@@ -359,13 +374,18 @@ def select_symbols(cfg, store, market: str, limit: int | None = None) -> list[di
     held_syms = [p["symbol"] for p in held if (p.get("market") or "KR") == market]
     held_set = set(held_syms)
     covered = {r["symbol"]: r["created_at"] for r in store.dossier_coverage()}
+    px = prices if prices is not None else prices_from_market_state(
+        market_state, symbols=uni.keys())
     fresh_order: list[str] = []
     fresh_order += held_syms
+    if p2.get("enabled", True):
+        fresh_order += _athena_queued(store, market,
+                                      since_hours=p2["queue_since_hours"])
     fresh_order += _disclosure_queued(store, market)              # 공시 재소환(KR/US)
     fresh_order += _earnings_result_queued(store, market)         # 실적결과 재소환
     fresh_order += [s for s in uni if s not in covered]           # 미커버
-    fresh_order += sorted((s for s in uni if s in covered),       # 오래된 순
-                          key=lambda s: covered[s])
+    covered_syms = [s for s in uni if s in covered]
+    fresh_order += sort_covered_by_zone(covered_syms, store, px, covered)
     from ..security_filter import is_buy_ineligible
     seen: set[str] = set()
     out = []
@@ -390,6 +410,7 @@ def run_batch(cfg, store, llm, market: str, *,
               fetch_df: Callable[[str, str], pd.DataFrame] | None = None,
               market_state: dict | None = None,
               base_rates: dict | None = None,
+              only_symbols: list[str] | None = None,
               now_fn: Callable[[], float] = time.time) -> dict:
     """리서치 창 1회 실행: 우선순위 종목들에 도시레 생성. 반환: 요약 dict.
 
@@ -399,8 +420,16 @@ def run_batch(cfg, store, llm, market: str, *,
     from ..datasources.earnings import with_fresh_dday
 
     agent = AthenaAgent(llm)
-    targets = select_symbols(cfg, store, market, limit=limit)
     ms = market_state or {}
+    p2 = phase2_cfg(cfg)
+    prices = prices_from_market_state(ms)
+    if only_symbols:
+        uni = {it["symbol"]: it.get("name", it["symbol"])
+               for it in (cfg.universe or {}).get(market, []) if it.get("symbol")}
+        targets = [{"symbol": s, "name": uni.get(s, s)} for s in only_symbols]
+    else:
+        targets = select_symbols(cfg, store, market, limit=limit,
+                                 market_state=ms, prices=prices)
     # 주의층은 사이클마다 계산(파일 미저장). 창 1회만 만들어 전 종목에 공유.
     held = [dict(r) for r in store.get_open_positions()
             if (r["market"] or "KR") == market]
@@ -411,13 +440,14 @@ def run_batch(cfg, store, llm, market: str, *,
         positions=held)
     earnings_cal = _load_earnings_calendar()
     ers_by_sym = _earnings_results_by_symbol(store)
-    done, failed, stopped = 0, 0, False
+    done, failed, stopped, level_only_n = 0, 0, False, 0
     for t in targets:
         if stop_at is not None and now_fn() >= stop_at:
             stopped = True
             log.warning("하드스톱 도달 — 남은 %d종목은 다음 창에서.", len(targets) - done - failed)
             break
         sym = t["symbol"]
+        prev_row = None
         try:
             df = fetch_df(sym, market) if fetch_df else None
             br = (base_rates or {}).get(sym) if base_rates is not None else None
@@ -431,27 +461,54 @@ def run_batch(cfg, store, llm, market: str, *,
                                          earnings_results=ers)
             tech = ctx.get("technical") or {}
             px = tech.get("price") if isinstance(tech, dict) else None
-            out, notes = sanitize(agent.research(ctx), price=px)
+            if px is None:
+                px = prices.get(sym)
+            use_level, prev_row = should_level_only(
+                store, sym, px, p2, now=now_fn())
+            if use_level and prev_row:
+                lvl_ctx = build_level_context(ctx, prev_row)
+                level_out = agent.research_levels(lvl_ctx)
+                out = merge_level_refresh(prev_row, level_out)
+                mode = "level_only"
+                level_only_n += 1
+                level_note = level_out.level_note
+            else:
+                out = agent.research(ctx)
+                mode = "full"
+                level_note = None
+            out, notes = sanitize(out, price=px)
             rr = compute_rr(out.entry_low, out.entry_high, out.invalidation, out.target)
+            ev_payload = {"stance": out.stance, "horizon": out.horizon,
+                          "evidence": out.evidence, "key_risks": out.key_risks,
+                          "sanitize_notes": notes, "refresh_mode": mode}
+            if level_note:
+                ev_payload["level_note"] = level_note
+            if mode == "full" and px and float(px) > 0:
+                ev_payload["ref_price"] = round(float(px), 4)
+            elif mode == "level_only" and prev_row:
+                prev_ref = _parse_evidence(prev_row).get("ref_price")
+                if prev_ref is not None:
+                    ev_payload["ref_price"] = prev_ref
+                elif px and float(px) > 0:
+                    ev_payload["ref_price"] = round(float(px), 4)
             store.save_dossier(
                 sym, market, thesis=out.thesis,
                 entry_low=out.entry_low, entry_high=out.entry_high,
                 invalidation=out.invalidation, target=out.target,
                 rr=rr, conviction=out.conviction,
-                evidence={"stance": out.stance, "horizon": out.horizon,
-                          "evidence": out.evidence, "key_risks": out.key_risks,
-                          "sanitize_notes": notes},
+                evidence=ev_payload,
                 ttl_hours=ttl_hours)
             store.log_event("dossier", sym,
                             {"stance": out.stance, "conviction": out.conviction,
-                             "rr": rr, "thesis": out.thesis[:80]})
+                             "rr": rr, "thesis": out.thesis[:80], "mode": mode})
             done += 1
         except Exception as e:
             failed += 1
             log.error("[%s] 도시레 생성 실패: %s", sym, e)
             store.log_event("error", sym, {"where": "athena", "err": str(e)})
     summary = {"market": market, "targets": len(targets), "done": done,
-               "failed": failed, "stopped_by_deadline": stopped}
+               "failed": failed, "stopped_by_deadline": stopped,
+               "level_only": level_only_n}
     store.log_event("athena_done", None, summary)
     log.info("Athena %s 창 종료: %s", market, summary)
     return summary

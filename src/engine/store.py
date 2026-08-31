@@ -621,6 +621,16 @@ class Store:
                 " MAX(expires_at) AS expires_at FROM dossiers GROUP BY symbol"
                 " ORDER BY created_at ASC").fetchall()
 
+    def list_fresh_dossiers(self, now: float | None = None) -> list[sqlite3.Row]:
+        """유효기간 내 심볼별 최신 도시에 1건 — 품질 리포트·대시보드 공용."""
+        now = now or time.time()
+        with self._lock:
+            return self.conn.execute(
+                "SELECT * FROM dossiers d WHERE expires_at > ? AND created_at = "
+                "(SELECT MAX(created_at) FROM dossiers WHERE symbol = d.symbol)"
+                " ORDER BY created_at DESC",
+                (now,)).fetchall()
+
     def recent_events(self, kind: str, since: float,
                       limit: int = 20) -> list[sqlite3.Row]:
         """특정 종류의 최근 이벤트(최신순) — 예: 뇌 컨텍스트에 실을 최근 공시."""

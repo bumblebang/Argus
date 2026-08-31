@@ -1,33 +1,52 @@
-# 종합 판단 백로그 (미채택)
+# 종합 판단 백로그 (J1~J13)
 
-> 목적: 이슈를 **조사·재현으로 확인한 뒤** 기록하고, 한꺼번에 채택/기각을 판단한다.
-> 상태: `open` = 확인됨·미판단 · `unverified` = 주장만 · `decide`/`adopt`/`defer`/`reject`.
-> 규칙:
-> 1. **작성 전** 코드 추적 + (가능하면) 최소 재현. 추측만으로 올리지 않는다.
-> 2. 여기 있다고 구현 착수하지 않는다. 종합 판단 세션에서만 승격.
-> 3. 실운영 DB 증거는 있으면 `ops_evidence`, 없으면 `ops: unknown` 명시.
+> 목적: 이슈를 **조사·재현으로 확인한 뒤** 기록하고, adopt/defer/reject 로 집행한다.
+> **2026-08-27~28: J1~J13 코드 반영 완료** (PR #10 `fix/judgment-backlog-p1`, #14 `live-ops-hardening`).
+> 아래 각 J 섹션의 재현·코드 근거는 **감사 기록**으로 유지. **표·집행 요약이 최신 SSOT.**
 
-**최종 갱신:** 2026-08-27 (J12·J13 재현/감사 확정)
+**최종 갱신:** 2026-08-30 (표·판단 체크를 fix 커밋·테스트와 동기화)
 
 ---
 
-## 판단 대기 목록
+## 집행 현황 요약
+
+| ID | 상태 | fix | 테스트 |
+|----|------|-----|--------|
+| J1 | adopt(08-27) | `d84a3f4` 접수~체결 구간 게이트 예약 | `test_j1_gate_reservation.py` |
+| J2 | adopt(08-27) | `cf3f9ce` working order + TTL | `test_j2_working_orders.py` |
+| J3 | adopt(08-27) | `d7dbb17`·`731f5b8` 재대사 realized | `test_j3_*` |
+| J4 | adopt(08-27) | `53a9da3` min_lot 우회 | `test_j3_loss_budget.py` 등 |
+| J5 | adopt(08-27) | `a2c8c90` LAYOUT 락 + migrate 가드 | `test_j5_lock_path.py` |
+| J6 | adopt(08-27) | `c67a6c3` proposal.market 코드 권위 | `test_j6_market_authority.py` |
+| J7 | adopt(08-27) | `fcd4e19` combine_stop_target | `test_j7_stop_ownership.py` |
+| J8 | adopt(08-27) | `0cb39b0` finite·스키마 밖 키 | `test_j8_param_clamp.py` |
+| J9 | adopt(08-27) | `954ea4d`+`9709969` 잠금·scored_trades | `test_j9_calibration_gate.py` |
+| J10 | adopt(08-27) | `3ceb738` actual=scored_trades | attribution 테스트 |
+| J11 | adopt(08-27) | `5509df1` closed-since + 비용 | shadow 스코어 |
+| J12 | adopt(08-27) | `8e5fee5` 널 eligible=bullish | `test_eval_infra.py` |
+| J13 | adopt(08-27) | `3b367d0` apply_kill_rules | `test_instrumentation_layer.py` |
+
+**잔여(defer):** J13 — `can_promote`→PROTECTED 실변경·CI 미배선(의도). J10 — CF 비용·UI 분리.
+
+---
+
+## 상태 표 (감사 기록)
 
 | ID | 제목 | 확인 | 심각도(초안) | 상태 |
 |----|------|------|-------------|------|
-| J1 | 라이브 게이트↔원장 비원자 + inflight 예약 부재 | **재현됨** (현금 음수까지) | P0 | open |
-| J2 | 미체결 미추적 → 동일 조건 재평가 시 중복 발주 | **재현됨** (존 진입·청산) | P0 | open |
-| J3 | 재대사 흡수 체결 → realized_pnl 미반영 | **재현됨** (계정·store pnl) | P0 | open |
-| J4 | min_lot 면제가 종목비중·주문상한 무력화 + 누적 | **재현됨** (cap0→1주, 반복매수) | P1 | open |
-| J5 | 경로 컷오버가 싱글턴 락을 무력화(이중 기동) | **재현됨** (migrate/rollback) | P0 | open |
-| J6 | LLM `proposal.market`이 자본·한도·live 판정 기준을 바꿈 | **재현됨** (과대사이징·청산스킵) | P0 | open |
-| J7 | Athena invalidation→손절 덮어쓰기 + RR이 LLM 레벨에 종속 | **재현됨** (sanitize·overwrite·RR) | P1 | open |
-| J8 | 파라미터 클램프가 스키마 키만·NaN 통과 → 손절 경로 사망 | **재현됨** (passthrough·NaN) | P0 | open |
-| J9 | 캘리브레이션 입증이 노이즈로 사이징 평평 잠금 해제 | **재현됨** (비단조·동점·slice) | P1 | open |
-| J10 | 게이트 사후분석이 실승률을 깎고 반사실과 나란히 비교 | **재현됨** (~43pp 왜곡) | P1 | open |
-| J11 | 그림자 채점 `has_open_since` 생존편향 + 비용 0 | **재현됨** (보유취소·손절채점) | P1 | open |
-| J12 | 널 게이트≠라이브(stance) → `delta_vs_gated` 오염 | **재현됨** (존재만 vs bullish) | P1 | open |
-| J13 | 사전등록이 미집행(킬/pass/배선 없음) | **감사확정** (코드 전수) | P1 | open |
+| J1 | 라이브 게이트↔원장 비원자 + inflight 예약 부재 | **재현됨** (현금 음수까지) | P0 | **adopt(2026-08-27)** |
+| J2 | 미체결 미추적 → 동일 조건 재평가 시 중복 발주 | **재현됨** (존 진입·청산) | P0 | **adopt(2026-08-27)** |
+| J3 | 재대사 흡수 체결 → realized_pnl 미반영 | **재현됨** (계정·store pnl) | P0 | **adopt(2026-08-27)** |
+| J4 | min_lot 면제가 종목비중·주문상한 무력화 + 누적 | **재현됨** (cap0→1주, 반복매수) | P1 | **adopt(2026-08-27)** |
+| J5 | 경로 컷오버가 싱글턴 락을 무력화(이중 기동) | **재현됨** (migrate/rollback) | P0 | **adopt(2026-08-27)** |
+| J6 | LLM `proposal.market`이 자본·한도·live 판정 기준을 바꿈 | **재현됨** (과대사이징·청산스킵) | P0 | **adopt(2026-08-27)** |
+| J7 | Athena invalidation→손절 덮어쓰기 + RR이 LLM 레벨에 종속 | **재현됨** (sanitize·overwrite·RR) | P1 | **adopt(2026-08-27)** |
+| J8 | 파라미터 클램프가 스키마 키만·NaN 통과 → 손절 경로 사망 | **재현됨** (passthrough·NaN) | P0 | **adopt(2026-08-27)** |
+| J9 | 캘리브레이션 입증이 노이즈로 사이징 평평 잠금 해제 | **재현됨** (비단조·동점·slice) | P1 | **adopt(2026-08-27)** |
+| J10 | 게이트 사후분석이 실승률을 깎고 반사실과 나란히 비교 | **재현됨** (~43pp 왜곡) | P1 | **adopt(2026-08-27)** |
+| J11 | 그림자 채점 `has_open_since` 생존편향 + 비용 0 | **재현됨** (보유취소·손절채점) | P1 | **adopt(2026-08-27)** |
+| J12 | 널 게이트≠라이브(stance) → `delta_vs_gated` 오염 | **재현됨** (존재만 vs bullish) | P1 | **adopt(2026-08-27)** |
+| J13 | 사전등록이 미집행(킬/pass·배선 없음) | **감사확정** (코드 전수) | P1 | **adopt(2026-08-27)** · can_promote CI **defer** |
 
 ---
 
@@ -69,7 +88,7 @@
 
 - 후보: BUY 예약(권장) / 락 연장(비권장) / 전역 직렬
 - 트레이드오프: 예약 해제 누락→과차단; 미체결 구간 보수적 거절
-- [ ] 채택/보류/기각 · 범위(BUY만?) · 테스트: 위 재현이 거절로 바뀌는지
+- [x] **adopt(2026-08-27)** — `d84a3f4` inflight notional 예약 · `test_j1_gate_reservation.py`
 
 ---
 
@@ -148,9 +167,7 @@
 
 ### 판단 체크
 
-- [ ] 채택/보류/기각
-- [ ] 정책: 대기 vs 즉시 취소 vs 쿨다운
-- [ ] 전략 진입/청산도 같은 테스트로 고정할지
+- [x] **adopt(2026-08-27)** — `cf3f9ce` working 레지스트리 + TTL · `test_j2_working_orders.py`
 
 ---
 
@@ -227,9 +244,7 @@ J2를 고쳐도 부분체결·재시작·수동매도 고아는 재대사 경로
 
 ### 판단 체크
 
-- [ ] 채택/보류/기각
-- [ ] 체결가 출처(주문 API vs 추정 금지)
-- [ ] J2 설계와 한 패키지로 묶을지
+- [x] **adopt(2026-08-27)** — `d7dbb17`·`731f5b8` · `test_j3_*`
 
 ---
 
@@ -305,9 +320,7 @@ seed 1주 → **4주**. `CONFIRMED_ACCUM`.
 
 ### 판단 체크
 
-- [ ] 채택/보류/기각
-- [ ] 절대캡 수치·1회성 키(심볼 vs armed_id)
-- [ ] size_buy 부활 조건 수정 포함 여부
+- [x] **adopt(2026-08-27)** — `53a9da3` headroom·누적 우회
 
 ---
 
@@ -387,9 +400,7 @@ seed 1주 → **4주**. `CONFIRMED_ACCUM`.
 
 ### 판단 체크
 
-- [ ] 채택/보류/기각
-- [ ] 고정 락 vs 양쪽 AND vs migrate 가드 우선순위
-- [ ] 롤백 절차에 lock 정리 명시 여부
+- [x] **adopt(2026-08-27)** — `a2c8c90` LAYOUT 락 + migrate 가드 · `test_j5_lock_path.py`
 
 ---
 
@@ -457,9 +468,7 @@ seed 1주 → **4주**. `CONFIRMED_ACCUM`.
 
 ### 판단 체크
 
-- [ ] 채택/보류/기각
-- [ ] 덮어쓰기 vs 거부와 유니버스 부재 심볼 정책
-- [ ] Exit/armed/store market 일괄 교정 범위
+- [x] **adopt(2026-08-27)** — `c67a6c3` 코드 market 권위 · `test_j6_market_authority.py`
 
 ---
 
@@ -524,9 +533,7 @@ seed 1주 → **4주**. `CONFIRMED_ACCUM`.
 
 ### 판단 체크
 
-- [ ] 채택/보류/기각
-- [ ] 손절 결합 규칙(max/min/거부)
-- [ ] RR 가산 유지 여부·기준 가격
+- [x] **adopt(2026-08-27)** — `fcd4e19` `combine_stop_target` + `_sizing_rr` + `sanitize` 밴드 (`test_j7_stop_ownership`)
 
 ---
 
@@ -605,8 +612,7 @@ triggers.position_triggers:
 
 ### 판단 체크
 
-- [ ] 채택/보류/기각
-- [ ] finite 강제 vs 스키마 외 드롭 vs 공통 stop 스펙 우선순위
+- [x] **adopt(2026-08-27)** — `0cb39b0` finite·스키마 밖 키 · `test_j8_param_clamp.py`
 
 ---
 
@@ -678,9 +684,7 @@ and rates[-1] >= rates[0]
 
 ### 판단 체크
 
-- [ ] 채택/보류/기각
-- [ ] 단조성·parent 묶음·Brier 중 최소 세트
-- [ ] 자동 해제 유지 vs 수동 승격
+- [x] **adopt(2026-08-27)** — `954ea4d`(9a) 잠금 조건 + `9709969`(9b) scored_trades · `test_j9_calibration_gate.py`
 
 ---
 
@@ -751,8 +755,7 @@ actual_wins = sum(1 for r in closed if (r[3] or 0) > 0)  # pnl null → 0 → �
 
 ### 판단 체크
 
-- [ ] 채택/보류/기각
-- [ ] actual 필터 최소선 / CF 비용 가정 / 비교 UI 분리
+- [x] **adopt(2026-08-27)** — `3ceb738` actual=scored_trades (CF 비용·UI 분리는 defer)
 
 ---
 
@@ -820,8 +823,7 @@ SELECT 1 FROM positions WHERE symbol=? AND state='open' AND opened_at >= ?
 
 ### 판단 체크
 
-- [ ] 채택/보류/기각
-- [ ] closed-since / 비용 / hard-block 범위 · J10과 한 묶음 보정 여부
+- [x] **adopt(2026-08-27)** — `5509df1` closed-since + 왕복 비용
 
 ---
 
@@ -893,9 +895,7 @@ SELECT 1 FROM positions WHERE symbol=? AND state='open' AND opened_at >= ?
 
 ### 판단 체크
 
-- [ ] 채택/보류/기각
-- [ ] 널에 bullish 정렬 vs Δ 분해 vs 문서만 정정
-- [ ] stance 변경 증거 표준을 J12와 분리할지
+- [x] **adopt(2026-08-27)** — `8e5fee5` eligible stance==bullish + `delta_decomp` (`test_eval_infra`)
 
 ---
 
@@ -950,13 +950,12 @@ SELECT 1 FROM positions WHERE symbol=? AND state='open' AND opened_at >= ?
 
 ### 판단 체크
 
-- [ ] 채택/보류/기각
-- [ ] 자동 집행 vs 문서 격하 vs CI만
-- [ ] J12와 묶어 “평가 인프라” 안건으로 볼지
+- [x] **adopt(2026-08-27)** — `3b367d0` `apply_kill_rules` 구조화; `kill_if` 문자열 eval 폐기; 문서=수동 체크리스트
+- [ ] **defer** — `can_promote`→PROTECTED 실변경·CI (자동승격 원래 NO_PROMOTE)
 
 ---
 
 ## 다음에 이어서
 
-새 이슈: **코드 추적 → 재현(또는 명시적 불가 사유) → 표에 추가**.  
-`unverified`로 올리지 말 것. 종합 판단 세션에서는 이 파일의 `CONFIRMED` 항목만 안건으로.
+J1~J13은 **2026-08-27 adopt 완료**. 새 이슈만: 코드 추적 → 재현 → 표에 추가.  
+`unverified`로 올리지 말 것.

@@ -28,7 +28,7 @@ from src.engine.wake_request import request_brain_wake
 from src.agents.athena import run_batch
 from src.universe_roll import sort_core_by_turnover
 from src.agents.llm import ClaudeCLIClient, MockLLM
-from src.agents.schemas import DossierOutput
+from src.agents.schemas import DossierLevelOutput, DossierOutput
 from src.datasources.history import fetch_history
 
 log = get_logger("athena.cli")
@@ -61,8 +61,14 @@ def _window_of(cfg: dict, now: datetime) -> tuple[str | None, float | None]:
 
 def _dry_llm() -> MockLLM:
     def responder(schema, system, user):
-        assert schema is DossierOutput
         sym = json.loads(user).get("symbol", "?")
+        if schema is DossierLevelOutput:
+            return DossierLevelOutput(
+                stance="neutral", conviction=0.5,
+                entry_low=None, entry_high=None,
+                invalidation=None, target=None,
+                level_note=f"[DRY] {sym} 레벨 갱신 검증")
+        assert schema is DossierOutput
         return DossierOutput(stance="neutral", conviction=0.5,
                              thesis=f"[DRY] {sym} 합성 도시에(배선 검증)",
                              evidence=["dry-run"])
@@ -73,6 +79,7 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--market", choices=["KR", "US", "auto"], default="auto")
     ap.add_argument("--limit", type=int, default=None, help="도시에 수 상한(기본 config)")
+    ap.add_argument("--symbol", help="단일 종목 강제 리서치(창 밖 허용)")
     ap.add_argument("--dry", action="store_true", help="MockLLM 배선 검증")
     args = ap.parse_args()
     setup_logging("INFO", log_file="athena.log")
@@ -81,10 +88,14 @@ def main() -> int:
     acfg = cfg.raw.get("athena", {})
     now = datetime.now(KST)
 
-    if args.market == "auto":
+    if args.symbol:
+        market = args.market if args.market != "auto" else (
+            "KR" if str(args.symbol).isdigit() and len(str(args.symbol)) == 6 else "US")
+        stop_at = None
+    elif args.market == "auto":
         market, stop_at = _window_of(acfg, now)
         if not market:
-            log.info("리서치 창 밖(%s) — 실행 안 함. --market 로 강제 가능.",
+            log.info("리서치 창 밖(%s) — 실행 안 함. --market 또는 --symbol 로 강제 가능.",
                      now.strftime("%H:%M"))
             return 0
     else:
@@ -118,7 +129,8 @@ def main() -> int:
                         limit=args.limit or int(acfg.get("max_per_run", 30)),
                         ttl_hours=float(acfg.get("ttl_hours", 60)),
                         stop_at=stop_at, fetch_df=fetch_df,
-                        market_state=ms, base_rates=br)
+                        market_state=ms, base_rates=br,
+                        only_symbols=[args.symbol] if args.symbol else None)
     print(json.dumps(summary, ensure_ascii=False))
     # 도씨에 배치 직후 뇌 1회 — watch 데몬이 wake_request(resolve→state/) 를 소비.
     # --dry 는 배선 검증만이라 각성 요청을 남기지 않는다.
