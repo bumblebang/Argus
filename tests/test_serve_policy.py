@@ -28,14 +28,44 @@ def test_classify_disabled_always_scan():
     assert serve.classify_tier({"reason": "disclosure"}, cfg=cfg) == "scan"
 
 
-def test_select_scan_keeps_all_items():
+def test_select_scan_keeps_all_items_when_disabled():
     items = [{"symbol": f"{i:06d}", "market": "KR", "pool": "day"} for i in range(50)]
-    cfg = serve.serve_cfg({"serve": {"enabled": True, "focus_cap": 8}})
+    cfg = serve.serve_cfg({"serve": {
+        "enabled": True, "focus_cap": 8, "scan_enabled": False}})
     out, tier = serve.select_candidates(
         items, {"reason": "periodic"}, held=["000001"], cfg=cfg)
     assert tier == "scan"
     assert len(out) == 50
     assert out is not items  # 복사본
+
+
+def test_select_scan_shortlist_cap_and_must():
+    items = [{"symbol": f"{i:06d}", "market": "KR"} for i in range(1, 51)]
+    scores = {f"{i:06d}": {"ranking": [{"return_pct": i / 100.0}]}
+              for i in range(1, 51)}
+    cfg = serve.serve_cfg({"serve": {
+        "enabled": True, "scan_enabled": True, "scan_cap": 10}})
+    out, tier = serve.select_candidates(
+        items, {"reason": "periodic"},
+        held=["000003"], armed=["000007"], bullish=["000010"],
+        scores=scores, cfg=cfg)
+    assert tier == "scan"
+    syms = {c["symbol"] for c in out}
+    assert {"000003", "000007", "000010"}.issubset(syms)
+    assert len(out) == 10
+    # pad 는 scores 순 — must 3 + pad 7
+    must_rows = [c for c in out if c.get("serve_must")]
+    assert len(must_rows) == 3
+
+
+def test_select_scan_must_exceeds_cap():
+    items = [{"symbol": f"{i:06d}", "market": "KR"} for i in range(1, 15)]
+    held = [f"{i:06d}" for i in range(1, 9)]
+    cfg = serve.serve_cfg({"serve": {
+        "enabled": True, "scan_enabled": True, "scan_cap": 5}})
+    out, _ = serve.select_candidates(
+        items, {"reason": "extra"}, held=held, cfg=cfg)
+    assert len(out) == 8  # must 8 > cap 5 → must 전원
 
 
 def test_select_focus_held_and_wake_only():

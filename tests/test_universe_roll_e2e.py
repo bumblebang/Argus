@@ -30,6 +30,16 @@ def _synth_df(base=70000.0, n=80):
     })
 
 
+def _stub_pool(rows):
+    """liquidity_core 경로용 discover_trading_value_pool 스텁."""
+    def pool_fn(cfg, market, pool, dry):
+        c = rows[:pool]
+        tv = {sym: float(1e9 * (pool - i)) for i, (_, sym, _) in enumerate(c)}
+        prices = {sym: 50_000.0 for _, sym, _ in c}
+        return c, tv, prices
+    return pool_fn
+
+
 def test_core_refresh_reflected_in_provider(tmp_path, monkeypatch):
     out = tmp_path / "universe.yaml"
     monkeypatch.setattr(UR, "OUT", out)
@@ -38,7 +48,11 @@ def test_core_refresh_reflected_in_provider(tmp_path, monkeypatch):
     dk = lambda cfg, count, dry: kr[:count]
     monkeypatch.setattr(UR, "discover_kr", dk)
     monkeypatch.setattr(UR, "_DISCOVER", {"KR": dk})
+    monkeypatch.setattr(UR, "discover_trading_value_pool", _stub_pool(kr))
     monkeypatch.setattr(UR, "_fetch_fn", lambda cfg, dry: (lambda s, m: _synth_df()))
+    monkeypatch.setattr(
+        "src.strategy_scores.refresh_strategy_scores",
+        lambda *a, **k: {})
 
     cfg = load_config()
     # core_refresh 로 파일 생성.
@@ -64,8 +78,13 @@ def test_provider_reloads_after_second_refresh(tmp_path, monkeypatch):
     cfg = load_config()
 
     # 1차: K 종목.
-    dk1 = lambda cfg, count, dry: [("KR", f"K{i}", f"K{i}") for i in range(8)][:count]
+    kr1 = [("KR", f"K{i}", f"K{i}") for i in range(8)]
+    dk1 = lambda cfg, count, dry: kr1[:count]
     monkeypatch.setattr(UR, "_DISCOVER", {"KR": dk1})
+    monkeypatch.setattr(UR, "discover_trading_value_pool", _stub_pool(kr1))
+    monkeypatch.setattr(
+        "src.strategy_scores.refresh_strategy_scores",
+        lambda *a, **k: {})
     UR.core_refresh(cfg, "KR")
     raw = {"universe": {"KR": []}, "screener": {"enabled": True}}
     provider = UniverseProvider(_Cfg(raw), data_dir=tmp_path)
@@ -73,8 +92,10 @@ def test_provider_reloads_after_second_refresh(tmp_path, monkeypatch):
     assert all(s.startswith("K") for s in first)
 
     # 2차: Z 종목으로 교체 + mtime 을 앞당겨 확실히 리로드 유발.
-    dk2 = lambda cfg, count, dry: [("KR", f"Z{i}", f"Z{i}") for i in range(8)][:count]
+    kr2 = [("KR", f"Z{i}", f"Z{i}") for i in range(8)]
+    dk2 = lambda cfg, count, dry: kr2[:count]
     monkeypatch.setattr(UR, "_DISCOVER", {"KR": dk2})
+    monkeypatch.setattr(UR, "discover_trading_value_pool", _stub_pool(kr2))
     UR.core_refresh(cfg, "KR")
     os.utime(out, (out.stat().st_atime, out.stat().st_mtime + 10))
     second = {it["symbol"] for it in provider.markets()["KR"]}

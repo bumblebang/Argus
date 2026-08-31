@@ -91,6 +91,20 @@ class FakeStore:
         return _Row(d) if d else None
 
 
+@pytest.fixture(autouse=True)
+def _legacy_picks_universe(cfg, request):
+    """liquidity_core 전용 테스트만 enabled — 나머지는 구 picks 경로."""
+    if "liquidity_core" in request.node.name:
+        return
+    cfg.raw.setdefault("screener", {}).setdefault("liquidity_core", {})["enabled"] = False
+
+
+def _enable_liquidity_core(cfg, *, core_size=100, discover_pool=120, light=False, **kw):
+    lc = cfg.raw.setdefault("screener", {}).setdefault("liquidity_core", {})
+    lc.update({"enabled": True, "core_size": core_size, "discover_pool": discover_pool,
+               "light": light, **kw})
+
+
 # ── core_refresh ───────────────────────────────────────────────────────────
 def test_core_refresh_writes_layer_and_added_at(cfg, monkeypatch, _redirect_out):
     _inject_discovery(monkeypatch)
@@ -137,6 +151,34 @@ def test_core_refresh_kr_no_scale(cfg, monkeypatch, _redirect_out):
     UR.core_refresh(cfg, "KR")
     data = yaml.safe_load(_redirect_out.read_text(encoding="utf-8"))
     assert len(data["KR"]) == 12, "KR scale=1.0 → 4*3=12"
+
+
+def test_core_refresh_liquidity_core_caps_at_core_size(cfg, monkeypatch, _redirect_out):
+    _enable_liquidity_core(cfg, core_size=10, discover_pool=30)
+    monkeypatch.setattr(UR, "_DRY", True)
+    _inject_fetch(monkeypatch)
+    out = UR.core_refresh(cfg, "KR")
+    assert out is not None
+    data = yaml.safe_load(_redirect_out.read_text(encoding="utf-8"))
+    assert len(data["KR"]) == 10
+    assert all(it.get("strategy") == "ma_crossover" for it in data["KR"])
+    assert all(it.get("layer") == "core" for it in data["KR"])
+
+
+def test_core_refresh_liquidity_core_light(cfg, monkeypatch, _redirect_out):
+    _enable_liquidity_core(cfg, core_size=10, discover_pool=30, light=True,
+                           rank_by="discovery_tv", day_tag_top=3)
+    monkeypatch.setattr(UR, "_DRY", True)
+    monkeypatch.setattr(
+        "src.strategy_scores.refresh_strategy_scores",
+        lambda *a, **k: {})
+    out = UR.core_refresh(cfg, "KR")
+    assert out is not None
+    data = yaml.safe_load(_redirect_out.read_text(encoding="utf-8"))
+    assert len(data["KR"]) == 10
+    day_tagged = [it for it in data["KR"] if it.get("pool") == "day"]
+    assert len(day_tagged) == 3
+    assert all(it.get("strategy") == "volatility_breakout" for it in day_tagged)
 
 
 def test_core_refresh_retains_held(cfg, monkeypatch, _redirect_out):

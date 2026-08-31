@@ -383,8 +383,18 @@ class CycleRunner:
                 log.info("갭반등 NXT split %s %d→%d", wake_reason, before, len(items))
         agents_cfg = self.cfg.raw.get("agents", {})
         scfg = serve.serve_cfg(agents_cfg)
+        armed = ([str(r["symbol"]) for r in self.store.get_armed()]
+                 if self.store else [])
+        bullish = (self.store.list_fresh_bullish_symbols()
+                   if self.store else [])
+        from ..strategy_scores import load_strategy_scores
+        strat_scores = load_strategy_scores()
+        n_items_before = len(items)
         items, tier = serve.select_candidates(
-            items, wake, held=held, cfg=scfg)
+            items, wake, held=held, armed=armed, bullish=bullish,
+            scores=strat_scores, cfg=scfg)
+        scan_shortlist = tier == "scan" and scfg.get("scan_enabled", True)
+        enrich_strategy = not scan_shortlist
         gap_scan = wake_reason in GAP_SCAN_REASONS
         fetch_fn = self.fetch_candles
         if gap_scan:
@@ -392,10 +402,18 @@ class CycleRunner:
             fetch_fn = lambda s, m: history_candles_1y(s, m, fresh=True)
         live_prices = self._batch_live_prices(items)
         candidates, price_lookup = assemble(items, ms, fetch_fn,
-                                            enrich_strategy=True,
+                                            enrich_strategy=enrich_strategy,
                                             base_rates=self._base_rates(),
                                             live_prices=live_prices or None,
                                             daily_fetch_fresh=gap_scan)
+        if scan_shortlist:
+            for c in candidates:
+                rec = strat_scores.get(str(c.get("symbol") or ""))
+                if rec and rec.get("best"):
+                    c["strategy_fit"] = {
+                        "best": rec["best"],
+                        "ranking": rec.get("ranking", []),
+                    }
         if wake_reason in GAP_SCAN_REASONS:
             before = len(candidates)
             candidates = filter_gap_rebound_candidates(candidates, held=held)
@@ -500,6 +518,9 @@ class CycleRunner:
                     "tier": tier,
                     "n_candidates": len(candidates),
                     "n_items": len(items),
+                    "n_items_before": n_items_before,
+                    "scan_shortlist": scan_shortlist,
+                    "enrich_strategy": enrich_strategy,
                     "context_bytes": len(context.encode("utf-8")),
                     "ondemand_n": ondemand_n,
                     "asof": asof,

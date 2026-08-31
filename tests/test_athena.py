@@ -145,6 +145,7 @@ def test_athena_prompt_mentions_us_macro_and_earnings():
 # ── 우선순위 ───────────────────────────────────────────────────────
 def test_select_symbols_priority(tmp_path):
     cfg = load_config()
+    cfg.raw.setdefault("athena", {})["min_refresh_hours"] = 0
     cfg.universe["KR"] = [{"symbol": "AAA", "name": "a"}, {"symbol": "BBB", "name": "b"},
                           {"symbol": "CCC", "name": "c"}]
     store = Store(tmp_path / "t.db")
@@ -152,6 +153,43 @@ def test_select_symbols_priority(tmp_path):
     store.save_dossier("AAA", "KR", thesis="old")       # AAA 커버됨 → 맨 뒤
     order = [t["symbol"] for t in select_symbols(cfg, store, "KR")]
     assert order == ["CCC", "BBB", "AAA"]               # 보유 > 미커버 > 기존커버
+
+
+def test_select_symbols_skips_fresh_covered(tmp_path):
+    import time as _time
+    cfg = load_config()
+    cfg.raw.setdefault("athena", {})["min_refresh_hours"] = 48
+    cfg.universe["KR"] = [{"symbol": "AAA", "name": "a"}, {"symbol": "BBB", "name": "b"}]
+    store = Store(tmp_path / "t.db")
+    store.save_dossier("AAA", "KR", thesis="fresh")
+    order = [t["symbol"] for t in select_symbols(cfg, store, "KR")]
+    assert order == ["BBB"]
+
+
+def test_select_symbols_refreshes_stale_covered(tmp_path):
+    import time as _time
+    cfg = load_config()
+    cfg.raw.setdefault("athena", {})["min_refresh_hours"] = 48
+    cfg.universe["KR"] = [{"symbol": "AAA", "name": "a"}, {"symbol": "BBB", "name": "b"}]
+    store = Store(tmp_path / "t.db")
+    store.save_dossier("AAA", "KR", thesis="stale")
+    old = _time.time() - 72 * 3600
+    store.conn.execute("UPDATE dossiers SET created_at=? WHERE symbol='AAA'", (old,))
+    order = [t["symbol"] for t in select_symbols(cfg, store, "KR")]
+    assert order == ["BBB", "AAA"]
+
+
+def test_select_symbols_queue_bypasses_min_refresh(tmp_path):
+    from src.agents.athena_phase2 import enqueue_athena
+    cfg = load_config()
+    cfg.raw.setdefault("athena", {})["min_refresh_hours"] = 48
+    cfg.universe["KR"] = [{"symbol": "AAA", "name": "a"}, {"symbol": "BBB", "name": "b"}]
+    store = Store(tmp_path / "t.db")
+    store.save_dossier("AAA", "KR", thesis="fresh")
+    enqueue_athena(store, "AAA", "KR", "gap", gap_pct=5.0)
+    order = [t["symbol"] for t in select_symbols(cfg, store, "KR")]
+    assert order[0] == "AAA"
+    assert "BBB" in order
 
 
 # ── 배치 실행 ──────────────────────────────────────────────────────

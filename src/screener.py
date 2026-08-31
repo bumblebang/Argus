@@ -124,6 +124,128 @@ def screen(
     return result
 
 
+def liquidity_core_pick(
+    candidates: list[tuple[str, str, str]],
+    fetch_candles: Callable[[str, str], pd.DataFrame],
+    criteria: dict,
+    *,
+    limit: int = 100,
+    default_strategy: str = "ma_crossover",
+    rank_by: str = "avg_turnover",
+    discovery_tv: dict[str, float] | None = None,
+    exclude_fn: Callable[[str, str], bool] | None = None,
+) -> dict[str, list[dict]]:
+    """거래대금 발굴 풀 → 하드필터 → 유동성 순 상위 limit (관심권 코어).
+
+    rank_by: avg_turnover(20일 평균 거래대금, 기본) | discovery_tv(발굴 시점 거래대금).
+    """
+    passed: list[Metrics] = []
+    for market, symbol, name in candidates:
+        if exclude_fn and exclude_fn(symbol, market):
+            log.info("[%s] 제외(관리/투자유의)", symbol)
+            continue
+        try:
+            df = fetch_candles(symbol, market)
+        except Exception as e:
+            log.warning("[%s] 캔들 조회 실패: %s", symbol, e)
+            continue
+        m = compute_metrics(df, symbol, market, name)
+        if m and passes_filters(m, criteria):
+            passed.append(m)
+    log.info("liquidity_core 필터 통과: %d / %d", len(passed), len(candidates))
+
+    tv = discovery_tv or {}
+
+    def _rank_key(m: Metrics) -> float:
+        if rank_by == "discovery_tv":
+            return float(tv.get(m.symbol, 0.0))
+        return m.avg_turnover
+
+    by_market: dict[str, list[Metrics]] = {}
+    for m in passed:
+        by_market.setdefault(m.market, []).append(m)
+
+    result: dict[str, list[dict]] = {}
+    for market, rows in by_market.items():
+        ranked = sorted(rows, key=_rank_key, reverse=True)
+        picked = []
+        for m in ranked[: max(0, limit)]:
+            picked.append({
+                "symbol": m.symbol,
+                "name": m.name,
+                "strategy": default_strategy,
+            })
+            log.info("liquidity_core [%s] %s (%s=%.4g)", market, m.symbol,
+                     rank_by, _rank_key(m))
+        if picked:
+            result[market] = picked
+    return result
+
+
+def _price_bounds(criteria: dict, market: str) -> tuple[float, float]:
+    def _get(key, default):
+        v = criteria.get(key, default)
+        return v.get(market, default) if isinstance(v, dict) else v
+
+    lo = float(_get("min_price", 0) or 0)
+    hi = float(_get("max_price", float("inf")) or float("inf"))
+    return lo, hi
+
+
+def liquidity_core_pick_light(
+    candidates: list[tuple[str, str, str]],
+    criteria: dict,
+    *,
+    limit: int = 100,
+    default_strategy: str = "ma_crossover",
+    discovery_tv: dict[str, float] | None = None,
+    discovery_prices: dict[str, float] | None = None,
+    day_tag_top: int = 0,
+    day_strategy: str = "volatility_breakout",
+) -> dict[str, list[dict]]:
+    """거래대금 발굴 풀 → 가격 스칼ar 필터 → TV 순 top N (캔들 fetch 없음).
+
+    day_tag_top > 0 이면 TV 순 상위 N종에 pool=day·day_strategy 태그.
+    """
+    tv = discovery_tv or {}
+    prices = discovery_prices or {}
+    by_market: dict[str, list[tuple[str, str, str, float]]] = {}
+
+    for market, symbol, name in candidates:
+        lo, hi = _price_bounds(criteria, market)
+        px = float(prices.get(symbol) or 0)
+        if px <= 0:
+            log.info("[%s] light 제외 %s (price missing)", market, symbol)
+            continue
+        if px < lo or px > hi:
+            log.info("[%s] light 제외 %s (price=%.4g)", market, symbol, px)
+            continue
+        score = float(tv.get(symbol) or 0)
+        by_market.setdefault(market, []).append((market, symbol, name, score))
+
+    result: dict[str, list[dict]] = {}
+    for market, rows in by_market.items():
+        ranked = sorted(rows, key=lambda r: r[3], reverse=True)
+        picked: list[dict] = []
+        for i, (_m, symbol, name, score) in enumerate(ranked[: max(0, limit)]):
+            row: dict = {
+                "symbol": symbol,
+                "name": name,
+                "strategy": default_strategy,
+            }
+            if day_tag_top > 0 and i < day_tag_top:
+                row["pool"] = "day"
+                row["strategy"] = day_strategy
+                row["layer"] = "day"
+            picked.append(row)
+            log.info("liquidity_core_light [%s] %s (discovery_tv=%.4g)", market, symbol, score)
+        if picked:
+            result[market] = picked
+    log.info("liquidity_core_light 선정: %s",
+             {m: len(v) for m, v in result.items()})
+    return result
+
+
 def load_candidates(data_dir: str | Path, markets: list[str]) -> list[tuple[str, str, str]]:
     """data/base_universe_{MARKET}.txt 에서 후보군 로드."""
     out: list[tuple[str, str, str]] = []

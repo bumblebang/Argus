@@ -730,7 +730,7 @@ def main() -> int:
         _on_pool_refresh(market, hhmm, reason, cfg=cfg, gateway=gateway)
 
     brain = _build_brain(cfg, gateway, store, args, broker, risk,
-                         universe_fn=combined_universe,
+                         universe_fn=provider.markets,
                          open_markets_fn=open_markets_fn,
                          illiquid_fn=lambda: loop_ref[0].illiquid_snapshot() if loop_ref else set())
     # 밸류 트랙 워커(하루 1회 저평가주 진입) — 데몬 공유 broker/risk 로 페이퍼 단일 원칙 유지.

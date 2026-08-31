@@ -54,6 +54,7 @@ def test_sort_covered_by_zone(tmp_path):
 
 def test_select_symbols_zone_and_queue(tmp_path):
     cfg = load_config()
+    cfg.raw.setdefault("athena", {})["min_refresh_hours"] = 0
     cfg.universe["KR"] = [
         {"symbol": "QUE", "name": "q"},
         {"symbol": "INZ", "name": "i"},
