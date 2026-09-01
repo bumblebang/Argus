@@ -1,0 +1,83 @@
+# 설계 SSOT — CONTEXT/plan 합의 ↔ config.example + 코드 정합 자동 점검.
+# scripts/check_design_alignment.py · CI · 에이전트 완료 게이트.
+#
+# waive: true + reason 필수 → 의도적 예외(만료일 권장). 미기재 error는 CI 실패.
+version: 1
+
+groups:
+  pool_brain_a:
+    doc: "CONTEXT.md §풀·뇌 A/B · config.example.yaml screener/agents"
+    checks:
+      - id: core_refresh_daily
+        desc: "core_weekdays 미설정 = 거래일마다 개장 전 core_refresh"
+        type: config_absent
+        path: [screener, rolling, core_weekdays]
+
+      - id: liquidity_core_enabled
+        type: config_eq
+        path: [screener, liquidity_core, enabled]
+        value: true
+
+      - id: liquidity_core_light
+        type: config_eq
+        path: [screener, liquidity_core, light]
+        value: true
+
+      - id: liquidity_core_size_100
+        type: config_eq
+        path: [screener, liquidity_core, core_size]
+        value: 100
+
+      - id: liquidity_discover_pool_300
+        type: config_eq
+        path: [screener, liquidity_core, discover_pool]
+        value: 300
+
+      - id: liquidity_rank_discovery_tv
+        type: config_eq
+        path: [screener, liquidity_core, rank_by]
+        value: discovery_tv
+
+      - id: scan_shortlist_enabled
+        type: config_eq
+        path: [agents, serve, scan_enabled]
+        value: true
+
+      - id: scan_cap_40
+        type: config_eq
+        path: [agents, serve, scan_cap]
+        value: 40
+
+      - id: brain_swing_universe_watch
+        type: file_contains
+        path: scripts/watch.py
+        needle: "universe_fn=provider.markets"
+
+      - id: brain_swing_universe_orchestrator
+        type: file_contains
+        path: src/engine/orchestrator.py
+        needle: "universe_fn=provider.markets"
+
+      - id: scan_select_fn
+        type: file_contains
+        path: src/agents/serve_policy.py
+        needle: "def select_scan_candidates"
+
+      - id: strategy_scores_module
+        type: file_exists
+        path: src/strategy_scores.py
+
+      - id: core_refresh_strategy_scores
+        type: file_contains
+        path: src/universe_roll.py
+        needle: "refresh_strategy_scores"
+
+      # 설계: KR 당일 거래대금 top ~300 (시총 풀 재정렬 아님). Toss/day_pool 동급.
+      - id: kr_discovery_pure_trading_value
+        desc: "KR core 발굴이 Naver marketValue API에만 의존하지 않음"
+        type: file_not_contains
+        path: src/datasources/discovery.py
+        needle: 'NAVER = "https://m.stock.naver.com/api/stocks/marketValue/{market}"'
+        waive: true
+        waive_reason: "Phase0 Naver — Toss TV unify 후 waive 제거"
+        waive_until: "2026-09-30"
