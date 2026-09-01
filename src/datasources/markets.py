@@ -4,12 +4,11 @@
 """
 from __future__ import annotations
 
-from datetime import date, datetime, timezone
-
 import requests
 
 from .base import DataSource, SourceContext
 from ..logging_setup import get_logger
+from ..market_hours import trading_date
 
 log = get_logger("src.markets")
 
@@ -17,11 +16,15 @@ _UA = {"User-Agent": "Mozilla/5.0 argus"}
 YF = "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
 
 
-def _day(epoch) -> date:
-    return datetime.fromtimestamp(float(epoch), timezone.utc).date()
+def _yahoo_market(name: str, sym: str) -> str:
+    """Yahoo 지수/상품 → 거래일 timezone. KR 지수만 KR, 나머지 US."""
+    u = sym.upper()
+    if u in ("^KS11", "^KQ11") or name.upper() in ("KOSPI", "KOSDAQ"):
+        return "KR"
+    return "US"
 
 
-def _closes_with_time(res: dict) -> list[tuple[int, float]]:
+def _closes_with_time(res: dict, *, market: str = "US") -> list[tuple[int, float]]:
     """일봉 응답 → [(epoch, close), ...] 오름차순. 마지막 거래일이 비면 meta 로 메운다.
 
     Yahoo 는 최근 거래일 봉을 빼거나 close 를 null 로 주는 때가 있다. None 만 걸러
@@ -29,7 +32,7 @@ def _closes_with_time(res: dict) -> list[tuple[int, float]]:
     국면 숫자가 틀린 채로 뇌에 들어간다.
 
     meta.regularMarketTime 의 거래일이 마지막 봉보다 뒤면 meta.regularMarketPrice 로
-    한 점을 보충한다.
+    한 점을 보충한다. 거래일은 market_hours.trading_date(시장 로컬).
     """
     q = (res.get("indicators") or {}).get("quote") or [{}]
     closes = q[0].get("close") or []
@@ -43,7 +46,7 @@ def _closes_with_time(res: dict) -> list[tuple[int, float]]:
     mt, mp = meta.get("regularMarketTime"), meta.get("regularMarketPrice")
     if mt is not None and mp is not None:
         try:
-            if not pairs or _day(mt) > _day(pairs[-1][0]):
+            if not pairs or trading_date(market, mt) > trading_date(market, pairs[-1][0]):
                 pairs.append((int(mt), float(mp)))
         except (TypeError, ValueError, OSError):
             pass
@@ -66,7 +69,8 @@ class MarketsSource(DataSource):
                                  params={"range": "5d", "interval": "1d"},
                                  headers=_UA, timeout=12)
                 res = r.json()["chart"]["result"][0]
-                pairs = _closes_with_time(res)
+                mkt = _yahoo_market(name, sym)
+                pairs = _closes_with_time(res, market=mkt)
                 if not pairs:
                     continue
                 (last_t, last), prev = pairs[-1], (pairs[-2][1] if len(pairs) > 1 else None)
@@ -75,7 +79,7 @@ class MarketsSource(DataSource):
                 if last_t is not None:
                     # 어느 거래일 기준인지 남긴다 — 소비자(뇌·공개 브리핑)가 낡은 값을
                     # 최신으로 오해하지 않게. 하루 밀림은 조용히 생긴다.
-                    row["asof"] = _day(last_t).isoformat()
+                    row["asof"] = trading_date(mkt, last_t)
                 out[name] = row
             except Exception as e:
                 log.warning("[%s/%s] 시세 조회 실패: %s", name, sym, e)
