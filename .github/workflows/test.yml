@@ -19,6 +19,8 @@ jobs:
         run: python -m pytest -m ops_golden
         env:
           DRY_RUN: "true"
+      - name: Design alignment (plan ↔ config/code)
+        run: python scripts/check_design_alignment.py
       - name: Protected change guard (J13)
         run: python scripts/check_protected_changes.py --base ${{ github.event.pull_request.base.sha || 'HEAD~1' }}
         env:
