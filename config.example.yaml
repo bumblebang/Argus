@@ -337,7 +337,7 @@ screener:
     interval_min: 60
     movers_per_scan: 3
     mover_max_per_market: 6
-    core_weekdays: [0]
+    # core_weekdays 미설정 = 거래일마다 개장 전 코어 1회. [0]=월요일만(레거시).
     core_preopen_min: { KR: 90, US: 330 }
     picks_scale: { KR: 1.0, US: 1.5 }
 

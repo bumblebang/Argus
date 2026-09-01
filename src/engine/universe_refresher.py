@@ -64,7 +64,7 @@ class UniverseRefresher:
         self.on_added = on_added
         self._now = now_fn or (lambda: datetime.now(ZoneInfo("UTC")))
         self._sleep = sleep_fn
-        # None = 거래일마다. [0]=월요일만(스윙 멤버십 주 1회).
+        # None = 거래일마다. [0]=월요일만(레거시 스윙 멤버십 주1회).
         self.core_weekdays = (None if core_weekdays is None
                               else [int(d) for d in core_weekdays])
         # 코어: 그 시장 거래일에 이미 했는지(market_day 키). 무버: 시장별 마지막 스캔 시각.
