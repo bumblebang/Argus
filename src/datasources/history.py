@@ -12,7 +12,6 @@
 """
 from __future__ import annotations
 
-from datetime import date, datetime, timezone
 from pathlib import Path
 
 import pandas as pd
@@ -20,6 +19,7 @@ import requests
 
 from ..config import ROOT
 from ..logging_setup import get_logger
+from ..market_hours import trading_date
 
 log = get_logger("src.history")
 
@@ -32,10 +32,6 @@ _INTERVAL_ALIAS = {"1h": "60m", "hourly": "60m", "daily": "1d",
                    "weekly": "1wk", "1w": "1wk", "monthly": "1mo"}
 
 COLUMNS = ["time", "open", "high", "low", "close", "volume"]
-
-
-def _utc_day(epoch) -> date:
-    return datetime.fromtimestamp(float(epoch), timezone.utc).date()
 
 
 def _kr_yahoo_suffix(symbol: str, info_cache: dict | None) -> str:
@@ -63,11 +59,12 @@ def to_yahoo(symbol: str, market: str = "KR", *,
     return f"{s}{_kr_yahoo_suffix(s, info_cache)}"
 
 
-def _supplement_daily_from_meta(res: dict, df: pd.DataFrame) -> pd.DataFrame:
+def _supplement_daily_from_meta(res: dict, df: pd.DataFrame, *,
+                                market: str = "KR") -> pd.DataFrame:
     """일봉: Yahoo 가 당일 봉을 빼거나 null 이면 meta.regularMarket* 로 한 봉 보충.
 
-    markets._closes_with_time 과 동일 계약 — 15:20 갭스캔 fresh fetch 가 어제까지만
-    오는 창 밀림을 막는다.
+    거래일 비교는 market_hours.trading_date(시장 로컬) — last_bar_trading_date 와
+    같은 축. 15:20 갭스캔 fresh fetch 가 어제까지만 오는 창 밀림을 막는다.
     """
     if df.empty:
         return df
@@ -76,12 +73,11 @@ def _supplement_daily_from_meta(res: dict, df: pd.DataFrame) -> pd.DataFrame:
     if mt is None or mp is None:
         return df
     try:
-        # markets._day(epoch) 과 동일 — Yahoo epoch UTC 거래일 비교
         ts = pd.Timestamp(df["time"].iloc[-1])
         if ts.tzinfo is None:
             ts = ts.tz_localize("UTC")
         last_epoch = int(ts.timestamp())
-        if _utc_day(mt) <= _utc_day(last_epoch):
+        if trading_date(market, mt) <= trading_date(market, last_epoch):
             return df
         mp_f = float(mp)
         mo = meta.get("regularMarketOpen")
@@ -101,7 +97,8 @@ def _supplement_daily_from_meta(res: dict, df: pd.DataFrame) -> pd.DataFrame:
         return df
 
 
-def _fetch_yahoo(ysym: str, interval: str, range_: str) -> pd.DataFrame:
+def _fetch_yahoo(ysym: str, interval: str, range_: str, *,
+                 market: str = "KR") -> pd.DataFrame:
     url = YF.format(symbol=ysym.replace("^", "%5E"))
     r = requests.get(url, params={"range": range_, "interval": interval},
                      headers=_UA, timeout=15)
@@ -125,7 +122,7 @@ def _fetch_yahoo(ysym: str, interval: str, range_: str) -> pd.DataFrame:
                      row[4] or 0))
     df = pd.DataFrame(rows, columns=COLUMNS)
     if interval == "1d":
-        df = _supplement_daily_from_meta(res, df)
+        df = _supplement_daily_from_meta(res, df, market=market)
     return df
 
 
@@ -153,10 +150,10 @@ def fetch_history(symbol: str, interval: str = "1d", range_: str = "2y",
             return pd.read_csv(cache, parse_dates=["time"])
 
     try:
-        df = _fetch_yahoo(ysym, interval, range_)
+        df = _fetch_yahoo(ysym, interval, range_, market=market)
         if df.empty and market == "KR" and ysym.endswith((".KS", ".KQ")):
             alt = ".KQ" if ysym.endswith(".KS") else ".KS"
-            df = _fetch_yahoo(ysym[:-3] + alt, interval, range_)   # stock_info 미스 폴백
+            df = _fetch_yahoo(ysym[:-3] + alt, interval, range_, market=market)
     except requests.RequestException as e:
         log.warning("Yahoo 조회 실패 %s: %s", ysym, e)
         df = pd.DataFrame(columns=COLUMNS)
