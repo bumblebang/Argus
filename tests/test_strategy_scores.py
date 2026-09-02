@@ -22,8 +22,8 @@ def _synth_df(n=80, base=50_000.0):
 
 
 def test_pad_score_uses_ranking_return():
-    scores = {"A": {"ranking": [{"return_pct": 0.12}]},
-              "B": {"ranking": [{"return_pct": 0.05}]}}
+    scores = {"A": {"ranking": [{"return_pct": 0.12, "n_trades": 5}]},
+              "B": {"ranking": [{"return_pct": 0.05, "n_trades": 4}]}}
     assert ss.pad_score(scores, "A") > ss.pad_score(scores, "B")
     assert ss.pad_score(scores, "MISSING") == float("-inf")
 

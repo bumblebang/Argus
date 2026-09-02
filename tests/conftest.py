@@ -33,3 +33,23 @@ def _sod_snap_when_closed(monkeypatch):
     """
     monkeypatch.setattr("src.paper_account.current_session",
                         lambda market, now=None: "closed")
+
+
+def agents_test_cfg(cfg):
+    """pipeline/통합 테스트 — 도시에·scan shortlist·운영 gap 풀 간섭 최소화."""
+    agents = cfg.raw.setdefault("agents", {})
+    agents["require_dossier"] = False
+    agents.setdefault("serve", {})["scan_enabled"] = False
+    return cfg
+
+
+@pytest.fixture(autouse=True)
+def _isolate_operational_gap_pool(request, monkeypatch):
+    """당일 gap_decline 풀(005930 등)이 pipeline·trailing 회귀를 오염시키지 않게.
+
+    test_gap_decline_pool 은 load/refresh 자체를 검증하므로 제외.
+    """
+    if request.module.__name__ == "test_gap_decline_pool":
+        return
+    monkeypatch.setattr("src.gap_decline_pool.load_gap_decline_pool", lambda *a, **k: {})
+    monkeypatch.setattr("src.gap_decline_pool.fresh_gap_symbols", lambda *a, **k: {})

@@ -29,6 +29,15 @@ SYSTEM = """\
   n 이 작으면(예: n=2) 국면 판단에 과신하지 마라.
 - 확신이 없으면 HOLD가 정답이다. 억지로 매매를 만들지 마라.
 
+신선도(freshness — now/clock/freshness.slots):
+- now 는 이번 판단 시각(KST), clock.phase 는 premarket/regular/aftermarket/closed.
+  minutes_to_close 가 있으면 정규장 종료까지 남은 분이다(마감 직전 신규 BUY 는 보수적으로).
+- freshness.batch_asof 는 느린 슬롯(fundamentals/news/flows/sectors) 전량 빌드 시각,
+  freshness.fast_asof 는 regime/sentiment/markets 장중 갱신 시각이다. 루트 asof 만 보지 마라.
+- freshness.slots.* 의 asof 가 24시간보다 오래됐거나 freshness.strategy_scores_stale=true 이면
+  해당 슬롯·strategy_fit.best 를 신뢰하지 말고 인용하지 마라.
+- strategy_fit.thin_sample=true 이면 백테스트 표본이 얇다 — best 전략 배정 근거로 쓰지 마라.
+
 공포 국면 — 리스크이자 기회 (market.sentiment.fear_greed / fear_kr):
 - 두 지표 모두 0~100 이고 **낮을수록 공포**다. fear_greed(CNN) 등급은 그 원점수 구간
   (25 미만 extreme_fear · 45 미만 fear · 75 이상 greed)이다. fear_kr 은 국내 무료
@@ -137,6 +146,8 @@ KR 갭반등 렌즈(gap_rebound / gap_rebound_scan / nxt_gap_scan):
 전략 배정(BUY 제안):
 - 입력의 strategies 카탈로그(이름·설명·horizon·파라미터 범위)와 후보의 strategy_fit(전략별 간이
   백테스트 적합도)을 보고, 이 종목에 가장 맞는 전략 1개를 strategy 로 지정하라.
+  strategy_fit.best 가 null 이거나 thin_sample=true 이면 ranking 만 참고하고 best 를 strategy 로
+  그대로 복사하지 마라(표본 부족).
 - 카탈로그 각 전략엔 horizon 이 있다: position=중장기 추세, swing=단기 스윙, day=데이트레.
   네가 정한 제안 horizon 과 전략의 horizon 을 맞춰라(중장기 판단엔 position 전략, 데이트레엔
   day 전략). 가용 전략: 추세추종(ma_crossover·donchian_breakout·momentum), 모멘텀(macd),
@@ -242,8 +253,9 @@ KR 갭반등 렌즈(gap_rebound / gap_rebound_scan / nxt_gap_scan):
   중이면(실적 반등 확인·구조 개선 착수 등) 유지가 옳다. 그 판단 근거를 thesis 에 써라.
 
 보유 종목 재평가(thesis 깨짐):
-- portfolio.positions 의 각 보유 종목은 진입 사유(entry_thesis)가 함께 주어진다. 그 진입 논리가
-  현재 데이터(시황·수급·재무·뉴스·지표)에서 여전히 유효한지 반드시 점검하라.
+- portfolio.positions 의 각 보유 종목은 진입 사유(entry_thesis)가 함께 주어진다. current_price·
+  unrealized_pnl_pct(있으면)로 지금 손익 상태를 보고, candidates 와 조인하지 마라.
+  그 진입 논리가 현재 데이터(시황·수급·재무·뉴스·지표)에서 여전히 유효한지 반드시 점검하라.
 - 진입 thesis가 무너졌으면(예: 매수 근거였던 모멘텀/수급/국면이 반대로 돌아섬, 재무 악화, 악재 발생)
   그 종목에 SELL을 제안하고, thesis가 '어떻게' 깨졌는지 근거에 명시하라.
 - 단, 손절/익절 같은 단순 가격 도달 청산은 코드가 이미 처리한다. 여기서는 가격이 아니라 '논리가

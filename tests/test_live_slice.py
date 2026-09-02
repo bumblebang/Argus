@@ -110,6 +110,8 @@ def test_apply_fast_slice_preserves_other_slots(tmp_path):
     assert st.fx == {"USDKRW": 1380.0}
     # asof 갱신됨
     assert st.asof != old_asof
+    assert st.fast_asof == st.asof
+    assert st.batch_asof == old_asof
 
 
 def test_apply_fast_slice_creates_file_if_missing(tmp_path):

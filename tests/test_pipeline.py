@@ -1,4 +1,7 @@
 """agents.pipeline — 전략/손절·목표 계획 + 체결→store positions 미러링 + 데이트레 arm."""
+import pytest
+
+from tests.conftest import agents_test_cfg
 from src.config import load_config
 from src.agents.pipeline import (CycleRunner, position_plan, resolve_strategy,
                                  dry_llm_factory, synth_candles)
@@ -96,9 +99,7 @@ def test_brain_strategy_stored_on_arm(tmp_path):
 
 def _runner(tmp_path, store):
     cfg = load_config()
-    # 이 테스트들은 store 미러링이 관심사 — 도시에 우선 원칙(P4)은 끄고 검증한다
-    # (규칙 자체는 test_dossier_integration 에서 별도 검증).
-    cfg.raw.setdefault("agents", {})["require_dossier"] = False
+    agents_test_cfg(cfg)
     acct = PaperAccount(cash={"KR": 10_000_000, "US": 10_000},
                         state_path=tmp_path / "pa.json")
     gate = RiskGate({"capital": cfg.risk.get("capital", {}), "max_position_pct": 0.2,
@@ -159,7 +160,7 @@ def _day_buy_factory(symbol="005930"):
 
 def _runner_with(tmp_path, store, factory):
     cfg = load_config()
-    cfg.raw.setdefault("agents", {})["require_dossier"] = False   # P4 규칙은 별도 테스트
+    agents_test_cfg(cfg)
     acct = PaperAccount(cash={"KR": 10_000_000, "US": 10_000},
                         state_path=tmp_path / "pa.json")
     gate = RiskGate({"capital": cfg.risk.get("capital", {}), "max_position_pct": 0.2,
@@ -238,7 +239,7 @@ def test_val_llm_factory_routes_validation_separately(tmp_path):
     """val_llm_factory 주입 시 검증만 별도 LLM 을 쓴다(결정은 llm_factory)."""
     import json as _j
     cfg = load_config()
-    cfg.raw.setdefault("agents", {})["require_dossier"] = False
+    agents_test_cfg(cfg)
     used = {"decision": 0, "validation": 0}
 
     def dec_resp(schema, system, user):
@@ -288,7 +289,7 @@ def _capture_symbols_factory(seen):
 
 def _runner_with_universe(tmp_path, store, factory, universe_fn):
     cfg = load_config()
-    cfg.raw.setdefault("agents", {})["require_dossier"] = False
+    agents_test_cfg(cfg)
     acct = PaperAccount(cash={"KR": 10_000_000, "US": 10_000},
                         state_path=tmp_path / "pa.json")
     gate = RiskGate({"capital": cfg.risk.get("capital", {}), "max_position_pct": 0.2,
@@ -329,7 +330,7 @@ def test_universe_fn_absent_uses_frozen_items(tmp_path):
 # ── 열린 시장 필터: open_markets_fn 주면 닫힌 시장 후보 제외(opt-in) ──────────
 def _runner_open_filter(tmp_path, store, factory, universe_fn, open_markets_fn):
     cfg = load_config()
-    cfg.raw.setdefault("agents", {})["require_dossier"] = False
+    agents_test_cfg(cfg)
     acct = PaperAccount(cash={"KR": 10_000_000, "US": 10_000},
                         state_path=tmp_path / "pa.json")
     gate = RiskGate({"capital": cfg.risk.get("capital", {}), "max_position_pct": 0.2,
@@ -402,7 +403,7 @@ def test_athena_done_us_market_only(tmp_path):
 # ── 유동성 필터: illiquid_fn 주면 시간외 체결정지 종목을 후보에서 제외(opt-in) ──
 def _runner_illiquid(tmp_path, store, factory, universe_fn, illiquid_fn):
     cfg = load_config()
-    cfg.raw.setdefault("agents", {})["require_dossier"] = False
+    agents_test_cfg(cfg)
     acct = PaperAccount(cash={"KR": 10_000_000, "US": 10_000},
                         state_path=tmp_path / "pa.json")
     gate = RiskGate({"capital": cfg.risk.get("capital", {}), "max_position_pct": 0.2,
@@ -462,7 +463,7 @@ def _runner_with_universe_items(tmp_path, store, factory, universe):
     universe_fn 미지정 → _universe_item 이 이 cfg.universe 를 본다.
     """
     cfg = load_config()
-    cfg.raw.setdefault("agents", {})["require_dossier"] = False
+    agents_test_cfg(cfg)
     cfg.raw["universe"] = universe
     acct = PaperAccount(cash={"KR": 10_000_000, "US": 10_000},
                         state_path=tmp_path / "pa.json")

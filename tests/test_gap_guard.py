@@ -148,7 +148,8 @@ def test_day_buy_ignores_zone_fn(tmp_path):
 # ── (B) pipeline._entry_zone / _arm(zone=...) / run() 배선 ──────────
 def _pipeline_runner(tmp_path, store, factory=None, *, entry_zone_guard=True):
     cfg = load_config()
-    cfg.raw.setdefault("agents", {})["require_dossier"] = False
+    from tests.conftest import agents_test_cfg
+    agents_test_cfg(cfg)
     cfg.raw["agents"]["entry_zone_guard"] = entry_zone_guard
     acct = PaperAccount(cash={"KR": 10_000_000, "US": 10_000},
                         state_path=tmp_path / "pa.json")

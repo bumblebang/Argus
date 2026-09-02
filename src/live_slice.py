@@ -144,6 +144,10 @@ def apply_fast_slice(partial: dict, path: str | Path = "data/market_state.json")
     from datetime import datetime, timezone
     p = Path(path)
     state = MarketState.load(p) if p.exists() else MarketState()
+    if not state.batch_asof:
+        state.batch_asof = state.asof
     state.merge(partial or {})
-    state.asof = datetime.now(timezone.utc).isoformat()
+    now_iso = datetime.now(timezone.utc).isoformat()
+    state.fast_asof = now_iso
+    state.asof = now_iso
     state.save(p)
