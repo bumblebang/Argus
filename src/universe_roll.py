@@ -69,7 +69,7 @@ def _liquidity_core_cfg(cfg) -> dict:
         "enabled": bool(lc.get("enabled", False)),
         "light": bool(lc.get("light", False)),
         "core_size": int(lc.get("core_size", 100)),
-        "discover_pool": int(lc.get("discover_pool", 300)),
+        "discover_pool": int(lc.get("discover_pool", 250)),
         "default_strategy": str(lc.get("default_strategy", "ma_crossover")),
         "rank_by": str(lc.get("rank_by", "avg_turnover")),
         "day_tag_top": int(lc.get("day_tag_top", 0)),

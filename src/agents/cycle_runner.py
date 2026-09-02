@@ -349,7 +349,7 @@ class CycleRunner:
         # 없으면 기동 시 고정된 self.items(하위호환).
         items = self._items_from(self.universe_fn()) if self.universe_fn else self.items
         # 열린 시장 필터(opt-in): 주어졌을 때만 닫힌 시장 후보를 제외한다.
-        # Athena 종료 훅(07:30)은 프리 전이므로 후보를 비우면 안 된다 — 오늘 살 시장만 남긴다.
+        # Athena 종료 훅 — wake.market 시장만(프리 전이라 open_markets 우회). market 없으면 live_markets.
         wake_reason = str((wake or {}).get("reason") or "")
         full_universe = items
         held = serve.held_symbols(self.account.positions)
@@ -363,10 +363,17 @@ class CycleRunner:
         if self.open_markets_fn is not None:
             reason = str((wake or {}).get("reason") or "")
             if reason == "athena_done":
-                broker_live = (self.cfg.raw.get("broker") or {}).get("live_markets")
-                trade = (self.cfg.raw.get("run") or {}).get("trade_markets")
-                keep = [str(m).upper() for m in (broker_live or trade or ["KR"])]
-                items = [i for i in items if i["market"] in keep]
+                # Athena 창 종료 wake — 해당 시장 배치만 끝났다(wake.market).
+                # KR 직후에 US 스윙 20종을 넣지 않음(간밤 맥락은 market_state·헤드라인).
+                # market 태그 없으면 live_markets 폴백(구 wake 호환).
+                wake_mkt = str((wake or {}).get("market") or "").strip().upper()
+                if wake_mkt in ("KR", "US"):
+                    keep = {wake_mkt}
+                else:
+                    broker_live = (self.cfg.raw.get("broker") or {}).get("live_markets")
+                    trade = (self.cfg.raw.get("run") or {}).get("trade_markets")
+                    keep = {str(m).upper() for m in (broker_live or trade or ["KR"])}
+                items = [i for i in items if str(i.get("market") or "").upper() in keep]
             else:
                 open_mkts = set(self.open_markets_fn())
                 items = [i for i in items if i["market"] in open_mkts]
