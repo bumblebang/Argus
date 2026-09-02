@@ -59,6 +59,7 @@ def test_waive_allows_known_gap(tmp_path):
                     "needle": "bad needle",
                     "waive": True,
                     "waive_reason": "test",
+                    "waive_until": "2099-12-31",
                 }]
             }
         }
@@ -69,3 +70,28 @@ def test_waive_allows_known_gap(tmp_path):
     results = run_alignment(man, root / "config.example.yaml", root)
     assert alignment_ok(results)
     assert results[0].waived
+
+
+def test_waive_without_until_is_not_waived(tmp_path):
+    root = tmp_path
+    (root / "a.txt").write_text("bad needle here", encoding="utf-8")
+    manifest = {
+        "groups": {
+            "t": {
+                "checks": [{
+                    "id": "gap",
+                    "type": "file_not_contains",
+                    "path": "a.txt",
+                    "needle": "bad needle",
+                    "waive": True,
+                    "waive_reason": "test",
+                }]
+            }
+        }
+    }
+    man = root / "m.yaml"
+    man.write_text(yaml.dump(manifest), encoding="utf-8")
+    (root / "config.example.yaml").write_text("{}", encoding="utf-8")
+    results = run_alignment(man, root / "config.example.yaml", root)
+    assert not alignment_ok(results)
+    assert not results[0].waived

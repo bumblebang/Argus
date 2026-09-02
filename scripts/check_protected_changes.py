@@ -10,7 +10,6 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from src.eval.protected_guard import check_protected_changes  # noqa: E402
-from src.eval.labels import MIN_N  # noqa: E402
 
 
 def main() -> int:
@@ -20,7 +19,7 @@ def main() -> int:
     ap.add_argument("--registry", default="data/eval_registry.json")
     ap.add_argument("--experiment-id", default=os.environ.get("ARGUS_EVAL_EXPERIMENT_ID"))
     ap.add_argument("--evidence-n", type=int, default=None,
-                    help=f"can_promote 표본 수(기본 MIN_N={MIN_N})")
+                    help="can_promote 표본 n(미지정 시 registry experiment evidence_n)")
     args = ap.parse_args()
 
     pr_body = os.environ.get("GITHUB_PR_BODY") or os.environ.get("ARGUS_EVAL_PR_BODY")

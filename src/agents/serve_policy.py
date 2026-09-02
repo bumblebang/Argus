@@ -380,7 +380,12 @@ def merge_wake_pending(prev: dict | None, reason: str,
         else:
             picked = old_reason or new_reason
 
-    return {"reason": picked, "n": len(merged), "triggers": merged}
+    out = {"reason": picked, "n": len(merged), "triggers": merged}
+    if prev:
+        for key in ("at", "market"):
+            if prev.get(key):
+                out[key] = prev[key]
+    return out
 
 
 def _dedupe_triggers(rows: list[dict]) -> list[dict]:

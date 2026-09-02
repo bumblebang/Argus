@@ -71,6 +71,12 @@ def test_trading_date_uses_market_local_not_utc():
     assert trading_date("US", D2) == "2026-07-30"
 
 
+def test_trading_date_unknown_market_uses_ts_utc_not_kst_today():
+    """미등록 시장 — ts UTC 달력일. KST '오늘' 폴백 금지."""
+    assert trading_date("COMMODITY", D2) == "2026-07-31"
+    assert trading_date("COMMODITY", D1) == "2026-07-30"
+
+
 def test_no_timestamps_falls_back_to_closes_only():
     """Yahoo 응답에 timestamp 가 없어도 markets 슬롯이 통째로 비면 안 된다(예전 동작이 바닥)."""
     pairs = _closes_with_time({"indicators": {"quote": [{"close": [2480.0, 2500.0]}]}})
