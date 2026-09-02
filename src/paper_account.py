@@ -109,9 +109,10 @@ class PaperAccount:
     def ensure_sod_equity(self, market: str) -> float:
         """당일 시가 equity. 날짜가 바뀌면 현재 equity(>0)로 한 번만 스냅·영속.
 
-        장중(세션≠closed) 최초 스냅은 **해당 시장 보유가 있으면** 거부한다 — 재기동
-        mid-day 에 깎인 equity 를 SoD 로 찍어 일손실 델타가 0 으로 리셋되는 것을 막는다.
-        US 프리/정규·보유 없음 첫 틱은 허용 — KR-only 폴링 구간만으로는 US 거래일
+        장중(세션≠closed) 최초 스냅은 **당일 체결 이력 + 보유**일 때만 거부한다 —
+        mid-day 재기동에 깎인 equity 를 SoD 로 찍어 일손실 델타가 0 으로 리셋되는 것을
+        막는다. 오버나잇 보유만 있고 당일 체결이 없으면(13:27 cold start 등) 허용한다.
+        US 프리/정규·보유 없음 첫 틱도 허용 — KR-only 폴링 구간만으로는 US 거래일
         SoD 창이 0분이 되는 문제(프리마켓~정규 진입)를 피한다.
         거부 시 sod=0 → 게이트 capital 폴백.
         """
@@ -119,8 +120,9 @@ class PaperAccount:
         if self._sod_day.get(market) == day:
             return float(self._sod_equity.get(market, 0.0) or 0.0)
         session = current_session(market)
-        if session != "closed" and self.count_open(market) > 0:
-            log.error("[SoD] 장중 최초 스냅 거부(%s, 보유 있음) — capital 폴백",
+        traded_today = self._last_fill_day.get(market) == day
+        if session != "closed" and self.count_open(market) > 0 and traded_today:
+            log.error("[SoD] 장중 최초 스냅 거부(%s, 당일체결+보유) — capital 폴백",
                       market)
             self._sod_day[market] = day
             self._sod_equity[market] = 0.0

@@ -70,7 +70,9 @@ def _waived(check: dict, today: date | None = None) -> tuple[bool, str]:
         return False, ""
     reason = str(check.get("waive_reason") or "waive_reason 없음")
     until = _parse_date(check.get("waive_until"))
-    if until and (today or date.today()) > until:
+    if not until:
+        return False, "waive_until 없음 — 무기한 면제 불가"
+    if (today or date.today()) > until:
         return False, f"waive 만료({until}) — {reason}"
     return True, reason
 

@@ -112,18 +112,34 @@ def test_equity_gain_does_not_mask_realized_loss(tmp_path):
 
 
 def test_midday_first_sod_snap_refused(tmp_path, monkeypatch):
-    """장중 + 보유 있음: SoD 스냅 거부(일손실 리셋 방지)."""
+    """장중 + 당일체결 + 보유: SoD 스냅 거부(일손실 리셋 방지)."""
     monkeypatch.setattr("src.paper_account.current_session",
                         lambda m, now=None: "regular")
     gate, acct = _gate(tmp_path), _acct(tmp_path, cash=940_000)
     acct.apply_fill("005930", "KR", "BUY", 1, 70000, 0.0, "seed")
     assert acct.count_open("KR") == 1
+    assert acct._last_fill_day.get("KR") == market_day("KR")
     assert acct.ensure_sod_equity("KR") == 0.0
     assert acct.sod_equity_delta("KR") is None
     # capital 폴백(1M×5%=50k). 실현 -60k 면 차단.
     _set_realized_today(acct, "KR", -60_000)
     d = gate.check(_order(), acct)
     assert not d.approved and "일 손실" in d.reason
+
+
+def test_overnight_cold_start_allows_sod_during_session(tmp_path, monkeypatch):
+    """오버나잇 보유·당일 체결 없음 — 장중 cold start SoD 허용."""
+    monkeypatch.setattr("src.paper_account.current_session",
+                        lambda m, now=None: "regular")
+    acct = _acct(tmp_path, cash=600_000)
+    acct.apply_fill("005930", "KR", "BUY", 10, 10_000, 0.0, "seed")
+    acct._last_fill_day["KR"] = "20200101"          # 전일 carry
+    acct._sod_day.clear()
+    acct._sod_equity.clear()
+    acct.set_marks({"005930": 10_000})
+    eq = acct.ensure_sod_equity("KR")
+    assert eq == 600_000.0
+    assert acct.sod_equity_delta("KR") == 0.0
 
 
 def test_us_first_sod_allowed_when_no_fill_yet(tmp_path, monkeypatch):

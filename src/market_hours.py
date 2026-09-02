@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Iterable
-from datetime import datetime, time
+from datetime import datetime, time, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -116,10 +116,14 @@ def market_day(market: str, now: datetime | None = None) -> str:
 
 
 def trading_date(market: str, ts: float | None = None) -> str:
-    """해당 시장 타임존 기준 거래일(ISO). 세션표 date 필드와 대조한다."""
-    if market not in _SESSIONS:
-        return market_day(market)
+    """해당 시장 타임존 기준 거래일(ISO). 세션표 date 필드와 대조한다.
+
+    _SESSIONS 미등록 시장(COMMODITY 등)은 ts 를 UTC 달력일로 — ts 무시하고
+    KST '오늘'을 쓰지 않는다.
+    """
     ts_val = datetime.now(_KST).timestamp() if ts is None else float(ts)
+    if market not in _SESSIONS:
+        return datetime.fromtimestamp(ts_val, timezone.utc).date().isoformat()
     tzname = _SESSIONS[market][0]
     return datetime.fromtimestamp(ts_val, ZoneInfo(tzname)).date().isoformat()
 
