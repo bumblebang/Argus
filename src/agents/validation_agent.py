@@ -44,7 +44,10 @@ SYSTEM = """\
    **min_conviction 이 0 이면 이 규칙을 적용하지 마라.** 그때 확신도는 코드가 산출한
    사이징 입력이므로, 숫자가 낮다는 이유만으로 거부하지 마라. 거부는 1–5·7–11.
 7. 재무 레드플래그: 심각한 음수 순이익률 등인데 명확한 촉매 없이 매수.
-8. 악재 미반영: headlines/뉴스의 중대한 악재·공시를 thesis가 다루지 않음.
+8. 악재 미반영: headlines·candidates[].news·recent_disclosures 의 중대한 악재·공시를
+   thesis가 다루지 않음. wake_triggers/disclosure/earnings_result 각성이면
+   candidates[].news·recent_disclosures 를 우선 보라 — global headlines 만으로
+   판단하지 마라(focus 티어 global headlines 는 macro 위주다).
 9. 전략 부적합: 배정된 전략(strategy)이 종목/국면 성격과 어긋남 (예: 명확한 추세장에
    평균회귀(rsi_reversion) 배정, 박스권에 돌파 전략 배정). strategy_fit(전략 적합도)이
    현저히 낮은데 그 전략을 고른 경우도 의심하라.

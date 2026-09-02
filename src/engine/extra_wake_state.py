@@ -19,10 +19,10 @@ from zoneinfo import ZoneInfo
 
 from .. import paths as _paths
 from ..logging_setup import get_logger
+from ..market_hours import _SESSIONS
 
 log = get_logger("engine.extra_wake_state")
 
-_KST = ZoneInfo("Asia/Seoul")
 DEFAULT_PATH = "data/state/extra_wake_fired.json"
 _MAX_ENTRIES = 512
 
@@ -80,16 +80,16 @@ def save_fired(mapping: dict[tuple[str, str], str], *,
         log.warning("extra_wake 상태 저장 실패(무시): %s", e)
 
 
-def minutes_since_hhmm(now_kst: datetime, hhmm: str) -> int | None:
-    """now 가 target HH:MM 이후면 경과 분(정수). 아직 전이면 None."""
+def minutes_since_hhmm(now_local: datetime, hhmm: str) -> int | None:
+    """now(시장 로컬) 가 target HH:MM 이후면 경과 분(정수). 아직 전이면 None."""
     try:
         target = datetime.strptime(hhmm, "%H:%M").time()
     except ValueError:
         return None
-    now_t = now_kst.time()
+    now_t = now_local.time()
     if now_t < target:
         return None
-    now_m = now_kst.hour * 60 + now_kst.minute
+    now_m = now_local.hour * 60 + now_local.minute
     tgt_m = target.hour * 60 + target.minute
     return now_m - tgt_m
 
@@ -133,8 +133,9 @@ def should_fire_extra(*, market: str, hhmm: str, trading_day: str,
     key = (market, hhmm)
     if fired.get(key) == trading_day:
         return False
-    now_kst = datetime.fromtimestamp(now_ts, tz=_KST)
-    elapsed = minutes_since_hhmm(now_kst, hhmm)
+    tzname = _SESSIONS.get(market, ("Asia/Seoul",))[0]
+    now_local = datetime.fromtimestamp(now_ts, tz=ZoneInfo(tzname))
+    elapsed = minutes_since_hhmm(now_local, hhmm)
     if elapsed is None:
         return False
     if window_min > 0 and elapsed > int(window_min):

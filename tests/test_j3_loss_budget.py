@@ -112,11 +112,12 @@ def test_equity_gain_does_not_mask_realized_loss(tmp_path):
 
 
 def test_midday_first_sod_snap_refused(tmp_path, monkeypatch):
-    """장중 + 당일 체결 있음: SoD 스냅 거부(일손실 리셋 방지)."""
+    """장중 + 보유 있음: SoD 스냅 거부(일손실 리셋 방지)."""
     monkeypatch.setattr("src.paper_account.current_session",
                         lambda m, now=None: "regular")
     gate, acct = _gate(tmp_path), _acct(tmp_path, cash=940_000)
     acct.apply_fill("005930", "KR", "BUY", 1, 70000, 0.0, "seed")
+    assert acct.count_open("KR") == 1
     assert acct.ensure_sod_equity("KR") == 0.0
     assert acct.sod_equity_delta("KR") is None
     # capital 폴백(1M×5%=50k). 실현 -60k 면 차단.

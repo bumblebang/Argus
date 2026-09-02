@@ -4,6 +4,8 @@
 """
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 import requests
 
 from .base import DataSource, SourceContext
@@ -15,13 +17,26 @@ log = get_logger("src.markets")
 _UA = {"User-Agent": "Mozilla/5.0 argus"}
 YF = "https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
 
+# COMEX/NYMEX 선물 — ET equity 세션과 거래일 경계가 어긋나 겨울 ASOF 가 하루 밀릴 수 있다.
+_COMMODITY_SYMS = frozenset({"GC=F", "CL=F", "SI=F", "HG=F", "NG=F"})
+
 
 def _yahoo_market(name: str, sym: str) -> str:
-    """Yahoo 지수/상품 → 거래일 timezone. KR 지수만 KR, 나머지 US."""
+    """Yahoo 지수/상품 → 거래일 timezone. KR 지수 / 원자재(UTC) / 그 외 US."""
     u = sym.upper()
-    if u in ("^KS11", "^KQ11") or name.upper() in ("KOSPI", "KOSDAQ"):
+    n = name.upper()
+    if u in ("^KS11", "^KQ11") or n in ("KOSPI", "KOSDAQ"):
         return "KR"
+    if u in _COMMODITY_SYMS or n in ("GOLD", "WTI", "SILVER", "OIL", "CRUDE"):
+        return "COMMODITY"
     return "US"
+
+
+def _trade_date_key(market: str, ts: int | float) -> str:
+    """시장별 거래일 ISO — 원자재는 UTC 달력(ET DST 밀림 방지)."""
+    if market == "COMMODITY":
+        return datetime.fromtimestamp(float(ts), tz=timezone.utc).date().isoformat()
+    return trading_date(market, ts)
 
 
 def _closes_with_time(res: dict, *, market: str = "US") -> list[tuple[int, float]]:
@@ -46,7 +61,7 @@ def _closes_with_time(res: dict, *, market: str = "US") -> list[tuple[int, float
     mt, mp = meta.get("regularMarketTime"), meta.get("regularMarketPrice")
     if mt is not None and mp is not None:
         try:
-            if not pairs or trading_date(market, mt) > trading_date(market, pairs[-1][0]):
+            if not pairs or _trade_date_key(market, mt) > _trade_date_key(market, pairs[-1][0]):
                 pairs.append((int(mt), float(mp)))
         except (TypeError, ValueError, OSError):
             pass
@@ -79,7 +94,7 @@ class MarketsSource(DataSource):
                 if last_t is not None:
                     # 어느 거래일 기준인지 남긴다 — 소비자(뇌·공개 브리핑)가 낡은 값을
                     # 최신으로 오해하지 않게. 하루 밀림은 조용히 생긴다.
-                    row["asof"] = trading_date(mkt, last_t)
+                    row["asof"] = _trade_date_key(mkt, last_t)
                 out[name] = row
             except Exception as e:
                 log.warning("[%s/%s] 시세 조회 실패: %s", name, sym, e)

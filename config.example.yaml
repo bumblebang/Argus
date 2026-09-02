@@ -77,8 +77,8 @@ watch:
     KR: [premarket, regular, aftermarket]   # 19:50 nxt_gap_scan
     US: [premarket, regular]   # 17:00 프리 extra
   extra_wakes:
-    KR: ["08:00", "09:00", "11:00", "13:00", "15:15", "15:20", "19:50"]  # 15:15 pool / 15:20 gap_rebound_scan
-    US: ["17:00", "22:30", "00:30", "02:30", "04:30"]   # KST, EDT 기준(썸머타임 ±1h 수동)
+    KR: ["08:00", "09:00", "11:00", "13:00", "15:15", "15:20", "19:50"]  # KST — 15:15 pool / 15:20 gap_rebound_scan
+    US: ["04:00", "09:30", "11:30", "13:30", "15:30"]   # America/New_York(ET, DST 자동). brain_interval=0 이므로 정기 각성은 extra_wakes 전용
   extra_wake_state_path: "data/state/extra_wake_fired.json"
   extra_wake_grace_sec: 120     # 재기동 직후 extra 억제
   extra_wake_window_min: 5       # HH:MM 후 5분 창 — 지나면 그날 catch-up 안 함
@@ -223,8 +223,11 @@ agents:
     focus_cap: 16
     focus_pad: 0
     ondemand_flows: true
-    ondemand_news: false
-    focus_headline_limit: 40
+    ondemand_news: true
+    focus_headline_limit: 12
+    focus_macro_pad: 8
+    headline_ttl_hours: 24
+    focus_trim_notify: false
     compact_json: true
     enrich_fundamentals: true
     enrich_flows: true

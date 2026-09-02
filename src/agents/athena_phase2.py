@@ -302,6 +302,17 @@ def should_level_only(store, sym: str, price: float | None, p2cfg: dict,
     return True, dict(row)
 
 
+_LEVEL_REFRESH_TAG = "[레벨갱신]"
+
+
+def _strip_level_refresh_notes(thesis: str) -> str:
+    """이전 레벨갱신 접미사 제거 — 무한 append 방지."""
+    idx = thesis.find(_LEVEL_REFRESH_TAG)
+    if idx >= 0:
+        return thesis[:idx].strip()
+    return thesis.strip()
+
+
 def merge_level_refresh(prev_row: dict, level: DossierLevelOutput) -> DossierOutput:
     """레벨-only 결과를 기존 도시에와 병합 — thesis·evidence 유지."""
     ev_raw = prev_row.get("evidence")
@@ -314,9 +325,9 @@ def merge_level_refresh(prev_row: dict, level: DossierLevelOutput) -> DossierOut
         ev = dict(ev_raw)
     else:
         ev = {}
-    thesis = str(prev_row.get("thesis") or "")
+    thesis = _strip_level_refresh_notes(str(prev_row.get("thesis") or ""))
     if level.level_note:
-        thesis = f"{thesis} [레벨갱신] {level.level_note}".strip()
+        thesis = f"{thesis} {_LEVEL_REFRESH_TAG} {level.level_note}".strip()
     return DossierOutput(
         stance=level.stance,
         thesis=thesis,

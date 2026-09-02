@@ -45,10 +45,10 @@ def wake_has_gap_scan(reason: str) -> bool:
 
 
 def _passes_intraday_floor(c: dict, floor: float) -> bool:
-    """intraday_ret_pct 우선, 없으면 풀 랭킹 fluctuation/decline_pct 로 1차 컷."""
+    """intraday_ret_pct(시가 대비) 우선. 있으면 전일대비 fluctuation 은 보지 않는다(백테 일치)."""
     ir = c.get("intraday_ret_pct")
-    if isinstance(ir, (int, float)) and ir <= floor:
-        return True
+    if isinstance(ir, (int, float)):
+        return ir <= floor
     for key in ("decline_pct", "fluctuation"):
         v = c.get(key)
         if isinstance(v, (int, float)) and v <= floor:

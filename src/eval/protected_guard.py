@@ -8,7 +8,8 @@ from typing import Any
 
 import yaml
 
-from ..eval_protocol import PROTECTED, can_promote
+from .labels import MIN_N
+from ..eval_protocol import can_promote
 
 # 코드 파일 → PROTECTED touch 키
 FILE_TOUCHES: dict[str, str] = {
@@ -138,9 +139,10 @@ def check_protected_changes(
     registry_path: Path | str = "data/eval_registry.json",
     experiment_id: str | None = None,
     pr_body: str | None = None,
-    evidence_n: int = 999,
+    evidence_n: int | None = None,
 ) -> tuple[bool, list[str]]:
     """PROTECTED touch 가 있으면 defect-fix 또는 can_promote 통과 필요."""
+    eff_n = MIN_N if evidence_n is None else evidence_n
     changed = git_changed_files(base_ref, head_ref)
     if not changed:
         return True, ["변경 파일 없음"]
@@ -171,7 +173,7 @@ def check_protected_changes(
     for touch in sorted(touches):
         ok, why = can_promote(
             change=touch,
-            evidence_n=evidence_n,
+            evidence_n=eff_n,
             registry_path=registry_path,
             experiment_id=exp_id,
         )

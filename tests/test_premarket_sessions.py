@@ -284,7 +284,7 @@ def test_example_config_yaml_brain_budget_schedule():
     assert cfg.brain_interval_sec == 0
     assert cfg.extra_wakes.get("KR") == (
         "08:00", "09:00", "11:00", "13:00", "15:15", "15:20", "19:50")
-    assert cfg.extra_wakes.get("US") == ("17:00", "22:30", "00:30", "02:30", "04:30")
+    assert cfg.extra_wakes.get("US") == ("04:00", "09:30", "11:30", "13:30", "15:30")
     assert cfg.extra_wake_grace_sec == 120
     assert cfg.extra_wake_window_min == 5
     assert "brain_wake_request" in (cfg.wake_request_path or "")

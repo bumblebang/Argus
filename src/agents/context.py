@@ -8,6 +8,9 @@ from __future__ import annotations
 import json
 import os
 import time
+from collections import Counter
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 
 from ..strategies import strategy_catalog
@@ -15,11 +18,190 @@ from ..logging_setup import get_logger
 
 log = get_logger("agents.context")
 
-# 제목만이라 토큰 부담이 작다 — 배치 뉴스(~110건) 전부 + 여유 200.
-# 한도에 걸려 잘리면 ntfy 로 알린다(쿨다운으로 스팸 방지).
+# scan: 배치 뉴스(~110건) 전부 + 여유. focus global headlines 는 select_headlines 가 macro 만.
 HEADLINE_LIMIT = 200
+_DEFAULT_FOCUS_MACRO_LIMIT = 12
+_DEFAULT_FOCUS_MACRO_PAD = 8
+_DEFAULT_HEADLINE_TTL_HOURS = 24.0
 _TRIM_STATE = Path(__file__).resolve().parents[2] / "data" / "headline_trim_notify.json"
 _TRIM_COOLDOWN_SEC = 6 * 3600
+
+
+def infer_market_from_symbol(symbol: str | None) -> str:
+    s = str(symbol or "").strip()
+    if s.isdigit() and len(s) == 6:
+        return "KR"
+    return "US"
+
+
+def classify_news_item(item: dict) -> str:
+    """KR | US | macro_kr | macro_us — headlines 랭킹·시장 필터용."""
+    sym = str(item.get("symbol") or "").strip()
+    src = str(item.get("source") or "")
+    if sym.isdigit() and len(sym) == 6:
+        return "KR"
+    if sym and not sym.isdigit():
+        return "US"
+    if "DART" in src or "dart" in src.lower():
+        return "KR"
+    if "Finnhub" in src:
+        return "macro_us" if "/" not in src else "US"
+    return "macro_kr"
+
+
+def infer_wake_market(wake: dict | None, candidates: list[dict] | None,
+                      triggers: list | None = None) -> str | None:
+    """focus headlines 시장 필터 — wake.market > 트리거 > 후보 다수결."""
+    w = wake or {}
+    if w.get("market"):
+        return str(w["market"]).upper()
+    mkts: set[str] = set()
+    for t in (triggers or w.get("triggers") or []):
+        if hasattr(t, "symbol"):
+            mkts.add(infer_market_from_symbol(getattr(t, "symbol", "")))
+            continue
+        if not isinstance(t, dict):
+            continue
+        if t.get("market"):
+            mkts.add(str(t["market"]).upper())
+        elif t.get("symbol") or t.get("stock_code"):
+            mkts.add(infer_market_from_symbol(
+                t.get("symbol") or t.get("stock_code")))
+    if len(mkts) == 1:
+        return next(iter(mkts))
+    if candidates:
+        counts = Counter(str(c.get("market") or "KR").upper() for c in candidates)
+        if counts:
+            return counts.most_common(1)[0][0]
+    return None
+
+
+def _parse_news_ts(item: dict) -> float | None:
+    """published/pubDate/date/rcept_dt → epoch. 실패 시 None( TTL 통과 처리)."""
+    for key in ("published", "pubDate", "date", "rcept_dt"):
+        raw = item.get(key)
+        if raw is None or raw == "":
+            continue
+        s = str(raw).strip()
+        if len(s) >= 8 and s[:8].isdigit() and "T" not in s and " " not in s:
+            try:
+                dt = datetime.strptime(s[:8], "%Y%m%d").replace(tzinfo=timezone.utc)
+                return dt.timestamp()
+            except ValueError:
+                pass
+        try:
+            if "T" in s or s.endswith("Z"):
+                dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+                return dt.timestamp()
+        except (TypeError, ValueError):
+            pass
+        try:
+            dt = parsedate_to_datetime(s)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.timestamp()
+        except (TypeError, ValueError, IndexError):
+            pass
+    return None
+
+
+def _news_fresh(item: dict, ttl_hours: float, now_ts: float) -> bool:
+    if ttl_hours <= 0:
+        return True
+    ts = _parse_news_ts(item)
+    if ts is None:
+        return True
+    return (now_ts - ts) <= ttl_hours * 3600
+
+
+def _compact_news_item(item: dict) -> dict:
+    return {"source": item.get("source"), "title": item.get("title"),
+            "symbol": item.get("symbol")}
+
+
+def _dedupe_append(out: list[dict], seen: set[tuple], item: dict, cap: int) -> bool:
+    """True if appended. cap 도달 시 False."""
+    if len(out) >= cap:
+        return False
+    key = (str(item.get("title") or ""), str(item.get("source") or ""),
+           str(item.get("symbol") or ""))
+    if key in seen:
+        return False
+    seen.add(key)
+    out.append(_compact_news_item(item))
+    return True
+
+
+def _priority_symbols(wake: dict | None, candidates: list[dict] | None) -> set[str]:
+    syms: set[str] = set()
+    w = wake or {}
+    for t in w.get("triggers") or []:
+        if isinstance(t, dict):
+            s = t.get("symbol") or t.get("stock_code")
+            if s:
+                syms.add(str(s))
+    for c in candidates or []:
+        s = c.get("symbol")
+        if s:
+            syms.add(str(s))
+    return syms
+
+
+def select_headlines(news: list[dict], *,
+                     tier: str = "scan",
+                     limit: int | None = None,
+                     wake: dict | None = None,
+                     candidates: list[dict] | None = None,
+                     ttl_hours: float = _DEFAULT_HEADLINE_TTL_HOURS,
+                     focus_macro_pad: int = _DEFAULT_FOCUS_MACRO_PAD,
+                     notify_trim: bool = True,
+                     now_ts: float | None = None) -> list[dict]:
+    """티어별 headlines 선택.
+
+    scan: TTL 필터 후 배치 순서 상한(기본 200). 초과 시 notify_trim 이면 ntfy.
+    focus: global 은 macro 위주(종목 뉴스는 candidates[].news·온디맨드).
+      KR focus → macro_kr 우선 + macro_us pad(기본 8). US 종목 헤드라인 제외.
+    """
+    raw = list(news or [])
+    now = time.time() if now_ts is None else now_ts
+    fresh = [n for n in raw if _news_fresh(n, ttl_hours, now)]
+
+    if tier == "focus":
+        lim = _DEFAULT_FOCUS_MACRO_LIMIT if limit is None else int(limit)
+        if lim <= 0:
+            return []
+        mkt = infer_wake_market(wake, candidates)
+        pad = max(0, min(int(focus_macro_pad), lim))
+        macro_kr = [n for n in fresh if classify_news_item(n) == "macro_kr"]
+        macro_us = [n for n in fresh if classify_news_item(n) == "macro_us"]
+        out: list[dict] = []
+        seen: set[tuple] = set()
+        if mkt == "US":
+            primary, cross = macro_us, macro_kr
+            cross_n = min(pad, max(0, lim // 4))
+        elif mkt == "KR":
+            primary, cross = macro_kr, macro_us
+            cross_n = min(pad, lim)
+        else:
+            primary = macro_kr + macro_us
+            cross, cross_n = [], 0
+        room_primary = max(0, lim - cross_n)
+        for n in primary:
+            if len(out) >= room_primary:
+                break
+            _dedupe_append(out, seen, n, room_primary)
+        for n in cross:
+            if len(out) >= lim:
+                break
+            _dedupe_append(out, seen, n, lim)
+        return out[:lim]
+
+    lim = HEADLINE_LIMIT if limit is None else int(limit)
+    if len(fresh) > lim and notify_trim:
+        _notify_headline_trim(len(fresh), lim)
+    return [_compact_news_item(n) for n in fresh[:lim]]
 
 
 def _notify_headline_trim(total: int, limit: int) -> None:
@@ -56,11 +238,8 @@ def _notify_headline_trim(total: int, limit: int) -> None:
 
 
 def _trim_news(news: list[dict], limit: int = HEADLINE_LIMIT) -> list[dict]:
-    raw = news or []
-    if len(raw) > limit:
-        _notify_headline_trim(len(raw), limit)
-    return [{"source": n.get("source"), "title": n.get("title"), "symbol": n.get("symbol")}
-            for n in raw[:limit]]
+    """하위호환 — scan 경로 select_headlines 위임."""
+    return select_headlines(news, tier="scan", limit=limit)
 
 
 def build_context(market_state: dict, candidates: list[dict], portfolio: dict,
@@ -70,7 +249,11 @@ def build_context(market_state: dict, candidates: list[dict], portfolio: dict,
                   focus: dict | None = None,
                   wake: dict | None = None,
                   *,
+                  tier: str = "scan",
                   headline_limit: int | None = None,
+                  headline_ttl_hours: float = _DEFAULT_HEADLINE_TTL_HOURS,
+                  focus_macro_pad: int = _DEFAULT_FOCUS_MACRO_PAD,
+                  notify_headline_trim: bool = True,
                   compact: bool = False) -> str:
     """candidates: [{symbol,name,market,price,ma20,rsi,momentum,fundamentals,flows,news[],strategy_fit?}]
 
@@ -80,11 +263,17 @@ def build_context(market_state: dict, candidates: list[dict], portfolio: dict,
     '오늘 무엇에 집중할지' — 없으면 평소처럼 regime·dossier·수급으로 판단.
     wake(선택): 이번 사이클을 깨운 사유(reason)와 트리거 요약 — periodic/vol_spike/
     regime_flip/disclosure 등. 없으면 정기 각성으로 보면 된다.
-    headline_limit: None 이면 HEADLINE_LIMIT. focus 티어에서 더 세게 자를 때 사용.
-    compact: True 면 indent 없이 직렬화(토큰/바이트 절약, 의미 동일).
+    tier: scan | focus — headlines 선택 정책.
+    headline_limit: None 이면 scan=HEADLINE_LIMIT, focus=12(macro). 0 이면 focus global off.
+    notify_headline_trim: focus 기본 False(config).
+    compact: True 면 indent 없이 직렬화(토큰/바이트 절약, meaning 동일).
     """
     ms = market_state or {}
-    lim = HEADLINE_LIMIT if headline_limit is None else int(headline_limit)
+    if tier == "focus":
+        lim = (_DEFAULT_FOCUS_MACRO_LIMIT if headline_limit is None
+               else int(headline_limit))
+    else:
+        lim = HEADLINE_LIMIT if headline_limit is None else int(headline_limit)
     ctx = {
         "asof": ms.get("asof"),
         "market": {
@@ -97,8 +286,16 @@ def build_context(market_state: dict, candidates: list[dict], portfolio: dict,
             "fx": ms.get("fx"),
             "flows_market": ms.get("flows_market"),
         },
-        "headlines": _trim_news(ms.get("news", []), limit=lim),
-        # 뇌가 전략·파라미터를 고를 때 참고할 도구 출력(전략 카탈로그 + 후보별 strategy_fit).
+        "headlines": select_headlines(
+            ms.get("news", []),
+            tier=tier,
+            limit=lim,
+            wake=wake,
+            candidates=candidates,
+            ttl_hours=headline_ttl_hours,
+            focus_macro_pad=focus_macro_pad,
+            notify_trim=notify_headline_trim,
+        ),
         "strategies": strategy_catalog(),
         "candidates": candidates,
         "portfolio": portfolio,
@@ -111,9 +308,9 @@ def build_context(market_state: dict, candidates: list[dict], portfolio: dict,
     if track_record:
         ctx["track_record"] = track_record
     if recent_disclosures:
-        ctx["recent_disclosures"] = recent_disclosures   # 워처가 잡은 최근 중대 공시
+        ctx["recent_disclosures"] = recent_disclosures
     if earnings_results:
-        ctx["earnings_results"] = earnings_results       # 발표된 실적의 컨센서스 대비 편차
+        ctx["earnings_results"] = earnings_results
     if compact:
         return json.dumps(ctx, ensure_ascii=False, separators=(",", ":"))
     return json.dumps(ctx, ensure_ascii=False, indent=2)

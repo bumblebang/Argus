@@ -39,17 +39,18 @@ def test_loop_consumes_wake_when_markets_closed(tmp_path, monkeypatch):
     import src.engine.loop as loop_mod
     monkeypatch.setattr(loop_mod, "is_tradable", lambda *a, **k: False)
 
-    wakes: list[str] = []
+    wakes: list[tuple] = []
     store = Store(tmp_path / "bot.db")
     req = tmp_path / "wake.json"
     request_brain_wake(reason="athena_done", market="KR", path=req)
 
     cfg = WatchConfig(wake_request_path=str(req), brain_interval_sec=0)
     loop = WatchLoop(_FakeGW(), store, lambda: {}, markets=("KR",),
-                     config=cfg, on_wake=lambda r, t: wakes.append(r))
+                     config=cfg,
+                     on_wake=lambda r, t, *, at=None, market=None: wakes.append((r, market)))
     res = loop.run_once()
     assert res.woke is True
-    assert wakes == ["athena_done"]
+    assert wakes == [("athena_done", "KR")]
     assert not req.exists()
 
 

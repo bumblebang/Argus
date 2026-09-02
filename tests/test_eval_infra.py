@@ -155,6 +155,23 @@ def test_hold_policy_is_zero(tmp_path):
     assert policy_return("BUY", lab["fwd_ret"]) == pytest.approx(0.10, abs=1e-6)
 
 
+def test_exit_close_on_calendar_respects_market_tz():
+    """US exit horizon 은 ET 날짜 — KST 고정이면 entry 경계에서 하루 어긋날 수 있다."""
+    from datetime import datetime, timezone
+
+    from src.shadow_ledger import exit_close_on_calendar, KST
+
+    series = [
+        (datetime(2026, 1, 9, tzinfo=KST), 100.0),
+        (datetime(2026, 1, 10, tzinfo=KST), 105.0),
+        (datetime(2026, 1, 11, tzinfo=KST), 110.0),
+    ]
+    # 2026-01-10 04:00 UTC = Jan 9 23:00 ET / Jan 10 13:00 KST
+    entry_ts = datetime(2026, 1, 10, 4, 0, tzinfo=timezone.utc).timestamp()
+    assert exit_close_on_calendar(series, entry_ts, 1, market="US") == 105.0
+    assert exit_close_on_calendar(series, entry_ts, 1, market="KR") == 110.0
+
+
 def test_target_hit_before_stop_labels(tmp_path):
     data = _history(tmp_path)
     hit = target_hit_before_stop(

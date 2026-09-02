@@ -501,16 +501,22 @@ class CycleRunner:
         ers = self._recent_earnings_results()
         hl_lim = scfg.get("focus_headline_limit") if tier == "focus" else None
         compact = bool(scfg.get("compact_json")) and tier == "focus"
+        wake_ctx = (wake if wake and (wake.get("reason") or wake.get("triggers"))
+                    else None)
+        notify_hl = bool(scfg.get("focus_trim_notify", False)) if tier == "focus" else True
         context = build_context(ms, candidates, portfolio, constraints,
                                 track_record=(track_record(self.store)
                                               if self.store else None),
                                 recent_disclosures=discs,
                                 earnings_results=ers,
                                 focus=focus,
-                                wake=(wake if wake and (wake.get("reason")
-                                                        or wake.get("triggers"))
-                                      else None),
+                                wake=wake_ctx,
+                                tier=tier,
                                 headline_limit=hl_lim,
+                                headline_ttl_hours=float(
+                                    scfg.get("headline_ttl_hours", 24)),
+                                focus_macro_pad=int(scfg.get("focus_macro_pad", 8)),
+                                notify_headline_trim=notify_hl,
                                 compact=compact)
         if self.store:
             try:

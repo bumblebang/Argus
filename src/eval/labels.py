@@ -10,14 +10,28 @@ P2: Proposal.p_target_before_stop (선택) vs 도시레 target/invalidation 으�
 from __future__ import annotations
 
 import math
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from zoneinfo import ZoneInfo
 
+from ..market_hours import _SESSIONS
 from ..shadow_ledger import (KST, exit_close_on_calendar, horizon_calendar_days,
                              load_daily_series)
 
 MIN_N = 20
+
+
+def symbol_market(symbol: str) -> str:
+    """KR 6자리 vs 그 외 US."""
+    s = str(symbol or "")
+    return "KR" if s.isdigit() and len(s) == 6 else "US"
+
+
+def asof_local_date(asof: datetime, market: str) -> date:
+    """판단일을 해당 시장 타임존 날짜로."""
+    tzname = _SESSIONS.get(market, ("Asia/Seoul",))[0]
+    return asof.astimezone(ZoneInfo(tzname)).date()
 
 
 def parse_asof(ts) -> datetime | None:
@@ -43,10 +57,10 @@ def parse_asof(ts) -> datetime | None:
 
 
 def close_on_or_before(series: list[tuple[datetime, float]],
-                       asof: datetime) -> float | None:
+                       asof: datetime, *, market: str = "KR") -> float | None:
     if not series:
         return None
-    asof_d = asof.astimezone(KST).date()
+    asof_d = asof_local_date(asof, market)
     best = None
     for d, c in series:
         if d.date() <= asof_d:
@@ -62,14 +76,15 @@ def forward_return(data_dir: Path | str, symbol: str, asof, *,
     """판단일 종가 대비 horizon 종가 수익률(소수). 데이터 없으면 ret=None."""
     data_dir = Path(data_dir)
     dt = parse_asof(asof)
+    mkt = symbol_market(symbol)
     days = horizon_calendar_days(horizon, cfg)
     series = load_daily_series(data_dir, symbol)
     if dt is None or not series:
         return {"fwd_ret": None, "entry": None, "exit": None,
                 "horizon_days": days, "symbol": symbol}
-    entry = close_on_or_before(series, dt)
+    entry = close_on_or_before(series, dt, market=mkt)
     entry_ts = dt.timestamp()
-    exit_px = exit_close_on_calendar(series, entry_ts, days)
+    exit_px = exit_close_on_calendar(series, entry_ts, days, market=mkt)
     ret = None
     if entry and entry > 0 and exit_px is not None:
         ret = exit_px / entry - 1.0
@@ -135,12 +150,13 @@ def target_hit_before_stop(data_dir: Path | str, symbol: str, asof, *,
     if dt is None:
         out["reason"] = "no_asof"
         return out
+    mkt = symbol_market(symbol)
     days = horizon_calendar_days(horizon, cfg)
     bars = _load_ohlc(Path(data_dir), symbol)
     if not bars:
         out["reason"] = "no_bars"
         return out
-    start = dt.astimezone(KST).date()
+    start = asof_local_date(dt, mkt)
     end = start + timedelta(days=days)
     for d, high, low, _c in bars:
         day = d.date()

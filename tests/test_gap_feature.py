@@ -166,6 +166,17 @@ def test_filter_gap_rebound_keeps_held():
     assert syms == {"A", "B", "C"}
 
 
+def test_filter_gap_rebound_intraday_blocks_fluctuation_or():
+    """intraday 가 있으면 fluctuation OR 폴백 금지 — 백테(시가 대비)와 일치."""
+    from src.agents.features import filter_gap_rebound_candidates
+    cands = [
+        {"symbol": "A", "intraday_ret_pct": -3.0, "fluctuation": -8.0},
+        {"symbol": "B", "intraday_ret_pct": -6.0, "fluctuation": -3.0},
+    ]
+    out = filter_gap_rebound_candidates(cands)
+    assert [c["symbol"] for c in out] == ["B"]
+
+
 def test_filter_gap_rebound_fluctuation_fallback():
     """캔들 실패로 intraday 없을 때 풀 fluctuation 으로 -5% 컷."""
     from src.agents.features import filter_gap_rebound_candidates

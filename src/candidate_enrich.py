@@ -87,8 +87,9 @@ def enrich_candidates(
         need_f.append(sym)
 
     if enrich_fundamentals and need_f:
-        ordered = [c["symbol"] for c in _sort_for_enrich(
-            [x for x in candidates if x.get("symbol") in need_f])]
+        need_set = set(need_f)
+        ordered = [str(c.get("symbol") or "") for c in _sort_for_enrich(
+            [x for x in candidates if str(x.get("symbol") or "") in need_set])]
         cap = gap_enrich_max if gap_scan else patch_missing_max
         to_fetch = ordered[:max(0, cap)]
         if to_fetch:
@@ -96,18 +97,21 @@ def enrich_candidates(
             stats["fundamentals"] += patch_fundamentals(candidates, got)
 
     if enrich_flows:
-        need_flow = [
-            str(c["symbol"]) for c in candidates
-            if c.get("market", "KR") == "KR"
-            and not c.get("flows")
-            and not (ms.get("flows") or {}).get(c.get("symbol"))
-        ]
+        ms_flows = ms.get("flows") or {}
+        need_flow: list[str] = []
+        for c in candidates:
+            sym = str(c.get("symbol") or "")
+            if not sym or c.get("market", "KR") != "KR":
+                continue
+            if c.get("flows") or ms_flows.get(sym):
+                continue
+            need_flow.append(sym)
         if gap_scan:
             flow_syms = need_flow[:gap_enrich_max]
         else:
             flow_syms = [
-                c["symbol"] for c in _sort_for_enrich(candidates)
-                if c.get("symbol") in need_flow
+                str(c.get("symbol") or "") for c in _sort_for_enrich(candidates)
+                if str(c.get("symbol") or "") in need_flow
             ][:patch_missing_max]
         if flow_syms:
             try:
