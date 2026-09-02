@@ -257,8 +257,13 @@ def top_by_trading_value(market: str = "KR", count: int = 20, pool: int = 100,
     return ranked[:count]
 
 
+# Yahoo most_actives count 상한 — 300 요청 시 빈 응답(실측). core_size 100 이면 250 이면 충분.
+_YAHOO_ACTIVES_MAX = 250
+
+
 def fetch_us_actives(pool: int = 50) -> list[dict]:
     """Yahoo 거래량 상위(most_actives) pool개. 거래대금=price×volume 으로 환산해 담는다."""
+    pool = min(int(pool), _YAHOO_ACTIVES_MAX)
     r = requests.get(YAHOO_SCREENER, params={"scrIds": "most_actives", "count": pool},
                      headers={"User-Agent": "Mozilla/5.0"}, timeout=12)
     if not r.text.strip().startswith("{"):

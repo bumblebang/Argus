@@ -28,10 +28,10 @@ groups:
         path: [screener, liquidity_core, core_size]
         value: 100
 
-      - id: liquidity_discover_pool_300
+      - id: liquidity_discover_pool_250
         type: config_eq
         path: [screener, liquidity_core, discover_pool]
-        value: 300
+        value: 250
 
       - id: liquidity_rank_discovery_tv
         type: config_eq
