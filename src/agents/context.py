@@ -257,9 +257,36 @@ def _parse_iso_epoch(raw) -> float | None:
         return None
 
 
+# 느린 슬롯 — scripts/build_market_state.py 전량 빌드 시각(batch_asof)으로만 갱신.
+_SLOW_SLOTS = (
+    "fundamentals", "news", "flows", "sectors", "fx", "warnings",
+    "positioning", "short_market", "foreign_exhaustion", "index_constituents",
+)
+# 장중 fast slice 가 갱신하는 슬롯 — 블록 자체 asof 사용.
+_FAST_SLOT_KEYS = ("macro", "macro_kr", "vkospi", "program_flows", "sentiment")
+SLOW_SLOT_STALE_HOURS = 24.0
+
+
+def _slot_has_content(block) -> bool:
+    if isinstance(block, dict):
+        return bool(block)
+    if isinstance(block, list):
+        return bool(block)
+    return block is not None
+
+
+def _age_sec(raw, now_ts: float | None = None) -> float | None:
+    ep = _parse_iso_epoch(raw)
+    if ep is None:
+        return None
+    ts = time.time() if now_ts is None else float(now_ts)
+    return round(ts - ep, 1)
+
+
 def _slot_freshness(ms: dict) -> dict:
     """market_state 슬롯별 asof(있는 것만)."""
     slots: dict = {}
+    batch = ms.get("batch_asof")
     regime = ms.get("regime") or {}
     if isinstance(regime, dict):
         for m, v in regime.items():
@@ -268,10 +295,14 @@ def _slot_freshness(ms: dict) -> dict:
     fm = ms.get("flows_market") or {}
     if isinstance(fm, dict) and fm.get("asof"):
         slots["flows_market"] = fm["asof"]
-    for key in ("macro", "macro_kr", "vkospi", "program_flows", "sentiment"):
+    for key in _FAST_SLOT_KEYS:
         block = ms.get(key)
         if isinstance(block, dict) and block.get("asof"):
             slots[key] = block["asof"]
+    if batch:
+        for key in _SLOW_SLOTS:
+            if _slot_has_content(ms.get(key)):
+                slots[key] = batch
     return slots
 
 
@@ -295,14 +326,26 @@ def build_clock(markets: tuple[str, ...] = ("KR", "US"),
 
 def build_freshness(ms: dict, *,
                     strategy_scores_asof: float | None = None,
-                    strategy_scores_stale: bool = False) -> dict:
-    batch = ms.get("batch_asof") or ms.get("asof")
+                    strategy_scores_stale: bool = False,
+                    now_ts: float | None = None,
+                    stale_hours: float = SLOW_SLOT_STALE_HOURS) -> dict:
+    """느린 슬롯 신선도 — batch_asof 만 신뢰(asof 폴백 금지: fast slice 가 덮어씀)."""
+    batch = ms.get("batch_asof")
     fast = ms.get("fast_asof")
+    batch_age = _age_sec(batch, now_ts)
     out: dict = {
         "batch_asof": batch,
         "fast_asof": fast,
         "slots": _slot_freshness(ms or {}),
     }
+    if batch_age is not None:
+        out["batch_asof_age_sec"] = batch_age
+    fast_age = _age_sec(fast, now_ts)
+    if fast_age is not None:
+        out["fast_asof_age_sec"] = fast_age
+    stale_sec = float(stale_hours) * 3600.0
+    if batch is None or (batch_age is not None and batch_age > stale_sec):
+        out["batch_asof_stale"] = True
     if strategy_scores_asof is not None:
         out["strategy_scores_asof"] = strategy_scores_asof
     if strategy_scores_stale:
@@ -356,6 +399,7 @@ def build_context(market_state: dict, candidates: list[dict], portfolio: dict,
             ms,
             strategy_scores_asof=strategy_scores_asof,
             strategy_scores_stale=strategy_scores_stale,
+            now_ts=ts,
         ),
         "market": {
             "regime": ms.get("regime"),

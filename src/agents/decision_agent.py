@@ -34,6 +34,8 @@ SYSTEM = """\
   minutes_to_close 가 있으면 정규장 종료까지 남은 분이다(마감 직전 신규 BUY 는 보수적으로).
 - freshness.batch_asof 는 느린 슬롯(fundamentals/news/flows/sectors) 전량 빌드 시각,
   freshness.fast_asof 는 regime/sentiment/markets 장중 갱신 시각이다. 루트 asof 만 보지 마라.
+- freshness.batch_asof_stale=true 이거나 batch_asof 가 null 이면 fundamentals/news/flows/
+  sectors 및 freshness.slots 의 느린 슬롯을 신뢰·인용하지 마라.
 - freshness.slots.* 의 asof 가 24시간보다 오래됐거나 freshness.strategy_scores_stale=true 이면
   해당 슬롯·strategy_fit.best 를 신뢰하지 말고 인용하지 마라.
 - strategy_fit.thin_sample=true 이면 백테스트 표본이 얇다 — best 전략 배정 근거로 쓰지 마라.

@@ -159,6 +159,60 @@ def run_migrate(*, apply: bool) -> int:
     return 0
 
 
+def check_market_state_freshness(root: Path) -> None:
+    """batch_asof — fast slice 가 asof 를 덮어 fast slice 시각으로 착각하지 않게 검사."""
+    from src.market_state import MarketState
+    from src.agents.context import build_freshness, SLOW_SLOT_STALE_HOURS
+
+    ms_path = root / "data" / "market_state.json"
+    if not ms_path.is_file():
+        _warn("market_state", "data/market_state.json 없음 — argus market-state 실행")
+        return
+    try:
+        ms = MarketState.load(ms_path).to_dict()
+    except Exception as e:
+        _warn("market_state", f"읽기 실패: {e}")
+        return
+    fr = build_freshness(ms)
+    batch = fr.get("batch_asof")
+    if batch is None:
+        _warn(
+            "market_state",
+            "batch_asof 없음 — 업그레이드 직후이거나 전량 빌드 전. "
+            "argus market-state 1회 후 watch 기동",
+        )
+        return
+    age = fr.get("batch_asof_age_sec")
+    if fr.get("batch_asof_stale"):
+        hrs = SLOW_SLOT_STALE_HOURS
+        _warn(
+            "market_state",
+            f"batch_asof {int(age or 0)}s 경과(>{hrs}h) — fundamentals 등 느린 슬롯 stale. "
+            "argus market-state 재실행",
+        )
+    else:
+        _ok("market_state", f"batch_asof fresh ({int(age or 0)}s)")
+
+
+def check_risk_capital(cfg) -> None:
+    from src.risk_gate import capital_coverage_gaps, _normalize_capital
+
+    risk_cfg = cfg.raw.get("risk") or {}
+    broker = cfg.raw.get("broker") or {}
+    live_markets = broker.get("live_markets", ["KR"])
+    universe_markets = [str(m).upper() for m in (cfg.universe or {}).keys()]
+    trade_markets = sorted({str(m).upper() for m in live_markets} | set(universe_markets))
+    norm = _normalize_capital(risk_cfg.get("capital", {}))
+    for m in capital_coverage_gaps(risk_cfg.get("capital", {}), trade_markets):
+        _warn(
+            "risk.capital",
+            f"{m} 없음 — 일손실·DD·비중·총노출·섹터 한도 비활성",
+        )
+    for m in trade_markets:
+        if m in norm and norm[m] <= 0:
+            _warn("risk.capital", f"{m}=0 — 한도 비활성")
+
+
 def check_research_boundary() -> None:
     """Phase 4: data/quant_review 잔여·research README."""
     from src import research_boundary as rb
@@ -282,6 +336,16 @@ def main(argv: list[str] | None = None) -> int:
         check_research_boundary()
     except Exception as e:
         _warn("research", f"경계 점검 실패: {e}")
+
+    try:
+        check_market_state_freshness(ROOT)
+    except Exception as e:
+        _warn("market_state", f"신선도 점검 실패: {e}")
+
+    try:
+        check_risk_capital(cfg)
+    except Exception as e:
+        _warn("risk.capital", f"점검 실패: {e}")
 
     if _filled("TOSS_CLIENT_ID") and _filled("TOSS_CLIENT_SECRET"):
         _ok("toss keys", "CLIENT_ID/SECRET 있음")

@@ -584,7 +584,7 @@ class CycleRunner:
                         return None
 
                 fast_asof = ms.get("fast_asof") or ms.get("asof")
-                batch_asof = ms.get("batch_asof") or ms.get("asof")
+                batch_asof = ms.get("batch_asof")
                 self.store.log_event("brain_serve", None, {
                     "tier": tier,
                     "n_candidates": len(candidates),

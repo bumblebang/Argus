@@ -432,8 +432,16 @@ def test_capital_keys_normalized_upper(tmp_path):
     assert gate._cap("kr") == 1_000_000
 
 
-def test_missing_capital_market_skips_five_limits(tmp_path):
+def test_missing_capital_market_skips_five_limits(tmp_path, caplog):
     """capital 에 없는 시장은 base=0 — 일손실·DD·비중·총노출·섹터 전부 스킵."""
+    import logging
+    from src.risk_gate import capital_coverage_gaps, warn_capital_coverage
+
+    assert capital_coverage_gaps({"KR": 1_000_000}, ["KR", "US"]) == ["US"]
+    with caplog.at_level(logging.WARNING, logger="risk.gate"):
+        warn_capital_coverage({"KR": 1_000_000}, ["US"])
+    assert any("capital[US]" in r.message for r in caplog.records)
+
     smap = {"AAPL": "테크"}
     gate = _gate(
         tmp_path,

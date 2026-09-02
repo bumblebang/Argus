@@ -17,7 +17,7 @@ from ..logging_setup import get_logger
 from ..strategies import REGISTRY, validate_params
 from ..paper_account import PaperAccount
 from ..risk import RiskManager, risk_manager_from_cfg
-from ..risk_gate import RiskGate
+from ..risk_gate import RiskGate, warn_capital_coverage
 from ..broker import Broker
 from ..datasources.earnings import dday_of
 from . import (LLMClient, ClaudeCLIClient, MockLLM,
@@ -109,6 +109,9 @@ def build_paper_core(cfg: AppConfig, *, live_client=None, account_seq=None,
     broker_cfg = cfg.raw.get("broker", {}) or {}
     mode = broker_cfg.get("mode", "paper")
     live_markets = broker_cfg.get("live_markets", ["KR"])
+    universe_markets = [str(m).upper() for m in (cfg.universe or {}).keys()]
+    trade_markets = sorted({str(m).upper() for m in live_markets} | set(universe_markets))
+    warn_capital_coverage(risk_cfg.get("capital", {}), trade_markets)
     # 라이브 집행 파라미터(마켓터블 리밋 슬리피지 상한·체결 대사 폴링). config 미지정 시 기본.
     live_kw = dict(
         limit_slippage_pct=float(broker_cfg.get("limit_slippage_pct", 0.01)),
