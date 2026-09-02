@@ -35,6 +35,34 @@ def _resolve_market(market_fn, symbol: str) -> str | None:
     return str(m) if m else None
 
 
+def _fill_proposal_prices(decision: DecisionOutput, price_lookup: dict[str, float],
+                          resolve_price_fn) -> None:
+    """shortlist 밖 제안 심볼 등 price_lookup 누락분을 집행 직전 보강."""
+    if not resolve_price_fn:
+        return
+    for p in decision.proposals:
+        if p.side == "HOLD":
+            continue
+        sym = p.symbol
+        try:
+            px = float(price_lookup.get(sym) or 0)
+        except (TypeError, ValueError):
+            px = 0.0
+        if px > 0:
+            continue
+        try:
+            got = resolve_price_fn(sym, p.market)
+        except Exception as e:
+            log.warning("[%s] 제안가격 조회 실패: %s", sym, e)
+            continue
+        try:
+            v = float(got)
+        except (TypeError, ValueError):
+            continue
+        if v > 0:
+            price_lookup[sym] = v
+
+
 def _already_held(broker, store, symbol: str) -> bool:
     """broker 원장 또는 store open 행 — 피라미딩 차단(allow_add=False 일 때)."""
     if broker.position(symbol).qty > 0:
@@ -115,7 +143,8 @@ def run_cycle(*, context_json: str, decision_agent, validation_agent, broker, ri
               allow_add: bool = False,
               tranche_weights: dict[str, float] | None = None,
               budget_caps: dict[str, float] | None = None,
-              wake_reason: str = "") -> CycleResult:
+              wake_reason: str = "",
+              resolve_price_fn=None) -> CycleResult:
     """결정→검증→집행. 데이트레(horizon='day') BUY 는 즉시 체결 대신 arm_fn 으로 라우팅.
 
     arm_fn(proposal, price)->bool 이 주어지면 day BUY 는 진입대기(armed)로 등록하고
@@ -160,6 +189,7 @@ def run_cycle(*, context_json: str, decision_agent, validation_agent, broker, ri
         log.info("확신도 코드 %s", conv_audit)
     validation = validation_agent.review(context_json, decision)
     verdict_by_sym = {v.symbol: v for v in validation.verdicts}
+    _fill_proposal_prices(decision, price_lookup, resolve_price_fn)
 
     executed: list[dict] = []
     try:

@@ -225,15 +225,21 @@ def select_scan_candidates(
             })
             chosen_syms.add(s)
 
+    pad_eligible = [
+        s for s in by_sym
+        if s not in chosen_syms and pad_score(scores or {}, s) > float("-inf")]
     ranked_pad = sorted(
-        (s for s in by_sym if s not in chosen_syms),
+        pad_eligible,
         key=lambda sym: pad_score(scores or {}, sym),
         reverse=True,
     )
     if cap:
         room = max(0, cap - len(chosen))
     else:
-        room = len(ranked_pad)
+        room = len(by_sym) - len(chosen_syms)
+    if room > 0 and not ranked_pad:
+        # scores stale·thin_sample 전부 — pad 는 유니버스 순(점수 pad off)
+        ranked_pad = [s for s in by_sym if s not in chosen_syms]
     for s in ranked_pad[:room]:
         chosen.append(by_sym[s])
         chosen_syms.add(s)

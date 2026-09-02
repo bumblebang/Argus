@@ -16,6 +16,10 @@ from pathlib import Path
 @dataclass
 class MarketState:
     asof: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    # batch_asof: scripts/build_market_state.py 전량 빌드 시각.
+    # fast_asof: live_slice 장중 갱신 시각. asof 는 하위호환(마지막 save 시각).
+    batch_asof: str | None = None
+    fast_asof: str | None = None
     fx: dict = field(default_factory=dict)        # {"USDKRW": 1380.5}
     regime: dict = field(default_factory=dict)    # {"KR": {"label": "risk_on", ...}, "US": {...}}
     sessions: dict = field(default_factory=dict)  # {"KR": {...calendar...}, "US": {...}}

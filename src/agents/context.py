@@ -12,6 +12,7 @@ from collections import Counter
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from ..strategies import strategy_catalog
 from ..logging_setup import get_logger
@@ -204,6 +205,11 @@ def select_headlines(news: list[dict], *,
     return [_compact_news_item(n) for n in fresh[:lim]]
 
 
+def _trim_news(news: list[dict], *, limit: int = HEADLINE_LIMIT) -> list[dict]:
+    """scan-tier headlines 상한(레거시 테스트·호출 호환)."""
+    return select_headlines(news, tier="scan", limit=limit)
+
+
 def _notify_headline_trim(total: int, limit: int) -> None:
     """헤드라인이 한도에 잘렸을 때 로그 + ntfy(토픽 없으면 로그만). 6h 쿨다운."""
     log.warning("헤드라인 한도 초과 — 전체 %d건 중 앞 %d건만 뇌에 전달", total, limit)
@@ -237,9 +243,71 @@ def _notify_headline_trim(total: int, limit: int) -> None:
         pass
 
 
-def _trim_news(news: list[dict], limit: int = HEADLINE_LIMIT) -> list[dict]:
-    """하위호환 — scan 경로 select_headlines 위임."""
-    return select_headlines(news, tier="scan", limit=limit)
+def _parse_iso_epoch(raw) -> float | None:
+    if raw is None:
+        return None
+    if isinstance(raw, (int, float)):
+        return float(raw)
+    try:
+        dt = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.timestamp()
+    except (TypeError, ValueError):
+        return None
+
+
+def _slot_freshness(ms: dict) -> dict:
+    """market_state 슬롯별 asof(있는 것만)."""
+    slots: dict = {}
+    regime = ms.get("regime") or {}
+    if isinstance(regime, dict):
+        for m, v in regime.items():
+            if isinstance(v, dict) and v.get("asof"):
+                slots[f"regime.{m}"] = v["asof"]
+    fm = ms.get("flows_market") or {}
+    if isinstance(fm, dict) and fm.get("asof"):
+        slots["flows_market"] = fm["asof"]
+    for key in ("macro", "macro_kr", "vkospi", "program_flows", "sentiment"):
+        block = ms.get(key)
+        if isinstance(block, dict) and block.get("asof"):
+            slots[key] = block["asof"]
+    return slots
+
+
+def build_clock(markets: tuple[str, ...] = ("KR", "US"),
+                now_ts: float | None = None) -> dict:
+    """세션 phase + 정규장 minutes_to_close(가능할 때만)."""
+    from ..market_hours import current_session, last_session_end_ts
+
+    ts = time.time() if now_ts is None else float(now_ts)
+    out: dict = {}
+    for m in markets:
+        phase = current_session(m, ts)
+        entry: dict = {"phase": phase}
+        if phase == "regular":
+            end = last_session_end_ts(m, ("regular",), ts)
+            if end is not None:
+                entry["minutes_to_close"] = max(0, int((end - ts) // 60))
+        out[m] = entry
+    return out
+
+
+def build_freshness(ms: dict, *,
+                    strategy_scores_asof: float | None = None,
+                    strategy_scores_stale: bool = False) -> dict:
+    batch = ms.get("batch_asof") or ms.get("asof")
+    fast = ms.get("fast_asof")
+    out: dict = {
+        "batch_asof": batch,
+        "fast_asof": fast,
+        "slots": _slot_freshness(ms or {}),
+    }
+    if strategy_scores_asof is not None:
+        out["strategy_scores_asof"] = strategy_scores_asof
+    if strategy_scores_stale:
+        out["strategy_scores_stale"] = True
+    return out
 
 
 def build_context(market_state: dict, candidates: list[dict], portfolio: dict,
@@ -254,7 +322,10 @@ def build_context(market_state: dict, candidates: list[dict], portfolio: dict,
                   headline_ttl_hours: float = _DEFAULT_HEADLINE_TTL_HOURS,
                   focus_macro_pad: int = _DEFAULT_FOCUS_MACRO_PAD,
                   notify_headline_trim: bool = True,
-                  compact: bool = False) -> str:
+                  compact: bool = False,
+                  now_ts: float | None = None,
+                  strategy_scores_asof: float | None = None,
+                  strategy_scores_stale: bool = False) -> str:
     """candidates: [{symbol,name,market,price,ma20,rsi,momentum,fundamentals,flows,news[],strategy_fit?}]
 
     track_record(선택): 라이브 성과 귀속(전략별 승률/최근 거래/결정 통계) — 뇌가 자기
@@ -269,13 +340,23 @@ def build_context(market_state: dict, candidates: list[dict], portfolio: dict,
     compact: True 면 indent 없이 직렬화(토큰/바이트 절약, meaning 동일).
     """
     ms = market_state or {}
+    ts = time.time() if now_ts is None else float(now_ts)
     if tier == "focus":
         lim = (_DEFAULT_FOCUS_MACRO_LIMIT if headline_limit is None
                else int(headline_limit))
     else:
         lim = HEADLINE_LIMIT if headline_limit is None else int(headline_limit)
+    now_iso = datetime.fromtimestamp(ts, tz=timezone.utc).astimezone(
+        ZoneInfo("Asia/Seoul")).isoformat()
     ctx = {
+        "now": now_iso,
         "asof": ms.get("asof"),
+        "clock": build_clock(now_ts=ts),
+        "freshness": build_freshness(
+            ms,
+            strategy_scores_asof=strategy_scores_asof,
+            strategy_scores_stale=strategy_scores_stale,
+        ),
         "market": {
             "regime": ms.get("regime"),
             "sentiment": ms.get("sentiment"),

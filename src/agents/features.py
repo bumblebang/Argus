@@ -323,9 +323,11 @@ def assemble(items: list[dict], market_state: dict,
                 feat.update(_long_horizon_fields(df))
                 price_lookup[sym] = price
                 if enrich_strategy:   # 도구: 후보 캔들에 전략 적합도 랭킹
+                    from ..strategy_scores import strategy_fit_brief
                     rec = recommend_strategy(df)
-                    feat["strategy_fit"] = {"best": rec["best"],
-                                            "ranking": rec["ranking"][:3]}
+                    brief = strategy_fit_brief(rec)
+                    if brief:
+                        feat["strategy_fit"] = brief
         except Exception as e:
             log.warning("[%s] 피처 조립 실패: %s", sym, e)
         candidates.append(feat)

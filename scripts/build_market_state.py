@@ -152,9 +152,15 @@ def main() -> int:
     else:
         log.warning("DART_API_KEY 없음 -> 국내 재무·공시 스킵")
 
-    state = MarketState()
+    out_path = DATA_DIR / "market_state.json"
+    state = MarketState.load(out_path) if out_path.exists() else MarketState()
     for s in sources:
-        state.merge(s.fetch(ctx))
+        try:
+            partial = s.fetch(ctx)
+            if partial:
+                state.merge(partial)
+        except Exception as e:
+            log.warning("소스 %s 실패(직전값 유지): %s", type(s).__name__, e)
 
     # 공포지수는 regime/markets 가 다 채워진 뒤에 합성한다(--dry 는 네트워크 무접촉).
     if not args.dry:
@@ -167,7 +173,11 @@ def main() -> int:
                 log.warning("KRX fear 캐시 갱신 실패(기존 캐시/스킵): %s", e)
         state.merge({"sentiment": assess_fear(state.to_dict(), cfg)})
 
-    state.save(DATA_DIR / "market_state.json")
+    from datetime import datetime, timezone
+    now_iso = datetime.now(timezone.utc).isoformat()
+    state.batch_asof = now_iso
+    state.asof = now_iso
+    state.save(out_path)
     log.info("market_state 저장 완료")
     log.info("  fx=%s", state.fx)
     log.info("  regime=%s", state.regime)

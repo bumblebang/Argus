@@ -17,19 +17,66 @@ from .logging_setup import get_logger
 log = get_logger("src.strategy_scores")
 
 OUT = ROOT / "data" / "strategy_scores.json"
+DEFAULT_MAX_AGE_HOURS = 36.0
+MIN_TRADES_BEST = 3
 
 
-def load_strategy_scores(path: Path | None = None) -> dict[str, dict]:
-    """{symbol: {best, ranking}}. 없거나 깨지면 {}."""
-    p = path or OUT
+def _read_payload(path: Path) -> dict | None:
     try:
-        if p.exists():
-            data = json.loads(p.read_text(encoding="utf-8"))
-            syms = data.get("symbols") if isinstance(data, dict) else data
-            return syms if isinstance(syms, dict) else {}
+        if path.exists():
+            data = json.loads(path.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else None
     except (OSError, ValueError) as e:
         log.warning("strategy_scores 로드 실패: %s", e)
-    return {}
+    return None
+
+
+def strategy_scores_asof(path: Path | None = None) -> float | None:
+    """파일 asof(epoch 또는 iso). 없/깨짐 → None."""
+    data = _read_payload(path or OUT)
+    if not data:
+        return None
+    raw = data.get("asof")
+    if raw is None:
+        return None
+    if isinstance(raw, (int, float)):
+        return float(raw)
+    try:
+        from datetime import datetime, timezone
+        dt = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.timestamp()
+    except (TypeError, ValueError):
+        return None
+
+
+def strategy_scores_stale(path: Path | None = None, *,
+                          max_age_hours: float = DEFAULT_MAX_AGE_HOURS,
+                          now_fn: Callable[[], float] = time.time) -> bool:
+    """True if missing, unreadable, or older than max_age_hours."""
+    if max_age_hours <= 0:
+        return False
+    ts = strategy_scores_asof(path)
+    if ts is None:
+        return True
+    return (now_fn() - ts) > max_age_hours * 3600
+
+
+def load_strategy_scores(path: Path | None = None, *,
+                         max_age_hours: float | None = DEFAULT_MAX_AGE_HOURS,
+                         now_fn: Callable[[], float] = time.time) -> dict[str, dict]:
+    """{symbol: {best, ranking}}. 없거나 깨지거나 stale 이면 {}."""
+    p = path or OUT
+    if max_age_hours is not None and strategy_scores_stale(
+            p, max_age_hours=max_age_hours, now_fn=now_fn):
+        log.info("strategy_scores stale (max_age=%sh) — load 스킵", max_age_hours)
+        return {}
+    data = _read_payload(p)
+    if not data:
+        return {}
+    syms = data.get("symbols") if isinstance(data, dict) else data
+    return syms if isinstance(syms, dict) else {}
 
 
 def _atomic_write(payload: dict, path: Path) -> None:
@@ -69,7 +116,7 @@ def refresh_strategy_scores(
     import pandas as pd
 
     out_path = path or OUT
-    existing = load_strategy_scores(out_path)
+    existing = load_strategy_scores(out_path, max_age_hours=None)
     scores: dict[str, dict] = dict(existing)
     n_ok, n_fail = 0, 0
     for _market, items in (universe or {}).items():
@@ -114,12 +161,41 @@ def refresh_strategy_scores(
 
 
 def pad_score(scores: dict[str, dict], symbol: str) -> float:
-    """scan pad 정렬용 — ranking[0].return_pct (없으면 -inf)."""
+    """scan pad 정렬용 — ranking[0].return_pct (없으면 -inf).
+
+    n_trades < MIN_TRADES_BEST 이면 pad 에서 제외(-inf).
+    """
     rec = scores.get(symbol) or {}
     ranking = rec.get("ranking") or []
     if not ranking:
         return float("-inf")
     try:
+        n = int(ranking[0].get("n_trades") or 0)
+    except (TypeError, ValueError):
+        n = 0
+    if n < MIN_TRADES_BEST:
+        return float("-inf")
+    try:
         return float(ranking[0].get("return_pct", float("-inf")))
     except (TypeError, ValueError):
         return float("-inf")
+
+
+def strategy_fit_brief(rec: dict | None, *, min_trades: int = MIN_TRADES_BEST) -> dict | None:
+    """뇌 컨텍스트용 strategy_fit — best 는 min_trades 미만이면 null + thin_sample."""
+    if not rec:
+        return None
+    ranking = list(rec.get("ranking") or [])[:3]
+    best = rec.get("best")
+    thin = True
+    if ranking:
+        try:
+            thin = int(ranking[0].get("n_trades") or 0) < min_trades
+        except (TypeError, ValueError):
+            thin = True
+    elif best:
+        thin = False
+    out: dict = {"ranking": ranking, "best": best if not thin else None}
+    if thin:
+        out["thin_sample"] = True
+    return out

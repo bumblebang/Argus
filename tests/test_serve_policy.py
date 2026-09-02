@@ -48,7 +48,7 @@ def test_select_scan_keeps_all_items_when_disabled():
 
 def test_select_scan_shortlist_cap_and_must():
     items = [{"symbol": f"{i:06d}", "market": "KR"} for i in range(1, 51)]
-    scores = {f"{i:06d}": {"ranking": [{"return_pct": i / 100.0}]}
+    scores = {f"{i:06d}": {"ranking": [{"return_pct": i / 100.0, "n_trades": 5}]}
               for i in range(1, 51)}
     cfg = serve.serve_cfg({"serve": {
         "enabled": True, "scan_enabled": True, "scan_cap": 10}})
@@ -78,7 +78,7 @@ def test_select_scan_must_exceeds_cap():
 def test_gap_scan_exempt_from_scan_cap():
     items = [{"symbol": f"{i:06d}", "market": "KR", "decline_pct": -8.0}
              for i in range(1, 51)]
-    scores = {f"{i:06d}": {"ranking": [{"return_pct": i / 100.0}]}
+    scores = {f"{i:06d}": {"ranking": [{"return_pct": i / 100.0, "n_trades": 5}]}
               for i in range(1, 51)}
     cfg = serve.serve_cfg({"serve": {
         "enabled": True, "scan_enabled": True, "scan_cap": 10}})

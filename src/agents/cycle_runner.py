@@ -146,7 +146,8 @@ class CycleRunner:
         held = (getattr(acct, "symbol_market", None) or {}).get(symbol)
         return str(held) if held else None
 
-    def _portfolio(self, earnings: dict | None = None) -> dict:
+    def _portfolio(self, earnings: dict | None = None,
+                   live_prices: dict[str, float] | None = None) -> dict:
         """보유 종목에 store 의 진입 thesis/전략/손절목표/보유기간을 붙여 뇌에게 전달.
 
         뇌가 "왜 샀는지"(entry_thesis)를 현재 데이터와 대조해 thesis 가 깨졌으면 SELL 을
@@ -165,6 +166,20 @@ class CycleRunner:
                 continue
             item = {"symbol": s, "qty": p.qty, "avg_price": p.avg_price,
                     "market": self.account.symbol_market.get(s)}
+            px = None
+            if live_prices:
+                try:
+                    v = live_prices.get(s)
+                    if v is not None:
+                        px = float(v)
+                except (TypeError, ValueError):
+                    px = None
+            if px is not None and px > 0:
+                item["current_price"] = round(px, 2)
+                avg = float(p.avg_price or 0)
+                if avg > 0:
+                    item["unrealized_pnl_pct"] = round((px / avg - 1) * 100, 2)
+                    item["unrealized_pnl"] = round((px - avg) * p.qty, 0)
             row = rows.get(s)
             if row is not None:
                 item["entry_thesis"] = row["thesis"]
@@ -340,6 +355,29 @@ class CycleRunner:
             log.info("live price %d/%d종 (gateway 배치)", len(out), len(items))
         return out
 
+    def _resolve_price(self, symbol: str, market: str) -> float | None:
+        """shortlist 밖 제안·집행용 — live quote 우선, 없으면 캔들 종가."""
+        mkt = market or self.market_of(symbol) or "KR"
+        if self.price_fn:
+            try:
+                rows = self.price_fn([symbol], mkt) or {}
+                v = rows.get(symbol)
+                if v is not None:
+                    px = float(v)
+                    if px > 0:
+                        return px
+            except Exception as e:
+                log.debug("[%s] live quote 실패: %s", symbol, e)
+        try:
+            raw = self.fetch_candles(symbol, mkt)
+            from ..runner import candles_to_df
+            df = candles_to_df(raw) if raw else None
+            if df is not None and len(df) >= 1:
+                return float(df["close"].astype(float).iloc[-1])
+        except Exception as e:
+            log.debug("[%s] 캔들 가격 실패: %s", symbol, e)
+        return None
+
     def run(self, wake: dict | None = None) -> CycleResult:
         ms = (json.loads(self.market_state_path.read_text(encoding="utf-8"))
               if self.market_state_path.exists() else {})
@@ -394,8 +432,11 @@ class CycleRunner:
                  if self.store else [])
         bullish = (self.store.list_fresh_bullish_symbols()
                    if self.store else [])
-        from ..strategy_scores import load_strategy_scores
-        strat_scores = load_strategy_scores()
+        from ..strategy_scores import (load_strategy_scores, strategy_fit_brief,
+                                       strategy_scores_asof, strategy_scores_stale)
+        scores_stale = strategy_scores_stale()
+        strat_scores = load_strategy_scores() if not scores_stale else {}
+        scores_asof = strategy_scores_asof()
         n_items_before = len(items)
         items, tier = serve.select_candidates(
             items, wake, held=held, armed=armed, bullish=bullish,
@@ -410,6 +451,15 @@ class CycleRunner:
             from .wiring import history_candles_1y
             fetch_fn = lambda s, m: history_candles_1y(s, m, fresh=True)
         live_prices = self._batch_live_prices(items)
+        held_only = [
+            {"symbol": s, "market": self.market_of(s) or "KR"}
+            for s in held
+            if s and (not live_prices or s not in live_prices)
+        ]
+        if held_only:
+            held_px = self._batch_live_prices(held_only)
+            if held_px:
+                live_prices = {**(live_prices or {}), **held_px}
         candidates, price_lookup = assemble(items, ms, fetch_fn,
                                             enrich_strategy=enrich_strategy,
                                             base_rates=self._base_rates(),
@@ -418,11 +468,9 @@ class CycleRunner:
         if scan_shortlist:
             for c in candidates:
                 rec = strat_scores.get(str(c.get("symbol") or ""))
-                if rec and rec.get("best"):
-                    c["strategy_fit"] = {
-                        "best": rec["best"],
-                        "ranking": rec.get("ranking", []),
-                    }
+                brief = strategy_fit_brief(rec)
+                if brief:
+                    c["strategy_fit"] = brief
         if wake_has_gap_scan(wake_reason):
             before = len(candidates)
             candidates = filter_gap_rebound_candidates(candidates, held=held)
@@ -483,7 +531,7 @@ class CycleRunner:
                     c["past_trades"] = pt
         # 매크로 민감 태그(정적 맵) + 주의층 렌즈 — dday 신선도를 위해 사이클마다 계산.
         attach_macro_tags(candidates, sector_map_from_universe(self.cfg))
-        portfolio = self._portfolio(earnings)
+        portfolio = self._portfolio(earnings, live_prices=live_prices or None)
         focus = build_focus(ms, candidates=candidates,
                             positions=portfolio.get("positions") or [],
                             wake=wake)
@@ -517,18 +565,26 @@ class CycleRunner:
                                     scfg.get("headline_ttl_hours", 24)),
                                 focus_macro_pad=int(scfg.get("focus_macro_pad", 8)),
                                 notify_headline_trim=notify_hl,
-                                compact=compact)
+                                compact=compact,
+                                strategy_scores_asof=scores_asof,
+                                strategy_scores_stale=scores_stale)
         if self.store:
             try:
-                asof = ms.get("asof")
-                age = None
-                if asof:
+                from datetime import datetime, timezone
+
+                def _age_sec(raw) -> float | None:
+                    if not raw:
+                        return None
                     try:
-                        from datetime import datetime, timezone
-                        dt = datetime.fromisoformat(str(asof).replace("Z", "+00:00"))
-                        age = round((datetime.now(timezone.utc) - dt).total_seconds(), 1)
+                        dt = datetime.fromisoformat(str(raw).replace("Z", "+00:00"))
+                        if dt.tzinfo is None:
+                            dt = dt.replace(tzinfo=timezone.utc)
+                        return round((datetime.now(timezone.utc) - dt).total_seconds(), 1)
                     except (TypeError, ValueError):
-                        age = None
+                        return None
+
+                fast_asof = ms.get("fast_asof") or ms.get("asof")
+                batch_asof = ms.get("batch_asof") or ms.get("asof")
                 self.store.log_event("brain_serve", None, {
                     "tier": tier,
                     "n_candidates": len(candidates),
@@ -538,8 +594,13 @@ class CycleRunner:
                     "enrich_strategy": enrich_strategy,
                     "context_bytes": len(context.encode("utf-8")),
                     "ondemand_n": ondemand_n,
-                    "asof": asof,
-                    "asof_age_sec": age,
+                    "asof": ms.get("asof"),
+                    "fast_asof": fast_asof,
+                    "batch_asof": batch_asof,
+                    "asof_age_sec": _age_sec(fast_asof),
+                    "fast_asof_age_sec": _age_sec(fast_asof),
+                    "batch_asof_age_sec": _age_sec(batch_asof),
+                    "strategy_scores_stale": scores_stale,
                     "reason": (wake or {}).get("reason") if wake else None,
                     "decision_tier": (
                         decision_tier(wake, agents_cfg=self.cfg.raw.get("agents"))
@@ -577,6 +638,7 @@ class CycleRunner:
                         dossier_brief_fn=(self._dossier_brief if self.store else None),
                         features_by_sym=feat_map,
                         market_fn=self.market_of,
+                        resolve_price_fn=self._resolve_price,
                         store=self.store,
                         wake_reason=wake_reason)
         self._record(res)
