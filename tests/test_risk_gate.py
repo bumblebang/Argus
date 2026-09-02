@@ -424,3 +424,47 @@ def test_global_halt_blocks_sell_too(tmp_path):
     d = gate.check(Order("005930", "KR", "SELL", 1, 100), acct)
     assert not d.approved and "킬스위치" in d.reason
     assert gate.pause_status() == "ALL"
+
+
+def test_capital_keys_normalized_upper(tmp_path):
+    gate = _gate(tmp_path, capital={"kr": 1_000_000})
+    assert gate.capital == {"KR": 1_000_000}
+    assert gate._cap("kr") == 1_000_000
+
+
+def test_missing_capital_market_skips_five_limits(tmp_path):
+    """capital 에 없는 시장은 base=0 — 일손실·DD·비중·총노출·섹터 전부 스킵."""
+    smap = {"AAPL": "테크"}
+    gate = _gate(
+        tmp_path,
+        capital={"KR": 1_000_000},
+        max_drawdown_pct=0.01,
+        max_gross_exposure=0.1,
+        max_sector_pct=0.1,
+        sector_map=smap,
+        max_position_pct=0.01,
+        max_order_notional={},
+        daily_loss_limit_pct=0.01,
+    )
+    acct = PaperAccount(
+        cash={"US": 1_000_000},
+        fee_rate={"US": 0.0},
+        slippage_bps={"US": 0.0},
+        state_path=tmp_path / "us_only.json",
+    )
+    acct.realized_pnl_today["US"] = -500_000
+    acct.realized_pnl["US"] = -500_000
+    # 비중·총노출·섹터·일손실·DD 모두 걸릴 조건이지만 capital.US 없음 → 통과
+    d = gate.check(Order("AAPL", "US", "BUY", 9000, 100), acct)  # 90만 > 1% 비중
+    assert d.approved
+
+
+def test_zero_capital_warns_and_skips_limits(tmp_path, caplog):
+    import logging
+    with caplog.at_level(logging.WARNING, logger="risk.gate"):
+        gate = _gate(tmp_path, capital={"KR": 0}, max_position_pct=0.01,
+                     max_order_notional={})
+    assert any("capital[KR]=0" in r.message for r in caplog.records)
+    acct = _acct(tmp_path)
+    d = gate.check(Order("005930", "KR", "BUY", 9000, 100), acct)  # 90만 > 1% 비중
+    assert d.approved

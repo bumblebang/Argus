@@ -56,6 +56,19 @@ class GateDecision:
     reason: str
 
 
+def _normalize_capital(raw) -> dict[str, float]:
+    """dict → 시장별 float. 키는 KR/US 등 대문자."""
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, float] = {}
+    for k, v in raw.items():
+        try:
+            out[str(k).upper()] = float(v)
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
 def _normalize_max_positions(raw) -> dict[str, int]:
     """int → {KR,US: n}; dict → 시장별 int. 빈/이상값은 기본 5."""
     if isinstance(raw, dict):
@@ -87,7 +100,13 @@ class RiskGate:
     """
 
     def __init__(self, limits: dict):
-        self.capital = limits.get("capital", {})
+        self.capital = _normalize_capital(limits.get("capital", {}))
+        for mkt, val in self.capital.items():
+            if val <= 0:
+                log.warning(
+                    "capital[%s]=%s — 해당 시장 한도(일손실·DD·비중·총노출·섹터)가 "
+                    "비활성입니다.",
+                    mkt, val)
         self.max_position_pct = float(limits.get("max_position_pct", 0.20))
         self.max_positions = _normalize_max_positions(limits.get("max_positions", 5))
         self.daily_loss_limit_pct = float(limits.get("daily_loss_limit_pct", 0.05))
@@ -164,14 +183,22 @@ class RiskGate:
         return "+".join(paused)
 
     def _cap(self, market: str) -> float:
-        return float(self.capital.get(market, 0.0))
+        m = str(market or "").upper()
+        if m not in self.capital:
+            return 0.0
+        return float(self.capital[m])
+
+    def _capital_configured(self, market: str) -> bool:
+        """config capital 에 시장 키가 있고 값이 양수일 때만 한도 분모를 쓴다."""
+        m = str(market or "").upper()
+        return m in self.capital and float(self.capital[m]) > 0
 
     def _min_lot_cap(self, market: str) -> float | None:
         """시범매수 절대 상한. 시장별 dict 또는 스칼라. 없거나 ≤0 이면 None(비활성)."""
         cfg = self.min_lot_max_notional
         if cfg is None:
             return None
-        raw = cfg.get(market) if isinstance(cfg, dict) else cfg
+        raw = (cfg.get(str(market or "").upper()) if isinstance(cfg, dict) else cfg)
         try:
             v = float(raw)
         except (TypeError, ValueError):
@@ -179,7 +206,12 @@ class RiskGate:
         return v if v > 0 else None
 
     def _loss_budget_base(self, account, market: str) -> float:
-        """일손실·DD 분모: 당일 시가(SoD) equity, 없으면 config capital 폴백."""
+        """일손실·DD 분모: 당일 시가(SoD) equity, 없으면 config capital 폴백.
+
+        capital 에 시장 키가 없거나 0 이하면 분모 0 — 해당 시장 한도는 비활성(경고 없음).
+        """
+        if not self._capital_configured(market):
+            return 0.0
         base = 0.0
         if hasattr(account, "ensure_sod_equity"):
             try:
@@ -227,7 +259,11 @@ class RiskGate:
         고정 capital 은 자산이 불어나도 한도가 그대로라 실효 한도가 헐거워지고, 자산이
         줄면 반대로 과대 노출을 허용한다. equity 는 이를 추종한다. 산출 실패/0 이하면
         capital 로 폴백한다(한도가 조용히 사라지지 않게).
+
+        capital 에 시장 키가 없거나 0 이하면 0 — 비중·총노출·섹터 한도 비활성.
         """
+        if not self._capital_configured(market):
+            return 0.0
         if self.exposure_base != "equity":
             return self._cap(market)
         try:
