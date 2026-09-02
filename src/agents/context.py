@@ -15,9 +15,9 @@ from ..logging_setup import get_logger
 
 log = get_logger("agents.context")
 
-# 제목만이라 토큰 부담이 작다 — 배치 뉴스(~80건)를 거의 다 보게 100.
+# 제목만이라 토큰 부담이 작다 — 배치 뉴스(~110건) 전부 + 여유 200.
 # 한도에 걸려 잘리면 ntfy 로 알린다(쿨다운으로 스팸 방지).
-HEADLINE_LIMIT = 100
+HEADLINE_LIMIT = 200
 _TRIM_STATE = Path(__file__).resolve().parents[2] / "data" / "headline_trim_notify.json"
 _TRIM_COOLDOWN_SEC = 6 * 3600
 

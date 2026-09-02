@@ -15,13 +15,14 @@ data/universe.yaml(매매 유니버스)의 생명주기를 스케줄 배치가 �
 scripts/screen.py 의 발굴 헬퍼(_discover_kr/_discover_us)를 여기로 이동해 CLI 와 데몬이
 같은 발굴·쓰기 경로를 공유한다(scripts/screen.py 는 이 모듈을 재사용하는 얇은 CLI).
 
-역할 분리: 발굴=Naver(KR)/Yahoo(US), 백테스트 히스토리=Yahoo, 라이브 매매=토스.
+역할 분리: 발굴=Toss TV(KR core)/Naver(legacy)/Yahoo(US), 백테스트 히스토리=Yahoo, 라이브 매매=토스.
 """
 from __future__ import annotations
 
 import os
 import time
 from pathlib import Path
+from typing import Callable
 
 import numpy as np
 import pandas as pd
@@ -47,6 +48,15 @@ _MOVER_POOL = 40
 # 함수를 직접 monkeypatch 하므로 이 플래그를 건드리지 않아도 된다.
 _DRY = False
 
+# KR core 발굴 — TossGateway.get_rankings (watch 기동 시 set_rankings_fn 으로 주입).
+_RANKINGS_FN: Callable[[str, str, str, int], dict] | None = None
+
+
+def set_rankings_fn(fn: Callable[[str, str, str, int], dict] | None) -> None:
+    """데몬/CLI: Toss rankings fetch 콜백 주입. (rank_type, market, duration, count)."""
+    global _RANKINGS_FN
+    _RANKINGS_FN = fn
+
 
 # ── 발굴(scripts/screen.py 에서 이동, CLI·데몬 공유) ──────────────────────
 def _liquidity_core_cfg(cfg) -> dict:
@@ -54,6 +64,7 @@ def _liquidity_core_cfg(cfg) -> dict:
     raw = cfg.raw if hasattr(cfg, "raw") else (cfg or {})
     sc = (raw.get("screener") or {}) if isinstance(raw, dict) else {}
     lc = sc.get("liquidity_core") or {}
+    dp = (raw.get("day_pool") or {}) if isinstance(raw, dict) else {}
     return {
         "enabled": bool(lc.get("enabled", False)),
         "light": bool(lc.get("light", False)),
@@ -63,6 +74,12 @@ def _liquidity_core_cfg(cfg) -> dict:
         "rank_by": str(lc.get("rank_by", "avg_turnover")),
         "day_tag_top": int(lc.get("day_tag_top", 0)),
         "day_strategy": str(lc.get("day_strategy", "volatility_breakout")),
+        "kr_rank_type": str(lc.get("kr_rank_type") or dp.get("type")
+                             or "MARKET_TRADING_AMOUNT"),
+        "kr_duration_live": str(lc.get("kr_duration_live") or dp.get("duration_live")
+                                 or "realtime"),
+        "kr_duration_fallback": str(
+            lc.get("kr_duration_fallback") or dp.get("duration_fallback") or "1d"),
     }
 
 
@@ -85,9 +102,19 @@ def discover_trading_value_pool(cfg, market: str, pool: int, dry: bool
                      "price": 100.0}
                     for i in range(pool)]
     elif mkt == "KR":
-        # Naver: 시총 풀을 모은 뒤 accumulatedTradingValue 로 재정렬(당일/전일 거래대금).
-        rows = discovery.top_by_trading_value(
-            "KR", count=pool, pool=pool, min_price=min_price)
+        lc = _liquidity_core_cfg(cfg)
+        if _RANKINGS_FN is not None:
+            rows = discovery.top_kr_by_toss_trading_value(
+                count=pool, pool=pool, min_price=min_price,
+                fetch_rankings=_RANKINGS_FN,
+                rank_type=lc["kr_rank_type"],
+                duration_live=lc["kr_duration_live"],
+                duration_fallback=lc["kr_duration_fallback"],
+            )
+        else:
+            log.warning("[%s] Toss rankings_fn 미설정 — Naver TV 폴백(legacy)", mkt)
+            rows = discovery.top_by_trading_value(
+                "KR", count=pool, pool=pool, min_price=min_price)
     elif mkt == "US":
         rows = discovery.top_us_by_trading_value(
             count=pool, pool=pool, min_price=min_price)
@@ -140,9 +167,25 @@ def _fetch_fn(cfg, dry: bool):
     criteria = cfg.raw.get("screener", {})
     rng = criteria.get("history_range", "6mo")
 
+    max_age = float(criteria.get("history_max_age_hours", 20))
+
     def fetch(symbol: str, market: str) -> pd.DataFrame:
         return fetch_history(symbol, interval=criteria.get("candle_interval", "1d"),
-                             range_=rng, market=market)
+                             range_=rng, market=market, max_age_hours=max_age)
+    return fetch
+
+
+def _strategy_scores_fetch(cfg, dry: bool):
+    """core_refresh 배치용 — 당일 스코어는 stale CSV 재사용하지 않는다."""
+    if dry:
+        return _synthetic_fetch
+    criteria = cfg.raw.get("screener", {})
+    rng = criteria.get("history_range", "6mo")
+    interval = criteria.get("candle_interval", "1d")
+
+    def fetch(symbol: str, market: str) -> pd.DataFrame:
+        return fetch_history(symbol, interval=interval, range_=rng, market=market,
+                             max_age_hours=0, refresh=True)
     return fetch
 
 
@@ -452,7 +495,9 @@ def core_refresh(cfg, market: str, store=None, *, now_fn=time.time) -> dict | No
     if lc["enabled"] and lc.get("light"):
         try:
             from .strategy_scores import refresh_strategy_scores
-            refresh_strategy_scores(out, fetch, dry=dry)
+            refresh_strategy_scores(
+                {market: out[market]}, _strategy_scores_fetch(cfg, dry),
+                dry=dry, prune_universe=out)
         except Exception as e:
             log.warning("[%s] strategy_scores 배치 실패(유니버스는 저장됨): %s", market, e)
     mode = (f"liquidity_core_light/{lc['core_size']}" if lc.get("light")

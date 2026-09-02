@@ -17,7 +17,7 @@ from .schemas import DecisionOutput, ValidationOutput
 from .conviction import (
     apply_buy_conviction, size_weight, min_lot_adjust, skip_position_headroom,
 )
-from .features import GAP_SCAN_REASONS
+from .features import GAP_SCAN_REASONS, wake_has_gap_scan
 from ..logging_setup import get_logger
 from ..risk_gate import Order
 from .. import paths as _paths
@@ -80,7 +80,7 @@ def _apply_close_scan_horizon(p, *, wake_reason: str,
     """갭반등 close_scan 트랙 BUY 의 horizon 정규화. 거부 시 status 문자열."""
     if p.side != "BUY":
         return None
-    gap_wake = wake_reason in GAP_SCAN_REASONS
+    gap_wake = wake_has_gap_scan(wake_reason)
     gap_pool = _close_scan_candidate(p.symbol, features_by_sym)
     hz = (p.horizon or "swing").lower()
     if not gap_wake:

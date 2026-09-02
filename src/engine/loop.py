@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterable
 from zoneinfo import ZoneInfo
 
+from ..code_rev import current_code_rev
 from ..config import ROOT
 from ..datasources.breadth import label_of
 from ..logging_setup import get_logger
@@ -412,6 +413,7 @@ class WatchLoop:
         self.entry_executor = entry_executor     # armed 종목 전략기반 진입 실행기(.evaluate(armed,market))
         self.on_prices = on_prices               # 이번 틱 실시간가 콜백(계좌 마크 갱신 등)
         self.heartbeat_path = Path(heartbeat_path) if heartbeat_path else None
+        self._code_rev = current_code_rev()
         self._now = now_fn
         self._sleep = sleep_fn
         self._ticks = 0
@@ -510,6 +512,7 @@ class WatchLoop:
                 "should_be_open": should_be_open,
                 "markets_open": markets, "polled": polled,
                 "ok": ok, "tick_error": bool(tick_error),
+                "code_rev": self._code_rev,
             }), encoding="utf-8")
         except OSError as e:
             log.warning("하트비트 기록 실패: %s", e)

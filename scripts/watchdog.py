@@ -90,6 +90,18 @@ def restart() -> None:
         subprocess.run(argv, capture_output=True)
 
 
+def code_rev_stale(hb: dict | None) -> tuple[bool, str, str]:
+    """디스크 HEAD 와 프로세스 기동 rev 불일치. (stale, proc_rev, live_rev)."""
+    sys.path.insert(0, str(ROOT))
+    from src.code_rev import current_code_rev
+
+    live = current_code_rev(ROOT)
+    proc = str((hb or {}).get("code_rev") or "").strip()
+    if live == "unknown" or not proc:
+        return False, proc, live
+    return live != proc, proc, live
+
+
 def main() -> int:
     age = heartbeat_age()
     hb = heartbeat_payload() or {}
@@ -97,6 +109,10 @@ def main() -> int:
         log("[watchdog] heartbeat missing -> (re)start"); restart(); return 0
     if age > STALE_SEC:
         log(f"[watchdog] heartbeat stale {age:.0f}s > {STALE_SEC}s -> restart")
+        restart(); return 0
+    stale_rev, proc_rev, live_rev = code_rev_stale(hb)
+    if stale_rev:
+        log(f"[watchdog] code_rev stale proc={proc_rev} live={live_rev} -> restart")
         restart(); return 0
     # age 는 신선해도 장중 polled=0 이면 가짜 초록 — 재기동은 안 하고 경보만(alert_check).
     should = list(hb.get("should_be_open") or [])

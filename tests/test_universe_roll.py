@@ -181,6 +181,27 @@ def test_core_refresh_liquidity_core_light(cfg, monkeypatch, _redirect_out):
     assert all(it.get("strategy") == "volatility_breakout" for it in day_tagged)
 
 
+def test_discover_kr_uses_toss_when_rankings_fn(cfg, monkeypatch):
+    calls = []
+
+    def fetch(rt, mc, dur, cnt):
+        calls.append(dur)
+        return {"rankings": [
+            {"symbol": "005930", "name": "삼성", "price": 70000,
+             "tradingAmount": "10000000000"},
+        ]}
+
+    UR.set_rankings_fn(fetch)
+    try:
+        cands, tv, prices = UR.discover_trading_value_pool(cfg, "KR", 10, dry=False)
+        assert cands[0][1] == "005930"
+        assert tv["005930"] > 0
+        assert prices["005930"] == 70000
+        assert "realtime" in calls or "1d" in calls
+    finally:
+        UR.set_rankings_fn(None)
+
+
 def test_core_refresh_retains_held(cfg, monkeypatch, _redirect_out):
     # 보유 종목(HELD)이 새 스크린 리스트에 없어도 유지된다.
     _redirect_out.write_text(yaml.safe_dump(

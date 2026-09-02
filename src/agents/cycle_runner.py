@@ -11,7 +11,7 @@ from ..config import AppConfig
 from ..logging_setup import get_logger
 from ..risk import RiskManager, risk_manager_from_cfg
 from ..broker import Broker
-from .features import assemble, filter_gap_rebound_candidates, GAP_SCAN_REASONS
+from .features import assemble, filter_gap_rebound_candidates, wake_has_gap_scan
 from .context import build_context
 from .conviction import attach_event_features
 from ..lessons import build_symbol_lessons
@@ -353,7 +353,7 @@ class CycleRunner:
         wake_reason = str((wake or {}).get("reason") or "")
         full_universe = items
         held = serve.held_symbols(self.account.positions)
-        if wake_reason in GAP_SCAN_REASONS:
+        if wake_has_gap_scan(wake_reason):
             from ..gap_decline_pool import items_for_gap_scan
             items = items_for_gap_scan(wake_reason, universe_items=full_universe,
                                        held=held)
@@ -375,7 +375,7 @@ class CycleRunner:
             stale = self.illiquid_fn()
             if stale:
                 items = [i for i in items if i["symbol"] not in stale]
-        if wake_reason in GAP_SCAN_REASONS:
+        if wake_has_gap_scan(wake_reason):
             nxt = nxt_supported_map(i["symbol"] for i in items if i.get("market") == "KR")
             before = len(items)
             items = filter_items_for_gap_scan(items, wake_reason, nxt)
@@ -393,9 +393,11 @@ class CycleRunner:
         items, tier = serve.select_candidates(
             items, wake, held=held, armed=armed, bullish=bullish,
             scores=strat_scores, cfg=scfg)
-        scan_shortlist = tier == "scan" and scfg.get("scan_enabled", True)
+        scan_shortlist = (
+            tier == "scan" and scfg.get("scan_enabled", True)
+            and not serve.scan_shortlist_exempt(wake))
         enrich_strategy = not scan_shortlist
-        gap_scan = wake_reason in GAP_SCAN_REASONS
+        gap_scan = wake_has_gap_scan(wake_reason)
         fetch_fn = self.fetch_candles
         if gap_scan:
             from .wiring import history_candles_1y
@@ -414,7 +416,7 @@ class CycleRunner:
                         "best": rec["best"],
                         "ranking": rec.get("ranking", []),
                     }
-        if wake_reason in GAP_SCAN_REASONS:
+        if wake_has_gap_scan(wake_reason):
             before = len(candidates)
             candidates = filter_gap_rebound_candidates(candidates, held=held)
             if len(candidates) < before:
@@ -433,7 +435,7 @@ class CycleRunner:
         from ..candidate_enrich import enrich_candidates
         enrich_stats = enrich_candidates(
             candidates, ms,
-            gap_scan=(wake_reason in GAP_SCAN_REASONS),
+            gap_scan=(wake_has_gap_scan(wake_reason)),
             enrich_fundamentals=bool(scfg_enrich.get("enrich_fundamentals", True)),
             enrich_flows=bool(scfg_enrich.get("enrich_flows", True)),
             gap_enrich_max=int(scfg_enrich.get("gap_enrich_max", 25)),

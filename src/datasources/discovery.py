@@ -1,17 +1,17 @@
-"""동적 유니버스 발굴 — Naver 모바일 랭킹(거래대금 상위).
+"""동적 유니버스 발굴 — KR 코어=토스 거래대금, legacy=Naver 시총풀, US=Yahoo.
 
-시총 상위 풀(marketValue)을 받아 **거래대금(accumulatedTradingValue)**으로 재정렬 →
-가장 활발히 거래되는 liquid 종목 top-N. 스크리너의 후보 풀("어떤 종목을 볼지")을 매일
-동적으로 채운다. 역할분리: **발굴=Naver, 백테스트 히스토리=Yahoo, 라이브 매매=토스 공식.**
+KR liquidity_core: Toss GET /api/v1/rankings (MARKET_TRADING_AMOUNT) — day_pool 과 동일.
+개장 전 realtime=0 이면 duration 1d(전일) 폴백 + ranking_cache.
+Naver marketValue API 는 gap_decline·value_scan 등 legacy 경로만 사용.
 
-Naver 모바일 API(m.stock.naver.com)는 flows.py 와 같은 무인증 엔드포인트 — 준실시간
-(localTradedAt 체결시각). 일 단위 후보 발굴엔 충분(틱 단위 불요).
+역할분리: **코어 KR 발굴=토스**, legacy KR=Naver, 백테스트=Yahoo, 라이브=토스.
 """
 from __future__ import annotations
 
 import json
 import os
 import time
+from typing import Callable
 
 import requests
 
@@ -82,6 +82,97 @@ def _f(v):
         return round(float(v), 2) if v is not None else None
     except (TypeError, ValueError):
         return None
+
+
+def parse_toss_rankings_payload(payload: dict | None) -> list[dict]:
+    """토스 rankings API → [{symbol,name,price,trading_value,fluctuation?}]."""
+    if not isinstance(payload, dict):
+        return []
+    rows = payload.get("rankings")
+    if not isinstance(rows, list):
+        return []
+    out: list[dict] = []
+    for r in rows:
+        if not isinstance(r, dict) or not r.get("symbol"):
+            continue
+        sym = str(r["symbol"])
+        tv = _num(r.get("tradingAmount") or r.get("trading_amount") or 0)
+        px = _num(r.get("price") or r.get("regularMarketPrice") or 0)
+        out.append({
+            "symbol": sym,
+            "name": r.get("name") or r.get("shortName") or sym,
+            "price": px,
+            "trading_value": tv,
+            "fluctuation": _num(r.get("fluctuationsRatio")
+                                 or r.get("regularMarketChangePercent") or 0),
+        })
+    return out
+
+
+def top_kr_by_toss_trading_value(
+    count: int = 100,
+    pool: int | None = None,
+    min_price: float = 0.0,
+    *,
+    fetch_rankings: Callable[[str, str, str, int], dict],
+    rank_type: str = "MARKET_TRADING_AMOUNT",
+    duration_live: str = "realtime",
+    duration_fallback: str = "1d",
+    allow_cache_fallback: bool = True,
+) -> list[dict]:
+    """KR 거래대금 순 top-N — Toss rankings (live → 1d → ranking_cache).
+
+    fetch_rankings(rank_type, market_country, duration, count) → API payload.
+    개장 전 realtime 이 비면 1d(전일) + ranking_cache 폴백.
+    """
+    pool = int(pool or max(count, 100))
+    count = int(count)
+    rows: list[dict] = []
+    try:
+        live = parse_toss_rankings_payload(
+            fetch_rankings(rank_type, "KR", duration_live, pool))
+    except Exception as e:
+        log.warning("Toss KR 라이브 랭킹 실패: %s", e)
+        live = []
+    rows = [r for r in live
+            if float(r.get("price") or 0) >= min_price
+            and float(r.get("trading_value") or 0) > 0]
+    if not rows:
+        try:
+            fb = parse_toss_rankings_payload(
+                fetch_rankings(rank_type, "KR", duration_fallback, pool))
+        except Exception as e:
+            log.warning("Toss KR %s 폴백 랭킹 실패: %s", duration_fallback, e)
+            fb = []
+        seen = {r["symbol"] for r in rows}
+        for r in fb:
+            if r["symbol"] in seen:
+                continue
+            if float(r.get("price") or 0) < min_price:
+                continue
+            if float(r.get("trading_value") or 0) <= 0:
+                continue
+            rows.append(r)
+            seen.add(r["symbol"])
+        if fb:
+            log.info("Toss KR 라이브 %d건 — %s 폴백으로 %d건",
+                     len(live), duration_fallback, len(rows))
+    ranked = sorted(rows, key=lambda r: r["trading_value"], reverse=True)
+    if len(ranked) >= count:
+        _save_ranking_cache("KR", ranked)
+    elif allow_cache_fallback:
+        seen = {r["symbol"] for r in ranked}
+        cached = [r for r in _load_ranking_cache("KR")
+                  if r.get("symbol") not in seen
+                  and float(r.get("price") or 0) >= min_price]
+        if cached:
+            log.info("Toss KR 라이브 %d < %d — ranking_cache %d건 보충",
+                     len(ranked), count, len(cached))
+            ranked += cached
+            seen |= {r["symbol"] for r in cached}
+    log.info("발굴 KR(Toss TV) %d종목(pool=%d, 후보 %d)",
+             min(count, len(ranked)), pool, len(ranked))
+    return ranked[:count]
 
 
 def fetch_ranking(naver_market: str, pool: int = 100) -> list[dict]:

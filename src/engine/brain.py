@@ -22,7 +22,7 @@ import time
 from pathlib import Path
 from typing import Callable
 
-from ..agents.features import GAP_SCAN_REASONS
+from ..agents.features import wake_has_gap_scan
 from ..agents.llm import BrainQuotaError, is_bridge_armed
 from ..logging_setup import get_logger
 from . import brain_mode as bm
@@ -32,10 +32,7 @@ log = get_logger("engine.brain")
 
 def _cooldown_exempt(reason: str) -> bool:
     """갭반등 벽시계 슬롯은 쿨다운으로 놓치면 그날 기회가 사라진다."""
-    r = str(reason or "")
-    if not r:
-        return False
-    return any(tok.strip() in GAP_SCAN_REASONS for tok in r.split("+"))
+    return wake_has_gap_scan(reason)
 
 
 class BrainWorker:

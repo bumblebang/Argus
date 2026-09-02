@@ -67,3 +67,45 @@ def test_refresh_dry_skips(tmp_path):
     got = ss.refresh_strategy_scores(uni, lambda s, m: None, dry=True, path=out)
     assert got == {}
     assert not out.exists()
+
+
+def test_refresh_only_processes_passed_markets(tmp_path, monkeypatch):
+    out = tmp_path / "strategy_scores.json"
+    uni = {
+        "KR": [{"symbol": "005930", "market": "KR"}],
+        "US": [{"symbol": "AAPL", "market": "US"}],
+    }
+    monkeypatch.setattr(
+        ss, "recommend_strategy",
+        lambda df: {"best": "ma_crossover",
+                    "ranking": [{"strategy": "ma_crossover", "return_pct": 0.1}]})
+    seen: list[str] = []
+
+    def fetch(sym, mkt):
+        seen.append(sym)
+        return _synth_df()
+
+    ss.refresh_strategy_scores({"KR": uni["KR"]}, fetch, path=out)
+    assert seen == ["005930"]
+    ss.refresh_strategy_scores({"US": uni["US"]}, fetch, path=out)
+    assert seen == ["005930", "AAPL"]
+    loaded = ss.load_strategy_scores(out)
+    assert "005930" in loaded and "AAPL" in loaded
+
+
+def test_refresh_prunes_symbols_outside_universe(tmp_path, monkeypatch):
+    out = tmp_path / "strategy_scores.json"
+    out.write_text(
+        '{"asof": 1, "symbols": {"005930": {"best": "x", "ranking": []}, '
+        '"OLD": {"best": "y", "ranking": []}}}',
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        ss, "recommend_strategy",
+        lambda df: {"best": "ma_crossover",
+                    "ranking": [{"strategy": "ma_crossover", "return_pct": 0.1}]})
+    uni = {"KR": [{"symbol": "005930", "market": "KR"}]}
+    ss.refresh_strategy_scores(
+        uni, lambda s, m: _synth_df(), path=out, prune_universe=uni)
+    loaded = ss.load_strategy_scores(out)
+    assert "005930" in loaded and "OLD" not in loaded
