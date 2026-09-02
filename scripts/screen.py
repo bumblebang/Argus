@@ -4,9 +4,8 @@
   python scripts/screen.py --dry      # 네트워크 없이 합성데이터로 동작 확인(data/universe.dry.yaml)
   python scripts/screen.py --count 40 # 발굴 후보 풀 크기
 
-흐름: 발굴(Naver KR / Yahoo US 거래대금 상위) → Yahoo 일봉(검증/지표) → 하드필터+전략별
-      랭킹 → data/universe.yaml(레이어 태그·원자적 쓰기). 봇(config)이 screener.enabled 면
-      이 파일을 우선 사용. 역할분리: 발굴=Naver/Yahoo, 히스토리=Yahoo, 라이브 매매=토스.
+흐름: 발굴(KR=Toss 거래대금 / US=Yahoo) → light pick / Yahoo 일봉 → data/universe.yaml.
+      역할분리: KR 코어=Toss TV, legacy=Naver, 히스토리=Yahoo, 라이브=토스.
 
 이제 유니버스 생명주기는 상주 데몬(engine.universe_refresher)이 소유한다. 이 CLI 는 수동
 실행·점검용으로, 데몬과 **같은 쓰기 경로**(universe_roll.core_refresh: 원자적·레이어 태그)
@@ -39,6 +38,20 @@ def main() -> int:
     log = get_logger("screen")
     cfg = load_config()
     cfg.raw.setdefault("screener", {})["count"] = args.count
+    if not args.dry:
+        try:
+            from src.engine.gateway import TossGateway
+            from src.universe_roll import set_rankings_fn
+            gw = TossGateway.from_config(cfg, store=None)
+            if getattr(gw, "get_rankings", None):
+
+                def fetch(rt, mc, dur, cnt):
+                    return gw.get_rankings(rank_type=rt, market_country=mc,
+                                           duration=dur, count=cnt)
+
+                set_rankings_fn(fetch)
+        except Exception as e:
+            log.warning("Toss rankings 미연결 — KR Naver 폴백: %s", e)
     # --dry: 합성 경로로 강제 + 라이브 유니버스 오염 방지(전용 파일로 리다이렉트).
     orig_out, orig_dry = universe_roll.OUT, universe_roll._DRY
     if args.dry:

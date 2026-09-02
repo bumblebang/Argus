@@ -72,12 +72,14 @@ groups:
         path: src/universe_roll.py
         needle: "refresh_strategy_scores"
 
-      # 설계: KR 당일 거래대금 top ~300 (시총 풀 재정렬 아님). Toss/day_pool 동급.
-      - id: kr_discovery_pure_trading_value
-        desc: "KR core 발굴이 Naver marketValue API에만 의존하지 않음"
-        type: file_not_contains
-        path: src/datasources/discovery.py
-        needle: 'NAVER = "https://m.stock.naver.com/api/stocks/marketValue/{market}"'
-        waive: true
-        waive_reason: "Phase0 Naver — Toss TV unify 후 waive 제거"
-        waive_until: "2026-09-30"
+      - id: kr_core_toss_trading_value
+        desc: "KR core_refresh 가 Toss 거래대금 랭킹 사용"
+        type: file_contains
+        path: src/universe_roll.py
+        needle: top_kr_by_toss_trading_value
+
+      - id: kr_rankings_fn_wired
+        desc: "watch/orchestrator 가 set_rankings_fn 주입"
+        type: file_contains
+        path: scripts/watch.py
+        needle: _bind_core_rankings

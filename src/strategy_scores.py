@@ -40,6 +40,15 @@ def _atomic_write(payload: dict, path: Path) -> None:
     os.replace(tmp, path)
 
 
+def _universe_symbols(universe: dict | None) -> set[str]:
+    out: set[str] = set()
+    for items in (universe or {}).values():
+        for it in items or []:
+            if isinstance(it, dict) and it.get("symbol"):
+                out.add(str(it["symbol"]))
+    return out
+
+
 def refresh_strategy_scores(
     universe: dict,
     fetch_candles: Callable[[str, str], object],
@@ -47,8 +56,12 @@ def refresh_strategy_scores(
     dry: bool = False,
     path: Path | None = None,
     now_fn: Callable[[], float] = time.time,
+    prune_universe: dict | None = None,
 ) -> dict[str, dict]:
-    """유니버스 전 종목 8전략 간이 백테스트 → JSON 저장. 반환: symbols dict."""
+    """유니버스 전 종목 8전략 간이 백테스트 → JSON 저장. 반환: symbols dict.
+
+    prune_universe 지정 시 해당 유니버스에 없는 심볼 스코어는 제거한다.
+    """
     if dry:
         log.info("strategy_scores dry — 스킵")
         return {}
@@ -88,6 +101,12 @@ def refresh_strategy_scores(
             except Exception as e:
                 n_fail += 1
                 log.debug("[%s] strategy_scores 실패: %s", sym, e)
+    if prune_universe is not None:
+        keep = _universe_symbols(prune_universe)
+        before = len(scores)
+        scores = {k: v for k, v in scores.items() if k in keep}
+        if before > len(scores):
+            log.info("strategy_scores prune %d→%d (유니버스 밖 제거)", before, len(scores))
     payload = {"asof": now_fn(), "symbols": scores}
     _atomic_write(payload, out_path)
     log.info("strategy_scores %d종목 저장 (실패/스킵 %d) -> %s", n_ok, n_fail, out_path)

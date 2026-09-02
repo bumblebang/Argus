@@ -39,6 +39,7 @@ Register-ScheduledTask -TaskName "ArgusWatchdog" -Action $wdAction -Trigger $wdT
     -Settings $wdSettings -Description "Argus-Watch heartbeat watchdog (restart on hang)" -Force | Out-Null
 
 Write-Host "[OK] ArgusWatch + ArgusWatchdog 등록 완료."
+Write-Host "  git hook(머지 후 재기동):  powershell -ExecutionPolicy Bypass -File scripts\install_git_hooks.ps1"
 Write-Host "  시작:  schtasks /Run /TN ArgusWatch"
 Write-Host "  상태:  schtasks /Query /TN ArgusWatch ; schtasks /Query /TN ArgusWatchdog"
 Write-Host "  로그:  logs\watch.run.log (프로세스), data\state\watch.heartbeat (생존)"

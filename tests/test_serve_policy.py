@@ -68,6 +68,31 @@ def test_select_scan_must_exceeds_cap():
     assert len(out) == 8  # must 8 > cap 5 → must 전원
 
 
+def test_gap_scan_exempt_from_scan_cap():
+    items = [{"symbol": f"{i:06d}", "market": "KR", "decline_pct": -8.0}
+             for i in range(1, 51)]
+    scores = {f"{i:06d}": {"ranking": [{"return_pct": i / 100.0}]}
+              for i in range(1, 51)}
+    cfg = serve.serve_cfg({"serve": {
+        "enabled": True, "scan_enabled": True, "scan_cap": 10}})
+    for reason in ("gap_rebound_scan", "nxt_gap_scan"):
+        out, tier = serve.select_candidates(
+            items, {"reason": reason}, scores=scores, cfg=cfg)
+        assert tier == "scan"
+        assert len(out) == 50
+        assert serve.scan_shortlist_exempt({"reason": reason})
+
+
+def test_gap_scan_composite_reason_exempt_from_cap():
+    items = [{"symbol": f"{i:06d}", "market": "KR"} for i in range(1, 51)]
+    cfg = serve.serve_cfg({"serve": {
+        "enabled": True, "scan_enabled": True, "scan_cap": 10}})
+    out, tier = serve.select_candidates(
+        items, {"reason": "gap_rebound_scan+extra"}, cfg=cfg)
+    assert tier == "scan"
+    assert len(out) == 50
+
+
 def test_select_focus_held_and_wake_only():
     items = [{"symbol": f"{i:06d}", "market": "KR", "pool": "day"} for i in range(1, 51)]
     wake = {"reason": "wake_triggers",

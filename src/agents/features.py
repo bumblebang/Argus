@@ -34,6 +34,16 @@ GAP_SCAN_REASONS = frozenset({"gap_rebound_scan", "nxt_gap_scan"})
 GAP_REBOUND_INTRADAY_FLOOR = -5.0
 
 
+def wake_reason_tokens(reason: str) -> list[str]:
+    """coalesce 조인 reason('a+b' / 'a|b') 토큰 분리."""
+    return [p.strip() for p in str(reason or "").replace("|", "+").split("+") if p.strip()]
+
+
+def wake_has_gap_scan(reason: str) -> bool:
+    """단독·복합 wake.reason 에 갭반등 슬롯이 포함되는지."""
+    return any(p in GAP_SCAN_REASONS for p in wake_reason_tokens(reason))
+
+
 def _passes_intraday_floor(c: dict, floor: float) -> bool:
     """intraday_ret_pct 우선, 없으면 풀 랭킹 fluctuation/decline_pct 로 1차 컷."""
     ir = c.get("intraday_ret_pct")

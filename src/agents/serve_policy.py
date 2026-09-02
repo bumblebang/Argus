@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from typing import Any, Iterable
 
-# 정기 각성 — shortlist 미적용(현행 전량).
+# 정기 각성 — scan tier(느린 슬롯 전량 vs shortlist 분기).
 SCAN_REASONS = frozenset({
     "periodic", "extra", "athena_done", "gap_rebound_scan", "nxt_gap_scan", "",
 })
@@ -70,6 +70,13 @@ def serve_cfg(agents_cfg: dict | None) -> dict:
         "scan_enabled": bool(raw.get("scan_enabled", True)),
         "scan_cap": int(raw.get("scan_cap", 40)),
     }
+
+
+def scan_shortlist_exempt(wake: dict | None) -> bool:
+    """갭반등 각성 등 — pool 선별 후이므로 scan_cap 을 씌우지 않는다."""
+    from .features import wake_has_gap_scan
+
+    return wake_has_gap_scan(str((wake or {}).get("reason") or ""))
 
 
 def classify_tier(wake: dict | None, *, cfg: dict | None = None) -> str:
@@ -243,7 +250,8 @@ def select_candidates(items: list[dict], wake: dict | None, *,
     c = cfg or serve_cfg(None)
     t = tier or classify_tier(wake, cfg=c)
     if t != "focus":
-        if t == "scan" and c.get("scan_enabled", True):
+        if (t == "scan" and c.get("scan_enabled", True)
+                and not scan_shortlist_exempt(wake)):
             return select_scan_candidates(
                 items, held=held, armed=armed, bullish=bullish,
                 scores=scores, cfg=c), t

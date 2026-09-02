@@ -2,7 +2,15 @@
 import numpy as np
 import pandas as pd
 
-from src.agents.features import assemble, technical_summary
+from src.agents.features import assemble, technical_summary, wake_has_gap_scan
+
+
+def test_wake_has_gap_scan_composite():
+    assert wake_has_gap_scan("gap_rebound_scan")
+    assert wake_has_gap_scan("gap_rebound_scan+extra")
+    assert wake_has_gap_scan("extra|nxt_gap_scan")
+    assert not wake_has_gap_scan("periodic")
+    assert not wake_has_gap_scan("")
 
 
 def _candles(n=300, base=100.0) -> list[dict]:

@@ -8,7 +8,7 @@ import yaml
 import src.datasources.discovery as D
 from src.datasources.discovery import (top_by_trading_value, fetch_ranking,
                                        top_us_by_trading_value, fetch_us_actives,
-                                       fetch_us_value_pool)
+                                       fetch_us_value_pool, top_kr_by_toss_trading_value)
 from src.config import resolve_universe
 
 
@@ -201,6 +201,28 @@ def test_top_us_by_trading_value_sorts_and_filters():
     syms = [r["symbol"] for r in out]
     assert "OPEN" not in syms                          # $4.37 < min_price 5 제외
     assert syms == ["AAPL", "NVDA"]                    # 거래대금순(AAPL>NVDA)
+
+
+def test_top_kr_by_toss_trading_value_live_and_fallback():
+    calls = []
+
+    def fetch(rank_type, market, duration, count):
+        calls.append((rank_type, market, duration, count))
+        if duration == "realtime":
+            return {"rankings": []}
+        return {"rankings": [
+            {"rank": 1, "symbol": "005930", "name": "삼성", "price": 70000,
+             "tradingAmount": "20000000000"},
+            {"rank": 2, "symbol": "000660", "name": "하이닉스", "price": 500000,
+             "tradingAmount": "15000000000"},
+            {"rank": 3, "symbol": "001", "name": "cheap", "price": 1000,
+             "tradingAmount": "99000000000"},
+        ]}
+
+    out = top_kr_by_toss_trading_value(
+        count=2, pool=10, min_price=2000, fetch_rankings=fetch)
+    assert calls[0][2] == "realtime" and calls[1][2] == "1d"
+    assert [r["symbol"] for r in out] == ["005930", "000660"]
 
 
 def test_fetch_us_actives_parses(monkeypatch):

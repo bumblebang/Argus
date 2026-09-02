@@ -44,6 +44,7 @@ from src.engine.slice_refresher import SliceRefresher, start_slice_refresher_thr
 from src.engine.universe_refresher import (UniverseRefresher,
                                           start_universe_refresher_thread)
 from src.universe_roll import core_refresh, mover_scan
+from src.agents.features import wake_has_gap_scan
 from src.market_hours import is_tradable, calendar_covers
 from src.session_policy import (make_tradable_fn, market_value_due, trading_sessions_from_raw,
                                 value_sessions_from_raw)
@@ -105,6 +106,19 @@ def _refresh_day_pool(gateway, cfg) -> None:
                                     duration=duration, count=count)
 
     refresh_all_day_pools(fetch, cfg)
+
+
+def _bind_core_rankings(gateway) -> None:
+    """KR liquidity_core 발굴 — Toss 거래대금 랭킹(day_pool 과 동일 API)."""
+    if getattr(gateway, "get_rankings", None) is None:
+        return
+    from src.universe_roll import set_rankings_fn
+
+    def fetch(rank_type, market_country, duration, count):
+        return gateway.get_rankings(rank_type=rank_type, market_country=market_country,
+                                    duration=duration, count=count)
+
+    set_rankings_fn(fetch)
 
 
 def _refresh_gap_decline_pool(cfg) -> None:
@@ -182,7 +196,7 @@ def _build_brain(cfg, gateway, store, args, broker, risk, universe_fn=None,
         except Exception as e:
             log.warning("day_pool 리프레시 실패(기존 유지): %s", e)
         wake_reason = str((wake or {}).get("reason") or "")
-        if wake_reason in ("gap_rebound_scan", "nxt_gap_scan"):
+        if wake_has_gap_scan(wake_reason):
             try:
                 _refresh_gap_decline_pool(cfg)
             except Exception as e:
@@ -669,6 +683,7 @@ def main() -> int:
     wcfg = cfg.raw.get("watch", {})
     store = Store(run_cfg.get("db_path", "data/bot.db"))
     gateway = TossGateway.from_config(cfg, store=store)
+    _bind_core_rankings(gateway)
     markets = cfg.run.get("trade_markets", ["KR", "US"])
     heartbeat = str(_paths.resolve(
         "watch_hb",
@@ -764,8 +779,10 @@ def main() -> int:
 
     broker_tag = (f"LIVE({','.join(broker.live_markets)})" if broker.mode == "live"
                   else "PAPER")
-    log.info("Argus-Watch 시작 — markets=%s, broker=%s, 장중 %ss / 휴장 %ss, brain=%s, heartbeat=%s",
-             markets, broker_tag, loop.cfg.watch_interval_sec, loop.cfg.idle_interval_sec,
+    from src.code_rev import current_code_rev
+    _rev = current_code_rev()
+    log.info("Argus-Watch 시작 — markets=%s, broker=%s, code_rev=%s, 장중 %ss / 휴장 %ss, brain=%s, heartbeat=%s",
+             markets, broker_tag, _rev, loop.cfg.watch_interval_sec, loop.cfg.idle_interval_sec,
              "on" if brain else "off", heartbeat)
     if brain:
         brain.start()
