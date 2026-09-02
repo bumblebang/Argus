@@ -267,7 +267,9 @@ def test_fetch_ondemand_news_skips_us_without_key(monkeypatch):
     assert calls == []
 
 
-def test_build_context_focus_compact_and_headline_limit():
+def test_build_context_focus_compact_and_headline_limit(monkeypatch):
+    from src.agents import context as ctx
+    monkeypatch.setattr(ctx, "_notify_headline_trim", lambda *a: None)
     ms = {"news": [{"source": "t", "title": f"n{i}"} for i in range(80)]}
     wide = build_context(ms, [{"symbol": "1"}], {"cash": 0, "positions": []}, {})
     narrow = build_context(

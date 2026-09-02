@@ -137,6 +137,7 @@ def test_heartbeat_ok_false_on_tick_error(tmp_path):
     class _L:
         heartbeat_path = tmp_path / "hb.json"
         _ticks = 1
+        _code_rev = "test"
         markets = ["KR"]
         cfg = SimpleNamespace(trading_sessions={"KR": ("regular",)})
         def _now(self):
@@ -154,6 +155,7 @@ def test_heartbeat_ok_false_when_should_poll_but_idle(tmp_path, monkeypatch):
     class _L:
         heartbeat_path = tmp_path / "hb.json"
         _ticks = 3
+        _code_rev = "test"
         markets = ["KR", "US"]
         cfg = loopmod.WatchConfig(trading_sessions={"KR": ("regular",)})
         def _now(self):
@@ -171,6 +173,7 @@ def test_heartbeat_ok_true_when_closed(tmp_path, monkeypatch):
     class _L:
         heartbeat_path = tmp_path / "hb.json"
         _ticks = 1
+        _code_rev = "test"
         markets = ["KR", "US"]
         cfg = loopmod.WatchConfig()
         def _now(self):

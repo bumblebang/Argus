@@ -60,6 +60,7 @@ def test_watchdog_restarts_on_code_rev_mismatch(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(wd, "code_rev_stale",
                         lambda hb: (True, "oldrev111111", "newrev222222"))
     monkeypatch.setattr(wd, "restart", lambda: restarted.append("yes"))
+    monkeypatch.setattr(wd, "LOG", tmp_path / "watchdog.log")
 
     wd.main()
     assert restarted == ["yes"]
