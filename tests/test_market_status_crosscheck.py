@@ -60,6 +60,18 @@ def test_us_regular_open_yahoo_regular(monkeypatch):
     assert msc.us_regular_open_yahoo() is True
 
 
+def test_kr_regular_open_yahoo_regular(monkeypatch):
+    monkeypatch.setattr(msc, "_yahoo_regular_open",
+                        lambda url, timeout=8: True if "KS11" in url else None)
+    assert msc.kr_regular_open_yahoo() is True
+
+
+def test_external_kr_uses_yahoo_not_is_open(monkeypatch):
+    monkeypatch.setattr(msc, "kr_regular_open_yahoo", lambda timeout=8: False)
+    monkeypatch.setattr(msc, "is_open", lambda m, now=None: True)
+    assert msc.external_regular_open("KR") is False
+
+
 def test_kr_cache_date_mismatch_on_stale(tmp_path, monkeypatch):
     path = tmp_path / "market_sessions.json"
     path.write_text(json.dumps({

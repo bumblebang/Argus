@@ -2,6 +2,7 @@
 
 alert_check(5분 주기) 전용. 외부 조회 실패는 fail-open(경보 없음).
 정규장(regular)만 비교 — 프리/애프터는 Argus trading_sessions 설정과 정의가 달라 오탐 방지.
+KR/US 모두 Yahoo marketState(또는 US Finnhub) — 자기 is_open 달력과 비교하지 않는다.
 """
 from __future__ import annotations
 
@@ -28,6 +29,7 @@ log = get_logger("src.market_status_crosscheck")
 _KST = ZoneInfo("Asia/Seoul")
 _FINNHUB_BASE = "https://finnhub.io/api/v1"
 _YAHOO_CHART = "https://query1.finance.yahoo.com/v8/finance/chart/SPY"
+_YAHOO_CHART_KR = "https://query1.finance.yahoo.com/v8/finance/chart/%5EKS11"
 _YAHOO_UA = {"User-Agent": "Mozilla/5.0 argus"}
 
 
@@ -75,11 +77,11 @@ def us_regular_open_finnhub(api_key: str | None = None, *, now: float | None = N
     return False
 
 
-def us_regular_open_yahoo(*, timeout: float = 8) -> bool | None:
-    """Yahoo SPY chart meta.marketState == REGULAR. None=조회 불가."""
+def _yahoo_regular_open(url: str, *, timeout: float = 8) -> bool | None:
+    """Yahoo chart meta.marketState == REGULAR. None=조회 불가."""
     try:
         r = requests.get(
-            _YAHOO_CHART,
+            url,
             params={"interval": "1d", "range": "1d"},
             headers=_YAHOO_UA,
             timeout=timeout,
@@ -96,8 +98,18 @@ def us_regular_open_yahoo(*, timeout: float = 8) -> bool | None:
             return False
         return False
     except Exception as e:
-        log.debug("Yahoo marketState 실패: %s", e)
+        log.debug("Yahoo marketState 실패(%s): %s", url, e)
         return None
+
+
+def us_regular_open_yahoo(*, timeout: float = 8) -> bool | None:
+    """Yahoo SPY chart meta.marketState == REGULAR. None=조회 불가."""
+    return _yahoo_regular_open(_YAHOO_CHART, timeout=timeout)
+
+
+def kr_regular_open_yahoo(*, timeout: float = 8) -> bool | None:
+    """Yahoo ^KS11 chart meta.marketState == REGULAR. None=조회 불가."""
+    return _yahoo_regular_open(_YAHOO_CHART_KR, timeout=timeout)
 
 
 def external_regular_open(market: str, now: float | None = None) -> bool | None:
@@ -109,9 +121,7 @@ def external_regular_open(market: str, now: float | None = None) -> bool | None:
             return ext
         return us_regular_open_yahoo()
     if m == "KR":
-        ts = time.time() if now is None else float(now)
-        local = datetime.fromtimestamp(ts, _KST)
-        return is_open("KR", local)
+        return kr_regular_open_yahoo()
     return None
 
 

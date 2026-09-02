@@ -5,15 +5,23 @@ from pathlib import Path
 
 import yaml
 
-from src.eval.design_alignment import alignment_ok, run_alignment
+from src.eval.design_alignment import alignment_ok, resolve_config_path, run_alignment
 
 
 def test_design_invariants_pass_on_repo(tmp_path):
     """저장소 config.example + golden manifest — error급 전부 통과(waive 제외)."""
     root = Path(__file__).resolve().parents[1]
-    results = run_alignment(root=root)
+    results = run_alignment(root=root, config_path=root / "config.example.yaml")
     hard_fails = [r for r in results if not r.ok and not r.waived]
     assert not hard_fails, "\n".join(f"{r.check_id}: {r.detail}" for r in hard_fails)
+
+
+def test_resolve_config_prefers_live_yaml(tmp_path):
+    root = tmp_path
+    (root / "config.example.yaml").write_text("x: 1\n", encoding="utf-8")
+    assert resolve_config_path(root).name == "config.example.yaml"
+    (root / "config.yaml").write_text("x: 2\n", encoding="utf-8")
+    assert resolve_config_path(root).name == "config.yaml"
 
 
 def test_config_eq_detects_mismatch(tmp_path):

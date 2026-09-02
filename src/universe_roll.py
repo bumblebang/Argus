@@ -240,7 +240,7 @@ def _sector_lookup(cfg) -> dict[str, str]:
                 for sym, sec in lst.items():
                     if sym and sec:
                         out[str(sym)] = str(sec)
-        except (OSError, ValueError) as e:
+        except (OSError, ValueError, yaml.YAMLError) as e:
             log.warning("sector_map.yaml 로드 실패(무시): %s", e)
     if _UNIVERSE_PATH.is_file():
         try:
@@ -250,8 +250,8 @@ def _sector_lookup(cfg) -> dict[str, str]:
                     sym, sec = it.get("symbol"), it.get("sector")
                     if sym and sec:
                         out[str(sym)] = str(sec)
-        except (OSError, ValueError):
-            pass
+        except (OSError, ValueError, yaml.YAMLError) as e:
+            log.warning("universe.yaml sector 로드 실패(무시): %s", e)
     return out
 
 
@@ -272,7 +272,7 @@ def _load_yaml(path: Path) -> dict:
         if path.exists():
             data = yaml.safe_load(path.read_text(encoding="utf-8"))
             return data if isinstance(data, dict) else {}
-    except (OSError, ValueError) as e:
+    except (OSError, ValueError, yaml.YAMLError) as e:
         log.warning("universe.yaml 로드 실패(빈 dict 취급): %s", e)
     return {}
 

@@ -17,6 +17,13 @@ DEFAULT_MANIFEST = ROOT / "tests" / "golden" / "design_invariants.yaml"
 DEFAULT_CONFIG = ROOT / "config.example.yaml"
 
 
+def resolve_config_path(root: Path | None = None) -> Path:
+    """실운영 config.yaml 우선, 없으면 example."""
+    root = root or ROOT
+    live = root / "config.yaml"
+    return live if live.is_file() else root / "config.example.yaml"
+
+
 @dataclass
 class CheckResult:
     group: str
@@ -133,7 +140,7 @@ def run_alignment(
 ) -> list[CheckResult]:
     root = root or ROOT
     manifest = _load_yaml(manifest_path or DEFAULT_MANIFEST)
-    cfg = _load_yaml(config_path or DEFAULT_CONFIG)
+    cfg = _load_yaml(config_path or resolve_config_path(root))
     results: list[CheckResult] = []
     for gname, group in (manifest.get("groups") or {}).items():
         if not isinstance(group, dict):

@@ -14,6 +14,7 @@ act 가 뜨면 각성 콜백(on_wake)으로 '뇌(LLM)'를 깨울 수 있다(M2 �
 """
 from __future__ import annotations
 
+import inspect
 import json
 import threading
 import time
@@ -28,7 +29,7 @@ from ..code_rev import current_code_rev
 from ..config import ROOT
 from ..datasources.breadth import label_of
 from ..logging_setup import get_logger
-from ..market_hours import current_session, is_tradable, near_session_end, market_day
+from ..market_hours import current_session, is_tradable, near_session_end, market_day, _SESSIONS
 from .gateway import TossGateway
 from .store import Store
 from . import triggers as T
@@ -46,8 +47,6 @@ from ..session_policy import (
     parse_session_map,
     trading_sessions_from_raw,
 )
-
-_KST = ZoneInfo("Asia/Seoul")   # extra_wakes(지정시각 각성) HH:MM 판정용
 
 # MA20 캐시(data/ma20.json, 장전 배치 부산물) 신선도 한도. 넘으면 캐시를 안 쓴다 —
 # 낡은 MA20 으로 국면을 오판하느니 live_slice 의 지수 프록시로 폴백하는 게 낫다.
@@ -135,7 +134,7 @@ class WatchConfig:
     # brain_interval_sec 주기로 뇌가 재평가한다(NXT 프리마켓처럼 실가격이 형성되는 구간용).
     brain_sessions: dict[str, tuple[str, ...]] = field(
         default_factory=lambda: dict(DEFAULT_BRAIN_SESSIONS))
-    # 지정 시각(KST HH:MM) 1회 각성. {market: (HH:MM,...)}. 기본={}=비활성(기존 동작).
+    # 지정 시각(시장 로컬 HH:MM) 1회 각성. {market: (HH:MM,...)}. 기본={}=비활성(기존 동작).
     extra_wakes: dict[str, tuple[str, ...]] = field(default_factory=dict)
     # extra 발화 dedup 영속 파일. 빈 문자열이면 paths extra_wake_state 기본.
     extra_wake_state_path: str = ""
@@ -237,6 +236,12 @@ class WatchConfig:
 
 # watchlist_fn 반환형: {market: {"positions": [pos dict...], "candidates": [symbol...]}}
 WatchlistFn = Callable[[], dict]
+
+
+def _extra_wake_tz(market: str) -> ZoneInfo:
+    """extra_wakes HH:MM — 시장 로컬 벽시계(KR=KST, US=ET, DST 자동)."""
+    tzname = _SESSIONS.get(market, ("Asia/Seoul",))[0]
+    return ZoneInfo(tzname)
 
 
 def _blank_market() -> dict:
@@ -647,9 +652,12 @@ class WatchLoop:
         """on_wake 콜백 — BrainWorker.wake(at=,market=) 지원 시 메타 전달."""
         if not self.on_wake:
             return
-        try:
+        sig = inspect.signature(self.on_wake)
+        params = sig.parameters
+        if ("at" in params or "market" in params
+                or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())):
             self.on_wake(reason, triggers, at=at, market=market)
-        except TypeError:
+        else:
             self.on_wake(reason, triggers)
 
     # ── 한 틱: 폴링 → 트리거 평가 → 정밀 → 로깅 ──────────────
@@ -667,7 +675,8 @@ class WatchLoop:
                 })
                 try:
                     self._mark_brain_wake()
-                    self.on_wake(reason, [])
+                    mkt = str(req.get("market") or "").strip() or None
+                    self._call_on_wake(reason, [], at=None, market=mkt)
                 except Exception as e:
                     log.error("외부 각성 콜백 실패: %s", e)
                     self.store.log_event("error", None,
@@ -685,7 +694,12 @@ class WatchLoop:
         # 세션명은 아래 게이트들(데이트레 진입·주기 각성)이 다시 쓴다 — 틱당 1회만 조회.
         sessions = {m: current_session(m, now_ts) for m in open_markets}
 
-        wl = self.watchlist_fn()
+        wl: dict = {}
+        try:
+            wl = self.watchlist_fn()
+        except Exception as e:
+            log.error("watchlist 로드 실패(빈 dict): %s", e)
+            self.store.log_event("error", None, {"where": "watchlist_fn", "err": str(e)})
         ms_full = _read_market_state()
         cur_regime = wl.get("_regime", {})          # {market: label} — regime_flip 비교용
         imminent: list[tuple[str, str, list]] = []  # (market, symbol, triggers)
@@ -875,7 +889,10 @@ class WatchLoop:
             self.store.log_event("wake", None, {"triggers": payload})
             if self.on_wake:
                 try:
-                    self.on_wake("wake_triggers", wake_triggers)
+                    from ..agents.context import infer_wake_market
+                    wake_mkt = infer_wake_market(None, None, triggers=wake_triggers)
+                    self._call_on_wake("wake_triggers", wake_triggers,
+                                       market=wake_mkt)
                 except Exception as e:
                     log.error("각성 콜백 실패: %s", e)
                     self.store.log_event("error", None, {"where": "on_wake", "err": str(e)})
@@ -947,15 +964,15 @@ class WatchLoop:
         # 같은 틱에서 이미 깼으면(외부 요청·periodic·트리거) 건너뛴다(LLM 이중 호출 방지).
         # 열린 시장에서만 평가 -> 휴장일엔 open_markets 가 비어 이 블록 자체가 안 돈다.
         if (self.on_wake or self.on_pool_refresh) and not res.woke:
-            now_kst = datetime.fromtimestamp(now_ts, tz=_KST)
             for m in open_markets:
+                now_local = datetime.fromtimestamp(now_ts, tz=_extra_wake_tz(m))
                 for hhmm in self.cfg.extra_wakes.get(m, ()):
                     try:
                         datetime.strptime(hhmm, "%H:%M")
                     except ValueError:
                         log.warning("extra_wakes 시각 형식 오류(무시) %s: %s", m, hhmm)
                         continue
-                    day = market_day(m, now_kst)
+                    day = market_day(m, now_local)
                     if not ews.should_fire_extra(
                             market=m, hhmm=hhmm, trading_day=day,
                             fired=self._extra_fired, now_ts=now_ts,

@@ -100,6 +100,36 @@ ATHENA_SYSTEM = """\
   macro_kr 로 US 금리·물가를 대신하지 마라. 금리 민감이면 evidence 에 수치로 인용하라."""
 
 
+def _batch_symbol_news(market_state: dict | None, symbol: str, *, limit: int = 10) -> list[dict]:
+    ms = market_state or {}
+    rows = [n for n in (ms.get("news") or []) if n.get("symbol") == symbol][:limit]
+    return [{"source": n.get("source"), "title": n.get("title")} for n in rows]
+
+
+def fetch_symbol_news(symbol: str, market: str, *, per: int = 5) -> list[dict]:
+    """종목 헤드라인 live fetch — value_scan 과 동일 경로. 실패 시 []."""
+    mkt = str(market or "KR").upper()
+    sym = str(symbol or "").strip()
+    if not sym:
+        return []
+    try:
+        if mkt == "KR":
+            from ..datasources.news import fetch_kr_stock_news
+            rows = fetch_kr_stock_news(sym, per=per)
+        else:
+            import os
+            key = (os.getenv("FINNHUB_API_KEY") or "").strip()
+            if not key:
+                return []
+            from ..datasources.finnhub import fetch_company_news
+            rows = fetch_company_news(key, sym, per=per)
+        return [{"source": r.get("source"), "title": r.get("title")}
+                for r in (rows or []) if r.get("title")]
+    except Exception as e:
+        log.warning("[%s] 종목 뉴스 live fetch 실패(배치 폴백): %s", sym, e)
+        return []
+
+
 def build_research_context(symbol: str, name: str, market: str, *,
                            history_df: pd.DataFrame | None,
                            market_state: dict | None = None,
@@ -107,7 +137,9 @@ def build_research_context(symbol: str, name: str, market: str, *,
                            past_trades: list[dict] | None = None,
                            focus: dict | None = None,
                            earnings: dict | None = None,
-                           earnings_results: list[dict] | None = None) -> dict:
+                           earnings_results: list[dict] | None = None,
+                           live_news: bool = True,
+                           news_per: int = 5) -> dict:
     """종목 1개의 딥리서치 입력 묶음(~수 KB). LLM 이 이걸 보고 도시에를 쓴다.
 
     focus: 주의층 렌즈. None 이면 이 호출에서 build_focus 로 계산한다.
@@ -117,11 +149,16 @@ def build_research_context(symbol: str, name: str, market: str, *,
 
     earnings / earnings_results: 뇌 cycle_runner 와 같은 실적 슬롯. 없으면 생략.
     macro(FRED)는 market_state 에서 항상 실어 US 거시 배경을 맞춘다.
+    live_news: True 면 네이버/Finnhub live → 실패·빈 결과 시 배치 symbol match 폴백.
     """
     ms = market_state or {}
     br = base_rates if base_rates is not None else (
         analyze(history_df) if history_df is not None else {})
-    news = [n for n in (ms.get("news") or []) if n.get("symbol") == symbol][:10]
+    news: list[dict] = []
+    if live_news:
+        news = fetch_symbol_news(symbol, market, per=news_per)
+    if not news:
+        news = _batch_symbol_news(ms, symbol, limit=10)
     cand = {"symbol": symbol, "name": name, "market": market}
     attach_krx_fields([cand], ms)
     if focus is None:
@@ -143,7 +180,7 @@ def build_research_context(symbol: str, name: str, market: str, *,
         "program_flows": ms.get("program_flows"),
         "short_market": ms.get("short_market"),
         "focus": focus,
-        "news": [{"source": n.get("source"), "title": n.get("title")} for n in news],
+        "news": news,
         "past_trades": past_trades or [],
     }
     if earnings:

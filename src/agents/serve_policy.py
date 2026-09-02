@@ -57,10 +57,13 @@ def serve_cfg(agents_cfg: dict | None) -> dict:
         "focus_cap": int(raw.get("focus_cap", 16)),
         "focus_pad": int(raw.get("focus_pad", 0)),
         "ondemand_flows": bool(raw.get("ondemand_flows", True)),
-        "ondemand_news": bool(raw.get("ondemand_news", False)),
+        "ondemand_news": bool(raw.get("ondemand_news", True)),
         "focus_headline_limit": (
             int(raw["focus_headline_limit"])
-            if raw.get("focus_headline_limit") is not None else None),
+            if raw.get("focus_headline_limit") is not None else 12),
+        "focus_macro_pad": int(raw.get("focus_macro_pad", 8)),
+        "headline_ttl_hours": float(raw.get("headline_ttl_hours", 24)),
+        "focus_trim_notify": bool(raw.get("focus_trim_notify", False)),
         "focus_reasons": fr,
         "compact_json": bool(raw.get("compact_json", True)),
         "enrich_fundamentals": bool(raw.get("enrich_fundamentals", True)),

@@ -138,6 +138,19 @@ def test_merge_level_refresh():
     assert out.entry_low == 99
 
 
+def test_merge_level_refresh_replaces_prior_note():
+    prev = {"thesis": "원 thesis [레벨갱신] 이전 메모",
+            "evidence": json.dumps({"stance": "bullish", "horizon": "swing",
+                                    "evidence": [], "key_risks": []})}
+    lvl = DossierLevelOutput(stance="bullish", entry_low=99, entry_high=103,
+                             invalidation=96, target=112, conviction=0.65,
+                             level_note="신규 메모")
+    out = merge_level_refresh(prev, lvl)
+    assert out.thesis.count("[레벨갱신]") == 1
+    assert "이전 메모" not in out.thesis
+    assert "신규 메모" in out.thesis
+
+
 def test_run_batch_level_only(tmp_path):
     cfg = load_config()
     cfg.universe["KR"] = [{"symbol": "LVL", "name": "l"}]

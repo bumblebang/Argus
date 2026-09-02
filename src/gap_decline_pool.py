@@ -44,7 +44,7 @@ def load_gap_decline_pool(path: Path | None = None) -> dict:
         if p.exists():
             data = yaml.safe_load(p.read_text(encoding="utf-8"))
             return data if isinstance(data, dict) else {}
-    except (OSError, ValueError) as e:
+    except (OSError, ValueError, yaml.YAMLError) as e:
         log.warning("gap_decline_pool 로드 실패(빈 dict): %s", e)
     return {}
 

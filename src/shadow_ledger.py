@@ -359,12 +359,17 @@ def load_daily_series(data_dir: Path, symbol: str) -> list[tuple[datetime, float
 
 def exit_close_on_calendar(series: list[tuple[datetime, float]],
                            entry_ts: float,
-                           horizon_days: int) -> float | None:
-    """entry_ts + horizon_days 캘린더 기준, 그 이전 마지막 거래일 종가."""
+                           horizon_days: int,
+                           *, market: str = "KR") -> float | None:
+    """entry 시장 로컬 날짜 + horizon_days 캘린더, 그 이전 마지막 거래일 종가."""
     if not series:
         return None
-    target = entry_ts + horizon_days * 86400
-    target_date = datetime.fromtimestamp(target, tz=KST).date()
+    from zoneinfo import ZoneInfo
+
+    from .market_hours import _SESSIONS
+    tzname = _SESSIONS.get(market, ("Asia/Seoul",))[0]
+    entry_dt = datetime.fromtimestamp(entry_ts, tz=ZoneInfo(tzname))
+    target_date = entry_dt.date() + timedelta(days=horizon_days)
     best = None
     for d, c in series:
         if d.date() <= target_date:
@@ -437,7 +442,8 @@ def score_open_shadows(store, *, now: float | None = None,
         if sym not in daily_cache:
             daily_cache[sym] = load_daily_series(data_dir, sym)
         series = daily_cache[sym]
-        exit_px = exit_close_on_calendar(series, entry_ts, hdays)
+        exit_px = exit_close_on_calendar(series, entry_ts, hdays,
+                                         market=market or "KR")
         price_source = "history"
         if exit_px is None:
             exit_px = snap_forward(store, sym, entry_ts, float(hdays))

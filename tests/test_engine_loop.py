@@ -138,6 +138,31 @@ def test_vol_spike_wakes_brain(tmp_path, monkeypatch):
     assert "AAPL" in gw.candle_calls              # 임박 -> 정밀 폴링
 
 
+def test_vol_spike_wake_passes_market(tmp_path, monkeypatch):
+    """KR 6자리 vol_spike → on_wake(..., market='KR') — focus headlines 시장 필터."""
+    _only_kr_open(monkeypatch)
+    store = Store(tmp_path / "t.db")
+    sym = "196170"
+    gw = FakeGateway({sym: 100})
+    seen = []
+
+    def on_wake(why, trigs, *, at=None, market=None):
+        seen.append({"why": why, "market": market})
+
+    loop = WatchLoop(
+        gw, store,
+        lambda: {"KR": {"positions": [], "candidates": [sym]}},
+        on_wake=on_wake,
+        config=WatchConfig(vol_spike_pct=0.03, vol_window=5),
+    )
+    loop.run_once()
+    gw.prices[sym] = 105
+    res = loop.run_once()
+    assert res.woke and seen
+    assert seen[0]["why"] == "wake_triggers"
+    assert seen[0]["market"] == "KR"
+
+
 def test_precision_capped_per_tick(tmp_path, monkeypatch):
     _only_kr_open(monkeypatch)
     store = Store(tmp_path / "t.db")

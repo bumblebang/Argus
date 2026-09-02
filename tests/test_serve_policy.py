@@ -299,11 +299,17 @@ def test_fetch_ondemand_news_skips_us_without_key(monkeypatch):
 def test_build_context_focus_compact_and_headline_limit(monkeypatch):
     from src.agents import context as ctx
     monkeypatch.setattr(ctx, "_notify_headline_trim", lambda *a: None)
-    ms = {"news": [{"source": "t", "title": f"n{i}"} for i in range(80)]}
-    wide = build_context(ms, [{"symbol": "1"}], {"cash": 0, "positions": []}, {})
+    ms = {"news": [{"source": "t", "title": f"n{i}",
+                    "published": "2026-09-02T04:00:00+00:00"} for i in range(80)]}
+    wide = build_context(ms, [{"symbol": "1", "market": "KR"}],
+                         {"cash": 0, "positions": []}, {}, tier="scan")
     narrow = build_context(
-        ms, [{"symbol": "1"}], {"cash": 0, "positions": []}, {},
-        headline_limit=10, compact=True)
+        ms, [{"symbol": "196170", "market": "KR"}],
+        {"cash": 0, "positions": []}, {},
+        tier="focus", headline_limit=10, compact=True,
+        wake={"reason": "wake_triggers", "market": "KR"})
     assert len(narrow.encode("utf-8")) < len(wide.encode("utf-8"))
     import json
-    assert len(json.loads(narrow)["headlines"]) == 10
+    hl = json.loads(narrow)["headlines"]
+    assert len(hl) <= 10
+    assert all(h.get("symbol") is None for h in hl)
