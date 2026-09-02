@@ -377,15 +377,26 @@ def test_open_markets_fn_empty_excludes_all(tmp_path):
 
 
 def test_athena_done_keeps_live_market_when_closed(tmp_path):
-    """athena_done 은 프리 전이라 open_markets 가 비어도 KR(live) 후보를 남긴다."""
+    """athena_done + wake.market=KR 이면 프리 전·US 후보도 KR 만 남긴다."""
     store = Store(tmp_path / "t.db")
     seen = []
     uni = lambda: {"KR": [{"symbol": "005930"}], "US": [{"symbol": "AAPL"}]}
     r = _runner_open_filter(tmp_path, store, _capture_symbols_factory(seen),
                             universe_fn=uni, open_markets_fn=lambda: [])
-    r.cfg.raw.setdefault("broker", {})["live_markets"] = ["KR"]
-    r.run(wake={"reason": "athena_done"})
+    r.cfg.raw.setdefault("broker", {})["live_markets"] = ["KR", "US"]
+    r.run(wake={"reason": "athena_done", "market": "KR"})
     assert seen == [["005930"]]
+
+
+def test_athena_done_us_market_only(tmp_path):
+    """US Athena 직후 wake 는 US 종목만."""
+    store = Store(tmp_path / "t.db")
+    seen = []
+    uni = lambda: {"KR": [{"symbol": "005930"}], "US": [{"symbol": "AAPL"}]}
+    r = _runner_open_filter(tmp_path, store, _capture_symbols_factory(seen),
+                            universe_fn=uni, open_markets_fn=lambda: [])
+    r.run(wake={"reason": "athena_done", "market": "US"})
+    assert seen == [["AAPL"]]
 
 
 # ── 유동성 필터: illiquid_fn 주면 시간외 체결정지 종목을 후보에서 제외(opt-in) ──

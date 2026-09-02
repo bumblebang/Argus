@@ -310,7 +310,7 @@ screener:
     enabled: true
     light: true
     core_size: 100
-    discover_pool: 300
+    discover_pool: 250
     default_strategy: ma_crossover
     rank_by: discovery_tv
     day_tag_top: 20

@@ -216,8 +216,8 @@ def _build_brain(cfg, gateway, store, args, broker, risk, universe_fn=None,
     source_fn = None
     quota_info_fn = None
     if not dry:
-        # llm 은 위 else 분기에서 생성된 ClaudeCLIClient(또는 API 클라이언트).
-        _llm_ref = llm  # type: ignore[name-defined]
+        # quota/source 추적용 — 팩토리가 돌려주는 결정 LLM(opus) 인스턴스.
+        _llm_ref = llm_factory([])
 
         def source_fn():
             return getattr(_llm_ref, "last_source", None)
@@ -728,7 +728,7 @@ def main() -> int:
         broker.account.sell_tax_exempt_fn = lambda sym, mkt: is_sell_tax_exempt(
             sym, mkt, _info_cache)
     # 거래 가능 세션인 시장만 뇌 후보로(국장 마감 후 KR 후보 제외). 청산은 portfolio 경유라 무관.
-    # Athena 직후(athena_done)는 CycleRunner 가 프리 전이라도 live_markets 후보를 남긴다.
+    # Athena 직후(athena_done)는 CycleRunner 가 wake.market 시장 후보만 남긴다(프리 전 KR 등).
     # 감시 루프의 거래 게이트(WatchLoop.run_once)와 같은 판정을 써야 뇌가 못 사는 시장을 안 고른다.
     watch_config = WatchConfig.from_config(cfg.raw)
     open_markets_fn = lambda: [m for m in markets
