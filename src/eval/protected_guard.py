@@ -8,8 +8,7 @@ from typing import Any
 
 import yaml
 
-from .labels import MIN_N
-from ..eval_protocol import can_promote
+from ..eval_protocol import can_promote, experiment_evidence_n, load_registry
 
 # 코드 파일 → PROTECTED touch 키
 FILE_TOUCHES: dict[str, str] = {
@@ -142,7 +141,6 @@ def check_protected_changes(
     evidence_n: int | None = None,
 ) -> tuple[bool, list[str]]:
     """PROTECTED touch 가 있으면 defect-fix 또는 can_promote 통과 필요."""
-    eff_n = MIN_N if evidence_n is None else evidence_n
     changed = git_changed_files(base_ref, head_ref)
     if not changed:
         return True, ["변경 파일 없음"]
@@ -168,7 +166,29 @@ def check_protected_changes(
             f"changed={changed}",
         ]
 
-    msgs: list[str] = [f"touches={sorted(touches)}", f"experiment_id={exp_id}"]
+    reg = load_registry(registry_path)
+    exp = {e["id"]: e for e in (reg.get("experiments") or [])}.get(exp_id)
+    if not exp:
+        return False, [
+            f"미등록 실험 {exp_id}",
+            f"touches={sorted(touches)}",
+        ]
+
+    if evidence_n is not None:
+        eff_n: int | None = evidence_n
+        n_src = f"cli/env={evidence_n}"
+    else:
+        eff_n = experiment_evidence_n(exp)
+        n_src = f"registry evidence_n={eff_n}" if eff_n is not None else "registry evidence_n=없음"
+
+    if eff_n is None:
+        return False, [
+            f"PROTECTED touches={sorted(touches)} — experiment {exp_id} 표본 n 미기록",
+            "score_journal/apply_kill_rules 로 evidence 적재 또는 --evidence-n 지정",
+            f"changed={changed}",
+        ]
+
+    msgs: list[str] = [f"touches={sorted(touches)}", f"experiment_id={exp_id}", n_src]
     ok_all = True
     for touch in sorted(touches):
         ok, why = can_promote(

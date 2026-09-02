@@ -125,6 +125,10 @@ def apply_kill_rules(*, metrics: dict[str, Any], n: int | None = None,
                 pass
         if obs_n is None:
             continue
+        exp["evidence_n"] = int(obs_n)
+        exp["last_n"] = int(obs_n)
+        if metrics:
+            exp["last_metrics"] = dict(metrics)
         reason = None
         new_status = None
         if obs_n < min_n:
@@ -155,7 +159,52 @@ def apply_kill_rules(*, metrics: dict[str, Any], n: int | None = None,
     return changed
 
 
-def can_promote(*, change: str, evidence_n: int, registry_path: Path | str = DEFAULT_PATH,
+def experiment_evidence_n(exp: dict | None) -> int | None:
+    """실험 레코드에 적재된 관측 표본 n. 없으면 None(승격 검사 불가)."""
+    if not isinstance(exp, dict):
+        return None
+    for key in ("evidence_n", "last_n", "n"):
+        try:
+            n = int(exp.get(key))
+            if n >= 0:
+                return n
+        except (TypeError, ValueError):
+            continue
+    lm = exp.get("last_metrics")
+    if isinstance(lm, dict):
+        metric = str(exp.get("metric") or "")
+        for key in ("n", f"{metric}__n" if metric else ""):
+            if not key:
+                continue
+            try:
+                n = int(lm.get(key))
+                if n >= 0:
+                    return n
+            except (TypeError, ValueError):
+                continue
+    return None
+
+
+def record_experiment_evidence(*, experiment_id: str,
+                             n: int,
+                             metrics: dict[str, Any] | None = None,
+                             path: Path | str = DEFAULT_PATH) -> bool:
+    """score/apply_kill 후 실험에 표본 n 영속. 성공 시 True."""
+    reg = load_registry(path)
+    exps = reg.get("experiments") or []
+    for exp in exps:
+        if exp.get("id") != experiment_id:
+            continue
+        exp["evidence_n"] = int(n)
+        exp["last_n"] = int(n)
+        if metrics:
+            exp["last_metrics"] = dict(metrics)
+        save_registry(reg, path)
+        return True
+    return False
+
+
+def can_promote(*, change: str, evidence_n: int | None, registry_path: Path | str = DEFAULT_PATH,
                 experiment_id: str | None = None) -> tuple[bool, str]:
     """승격 허용 여부. PROTECTED 변경은 등록+표본+kill 미해당이어야 함.
 
@@ -173,8 +222,11 @@ def can_promote(*, change: str, evidence_n: int, registry_path: Path | str = DEF
             return False, f"미등록 실험 {experiment_id}"
         if exp.get("status") not in ("pass", "running"):
             return False, f"실험 status={exp.get('status')} — pass/running 만"
-        if evidence_n < int(exp.get("min_n") or 20):
-            return False, f"표본 {evidence_n} < min_n {exp.get('min_n')}"
+        min_n = int(exp.get("min_n") or 20)
+        if evidence_n is None:
+            return False, "표본 n 미제공 — experiment evidence_n 또는 --evidence-n 필요"
+        if evidence_n < min_n:
+            return False, f"표본 {evidence_n} < min_n {min_n}"
         if change not in (exp.get("touches") or []) and "any" not in (exp.get("touches") or []):
             return False, f"{change} 가 실험 touches 에 없음"
         return True, "ok"

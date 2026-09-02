@@ -1,7 +1,7 @@
 # 설계 SSOT — CONTEXT/plan 합의 ↔ config.example + 코드 정합 자동 점검.
 # scripts/check_design_alignment.py · CI · 에이전트 완료 게이트.
 #
-# waive: true + reason 필수 → 의도적 예외(만료일 권장). 미기재 error는 CI 실패.
+# waive: true + waive_reason + waive_until(필수) → 기한 한정 예외. until 없으면 FAIL.
 version: 1
 
 groups:

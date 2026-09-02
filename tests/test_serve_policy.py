@@ -224,6 +224,16 @@ def test_merge_wake_dedupes_same_kind_symbol():
     assert b["triggers"][0]["reason"] == "new"
 
 
+def test_merge_wake_pending_preserves_market_and_at():
+    prev = {"reason": "wake_triggers", "n": 1, "triggers": [{"symbol": "196170"}],
+            "market": "KR", "at": "13:27"}
+    out = serve.merge_wake_pending(prev, "disclosure",
+                                   [{"symbol": "111111", "report_nm": "유증"}])
+    assert out["market"] == "KR"
+    assert out["at"] == "13:27"
+    assert {t["symbol"] for t in out["triggers"]} == {"196170", "111111"}
+
+
 def test_brainworker_wake_coalesce_merges_triggers(tmp_path):
     store = Store(tmp_path / "t.db")
     seen = []
@@ -233,14 +243,15 @@ def test_brainworker_wake_coalesce_merges_triggers(tmp_path):
         return "ok"
 
     bw = BrainWorker(cycle, store=store)
+    bw.wake("wake_triggers", [{"kind": "vol_spike", "symbol": "196170"}],
+            market="KR", at="13:27")
     bw.wake("disclosure", [{"symbol": "111111", "report_nm": "유증"}])
-    bw.wake("wake_triggers", [
-        Trigger("vol_spike", "222222", "act", "급변", {"change_pct": 0.03}),
-    ])
     assert bw.run_pending() is True
     assert len(seen) == 1
     syms = {t.get("symbol") for t in seen[0]["triggers"]}
-    assert syms == {"111111", "222222"}
+    assert syms == {"196170", "111111"}
+    assert seen[0]["market"] == "KR"
+    assert seen[0]["at"] == "13:27"
     assert seen[0]["n"] == 2
 
 
