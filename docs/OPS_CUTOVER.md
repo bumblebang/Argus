@@ -86,9 +86,10 @@ xcopy /E /I backup\llm_inbox data\llm_inbox
    - `data/watch.pid` / `data/state/watch.pid` 의 pid 가 살아 있으면 taskkill
    - `data/watch.pid.lock` · `data/state/watch.pid.lock` 핸들 보유 프로세스 없음
 4. 신 코드 배포(venv/wheel/소스)
-5. `argus doctor` (또는 pytest 스모크) 그린 확인
-6. ArgusWatch Enable + Run
-7. 15분: heartbeat `ok`·`polled`, 이중 pid 없음, 의도치 않은 실주문 없음
+5. **`argus market-state` 전량 빌드 1회** — `batch_asof` 확정(업그레이드 직후 fast slice 만으로는 느린 슬롯 시각 거짓)
+6. `argus doctor` (또는 pytest 스모크) 그린 확인 — `market_state`·`risk.capital` WARN 없음
+7. ArgusWatch Enable + Run
+8. 15분: heartbeat `ok`·`polled`, 이중 pid 없음, 의도치 않은 실주문 없음
 
 ## 하지 말 것 (업그레이드)
 

@@ -69,6 +69,26 @@ def _normalize_capital(raw) -> dict[str, float]:
     return out
 
 
+def capital_coverage_gaps(capital: dict, markets: list[str]) -> list[str]:
+    """capital 키가 없는 시장 목록(KR/US 대문자)."""
+    norm = _normalize_capital(capital)
+    gaps: list[str] = []
+    for mkt in markets:
+        m = str(mkt or "").upper()
+        if m and m not in norm:
+            gaps.append(m)
+    return gaps
+
+
+def warn_capital_coverage(capital: dict, markets: list[str], *,
+                          label: str = "risk.capital") -> None:
+    """거래 대상 시장에 capital 키가 없으면 5개 한도가 조용히 꺼진다 — 기동 시 경고."""
+    for m in capital_coverage_gaps(capital, markets):
+        log.warning(
+            "%s[%s] 없음 — 일손실·DD·비중·총노출·섹터 한도가 비활성입니다.",
+            label, m)
+
+
 def _normalize_max_positions(raw) -> dict[str, int]:
     """int → {KR,US: n}; dict → 시장별 int. 빈/이상값은 기본 5."""
     if isinstance(raw, dict):

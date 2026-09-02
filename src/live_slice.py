@@ -145,7 +145,11 @@ def apply_fast_slice(partial: dict, path: str | Path = "data/market_state.json")
     p = Path(path)
     state = MarketState.load(p) if p.exists() else MarketState()
     if not state.batch_asof:
-        state.batch_asof = state.asof
+        # batch_asof 는 build_market_state 전량 빌드만 설정한다. asof(fast slice 시각)로
+        # 시드하면 업그레이드 직후 반나절 stale fundamentals 가 fresh 로 보인다.
+        log.warning(
+            "batch_asof 없음 — 느린 슬롯(fundamentals/news/flows/sectors) 신선도 미확인. "
+            "전량 빌드(argus market-state) 후 watch 기동 권장.")
     state.merge(partial or {})
     now_iso = datetime.now(timezone.utc).isoformat()
     state.fast_asof = now_iso

@@ -176,6 +176,7 @@ def main() -> int:
     from datetime import datetime, timezone
     now_iso = datetime.now(timezone.utc).isoformat()
     state.batch_asof = now_iso
+    state.fast_asof = now_iso
     state.asof = now_iso
     state.save(out_path)
     log.info("market_state 저장 완료")

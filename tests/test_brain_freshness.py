@@ -40,23 +40,62 @@ def test_apply_fast_slice_preserves_batch_asof(tmp_path):
 
 
 def test_build_context_includes_now_clock_freshness():
+    from datetime import datetime, timezone
+    batch = "2026-09-01T08:00:00+00:00"
+    now_dt = datetime(2026, 9, 2, 9, 0, tzinfo=timezone.utc)
+    now = now_dt.timestamp()
     ms = {
-        "asof": "2026-09-02T09:00:00+00:00",
-        "batch_asof": "2026-09-01T08:00:00+00:00",
-        "fast_asof": "2026-09-02T09:00:00+00:00",
+        "asof": now_dt.isoformat(),
+        "batch_asof": batch,
+        "fast_asof": now_dt.isoformat(),
         "regime": {"KR": {"label": "neutral", "asof": "2026-09-02T08:00:00+00:00"}},
+        "fundamentals": {"005930": {"net_margin": 0.1}},
     }
     ctx = json.loads(build_context(
         ms, [], {"cash": {}}, {},
-        strategy_scores_asof=1788341048.0,
+        strategy_scores_asof=now,
         strategy_scores_stale=True,
+        now_ts=now,
     ))
     assert "now" in ctx
     assert "clock" in ctx and "KR" in ctx["clock"]
-    assert ctx["freshness"]["batch_asof"] == "2026-09-01T08:00:00+00:00"
+    assert ctx["freshness"]["batch_asof"] == batch
     assert ctx["freshness"]["fast_asof"] == "2026-09-02T09:00:00+00:00"
     assert ctx["freshness"]["strategy_scores_stale"] is True
     assert ctx["freshness"]["slots"]["regime.KR"] == "2026-09-02T08:00:00+00:00"
+    assert ctx["freshness"]["slots"]["fundamentals"] == "2026-09-01T08:00:00+00:00"
+    assert ctx["freshness"]["batch_asof_age_sec"] == 25 * 3600.0
+    assert ctx["freshness"]["batch_asof_stale"] is True
+
+
+def test_build_freshness_no_asof_fallback():
+    """batch_asof 없을 때 asof 로 masquerade 하지 않는다."""
+    from datetime import datetime, timezone
+    from src.agents.context import build_freshness
+
+    now = datetime(2026, 9, 2, 9, 0, tzinfo=timezone.utc).timestamp()
+    ms = {
+        "asof": "2026-09-02T09:00:00+00:00",
+        "fundamentals": {"AAPL": {"pe": 20}},
+    }
+    fr = build_freshness(ms, now_ts=now)
+    assert fr["batch_asof"] is None
+    assert fr.get("batch_asof_stale") is True
+    assert "fundamentals" not in fr["slots"]
+
+
+def test_build_freshness_fresh_batch():
+    from datetime import datetime, timezone
+    from src.agents.context import build_freshness
+
+    now = datetime(2026, 9, 2, 9, 0, tzinfo=timezone.utc).timestamp()
+    ms = {
+        "batch_asof": "2026-09-02T08:30:00+00:00",
+        "fundamentals": {"AAPL": {"pe": 20}},
+    }
+    fr = build_freshness(ms, now_ts=now)
+    assert fr.get("batch_asof_stale") is not True
+    assert fr["slots"]["fundamentals"] == "2026-09-02T08:30:00+00:00"
 
 
 def test_strategy_scores_stale_load(tmp_path):
