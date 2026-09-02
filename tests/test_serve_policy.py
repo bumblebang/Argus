@@ -23,6 +23,13 @@ def test_classify_focus_reasons():
         assert serve.classify_tier({"reason": r}, cfg=cfg) == "focus"
 
 
+def test_classify_gap_scan_wins_over_focus_in_composite():
+    cfg = serve.serve_cfg({"serve": {"enabled": True}})
+    for r in ("wake_triggers+gap_rebound_scan", "gap_rebound_scan+wake_triggers",
+              "disclosure+gap_rebound_scan"):
+        assert serve.classify_tier({"reason": r}, cfg=cfg) == "scan"
+
+
 def test_classify_disabled_always_scan():
     cfg = serve.serve_cfg({"serve": {"enabled": False}})
     assert serve.classify_tier({"reason": "disclosure"}, cfg=cfg) == "scan"
@@ -89,6 +96,18 @@ def test_gap_scan_composite_reason_exempt_from_cap():
         "enabled": True, "scan_enabled": True, "scan_cap": 10}})
     out, tier = serve.select_candidates(
         items, {"reason": "gap_rebound_scan+extra"}, cfg=cfg)
+    assert tier == "scan"
+    assert len(out) == 50
+
+
+def test_gap_scan_coalesced_with_wake_triggers_keeps_full_pool():
+    """15:20 사이클 중 vol_spike coalesce — focus shortlist 로 떨어지면 안 됨."""
+    items = [{"symbol": f"{i:06d}", "market": "KR"} for i in range(1, 51)]
+    cfg = serve.serve_cfg({"serve": {
+        "enabled": True, "scan_enabled": True, "scan_cap": 10, "focus_cap": 16}})
+    wake = {"reason": "wake_triggers+gap_rebound_scan",
+            "triggers": [{"kind": "vol_spike", "symbol": "000007"}]}
+    out, tier = serve.select_candidates(items, wake, cfg=cfg)
     assert tier == "scan"
     assert len(out) == 50
 
@@ -182,6 +201,16 @@ def test_merge_wake_keeps_both_symbols():
     syms = {t["symbol"] for t in b["triggers"]}
     assert syms == {"005930", "000660"}
     assert "disclosure" in b["reason"] and "wake_triggers" in b["reason"]
+
+
+def test_merge_wake_preserves_gap_scan_under_vol_spike():
+    """gap_rebound_scan 대기 중 wake_triggers — reason 에 갭 토큰 유지."""
+    a = serve.merge_wake_pending(None, "gap_rebound_scan", [])
+    b = serve.merge_wake_pending(
+        a, "wake_triggers",
+        [{"kind": "vol_spike", "symbol": "000660", "reason": "급변"}])
+    assert "gap_rebound_scan" in b["reason"]
+    assert "wake_triggers" in b["reason"]
 
 
 def test_merge_wake_dedupes_same_kind_symbol():
