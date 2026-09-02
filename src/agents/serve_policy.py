@@ -85,11 +85,16 @@ def classify_tier(wake: dict | None, *, cfg: dict | None = None) -> str:
     serve.enabled=false 이면 항상 scan(현행 경로).
     reason 이 focus_reasons 에 있으면 focus, SCAN_REASONS 또는 미지·빈 값은 scan.
     복합 reason('disclosure+wake_triggers')은 focus 토큰이 하나라도 있으면 focus.
+    단, gap_rebound_scan/nxt_gap_scan 토큰이 있으면 focus 와 coalesce 돼도 scan(갭풀 전량).
     """
+    from .features import wake_has_gap_scan
+
     c = cfg or serve_cfg(None)
     if not c.get("enabled", True):
         return "scan"
     reason = str((wake or {}).get("reason") or "").strip()
+    if wake_has_gap_scan(reason):
+        return "scan"
     parts = [p.strip() for p in reason.replace("|", "+").split("+") if p.strip()]
     if not parts:
         # triggers 만 있고 reason 빈 경우 — 이벤트 취급
@@ -320,6 +325,20 @@ def reason_priority(reason: str) -> int:
     return max(_REASON_PRIORITY.get(p, 40) for p in parts)
 
 
+def _should_join_reason(keeper: str, other: str, other_pr: int) -> bool:
+    """coalesce 시 other reason 을 keeper 에 '+' 로 붙일지.
+
+    이벤트급(≥70)은 기존과 동일. 갭반등 슬롯은 priority 65여도 풀·tier 판정용으로 보존.
+    """
+    from .features import GAP_SCAN_REASONS, wake_reason_tokens
+
+    if not other or other in keeper:
+        return False
+    if other_pr >= 70:
+        return True
+    return any(p in GAP_SCAN_REASONS for p in wake_reason_tokens(other))
+
+
 def merge_wake_pending(prev: dict | None, reason: str,
                        triggers_serialized: list[dict]) -> dict:
     """BrainWorker coalesce: 덮어쓰기 대신 reason·triggers 합집합.
@@ -343,12 +362,12 @@ def merge_wake_pending(prev: dict | None, reason: str,
         picked = old_reason
     elif pr_new > pr_old:
         # 다른 계열이면 조인(재료 유실 방지용 표기)
-        if old_reason and old_reason not in new_reason and pr_old >= 70:
+        if _should_join_reason(new_reason, old_reason, pr_old):
             picked = f"{new_reason}+{old_reason}"
         else:
             picked = new_reason
     elif pr_old > pr_new:
-        if new_reason and new_reason not in old_reason and pr_new >= 70:
+        if _should_join_reason(old_reason, new_reason, pr_new):
             picked = f"{old_reason}+{new_reason}"
         else:
             picked = old_reason
