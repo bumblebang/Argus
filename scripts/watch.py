@@ -216,8 +216,8 @@ def _build_brain(cfg, gateway, store, args, broker, risk, universe_fn=None,
     source_fn = None
     quota_info_fn = None
     if not dry:
-        # llm 은 위 else 분기에서 생성된 ClaudeCLIClient(또는 API 클라이언트).
-        _llm_ref = llm  # type: ignore[name-defined]
+        # quota/source 추적용 — 팩토리가 돌려주는 결정 LLM(opus) 인스턴스.
+        _llm_ref = llm_factory([])
 
         def source_fn():
             return getattr(_llm_ref, "last_source", None)
