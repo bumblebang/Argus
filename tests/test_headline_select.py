@@ -3,28 +3,48 @@ from __future__ import annotations
 
 import json
 import time
+from datetime import datetime, timezone
 
 from src.agents import context as ctx
 from src.agents.context import build_context, select_headlines
 
 
-def _sample_pool() -> list[dict]:
-    """배치 순서를 흉내: RSS → Finnhub general → US sym → DART KR."""
+def _iso_utc(ts: float) -> str:
+    return datetime.fromtimestamp(ts, tz=timezone.utc).strftime(
+        "%Y-%m-%dT%H:%M:%S+00:00")
+
+
+def _rfc_gmt(ts: float) -> str:
+    return datetime.fromtimestamp(ts, tz=timezone.utc).strftime(
+        "%a, %d %b %Y %H:%M:%S GMT")
+
+
+def _yyyymmdd(ts: float) -> str:
+    return datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y%m%d")
+
+
+def _sample_pool(now_ts: float | None = None) -> list[dict]:
+    """배치 순서를 흉내: RSS → Finnhub general → US sym → DART KR.
+
+    published 는 now 기준 최근(기본 1h 전) — 고정 날짜는 TTL(24h)에 걸려 깨진다.
+    """
+    now = time.time() if now_ts is None else float(now_ts)
+    pub = now - 3600.0
     out: list[dict] = []
     for i in range(32):
         out.append({"source": "연합뉴스", "title": f"kr-macro-{i}",
-                    "published": "Wed, 02 Sep 2026 04:00:00 GMT"})
+                    "published": _rfc_gmt(pub)})
     for i in range(15):
         out.append({"source": "Finnhub", "title": f"us-macro-{i}",
-                    "published": "2026-09-02T04:00:00+00:00"})
+                    "published": _iso_utc(pub)})
     for sym in ("NVDA", "AAPL"):
         for i in range(3):
             out.append({"source": f"Finnhub/{sym}", "symbol": sym,
                         "title": f"{sym}-news-{i}",
-                        "published": "2026-09-02T04:00:00+00:00"})
+                        "published": _iso_utc(pub)})
     for i in range(5):
         out.append({"source": "DART공시", "symbol": "196170",
-                    "title": f"dart-{i}", "published": "20260902"})
+                    "title": f"dart-{i}", "published": _yyyymmdd(pub)})
     return out
 
 
@@ -38,8 +58,8 @@ def test_classify_news_item():
 
 
 def test_focus_kr_excludes_us_stock_headlines():
-    pool = _sample_pool()
     now = time.time()
+    pool = _sample_pool(now)
     out = select_headlines(
         pool, tier="focus", limit=12, focus_macro_pad=8,
         wake={"reason": "wake_triggers", "market": "KR",
@@ -71,7 +91,7 @@ def test_scan_ttl_drops_stale(monkeypatch):
     called = []
     monkeypatch.setattr(ctx, "_notify_headline_trim", lambda *a: called.append(a))
     now = time.time()
-    fresh = [{"source": "t", "title": "new", "published": "2026-09-02T12:00:00+00:00"}]
+    fresh = [{"source": "t", "title": "new", "published": _iso_utc(now - 3600)}]
     stale = [{"source": "t", "title": "old", "published": "2020-01-01T12:00:00+00:00"}]
     out = select_headlines(fresh + stale, tier="scan", limit=200, ttl_hours=24,
                            now_ts=now, notify_trim=False)
