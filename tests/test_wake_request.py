@@ -1,8 +1,11 @@
-"""외부 뇌 각성 요청(Athena → watch) 회귀."""
+"""외부 뇌 각성 요청(파일 신호) 회귀.
+
+Athena CLI 는 장전 wake 를 더 이상 남기지 않는다(test_athena_cli_skips_brain_wake_after_batch).
+이 모듈 API·루프 소비 경로는 다른 훅용으로 유지한다.
+"""
 from __future__ import annotations
 
 import time
-from pathlib import Path
 
 from src.engine.loop import WatchConfig, WatchLoop
 from src.engine.store import Store
@@ -35,14 +38,14 @@ def test_consume_stale_ignored(tmp_path):
 
 
 def test_loop_consumes_wake_when_markets_closed(tmp_path, monkeypatch):
-    """휴장 idle 틱에서도 Athena 요청을 소비해 뇌를 깨운다."""
+    """휴장 idle 틱에서도 wake_request 파일을 소비해 뇌를 깨운다(API 유지)."""
     import src.engine.loop as loop_mod
     monkeypatch.setattr(loop_mod, "is_tradable", lambda *a, **k: False)
 
     wakes: list[tuple] = []
     store = Store(tmp_path / "bot.db")
     req = tmp_path / "wake.json"
-    request_brain_wake(reason="athena_done", market="KR", path=req)
+    request_brain_wake(reason="external", market="KR", path=req)
 
     cfg = WatchConfig(wake_request_path=str(req), brain_interval_sec=0)
     loop = WatchLoop(_FakeGW(), store, lambda: {}, markets=("KR",),
@@ -50,7 +53,7 @@ def test_loop_consumes_wake_when_markets_closed(tmp_path, monkeypatch):
                      on_wake=lambda r, t, *, at=None, market=None: wakes.append((r, market)))
     res = loop.run_once()
     assert res.woke is True
-    assert wakes == [("athena_done", "KR")]
+    assert wakes == [("external", "KR")]
     assert not req.exists()
 
 

@@ -8,7 +8,9 @@
 설계: 직전에 닫힌 시장의 정보를 물고 곧 열릴 시장을 리서치한다. 개장 전
 하드스톱(config athena.windows)으로 장중 뇌의 LLM 사용량을 보호한다.
 토스 무접촉(Yahoo/파일) — 데몬과 동시 실행 안전(SQLite WAL).
-배치가 끝나면(성공·도씨에 0건이어도) watch 뇌에 athena_done 각성 요청을 남긴다.
+
+장전 athena_done 으로 뇌를 깨우지 않는다(즉시 매수 → Toss order-hours-closed
+알림 스팸). 신선한 bullish 도시에는 KR 08:00/09:00 extra 뇌 scan must 로 들어간다.
 """
 from __future__ import annotations
 
@@ -24,7 +26,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from src.config import load_config, ROOT, resolve_universe
 from src.logging_setup import setup_logging, get_logger
 from src.engine.store import Store
-from src.engine.wake_request import request_brain_wake
 from src.agents.athena import run_batch
 from src.universe_roll import sort_core_by_turnover
 from src.agents.llm import ClaudeCLIClient, MockLLM
@@ -132,17 +133,10 @@ def main() -> int:
                         market_state=ms, base_rates=br,
                         only_symbols=[args.symbol] if args.symbol else None)
     print(json.dumps(summary, ensure_ascii=False))
-    # 도씨에 배치 직후 뇌 1회 — watch 데몬이 wake_request(resolve→state/) 를 소비.
-    # --dry 는 배선 검증만이라 각성 요청을 남기지 않는다.
+    # 뇌 각성 요청 파일 안 남김 — 도씨에는 store 에 남고 08:00/09:00 뇌가 소비.
     if not args.dry:
-        wake_path = ((cfg.raw.get("watch") or {}).get("wake_request_path")
-                     or "data/state/brain_wake_request.json")
-        request_brain_wake(reason="athena_done", market=market, path=wake_path,
-                           extra={"done": summary.get("done"),
-                                  "failed": summary.get("failed"),
-                                  "targets": summary.get("targets")})
-        log.info("뇌 각성 요청 기록 — reason=athena_done market=%s path=%s",
-                 market, wake_path)
+        log.info("Athena %s 창 종료 — 뇌 각성 생략(extra 08:00/09:00 에 위임) done=%s",
+                 market, summary.get("done"))
     return 0
 
 

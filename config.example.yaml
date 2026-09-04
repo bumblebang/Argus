@@ -289,7 +289,7 @@ athena:
   timeout: 240
   windows:
     KR:
-      - { start: "05:30", stop: "07:30" }   # 종료 직후 athena_done → 뇌 1회
+      - { start: "05:30", stop: "07:30" }   # 도씨에만 저장 → KR 08:00/09:00 뇌가 소비(장전 wake 없음)
     # 방향4-A: US 도지어만(집행/brain_sessions.US 미개방). 태스크 17:10.
     US:
       - { start: "17:00", stop: "21:50" }
