@@ -375,6 +375,92 @@ class Store:
                 return float(row[0])
         return None
 
+    def latest_snapshot_prices(self, symbols: list[str], *,
+                               max_age_sec: float | None = 3 * 86400,
+                               now: float | None = None) -> dict[str, float]:
+        """심볼별 최신 스냅샷 가격. max_age_sec 이내면만(None=나이 무시)."""
+        out: dict[str, float] = {}
+        if not symbols:
+            return out
+        import time as _time
+        now_ts = float(now if now is not None else _time.time())
+        with self._lock:
+            for sym in symbols:
+                row = self.conn.execute(
+                    "SELECT price, ts FROM snapshots WHERE symbol=? AND price IS NOT NULL "
+                    "ORDER BY ts DESC LIMIT 1",
+                    (str(sym),),
+                ).fetchone()
+                if not row or row[0] is None:
+                    continue
+                if max_age_sec is not None and (now_ts - float(row[1])) > float(max_age_sec):
+                    continue
+                try:
+                    px = float(row[0])
+                except (TypeError, ValueError):
+                    continue
+                if px > 0:
+                    out[str(sym)] = px
+        return out
+
+    def closed_position_fidelity(self, since: float | None = None) -> dict:
+        """closed+pnl NULL 행을 armed 해제 vs 실체결 손익누락으로 나눈다.
+
+        armed 은 open_position 전에 close_position(reason=disarm:*) 되는 경우가 많아
+        qty=0·exit_price NULL·pnl NULL 로 남는다. 이걸 '청산 손익 누락'으로 읽으면 안 된다.
+        """
+        sql = ("SELECT id, symbol, qty, avg_price, exit_price, exit_reason "
+               "FROM positions WHERE state='closed' AND pnl IS NULL")
+        params: list[Any] = []
+        if since is not None:
+            sql += " AND closed_at >= ?"
+            params.append(since)
+        with self._lock:
+            rows = self.conn.execute(sql, params).fetchall()
+
+        armed_cancelled = 0
+        filled_null_pnl = 0
+        by_reason: dict[str, int] = {}
+        for r in rows:
+            reason = str(r["exit_reason"] or "?")
+            try:
+                qty = float(r["qty"] or 0)
+            except (TypeError, ValueError):
+                qty = 0.0
+            is_disarm = reason.startswith("disarm:")
+            never_filled = qty <= 0
+            if is_disarm or never_filled:
+                armed_cancelled += 1
+                by_reason[reason] = by_reason.get(reason, 0) + 1
+            else:
+                filled_null_pnl += 1
+                by_reason[f"filled_null:{reason}"] = (
+                    by_reason.get(f"filled_null:{reason}", 0) + 1)
+        return {
+            "armed_cancelled": armed_cancelled,
+            "filled_null_pnl": filled_null_pnl,
+            "by_reason": by_reason,
+            "note": ("armed_cancelled=미체결 해제(성과 표본 아님). "
+                     "filled_null_pnl>0 만 손익 위생 구멍."),
+        }
+
+    def count_closed_null_pnl(self, since: float | None = None) -> int:
+        """하위호환 — 실체결인데 pnl NULL 건수만(armed 해제 제외)."""
+        return int(self.closed_position_fidelity(since=since)["filled_null_pnl"])
+
+    def count_shadow_skipped(self, since: float | None = None) -> dict[str, int]:
+        """그림자 skipped 사유별 건수."""
+        sql = ("SELECT COALESCE(exit_reason, '?') r, COUNT(*) c FROM shadow_positions "
+               "WHERE state='skipped'")
+        params: list[Any] = []
+        if since is not None:
+            sql += " AND COALESCE(scored_at, entry_ts) >= ?"
+            params.append(since)
+        sql += " GROUP BY r"
+        with self._lock:
+            rows = self.conn.execute(sql, params).fetchall()
+        return {str(r[0]): int(r[1]) for r in rows}
+
     def record_decision(self, symbol: str | None, action: str | None,
                         conviction: float | None = None, thesis: str | None = None,
                         verdict: str | None = None, payload: dict | None = None,

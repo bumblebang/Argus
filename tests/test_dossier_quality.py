@@ -31,14 +31,24 @@ def test_summarize_fresh_dossiers(tmp_path):
         "000660", "KR", thesis="n",
         evidence={"stance": "neutral"},
         ttl_hours=48)
+    # history 폴백으로 존 측정
+    hist = tmp_path / "history"
+    hist.mkdir()
+    (hist / "005930.KS_1d_1y.csv").write_text(
+        "Date,Open,High,Low,Close,Volume\n2026-09-01,1,1,1,920,1\n",
+        encoding="utf-8")
     rep = summarize_dossiers(
         store,
         cfg={"universe": {"KR": [{"symbol": "005930"}, {"symbol": "000660"}]}},
+        data_dir=tmp_path,
         now=now + 1)
     assert rep["fresh_count"] == 2
     assert rep["stance"]["bullish"] == 1
     assert rep["stance"]["neutral"] == 1
     assert rep["bullish_with_levels"] == 1
+    assert rep["zone_bullish"]["in"] == 1
+    assert rep["zone_unknown_rate"] == 0.0
+    assert (rep.get("price_coverage") or {}).get("n") == 1
     cov = rep["coverage"]["KR"]
     assert cov["fresh"] == 2
     assert cov["universe"] == 2

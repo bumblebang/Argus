@@ -8,8 +8,8 @@ import pandas as pd
 from src.agents.athena import run_batch, select_symbols
 from src.agents.athena_phase2 import (
     enqueue_athena, merge_level_refresh, prices_from_market_state,
-    scan_athena_triggers, should_level_only, sort_covered_by_zone, zone_loc,
-    dossier_ref_price,
+    resolve_symbol_prices, scan_athena_triggers, should_level_only,
+    sort_covered_by_zone, zone_loc, dossier_ref_price,
 )
 from src.agents.llm import MockLLM
 from src.agents.schemas import DossierLevelOutput, DossierOutput
@@ -36,6 +36,35 @@ def test_zone_loc_and_prices():
     }
     px = prices_from_market_state(ms)
     assert px == {"AAA": 50.0, "BBB": 60.0, "CCC": 70.0}
+
+
+def test_resolve_symbol_prices_cascade(tmp_path):
+    """market_state 비어도 history/account 폴백으로 채운다."""
+    hist = tmp_path / "history"
+    hist.mkdir()
+    (hist / "005930.KS_1d_1y.csv").write_text(
+        "Date,Open,High,Low,Close,Volume\n"
+        "2026-09-01,1,1,1,100,1\n"
+        "2026-09-02,1,1,1,110,1\n",
+        encoding="utf-8")
+    (hist / "035720.KQ_1d_1y.csv").write_text(
+        "Date,Open,High,Low,Close,Volume\n"
+        "2026-09-02,1,1,1,55,1\n",
+        encoding="utf-8")
+    acct = {"items": [{"symbol": "NVDA", "last": 200.0}]}
+    px, meta = resolve_symbol_prices(
+        ["005930", "035720", "NVDA", "MISSING"],
+        market_state={},
+        data_dir=tmp_path,
+        account_snapshot=acct,
+    )
+    assert px["005930"] == 110.0
+    assert px["035720"] == 55.0
+    assert px["NVDA"] == 200.0
+    assert "MISSING" not in px
+    assert meta["source_counts"]["history"] >= 2
+    assert meta["source_counts"]["account"] == 1
+    assert meta["coverage_pct"] == 0.75
 
 
 def test_sort_covered_by_zone(tmp_path):

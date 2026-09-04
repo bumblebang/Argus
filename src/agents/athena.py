@@ -26,8 +26,8 @@ from .features import technical_summary
 from .schemas import DossierLevelOutput, DossierOutput
 from .athena_phase2 import (
     ATHENA_LEVEL_SYSTEM, _athena_queued, build_level_context, merge_level_refresh,
-    phase2_cfg, prices_from_market_state, should_level_only, sort_covered_by_zone,
-    _parse_evidence,
+    phase2_cfg, resolve_symbol_prices, should_level_only,
+    sort_covered_by_zone, _parse_evidence,
 )
 
 log = get_logger("agents.athena")
@@ -432,8 +432,17 @@ def select_symbols(cfg, store, market: str, limit: int | None = None, *,
     held_syms = [p["symbol"] for p in held if (p.get("market") or "KR") == market]
     held_set = set(held_syms)
     covered = {r["symbol"]: r["created_at"] for r in store.dossier_coverage()}
-    px = prices if prices is not None else prices_from_market_state(
-        market_state, symbols=uni.keys())
+    if prices is not None:
+        px = prices
+    else:
+        from ..config import ROOT
+        px, _meta = resolve_symbol_prices(
+            list(uni.keys()),
+            market_state=market_state,
+            store=store,
+            data_dir=ROOT / "data",
+            account_snapshot_path=ROOT / "data" / "account_snapshot.json",
+        )
     fresh_order: list[str] = []
     fresh_order += held_syms
     if p2.get("enabled", True):
@@ -482,7 +491,16 @@ def run_batch(cfg, store, llm, market: str, *,
     agent = AthenaAgent(llm)
     ms = market_state or {}
     p2 = phase2_cfg(cfg)
-    prices = prices_from_market_state(ms)
+    from ..config import ROOT
+    uni_syms = [it["symbol"] for it in (cfg.universe or {}).get(market, [])
+                if it.get("symbol")]
+    prices, _px_meta = resolve_symbol_prices(
+        uni_syms,
+        market_state=ms,
+        store=store,
+        data_dir=ROOT / "data",
+        account_snapshot_path=ROOT / "data" / "account_snapshot.json",
+    )
     if only_symbols:
         uni = {it["symbol"]: it.get("name", it["symbol"])
                for it in (cfg.universe or {}).get(market, []) if it.get("symbol")}

@@ -17,7 +17,7 @@ from zoneinfo import ZoneInfo
 
 from ..market_hours import _SESSIONS
 from ..shadow_ledger import (KST, exit_close_on_calendar, horizon_calendar_days,
-                             load_daily_series)
+                             load_daily_series, pick_history_csv)
 
 MIN_N = 20
 
@@ -104,12 +104,9 @@ def policy_return(side: str, fwd_ret: float | None) -> float | None:
 def _load_ohlc(data_dir: Path, symbol: str) -> list[tuple[datetime, float, float, float]]:
     """(dt, high, low, close). 컬럼 부족하면 close 만 복제."""
     series = load_daily_series(data_dir, symbol)
-    candidates = sorted(Path(data_dir).glob(f"history/{symbol}.KS_1d_*.csv"))
-    if not candidates:
-        candidates = sorted(Path(data_dir).glob(f"history/{symbol}_1d_*.csv"))
-    if not candidates:
+    path = pick_history_csv(Path(data_dir), symbol)
+    if path is None:
         return [(d, c, c, c) for d, c in series]
-    path = candidates[-1]
     rows: list[tuple[datetime, float, float, float]] = []
     for i, line in enumerate(path.read_text(encoding="utf-8").splitlines()):
         if i == 0 and ("Date" in line or "date" in line):
