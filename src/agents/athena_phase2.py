@@ -47,27 +47,13 @@ def phase2_cfg(cfg) -> dict[str, Any]:
     }
 
 
-def zone_loc(price: float | None, lo, hi) -> str | None:
-    if price is None or lo is None or hi is None:
-        return None
-    try:
-        px, lo_f, hi_f = float(price), float(lo), float(hi)
-    except (TypeError, ValueError):
-        return None
-    if px < lo_f:
-        return "below"
-    if px > hi_f:
-        return "above"
-    return "in"
-
-
-def zone_rank(loc: str | None) -> int:
-    return ZONE_RANK.get(loc or "unknown", 3)
-
-
 def prices_from_market_state(ms: dict | None,
                              symbols: Iterable[str] | None = None) -> dict[str, float]:
-    """market_state 에서 종목별 현재가 추출(candidates·fundamentals·flows·positioning)."""
+    """market_state 에서 종목별 현재가 추출(candidates·fundamentals·flows·positioning).
+
+    실전 market_state.json 에는 candidates 가 비고 fund/flows/pos 에 가격 필드가
+    없는 경우가 많다 → 빈 dict. 측정·존 정렬은 resolve_symbol_prices 를 쓴다.
+    """
     if not ms:
         return {}
     want = set(symbols) if symbols is not None else None
@@ -103,6 +89,138 @@ def prices_from_market_state(ms: dict | None,
                     _put(str(sym), row[k])
                     break
     return out
+
+
+def _prices_from_account_snapshot(snap: dict | None,
+                                  want: set[str] | None) -> dict[str, float]:
+    out: dict[str, float] = {}
+    if not isinstance(snap, dict):
+        return out
+    for it in snap.get("items") or []:
+        if not isinstance(it, dict):
+            continue
+        sym = it.get("symbol")
+        if not sym or (want is not None and str(sym) not in want):
+            continue
+        try:
+            px = float(it.get("last") or 0)
+        except (TypeError, ValueError):
+            continue
+        if px > 0:
+            out[str(sym)] = px
+    return out
+
+
+def _prices_from_history(data_dir, symbols: Iterable[str]) -> dict[str, float]:
+    from pathlib import Path
+    from ..shadow_ledger import load_daily_series
+    root = Path(data_dir) if data_dir is not None else None
+    if root is None or not root.is_dir():
+        return {}
+    out: dict[str, float] = {}
+    for sym in symbols:
+        series = load_daily_series(root, str(sym))
+        if series:
+            out[str(sym)] = float(series[-1][1])
+    return out
+
+
+def resolve_symbol_prices(
+    symbols: Iterable[str] | None = None,
+    *,
+    market_state: dict | None = None,
+    store=None,
+    data_dir=None,
+    account_snapshot: dict | None = None,
+    account_snapshot_path=None,
+    snapshot_max_age_sec: float = 3 * 86400,
+) -> tuple[dict[str, float], dict[str, Any]]:
+    """종목가 캐스케이드 — 측정·Athena 존 정렬용.
+
+    우선순위: market_state → store snapshots(신선) → account_snapshot → history 종가.
+    이미 채운 심볼은 덮지 않는다. meta 에 source_counts·coverage 를 남긴다.
+    """
+    want_list = [str(s) for s in (symbols or []) if s]
+    want = set(want_list) if symbols is not None else None
+    out: dict[str, float] = {}
+    source_of: dict[str, str] = {}
+    counts = {"market_state": 0, "snapshot": 0, "account": 0, "history": 0}
+
+    def _merge(chunk: dict[str, float], src: str) -> None:
+        for sym, px in chunk.items():
+            if want is not None and sym not in want:
+                continue
+            if sym in out:
+                continue
+            try:
+                v = float(px)
+            except (TypeError, ValueError):
+                continue
+            if v <= 0:
+                continue
+            out[sym] = v
+            source_of[sym] = src
+            counts[src] = counts.get(src, 0) + 1
+
+    _merge(prices_from_market_state(market_state, symbols=want), "market_state")
+
+    # symbols 미지정이면 snapshot/history 전수 스캔 금지(호출측이 목록을 줌)
+    if store is not None and want_list:
+        try:
+            snap_px = store.latest_snapshot_prices(
+                [s for s in want_list if s not in out],
+                max_age_sec=snapshot_max_age_sec)
+            _merge(snap_px, "snapshot")
+        except Exception as e:
+            log.warning("snapshot 가격 조회 실패(무시): %s", e)
+
+    snap_doc = account_snapshot
+    if snap_doc is None and account_snapshot_path is not None:
+        from pathlib import Path
+        import json as _json
+        p = Path(account_snapshot_path)
+        if p.is_file():
+            try:
+                snap_doc = _json.loads(p.read_text(encoding="utf-8"))
+            except (OSError, ValueError):
+                snap_doc = None
+    if snap_doc is not None:
+        _merge(_prices_from_account_snapshot(snap_doc, want), "account")
+
+    if data_dir is not None and want_list:
+        need = [s for s in want_list if s not in out]
+        if need:
+            _merge(_prices_from_history(data_dir, need), "history")
+
+    n_want = len(want_list) if want is not None else len(out)
+    meta = {
+        "n": len(out),
+        "wanted": n_want if want is not None else None,
+        "coverage_pct": (round(len(out) / n_want, 3) if n_want else None),
+        "source_counts": counts,
+        "sources": source_of,
+        "note": ("market_state 단독은 보통 0건 — snapshot/account/history 폴백. "
+                 "history 종가는 장중 실시간 아님(측정·존 정렬용)."),
+    }
+    return out, meta
+
+
+def zone_loc(price: float | None, lo, hi) -> str | None:
+    if price is None or lo is None or hi is None:
+        return None
+    try:
+        px, lo_f, hi_f = float(price), float(lo), float(hi)
+    except (TypeError, ValueError):
+        return None
+    if px < lo_f:
+        return "below"
+    if px > hi_f:
+        return "above"
+    return "in"
+
+
+def zone_rank(loc: str | None) -> int:
+    return ZONE_RANK.get(loc or "unknown", 3)
 
 
 def sort_covered_by_zone(symbols: list[str], store, prices: dict[str, float],

@@ -43,18 +43,23 @@ def conviction_calibration(store, since_days: float = 90) -> dict:
     buckets: dict[str, list[tuple[float, int]]] = defaultdict(list)
     # (conviction, win01)
     pairs: list[tuple[float, int]] = []
+    n_scored = 0
+    n_excluded_no_conviction = 0
 
     for trade in scored_trades(store, since=since):
+        n_scored += 1
         try:
             meta = json.loads(trade["meta"]) if trade["meta"] else {}
         except (ValueError, TypeError):
             meta = {}
         c = meta.get("conviction")
         if c is None:
+            n_excluded_no_conviction += 1
             continue
         try:
             c = float(c)
         except (TypeError, ValueError):
+            n_excluded_no_conviction += 1
             continue
         win = 1 if (trade["pnl"] or 0) > 0 else 0
         pairs.append((c, win))
@@ -92,6 +97,8 @@ def conviction_calibration(store, since_days: float = 90) -> dict:
         "note": ("확신도 캘리브레이션. calibrated=False 이면 사이징을 평평하게 "
                  "(conviction_sizing 비활성). 자동 가중치 갱신 없음."),
         "n": n,
+        "n_scored_trades": n_scored,
+        "n_excluded_no_conviction": n_excluded_no_conviction,
         "brier": brier,
         "by_bin": by_bin,
         "calibrated": calibrated,

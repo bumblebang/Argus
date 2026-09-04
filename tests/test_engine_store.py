@@ -55,3 +55,16 @@ def test_armed_lifecycle(tmp_path):
     assert opens[0]["state"] == "open" and opens[0]["qty"] == 5
     assert opens[0]["stop_price"] == 68600 and opens[0]["target_price"] == 72100
     assert opens[0]["strategy"] == "rsi_reversion"    # ë°°ì • ì „ëžµ ìœ ì§€
+
+def test_closed_position_fidelity_separates_armed_cancel(tmp_path):
+    s = Store(tmp_path / "t.db")
+    aid = s.arm_candidate("005930", "KR", strategy="volatility_breakout",
+                          meta={"horizon": "day"})
+    s.close_position(aid, reason="disarm:session_end")
+    pid = s.open_position("000660", "KR", qty=10, avg_price=100.0)
+    s.close_position(pid, reason="broker_sync")  # exit_price ¾øÀ½ ¡æ ½ÇÃ¼°á null
+    fid = s.closed_position_fidelity()
+    assert fid["armed_cancelled"] == 1
+    assert fid["filled_null_pnl"] == 1
+    assert fid["by_reason"].get("disarm:session_end") == 1
+    assert s.count_closed_null_pnl() == 1

@@ -333,14 +333,35 @@ def backfill_from_jsonl(store, path: Path | str, *, sleeve: str = "brain",
     return out
 
 
+def pick_history_csv(data_dir: Path, symbol: str) -> Path | None:
+    """1d history CSV — .KS/.KQ/무접미사 모두. 가장 긴 range 우선."""
+    root = Path(data_dir)
+    found: list[Path] = []
+    for pat in (
+        f"history/{symbol}.KS_1d_*.csv",
+        f"history/{symbol}.KQ_1d_*.csv",
+        f"history/{symbol}_1d_*.csv",
+    ):
+        found.extend(root.glob(pat))
+    if not found:
+        return None
+    rank = {"6mo": 1, "1y": 2, "2y": 3, "5y": 4}
+
+    def _key(p: Path) -> tuple[int, str]:
+        name = p.name
+        rng = 0
+        if "_1d_" in name:
+            rng = rank.get(name.split("_1d_")[-1].replace(".csv", ""), 0)
+        return (rng, name)
+
+    return max(found, key=_key)
+
+
 def load_daily_series(data_dir: Path, symbol: str) -> list[tuple[datetime, float]]:
     """history CSV 에서 (datetime, close) 시계열."""
-    candidates = sorted(data_dir.glob(f"history/{symbol}.KS_1d_*.csv"))
-    if not candidates:
-        candidates = sorted(data_dir.glob(f"history/{symbol}_1d_*.csv"))
-    if not candidates:
+    path = pick_history_csv(data_dir, symbol)
+    if path is None:
         return []
-    path = candidates[-1]
     rows: list[tuple[datetime, float]] = []
     for i, line in enumerate(path.read_text(encoding="utf-8").splitlines()):
         if i == 0 and ("Date" in line or "date" in line):
@@ -570,12 +591,17 @@ def shadow_stats(store, since_days: float = 90,
         "thesis": (r.get("thesis") or "")[:80],
     } for r in rows[:10]]
 
+    skipped = {}
+    if hasattr(store, "count_shadow_skipped"):
+        skipped = store.count_shadow_skipped(since=since)
+
     return {
         "note": (f"반사실 페이퍼. n<{MIN_SAMPLE}(small_sample) 과신·승격 금지. "
                  "뇌/검증 자동 변경에 사용하지 말 것."),
         "overall": overall_out,
         "by_bucket": {k: _agg_rows(v) for k, v in sorted(by_bucket.items())},
         "by_sleeve": {k: _agg_rows(v) for k, v in sorted(by_sleeve.items())},
+        "skipped": skipped,
         "verifier_value_add": {
             "vetoed_avg_ret_pct": vetoed_avg,
             "filled_actual_avg_ret_pct": filled_avg,

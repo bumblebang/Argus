@@ -60,11 +60,17 @@ def collect(store, cfg: dict, since_days: float) -> dict:
         store, cfg=cfg, data_dir=ROOT / "data",
         market_state_path=ms_path if ms_path.exists() else None,
         label_days=since_days)
+    import time as _time
+    since = _time.time() - since_days * 86400
+    closed_fid = (store.closed_position_fidelity(since=since)
+                  if hasattr(store, "closed_position_fidelity") else None)
     return {
         "since_days": since_days,
         "dossier_quality": dq,
         "calibration": {
             "n": cal.get("n"),
+            "n_scored_trades": cal.get("n_scored_trades"),
+            "n_excluded_no_conviction": cal.get("n_excluded_no_conviction"),
             "calibrated": cal.get("calibrated"),
             "brier": cal.get("brier"),
             "by_bin": {k: {kk: v.get(kk) for kk in ("n", "hit_rate", "small_sample")}
@@ -73,10 +79,20 @@ def collect(store, cfg: dict, since_days: float) -> dict:
         "shadow": {
             "overall": sh.get("overall"),
             "by_bucket": sh.get("by_bucket"),
+            "skipped": sh.get("skipped"),
             "verifier_value_add": sh.get("verifier_value_add"),
         },
         "strategy_stats": strat,
+        "closed_fidelity": closed_fid,
+        # 하위호환: 예전의 closed_null_pnl 은 '실체결 손익누락'만
+        "closed_null_pnl": (closed_fid or {}).get("filled_null_pnl"),
         "gate_postmortem": _postmortem_headline(),
+        "fidelity_note": (
+            "strategy_stats 는 pnl 확정 청산만. "
+            "closed_fidelity.armed_cancelled=미체결 armed 해제(표본 아님). "
+            "filled_null_pnl>0 만 손익 위생 구멍. "
+            "zone_unknown_rate·price_coverage 는 센서 상태."
+        ),
     }
 
 

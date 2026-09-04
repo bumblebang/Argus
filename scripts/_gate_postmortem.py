@@ -122,12 +122,10 @@ def collect(rows: list[dict], sleeve: str) -> tuple[list[dict], int]:
 
 def load_daily(symbol: str) -> list[tuple[datetime, float, float]]:
     """Load 1d (date, close, low) from history CSV if present."""
-    candidates = sorted(DATA.glob(f"history/{symbol}.KS_1d_*.csv"))
-    if not candidates:
-        candidates = sorted(DATA.glob(f"history/{symbol}_1d_*.csv"))
-    if not candidates:
+    from src.shadow_ledger import pick_history_csv
+    path = pick_history_csv(DATA, symbol)
+    if path is None:
         return []
-    path = candidates[-1]
     rows: list[tuple[datetime, float, float]] = []
     for i, line in enumerate(path.read_text(encoding="utf-8").splitlines()):
         if i == 0 and ("Date" in line or "date" in line):

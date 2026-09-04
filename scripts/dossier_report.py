@@ -40,6 +40,15 @@ def _print_human(rep: dict) -> None:
     if any(zone.values()):
         print(f"존 위치(bullish) - in {zone.get('in')} / below {zone.get('below')} "
               f"/ above {zone.get('above')} / unknown {zone.get('unknown')}")
+    zur = rep.get("zone_unknown_rate")
+    if zur is not None:
+        print(f"존 unknown 비율: {zur:.1%}  (높으면 가격 센서 실패)")
+    pc = rep.get("price_coverage") or {}
+    if pc:
+        sc = pc.get("source_counts") or {}
+        print(f"가격 커버: {pc.get('n')}/{pc.get('wanted')} "
+              f"({(pc.get('coverage_pct') or 0)*100:.0f}%) "
+              f"src={sc}")
     cov = rep.get("coverage") or {}
     for mkt, c in sorted(cov.items()):
         print(f"커버리지 [{mkt}] {c.get('fresh')}/{c.get('universe')} "
@@ -50,6 +59,10 @@ def _print_human(rep: dict) -> None:
         rate = b.get("target_first_rate")
         rate_s = f"{rate:.1%}" if rate is not None else "–"
         print(f"  {st_name}: target_first {b.get('target_first')}/{b.get('n')} ({rate_s})")
+    skipped = out.get("skipped") or {}
+    if skipped:
+        top = sorted(skipped.items(), key=lambda x: -x[1])[:6]
+        print(f"  skipped: {dict(top)}")
     print()
 
 
