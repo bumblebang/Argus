@@ -261,3 +261,42 @@ def test_window_detection():
     assert athena_cli._window_of(acfg, us)[0] == "US"
     off = datetime(2026, 7, 2, 12, 0, tzinfo=KST)
     assert athena_cli._window_of(acfg, off) == (None, None)
+
+
+def test_athena_cli_skips_brain_wake_after_batch(tmp_path, monkeypatch):
+    """장전 athena_done 뇌 각성 폐지 — 도씨에는 저장만, 08:00/09:00 뇌에 위임."""
+    import inspect
+
+    from src.engine import wake_request as wr
+
+    calls: list = []
+    monkeypatch.setattr(
+        wr, "request_brain_wake",
+        lambda **kw: calls.append(kw) or (tmp_path / "wake.json"))
+
+    cfg = load_config()
+    cfg.raw.setdefault("run", {})["db_path"] = str(tmp_path / "bot.db")
+    cfg.raw.setdefault("athena", {})["windows"] = {
+        "KR": [{"start": "05:30", "stop": "07:30"}],
+        "US": [{"start": "17:00", "stop": "21:50"}],
+    }
+    cfg.universe["KR"] = [{"symbol": "AAA", "name": "a"}]
+    monkeypatch.setattr(athena_cli, "load_config", lambda: cfg)
+    monkeypatch.setattr(athena_cli, "resolve_universe",
+                        lambda raw, root: {"KR": cfg.universe["KR"], "US": []})
+    monkeypatch.setattr(athena_cli, "sort_core_by_turnover", lambda m: None)
+    monkeypatch.setattr(athena_cli, "ClaudeCLIClient",
+                        lambda **k: object())
+    monkeypatch.setattr(athena_cli, "run_batch",
+                        lambda *a, **k: {"market": "KR", "targets": 1,
+                                         "done": 1, "failed": 0,
+                                         "stopped_by_deadline": False,
+                                         "level_only": 0})
+    monkeypatch.setattr(athena_cli, "setup_logging", lambda *a, **k: None)
+    monkeypatch.setattr(
+        sys, "argv",
+        ["athena.py", "--market", "KR", "--limit", "1"])
+
+    assert athena_cli.main() == 0
+    assert calls == []
+    assert "request_brain_wake" not in inspect.getsource(athena_cli.main)
