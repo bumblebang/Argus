@@ -253,6 +253,34 @@ def test_thesis_break_sell_exempt_from_conviction_floor(tmp_path):
     assert broker.position("005930").qty == 0                  # 전량 청산
 
 
+def test_sell_blocked_for_other_track_position(tmp_path):
+    """트랙 소유권: 밸류가 연 포지션은 뇌가 팔 수 없다(사는 판단자=파는 판단자)."""
+    broker = _broker(tmp_path)
+    broker.account.fill("005930", "KR", "BUY", 5, 1000)
+    llm = MockLLM(_responder(_decision_sell(0.9), approve=True))
+    res = run_cycle(context_json="{}", decision_agent=DecisionAgent(llm),
+                    validation_agent=ValidationAgent(llm, min_conviction=0.6), broker=broker,
+                    risk=RiskManager(capital={"KR": 1_000_000}, max_position_pct=0.2),
+                    price_lookup={"005930": 1000}, journal_path=tmp_path / "d.jsonl",
+                    sell_block_fn=lambda sym: "밸류 트랙 소유" if sym == "005930" else None)
+    assert res.executed[0]["status"] == "sell_blocked"
+    assert broker.position("005930").qty == 5                  # 그대로 보유
+
+
+def test_sell_not_blocked_for_own_position(tmp_path):
+    """대조군: 소유권 밖이면 기존대로 청산된다."""
+    broker = _broker(tmp_path)
+    broker.account.fill("005930", "KR", "BUY", 5, 1000)
+    llm = MockLLM(_responder(_decision_sell(0.9), approve=True))
+    res = run_cycle(context_json="{}", decision_agent=DecisionAgent(llm),
+                    validation_agent=ValidationAgent(llm, min_conviction=0.6), broker=broker,
+                    risk=RiskManager(capital={"KR": 1_000_000}, max_position_pct=0.2),
+                    price_lookup={"005930": 1000}, journal_path=tmp_path / "d.jsonl",
+                    sell_block_fn=lambda sym: None)
+    assert res.executed[0]["status"] == "filled"
+    assert broker.position("005930").qty == 0
+
+
 def test_buy_still_pre_rejected_by_conviction_floor(tmp_path):
     """대조군: min_conviction>0 이면 BUY 는 확신도 미달 시 사전거부."""
     broker = _broker(tmp_path)
@@ -307,3 +335,44 @@ def test_cycle_swing_buy_ignores_arm_fn(tmp_path):
     assert res.executed[0]["status"] == "filled"
     assert called == []                                # swing 은 즉시 체결(arm 미사용)
     assert broker.position("005930").qty > 0
+
+
+# ── 트랙 소유권: 뇌의 밸류 매도 차단 판정 ─────────────────────────
+class _OwnStore:
+    def __init__(self, rows):
+        self._rows = rows
+
+    def get_open_positions(self):
+        return self._rows
+
+
+def _runner_with(rows):
+    from src.agents.cycle_runner import CycleRunner
+    r = CycleRunner.__new__(CycleRunner)          # 순수 판정만 — 완전 초기화 불필요
+    r.store = _OwnStore(rows)
+    return r
+
+
+def test_value_owned_detected_by_meta_or_strategy():
+    import json as _json
+    rows = [
+        {"symbol": "A", "strategy": "value", "meta": None},
+        {"symbol": "B", "strategy": "rsi_reversion",
+         "meta": _json.dumps({"source": "value"})},
+        {"symbol": "C", "strategy": "rsi_reversion", "meta": _json.dumps({"source": "brain"})},
+        {"symbol": "D", "strategy": None, "meta": "깨진 json"},
+    ]
+    r = _runner_with(rows)
+    assert r._value_owned_symbols() == {"A", "B"}
+    assert r._sell_block_reason("A") and r._sell_block_reason("B")
+    assert r._sell_block_reason("C") is None
+    assert r._sell_block_reason("D") is None
+    assert r._sell_block_reason("") is None
+
+
+def test_value_owned_empty_without_store():
+    from src.agents.cycle_runner import CycleRunner
+    r = CycleRunner.__new__(CycleRunner)
+    r.store = None
+    assert r._value_owned_symbols() == set()
+    assert r._sell_block_reason("A") is None

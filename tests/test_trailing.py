@@ -276,3 +276,32 @@ def test_portfolio_carries_trail_active_only_when_active(tmp_path):
 
     pf1 = r._portfolio()
     assert pf1["positions"][0]["trail_active"] is True  # 활성엔 실림
+
+
+# ── 9) 밸류 전용 트레일 폭 ────────────────────────────────────────
+def _value_trail_config() -> WatchConfig:
+    return WatchConfig(trailing={
+        "enabled": True, "base_pct": 0.05, "value_base_pct": 0.12,
+        "regime_mult": {"risk_off": 0.6, "neutral": 1.0, "risk_on": 1.6},
+        "horizons": ("swing", "position")})
+
+
+def test_value_position_uses_wider_trail():
+    """밸류 목표가는 적정가 **하단**이라, 스윙 폭이면 상단 가기 전에 털린다."""
+    loop = WatchLoop.__new__(WatchLoop)
+    loop.cfg = _value_trail_config()
+    swing = {"symbol": "X", "strategy": "s", "meta": {"horizon": "swing"}}
+    value = {"symbol": "Y", "strategy": "value",
+             "meta": {"horizon": "position", "source": "value"}}
+    assert loop._trail_pct("KR", {"KR": "neutral"}, swing) == pytest.approx(0.05)
+    assert loop._trail_pct("KR", {"KR": "neutral"}, value) == pytest.approx(0.12)
+    # 국면 배수는 그대로 곱해진다
+    assert loop._trail_pct("KR", {"KR": "risk_off"}, value) == pytest.approx(0.072)
+
+
+def test_value_trail_falls_back_when_unset():
+    """value_base_pct 미설정이면 기존 동작(base_pct) — 하위호환."""
+    loop = WatchLoop.__new__(WatchLoop)
+    loop.cfg = _trail_config()
+    value = {"symbol": "Y", "strategy": "value", "meta": {"source": "value"}}
+    assert loop._trail_pct("KR", {"KR": "neutral"}, value) == pytest.approx(0.05)

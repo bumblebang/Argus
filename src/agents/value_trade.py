@@ -92,27 +92,52 @@ def _parse_tranches(raw_val) -> list[float]:
 def value_trade_cfg(cfg: AppConfig) -> dict:
     """config value_trade 블록 + 기본값."""
     raw = (cfg.raw.get("value_trade") or {})
+    # review/entry 분리. review_per_run 미지정이면 max_per_run(레거시) 또는 10.
+    if "review_per_run" in raw:
+        review = int(raw["review_per_run"])
+    elif "max_per_run" in raw:
+        review = int(raw["max_per_run"])
+    else:
+        review = 10
+    target_new = int(raw.get("new_entries_per_run", 1))
+    ceiling = int(raw.get("new_entries_ceiling", max(2, target_new)))
+    # max_positions: 숫자=고정(레거시/테스트), 없거나 null/'dynamic'=동적 뇌예약
+    if "max_positions" not in raw or raw.get("max_positions") in (None, "dynamic"):
+        max_pos = None
+    else:
+        max_pos = int(raw["max_positions"])
     return {
         "enabled": bool(raw.get("enabled", False)),
-        # 슬리브: sleeve_pct 는 **절대 상한**, brain_reserve_pct 는 뇌 트랙 활주로.
-        # 실예산은 뇌 사용량에 반응하는 동적 값이다(compute_sleeve 참조).
         "sleeve_pct": float(raw.get("sleeve_pct", 0.60)),
         "brain_reserve_pct": float(raw.get("brain_reserve_pct", 0.30)),
-        "max_per_run": int(raw.get("max_per_run", 2)),
-        "max_positions": int(raw.get("max_positions", 3)),
+        "max_per_run": review,  # 게이트 루프 호환 별칭 = review_per_run
+        "review_per_run": review,
+        "new_entries_per_run": target_new,
+        "new_entries_ceiling": max(target_new, ceiling),
+        "max_positions": max_pos,
+        # 1주 시범매수 — 밸류 기본 off(비중 상한 면제 경로라 쏠림이 크다).
+        "allow_min_lot": bool(raw.get("allow_min_lot", False)),
+        # 소수점 매수 시장 — 미장 정규장은 소수점이 되므로 고단가주도 정상 비중으로
+        # '되는 만큼' 산다. 밸류는 정규장 창(KR 10:00 / US 23:00)에만 돌아 안전하다.
+        "fractional_markets": [str(m).upper() for m in
+                               (raw.get("fractional_markets") or ["US"])],
+        "sort_key": str(raw.get("sort_key", "composite_value")),
         "min_dossier_conviction": float(raw.get("min_dossier_conviction", 0.4)),
         "dossier_ttl_hours": float(raw.get("dossier_ttl_hours", 400)),
         "hard_stop_pct": float(raw.get("hard_stop_pct", 0.20)),
-        # 시간 손절: 보유 N일 초과면 뇌 컨텍스트에 플래그(코드는 강제 청산하지 않는다).
-        # 0 이면 비활성(컨텍스트에 아예 안 붙음).
         "time_stop_days": int(raw.get("time_stop_days", 120)),
-        # 분할 매수: 회차별 비중 배분 + 회차 간 최소 경과일.
         "tranches": _parse_tranches(raw.get("tranches")),
         "tranche_min_days": float(raw.get("tranche_min_days", 7)),
         "markets": list(raw.get("markets", ["KR", "US"])),
         "model": raw.get("model", "fable"),
         "timeout": int(raw.get("timeout", 600)),
         "windows": dict(raw.get("windows", {"KR": "10:00", "US": "23:00"})),
+        "cooldown_hold_n": int(raw.get("cooldown_hold_n", 3)),
+        # "오늘 나보다 나은 후보가 있었다"는 그 종목에 대한 반증이 아니다 — 퇴짜(3회)와
+        # 같은 임계를 쓰면 준우승 종목이 순서대로 유배된다.
+        "cooldown_cap_bump_n": int(raw.get("cooldown_cap_bump_n", 8)),
+        "cooldown_days": float(raw.get("cooldown_days", 5)),
+        "cooldown_streak_ttl_days": float(raw.get("cooldown_streak_ttl_days", 5)),
     }
 
 
@@ -199,8 +224,8 @@ def tranche_ready(rows, cfg_v: dict, now: float) -> dict[str, dict]:
 
 
 def select_candidates(watchlist: dict, store, cfg_v: dict,
-                      now: float) -> list[dict]:
-    """value_watchlist 에서 매매 후보를 고른다(확신도 내림차순).
+                      now: float, *, cooldown_path=None) -> list[dict]:
+    """value_watchlist 에서 매매 후보를 고른다(composite_value 내림차순, 없으면 conviction).
 
     통과 조건: stance=='undervalued' & conviction>=min_dossier_conviction &
     신선(now-ts < dossier_ttl_hours*3600, 기본 400h=지도 수명) & market in markets
@@ -230,6 +255,8 @@ def select_candidates(watchlist: dict, store, cfg_v: dict,
     ttl_sec = cfg_v["dossier_ttl_hours"] * 3600
     min_conv = cfg_v["min_dossier_conviction"]
     tranches = cfg_v.get("tranches") or [1.0]
+    from ..value_ops import in_cooldown, load_cooldown
+    cooldown = load_cooldown(cooldown_path)
     out: list[dict] = []
     for sym, entry in (watchlist or {}).items():
         if not isinstance(entry, dict):
@@ -247,17 +274,32 @@ def select_candidates(watchlist: dict, store, cfg_v: dict,
             continue
         if sym in held and sym not in tranche:
             continue
+        # S3 쿨다운
+        if in_cooldown(cooldown, sym, now) and sym not in tranche:
+            continue
         cand = {"symbol": sym, **entry}
         if sym in tranche:
             cand["_tranche"] = tranche[sym]
         elif len(tranches) > 1:
-            # 1회차(신규 진입)도 첫 트랜치 비중으로 제한해야 '분할'이 성립한다. 안 걸면
-            # 1회차가 LLM 이 낸 비중 전량을 먹고 2회차가 종목 비중 하드게이트에 막힌다.
-            # tranches 가 [1.0](기본=분할 비활성)이면 붙이지 않는다 — 기존 동작 그대로.
             cand["_tranche"] = {"idx": 1, "total": len(tranches),
                                 "weight": float(tranches[0])}
         out.append(cand)
-    out.sort(key=lambda c: float(c.get("conviction") or 0), reverse=True)
+    sort_key = cfg_v.get("sort_key") or "composite_value"
+    # 폴백은 **리스트 단위**다. composite(0~1)와 conviction(0.4~0.9)은 스케일이 달라
+    # 종목별로 섞으면 'Score 없는 종목'이 항상 위로 올라온다(스캔 annotate 실패 직후).
+    if sort_key != "conviction" and any(
+            c.get("composite_value") is None for c in out):
+        missing = [c["symbol"] for c in out if c.get("composite_value") is None]
+        log.warning("[value_trade] composite_value 결손 %d종(%s…) — 이번 정렬은 "
+                    "conviction 폴백", len(missing), ",".join(missing[:3]))
+        sort_key = "conviction"
+
+    def _sk(c):
+        if sort_key == "conviction":
+            return float(c.get("conviction") or 0)
+        return float(c.get("composite_value") or 0)
+
+    out.sort(key=_sk, reverse=True)
     return out
 
 
@@ -472,6 +514,10 @@ class ValueRunner:
         self.state_path = Path(state_path) if state_path else (DATA / "value_trade_state.json")
         # 결정 저널은 state 파일과 같은 디렉터리에 둔다(tmp 격리 시 자동 동반).
         self.journal_path = self.state_path.parent / "value_decisions.jsonl"
+        # 쿨다운·깔때기도 state 와 같은 디렉터리 — 모듈 기본 경로를 쓰면 테스트가
+        # 라이브 data/ 를 덮어쓴다(측정 데이터 오염).
+        self.cooldown_path = self.state_path.parent / "value_trade_cooldown.json"
+        self.funnel_path = self.state_path.parent / "value_funnel.jsonl"
         self.market_state_path = (Path(market_state_path) if market_state_path
                                   else DATA / "market_state.json")
         self.now_fn = now_fn
@@ -479,6 +525,9 @@ class ValueRunner:
         self.min_conviction = float(agents_cfg.get("min_conviction", 0.6))
         self.max_position_pct = float(cfg.risk.get("max_position_pct", 0.25))
         self.base_position_pct = float(cfg.risk.get("base_position_pct", 0.20))
+        # 사이징 하한은 RiskGate 속성이 아니라 config 값이다(cycle.py 와 같은 소스).
+        self.conviction_size_floor = float(
+            cfg.risk.get("conviction_size_floor", 0.75) or 0.75)
 
     # ── 슬리브(중장기 자본 잠김 분리) ────────────────────────────
     def _value_positions(self) -> list:
@@ -493,6 +542,13 @@ class ValueRunner:
             if meta.get("source") == "value":
                 out.append(r)
         return out
+
+    def _market_open_count(self, market: str) -> int:
+        """이 시장의 열린 종목 수 — 뇌+밸류 합산(계좌 하드게이트와 같은 기준)."""
+        rows = self.store.get_open_positions() if self.store else []
+        return len({_row_val(r, "symbol") for r in rows
+                    if (_row_val(r, "market") or _row_meta(r).get("market")) == market
+                    and _row_val(r, "symbol")})
 
     def _exposure_base_amount(self, market: str) -> float:
         """슬리브 예산의 기준 금액 — 하드게이트와 **같은** 기준(실자산/고정자본)을 쓴다.
@@ -575,29 +631,91 @@ class ValueRunner:
 
     def _run_market(self, market: str, cfg_v: dict, watchlist: dict,
                     now: float) -> dict:
+        from ..value_ops import (
+            append_funnel, apply_post_cycle_cooldown, effective_new_entries_cap,
+            load_cooldown, record_cooldown_event, save_cooldown,
+            truncate_buys_by_score,
+        )
         # 1) 셀렉터 — 이 시장 후보만.
-        cands = [c for c in select_candidates(watchlist, self.store, cfg_v, now)
+        cands = [c for c in select_candidates(
+                     watchlist, self.store, cfg_v, now,
+                     cooldown_path=self.cooldown_path)
                  if c.get("market") == market]
+        funnel = {"market": market, "ts": now, "selected": len(cands),
+                  "too_expensive": 0, "margin_fail": 0, "timing_fail": 0, "gated": 0,
+                  "dropped": [],
+                  "cap_drops": [], "proposed": 0, "filled": 0, "vetoed": 0}
         res = {"candidates": len(cands), "gated": 0, "proposed": 0,
-               "filled": 0, "vetoed": 0}
+               "filled": 0, "vetoed": 0, "funnel": funnel}
         if not cands:
+            append_funnel(funnel, self.funnel_path)
             return res
 
-        # 2) 슬리브 체크 — 예산 소진/보유상한이면 스킵(LLM·집행 무접촉).
+        # 2) 슬리브·슬롯
         value_rows = self._value_positions()
+        # 시장별 보유만 슬롯에 반영(타시장 보유가 이 시장 remaining을 깎지 않음)
+        value_mkt = [
+            r for r in value_rows
+            if (_row_val(r, "market") or _row_meta(r).get("market")) == market
+        ]
+        if not value_mkt and value_rows:
+            # market 라벨이 전원 없으면 보수적으로 전체 카운트
+            if not any(_row_val(r, "market") or _row_meta(r).get("market")
+                       for r in value_rows):
+                value_mkt = list(value_rows)
         sleeve = self._sleeve(market, cfg_v, value_rows)
         if sleeve["room"] <= 0:
             res["skip"] = "sleeve_full"
+            funnel["skip"] = "sleeve_full"
+            append_funnel(funnel, self.funnel_path)
             return res
-        if len(value_rows) >= cfg_v["max_positions"]:
-            # max_positions 는 **신규 종목 수** 상한이다 — 이미 보유 중인 종목의 추가
-            # 트랜치는 보유 종목 수를 늘리지 않으므로 이 상한에 걸리지 않는다.
+
+        # 밸류 전용 칸 예약은 두지 않는다 — 슬리브 60% ÷ 티켓 18~20% 가 이미 3종에서
+        # 멈추고, 그 결과 뇌에 2칸이 남는다. 같은 답을 칸 수로 한 번 더 적으면 두 곳에서
+        # 관리해야 하고, 기본비중을 바꿨을 때 두 규칙이 어긋난다.
+        # 여기 slot_cap 은 **계좌 하드게이트(뇌+밸류 합산)** 를 미리 반영해 어차피 거부될
+        # BUY 를 LLM 에 태우지 않기 위한 것이다.
+        acct_cap = self.risk.max_positions_for(market) if self.risk else 5
+        if cfg_v.get("max_positions") is not None:      # 명시 설정(레거시/테스트)
+            slot_cap = int(cfg_v["max_positions"])
+            n_held = len({_row_val(r, "symbol") for r in value_mkt})
+        else:
+            slot_cap = int(acct_cap)
+            n_held = self._market_open_count(market)    # 뇌 포함 전체
+        remaining_slots = max(0, slot_cap - n_held)
+        # 뇌가 실제로 쓸 수 있는 여유 칸 — 막지 않고 **보이게** 한다(정책은 금액 하나).
+        n_value = len({_row_val(r, "symbol") for r in value_mkt})
+        funnel["account_slot_cap"] = int(acct_cap)
+        funnel["value_held"] = n_value
+        funnel["brain_slots_free"] = max(0, int(acct_cap) - self._market_open_count(market))
+        if remaining_slots <= 0:
             cands = [c for c in cands if c.get("_tranche")]
             if not cands:
                 res["skip"] = "max_positions"
+                funnel["skip"] = "max_positions"
+                append_funnel(funnel, self.funnel_path)
                 return res
 
-        # 3) 현재가 조회(배치, 있으면) → 사전 가드 → 타이밍 게이트.
+        min_ticket = (float(sleeve.get("base") or 0)
+                      * self.base_position_pct
+                      * self.conviction_size_floor)
+        # 하드캡 = ceiling×슬롯×room (플랜 §6.2). new_entries_per_run 은 LLM 힌트만.
+        eff_cap = effective_new_entries_cap(
+            ceiling=cfg_v["new_entries_ceiling"],
+            remaining_slots=remaining_slots,
+            sleeve_room=float(sleeve.get("room") or 0),
+            min_ticket=min_ticket,
+        )
+        funnel["effective_new_cap"] = eff_cap
+        funnel["new_entries_target"] = cfg_v["new_entries_per_run"]
+        funnel["slot_cap"] = slot_cap
+        funnel["remaining_slots"] = remaining_slots
+        funnel["min_ticket"] = round(min_ticket, 2)
+        log.info("[value_trade][%s] 밸류 %d종·계좌 %d/%d칸(뇌 여유 %d) · room %.0f · "
+                 "신규캡 %d", market, n_value, self._market_open_count(market),
+                 acct_cap, funnel["brain_slots_free"], sleeve.get("room") or 0, eff_cap)
+
+        # 3) 마진·타이밍 → review_per_run
         symbols = [c["symbol"] for c in cands]
         prices: dict = {}
         if self.price_fn is not None:
@@ -606,6 +724,17 @@ class ValueRunner:
             except Exception as e:
                 log.warning("[value_trade][%s] price_fn 실패 — 종가 폴백: %s", market, e)
                 prices = {}
+
+        fractional_ok = market.upper() in (cfg_v.get("fractional_markets") or [])
+        review_n = int(cfg_v.get("review_per_run") or cfg_v.get("max_per_run") or 10)
+
+        def _drop(sym: str, stage: str, extra: dict | None = None) -> None:
+            """탈락 종목·단계 기록 — 숫자만 남으면 '왜 A 를 안 샀나'에 답할 수 없다."""
+            if len(funnel["dropped"]) < 30:
+                row = {"symbol": sym, "stage": stage}
+                if extra:
+                    row.update(extra)
+                funnel["dropped"].append(row)
 
         gated: list[dict] = []
         for c in cands:
@@ -618,40 +747,123 @@ class ValueRunner:
             price = prices.get(sym) or _last_close(df)
             if not price or price <= 0:
                 continue
-            # 사전 가드: 안전마진 실재(현재가 < 적정가 하단). fair_low_pct 결손이면 제외.
-            if not passes_margin_guard(c, price):
+            if (not fractional_ok and not cfg_v.get("allow_min_lot")
+                    and min_ticket > 0 and price > min_ticket):
+                # 소수점이 안 되는 시장에서 1주 가격이 티켓보다 비싸면 정상 사이징으로
+                # 0주다. min_lot 을 끈 이상 제안돼도 체결될 수 없으니 자리를 안 쓴다.
+                # 소수점 시장(미장 정규장)은 '되는 만큼' 사면 되므로 제외하지 않는다.
+                funnel["too_expensive"] += 1
+                _drop(sym, "too_expensive", {"price": round(float(price), 2)})
                 continue
-            # 타이밍 게이트: 바닥 안정화(20일선 위·모멘텀 양전환).
+            if not passes_margin_guard(c, price):
+                funnel["margin_fail"] += 1
+                _drop(sym, "margin", {"price": round(float(price), 2),
+                                      "fair_low": fair_price_low(c)})
+                continue
             timing = timing_gate(df, price)
             if timing is None:
+                funnel["timing_fail"] += 1
+                _drop(sym, "timing", {"price": round(float(price), 2)})
                 continue
             c["_current_price"] = float(price)
             c["_timing"] = timing
             gated.append(c)
-            if len(gated) >= cfg_v["max_per_run"]:
+            if len(gated) >= review_n:
                 break
         res["gated"] = len(gated)
+        funnel["gated"] = len(gated)
         if not gated:
+            append_funnel(funnel, self.funnel_path)
             return res
 
-        # 4) 컨텍스트 JSON 구성.
+        # 4) 컨텍스트
         context = self._build_context(market, cfg_v, sleeve, gated, value_rows, now)
         price_lookup = {c["symbol"]: c["_current_price"] for c in gated}
 
-        # 5) 결정→검증→하드게이트→페이퍼(밸류는 arm/dossier/zone 하드가드 전부 비활성).
+        # 5) LLM → BUY 절단 → run_cycle
         llm = self.llm_factory(gated)
         val_llm = self.val_llm_factory(gated) if self.val_llm_factory else llm
         tranche_by_sym = {c["symbol"]: c["_tranche"] for c in gated if c.get("_tranche")}
+        # 1주 시범매수(min_lot)는 밸류에서 쓰지 않는다. 이 경로는 종목당 비중 상한을
+        # 면제하는데, 미국 예산이 작아 고단가주 1주가 계좌의 절반을 넘는다($414 1주 =
+        # 계좌 57%). 넉 달 들고 갈 진입에 쓰기엔 쏠림이 크고, 1주로는 밸류 논지를
+        # 표현할 수도(나중에 비중 상한 때문에 추가매수도) 없다.
         agents_cfg = self.cfg.raw.get("agents", {}) or {}
-        mlc = agents_cfg.get("min_lot_conviction")
-        if mlc is None and self.cfg.risk.get("allow_min_lot"):
-            mlc = self.min_conviction
-        # market 코드 권위(J6): 밸류는 시장별 루프라 세션 market 이 곧 권위.
-        # 미전달 시 LLM 오라벨이 자본 풀·원장 symbol_market 을 오염(US→KR 과대주문).
+        if cfg_v.get("allow_min_lot"):                  # 명시적으로 켰을 때만
+            mlc = agents_cfg.get("min_lot_conviction")
+            if mlc is None and self.cfg.risk.get("allow_min_lot"):
+                mlc = self.min_conviction
+        else:
+            mlc = None
+
+        decision_agent = ValueDecisionAgent(
+            llm, max_position_pct=self.max_position_pct, tranche_by_sym=tranche_by_sym)
+        cooldown_path = self.cooldown_path
+
+        # 결정만 먼저 받아 절단(run_cycle 전체를 두 번 돌리지 않기 위해 agent 래핑)
+        class _CapAgent:
+            def __init__(self, inner, gated_rows, cap, funnel_ref):
+                self.inner = inner
+                self.gated_rows = gated_rows
+                self.cap = cap
+                self.funnel_ref = funnel_ref
+
+            def decide(self, context_json: str):
+                out = self.inner.decide(context_json)
+                tranche_syms = {c["symbol"] for c in self.gated_rows if c.get("_tranche")}
+                # 1) cap 적용 먼저
+                forced_hold: set[str] = set()
+                if self.cap <= 0:
+                    for p in out.proposals:
+                        if p.side == "BUY" and p.symbol not in tranche_syms:
+                            p.side = "HOLD"
+                            forced_hold.add(p.symbol)
+                    self.funnel_ref["cap_drops"] = [
+                        {"symbol": s, "reason": "cap_zero"} for s in forced_hold]
+                else:
+                    non_tr = [p for p in out.proposals
+                              if p.side == "BUY" and p.symbol not in tranche_syms]
+                    _, drops = truncate_buys_by_score(
+                        non_tr, self.gated_rows, cap=self.cap)
+                    drop_syms = {d["symbol"] for d in drops}
+                    for p in out.proposals:
+                        if p.side == "BUY" and p.symbol in drop_syms:
+                            p.side = "HOLD"
+                            forced_hold.add(p.symbol)
+                    self.funnel_ref["cap_drops"] = drops
+
+                # 2) 쿨다운 (a)/(c)만 — BUY 리셋·(b) reject는 사이클 후 화이트리스트
+                cd = load_cooldown(cooldown_path)
+                buy_syms = {p.symbol for p in out.proposals if p.side == "BUY"}
+                for c in self.gated_rows:
+                    sym = c["symbol"]
+                    if sym in buy_syms:
+                        continue  # 체결/veto 후처리
+                    ttl = cfg_v.get("cooldown_streak_ttl_days", 5)
+                    if sym in forced_hold and self.cap > 0:
+                        record_cooldown_event(
+                            cd, sym, kind="cap_bump", now=now,
+                            hold_n=cfg_v.get("cooldown_cap_bump_n", 8),
+                            cool_days=cfg_v.get("cooldown_days", 5),
+                            streak_ttl_days=ttl)
+                    elif sym not in forced_hold:
+                        record_cooldown_event(
+                            cd, sym, kind="llm_hold", now=now,
+                            hold_n=cfg_v.get("cooldown_hold_n", 3),
+                            cool_days=cfg_v.get("cooldown_days", 5),
+                            streak_ttl_days=ttl)
+                    # cap==0 강제 HOLD → 미가산
+                save_cooldown(cd, cooldown_path)
+                return out
+
+            def __getattr__(self, name):
+                return getattr(self.inner, name)
+
+        capped_agent = _CapAgent(decision_agent, gated, eff_cap, funnel)
+
         cyc = run_cycle(
             context_json=context,
-            decision_agent=ValueDecisionAgent(llm, max_position_pct=self.max_position_pct,
-                                              tranche_by_sym=tranche_by_sym),
+            decision_agent=capped_agent,
             validation_agent=ValidationAgent(val_llm, min_conviction=self.min_conviction),
             broker=self.broker, risk=self.risk, price_lookup=price_lookup,
             journal_path=self.journal_path,
@@ -665,6 +877,7 @@ class ValueRunner:
                 for c in gated if c.get("_tranche")
             },
             budget_caps={c["symbol"]: float(sleeve.get("room") or 0) for c in gated},
+            fractional_markets=set(cfg_v.get("fractional_markets") or []),
         )
 
         if self.store:
@@ -678,8 +891,19 @@ class ValueRunner:
         res["vetoed"] = sum(1 for e in cyc.executed if e.get("status") == "vetoed")
         res["filled"] = sum(
             1 for e in cyc.executed if e.get("status") in ("filled", "partial"))
+        funnel["proposed"] = res["proposed"]
+        funnel["filled"] = res["filled"]
+        funnel["vetoed"] = res["vetoed"]
 
-        # 6) 체결 BUY value 메타 보강 — run_cycle(store=) mirror 가 1차, 여기는 value 전용 필드.
+        # (b) reject 화이트리스트 + 체결 시 streak 리셋 (하드게이트 거부는 제외)
+        apply_post_cycle_cooldown(
+            cyc.executed, now=now,
+            hold_n=cfg_v.get("cooldown_hold_n", 3),
+            cool_days=cfg_v.get("cooldown_days", 5),
+            streak_ttl_days=cfg_v.get("cooldown_streak_ttl_days", 5),
+            path=self.cooldown_path)
+        append_funnel(funnel, self.funnel_path)
+
         self._mirror_fills(market, cfg_v, cyc, gated)
         return res
 
@@ -730,8 +954,12 @@ class ValueRunner:
                "market_state": _market_block(ms),
                "sleeve": sleeve, "candidates": cand_ctx,
                "portfolio_value_positions": portfolio,
-               "constraints": {"max_position_pct": self.max_position_pct,
-                               "min_conviction": self.min_conviction}}
+               "constraints": {
+                   "max_position_pct": self.max_position_pct,
+                   "min_conviction": self.min_conviction,
+                   "new_entries_target": cfg_v.get("new_entries_per_run", 1),
+                   "new_entries_ceiling": cfg_v.get("new_entries_ceiling", 2),
+               }}
         if focus:
             ctx["focus"] = focus
         return json.dumps(ctx, ensure_ascii=False)

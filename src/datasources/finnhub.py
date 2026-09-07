@@ -20,6 +20,63 @@ BASE = "https://finnhub.io/api/v1"
 DEFAULT_NEWS_US_MAX = 20
 
 
+def _pct(v) -> float | None:
+    """Finnhub 는 비율을 % 로 준다(roeTTM 11.19 = 11.19%). 소수로 환산."""
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return round(f / 100.0, 4)
+
+
+def _num(v) -> float | None:
+    try:
+        return round(float(v), 4)
+    except (TypeError, ValueError):
+        return None
+
+
+def fetch_basic_financials(api_key: str, symbol: str, *,
+                           timeout: int = 12) -> dict | None:
+    """US 재무 건전성 지표 — /stock/metric(무료 티어 포함).
+
+    KR(DART) 도시어와 **같은 키 이름**으로 돌려줘 Score 의 QualityTilt 가 시장 구분 없이
+    읽게 한다. 단 debt_ratio 정의는 다르다: KR=부채총계/자기자본, US=총차입금/자기자본.
+    QualityTilt 는 절대 임계라 미국 쪽이 구조적으로 후하게 나오는데, 순위 비교가 시장
+    안에서만 일어나므로(밸류는 시장별 실행) 문제되지 않는다.
+
+    실패·비JSON 은 None(호출측이 삼켜 결측=중립 처리).
+    """
+    if not api_key or not symbol:
+        return None
+    try:
+        r = requests.get(f"{BASE}/stock/metric",
+                         params={"symbol": symbol, "metric": "all", "token": api_key},
+                         timeout=timeout)
+        if r.status_code != 200 or not r.text.strip().startswith("{"):
+            return None
+        m = (r.json() or {}).get("metric") or {}
+    except Exception as e:
+        log.debug("[finnhub][%s] basic financials 실패: %s", symbol, e)
+        return None
+    if not isinstance(m, dict) or not m:
+        return None
+    out = {
+        "roe": _pct(m.get("roeTTM") if m.get("roeTTM") is not None else m.get("roeRfy")),
+        "debt_ratio": _num(m.get("totalDebt/totalEquityQuarterly")
+                           if m.get("totalDebt/totalEquityQuarterly") is not None
+                           else m.get("totalDebt/totalEquityAnnual")),
+        "revenue_growth": _pct(m.get("revenueGrowthTTMYoy")),
+        "net_income_growth": _pct(m.get("epsGrowthTTMYoy")),   # EPS 성장 대용
+        "net_margin": _pct(m.get("netProfitMarginTTM")),
+        "current_ratio": _num(m.get("currentRatioQuarterly")),
+        "quality_source": "finnhub",
+    }
+    if all(v is None for k, v in out.items() if k != "quality_source"):
+        return None
+    return {k: v for k, v in out.items() if v is not None}
+
+
 def select_us_news_symbols(
     universe: list[str] | None,
     *,

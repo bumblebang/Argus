@@ -144,6 +144,8 @@ def run_cycle(*, context_json: str, decision_agent, validation_agent, broker, ri
               tranche_weights: dict[str, float] | None = None,
               budget_caps: dict[str, float] | None = None,
               wake_reason: str = "",
+              fractional_markets: set[str] | None = None,
+              sell_block_fn=None,
               resolve_price_fn=None) -> CycleResult:
     """결정→검증→집행. 데이트레(horizon='day') BUY 는 즉시 체결 대신 arm_fn 으로 라우팅.
 
@@ -157,6 +159,14 @@ def run_cycle(*, context_json: str, decision_agent, validation_agent, broker, ri
 
     min_lot_conviction 이 주어지면(예: 0.6) 그 확신도 이상 BUY 는 목표비중이 1주도
     못 살 때 최소 1주로 올린다(고단가 floor=0 구멍). RiskGate.allow_min_lot 과 짝.
+
+    fractional_markets: 소수점 수량을 허용할 시장 집합(예: {"US"}). 미장 소수점 매수는
+    정규장 한정이라, 정규장에만 도는 트랙에서만 켠다. None 이면 config risk 설정을 따른다.
+
+    sell_block_fn(symbol) -> str|None 이 주어지면 SELL 제안 중 사유가 돌아온 종목은
+    **집행하지 않고** status='sell_blocked' 로 기록한다. 트랙 소유권 분리에 쓴다 —
+    밸류가 산 포지션을 뇌가 파는 것을 막는다(사는 판단자와 파는 판단자를 일치시킨다).
+    코드 바닥(하드스톱·트레일링·빠른손 트리거)은 이 가드와 무관하게 계속 작동한다.
 
     tranche_weights: 심볼→회차 비중(밸류 분할). budget_caps: 심볼→명목 상한(슬리브 room).
     LLM target_weight 는 사이징에 쓰지 않는다(저널용으로만 남을 수 있음).
@@ -236,6 +246,14 @@ def run_cycle(*, context_json: str, decision_agent, validation_agent, broker, ri
                 executed.append({"symbol": p.symbol, "action": p.side, "status": hz_err,
                                  "reason": "갭반등은 horizon=close_scan 전용(day/swing 금지)"})
                 continue
+
+            # 트랙 소유권: 다른 트랙이 연 포지션의 SELL 은 집행하지 않는다.
+            if p.side == "SELL" and sell_block_fn is not None:
+                _why = sell_block_fn(p.symbol)
+                if _why:
+                    executed.append({"symbol": p.symbol, "action": "SELL",
+                                     "status": "sell_blocked", "reason": _why})
+                    continue
 
             # 데이트레 BUY: 코드 자율 진입(armed). 뇌는 종목/전략/파라미터만 배정.
             if p.side == "BUY" and arm_fn and (p.horizon or "").lower() == "day":
@@ -340,9 +358,12 @@ def run_cycle(*, context_json: str, decision_agent, validation_agent, broker, ri
                 if min_qty > 0 and equity > 0:
                     p.target_weight = min(
                         1.0, max(float(p.target_weight), price / equity))
+                frac_ovr = (None if fractional_markets is None
+                            else str(p.market).upper() in fractional_markets)
                 qty = risk.size_buy(
                     p.market, price, weight, min_qty=min_qty,
-                    base_equity=equity, notional_cap=notional_cap)
+                    base_equity=equity, notional_cap=notional_cap,
+                    allow_fractional=frac_ovr)
             else:  # SELL: 보유 수량 전량
                 qty = broker.position(p.symbol).qty
             exit_reason = "brain" if p.side == "SELL" else None

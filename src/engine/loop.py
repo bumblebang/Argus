@@ -189,9 +189,18 @@ class WatchConfig:
                     regime_mult[str(k)] = float(v)
                 except (TypeError, ValueError):
                     pass
+        # 밸류 전용 트레일 폭 — 밸류의 목표가는 적정가 **하단**이라 거기서 트레일이
+        # 켜지는데, 실제 논지는 적정가 **상단**까지 본다(하단 +12% / 상단 +36% 수준).
+        # 스윙과 같은 3~8% 폭이면 상단으로 가는 정상 눌림에 털려 논지의 뒷부분을 못 먹는다.
+        try:
+            value_base = block.get("value_base_pct")
+            value_base = float(value_base) if value_base is not None else None
+        except (TypeError, ValueError):
+            value_base = None
         return {
             "enabled": True,
             "base_pct": float(block.get("base_pct", 0.05)),
+            "value_base_pct": value_base,
             "regime_mult": regime_mult,
             "horizons": tuple(str(h) for h in horizons),
         }
@@ -334,6 +343,13 @@ def _entry_regime_of(pos: dict) -> str | None:
 def _horizon_of(pos: dict) -> str | None:
     """포지션/armed 행의 보유기간(meta.horizon). day 면 종가 강제청산 대상."""
     return _meta_field(pos, "horizon")
+
+
+def _is_value_position(pos: dict) -> bool:
+    """밸류 트랙이 연 포지션인가(meta.source 우선, 없으면 strategy)."""
+    if _meta_field(pos, "source") == "value":
+        return True
+    return str(pos.get("strategy") or "").lower() == "value"
 
 
 def _rotated(lst: list, offset: int) -> list:
@@ -577,10 +593,20 @@ class WatchLoop:
             return False
         return bool(pos.get("target_price"))
 
-    def _trail_pct(self, market: str, cur_regime: dict) -> float:
-        """실제 트레일 폭 = base_pct × regime_mult[현재국면]. 라벨 없거나 매핑에 없으면 배수 1.0."""
+    def _trail_pct(self, market: str, cur_regime: dict,
+                   pos: dict | None = None) -> float:
+        """실제 트레일 폭 = base_pct × regime_mult[현재국면].
+
+        밸류 포지션(meta.source=='value' 또는 strategy=='value')은 value_base_pct 를 쓴다
+        — 목표가(적정가 하단)에서 트레일이 켜지므로 스윙 폭이면 상단 가기 전에 털린다.
+        라벨 없거나 매핑에 없으면 배수 1.0.
+        """
         tr = self.cfg.trailing
         base = tr.get("base_pct", 0.05)
+        if pos is not None and _is_value_position(pos):
+            vb = tr.get("value_base_pct")
+            if vb is not None:
+                base = vb
         label = (cur_regime or {}).get(market)
         mult = tr.get("regime_mult", {}).get(label, 1.0)
         return base * mult
@@ -612,7 +638,7 @@ class WatchLoop:
         if not target:
             return
         meta = _meta_dict(pos)
-        pct = self._trail_pct(market, cur_regime)
+        pct = self._trail_pct(market, cur_regime, pos)
         cur_stop = pos.get("stop_price") or 0.0
         sym = pos.get("symbol")
 

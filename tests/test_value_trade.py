@@ -8,6 +8,7 @@ from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import pandas as pd
+import pytest
 
 from src.config import load_config
 from src.agents.llm import MockLLM
@@ -246,14 +247,58 @@ def test_sleeve_skips_when_max_positions_reached(tmp_path):
     assert summary["markets"]["KR"].get("skip") == "max_positions"
 
 
+def test_capital_alone_stops_at_three_and_leaves_brain_two_slots(tmp_path):
+    """종목 수 상한 없이 **금액만으로** 3종에서 멈추고, 계좌 5칸 중 2칸이 남는다.
+
+    base 1,000,000 · 슬리브 60%(=600,000) · 티켓 18~20%(180,000~200,000) ·
+    신규 진입 최소 요건 150,000. 3종(540,000) 뒤 잔여 60,000 < 150,000 → 신규 0.
+    """
+    wl = {"900001": _entry(name="밸류1", conviction=0.7, fair_low_pct=30.0,
+                           metrics={"price": 1000.0})}
+    runner, store = _build_runner(tmp_path, wl)
+    assert value_trade_cfg(runner.cfg)["max_positions"] is None      # 칸 상한 없음
+    for i, sym in enumerate(("000001", "000002", "000003")):
+        store.open_position(sym, "KR", 180, 1000.0, strategy="value",
+                            meta={"source": "value"})               # 각 180,000
+    summary = runner.run()
+    kr = summary["markets"]["KR"]
+    assert kr["filled"] == 0                                        # 4번째는 자금이 막는다
+    assert runner._market_open_count("KR") == 3
+    assert runner.risk.max_positions_for("KR") - 3 == 2             # 뇌 여유 2칸
+    funnel = [json.loads(l) for l in
+              (tmp_path / "value_funnel.jsonl").read_text(encoding="utf-8").splitlines()]
+    kr_rows = [f for f in funnel if f["market"] == "KR"]
+    assert kr_rows[-1]["brain_slots_free"] == 2
+    assert kr_rows[-1].get("effective_new_cap", 0) == 0 or kr_rows[-1].get("skip")
+
+
+def test_high_priced_symbol_dropped_before_llm(tmp_path):
+    """1주 가격이 티켓보다 비싸면(=정상 사이징 0주) LLM 앞에서 제외 — min_lot 미사용."""
+    wl = {"900001": _entry(name="고단가", conviction=0.7, fair_low_pct=30.0,
+                           metrics={"price": 400_000.0})}
+    # min_ticket = 1,000,000 × 0.2 × 0.75 = 150,000 < 주가 400,000(합성 시세도 그 배)
+    runner, store = _build_runner(
+        tmp_path, wl, fetch_fn=lambda s, m: _synth_uptrend(low=360_000, high=440_000))
+    summary = runner.run()
+    kr = summary["markets"]["KR"]
+    assert kr["gated"] == 0 and kr["filled"] == 0
+    funnel = [json.loads(l) for l in
+              (tmp_path / "value_funnel.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert [f for f in funnel if f["market"] == "KR"][-1]["too_expensive"] == 1
+
+
 def test_value_trade_cfg_sleeve_defaults():
-    """슬리브 기본값: 절대 상한 0.60 / 뇌 활주로 0.30 / 밸류 보유 상한 3."""
+    """슬리브 기본값: 절대 상한 0.60 / 뇌 활주로 0.30 / 종목 수 상한 없음(None)."""
     cfg = load_config()
     cfg.raw["value_trade"] = {"enabled": True}                  # 값 미지정 → 기본값
     v = value_trade_cfg(cfg)
     assert v["sleeve_pct"] == 0.60
     assert v["brain_reserve_pct"] == 0.30
-    assert v["max_positions"] == 3
+    assert v["max_positions"] is None
+    assert v["review_per_run"] == 10
+    assert v["new_entries_per_run"] == 1
+    assert v["sort_key"] == "composite_value"
+    assert v["allow_min_lot"] is False                              # 밸류는 1주 매수 off
 
 
 # ── 9) 동적 슬리브(compute_sleeve) ────────────────────────────────
@@ -404,3 +449,130 @@ def test_value_build_context_includes_market_state_and_focus(tmp_path):
     assert "market_state" in VALUE_TRADE_SYSTEM
     assert "fear_kr" in VALUE_TRADE_SYSTEM
     assert "fear_kr.incomplete" in VALUE_TRADE_SYSTEM
+
+
+# ── 10) S1~S4 아티팩트 격리 / 정렬 폴백 ───────────────────────────
+def test_artifacts_written_to_state_dir_not_repo_data(tmp_path):
+    """쿨다운·깔때기는 state 디렉터리에만 — 모듈 기본 경로(data/)면 테스트가 라이브를 덮는다."""
+    from src import value_ops
+    wl = {"900001": _entry(name="밸류1", conviction=0.7, fair_low_pct=30.0,
+                           metrics={"price": 1000.0})}
+    runner, _ = _build_runner(tmp_path, wl)
+    before = {p: (p.exists() and p.read_bytes())
+              for p in (value_ops.COOLDOWN_PATH, value_ops.FUNNEL_PATH,
+                        value_ops.JACCARD_PATH)}
+    runner.run()
+    assert (tmp_path / "value_funnel.jsonl").exists()
+    assert runner.cooldown_path == tmp_path / "value_trade_cooldown.json"
+    for p, prev in before.items():
+        now = p.exists() and p.read_bytes()
+        assert now == prev, f"라이브 아티팩트 오염: {p.name}"
+
+
+def test_sort_fallback_is_list_wide_not_per_item():
+    """composite 결손이 하나라도 있으면 리스트 전체가 conviction 폴백.
+
+    종목별 폴백이면 스케일이 달라(composite 0~1 vs conviction 0.4~0.9) 점수 없는
+    종목이 항상 1등이 된다.
+    """
+    wl = {
+        "900001": _entry(conviction=0.45, composite_value=0.80),
+        "900002": _entry(conviction=0.90),                    # composite 결손
+        "900003": _entry(conviction=0.60, composite_value=0.70),
+    }
+    out = select_candidates(wl, _FakeStore(), _CFG_V, _OPEN_NOW)
+    assert [c["symbol"] for c in out] == ["900002", "900003", "900001"]
+
+    wl["900002"]["composite_value"] = 0.10                    # 결손 해소 → Score 정렬
+    out = select_candidates(wl, _FakeStore(), _CFG_V, _OPEN_NOW)
+    assert [c["symbol"] for c in out] == ["900001", "900003", "900002"]
+
+
+def test_cap_bump_는_퇴짜보다_훨씬_느슨하다():
+    """자리가 없어 밀린 것(cap_bump)과 LLM 퇴짜는 같은 임계를 쓰면 안 된다."""
+    cfg = load_config()
+    cfg.raw["value_trade"] = {"enabled": True}
+    v = value_trade_cfg(cfg)
+    assert v["cooldown_hold_n"] == 3
+    assert v["cooldown_cap_bump_n"] >= 6
+    assert v["cooldown_streak_ttl_days"] > 0
+
+
+def test_funnel_records_dropped_symbols(tmp_path):
+    """숫자만 남으면 '왜 A 를 안 샀나'에 답할 수 없다 — 종목·단계가 남아야."""
+    wl = {
+        "900001": _entry(name="마진탈락", conviction=0.7, fair_low_pct=-10.0,
+                         metrics={"price": 1000.0}),          # fair_low < 현재가
+        "900002": _entry(name="정상", conviction=0.7, fair_low_pct=30.0,
+                         metrics={"price": 1000.0}),
+    }
+    runner, _ = _build_runner(tmp_path, wl)
+    runner.run()
+    funnel = [json.loads(l) for l in
+              (tmp_path / "value_funnel.jsonl").read_text(encoding="utf-8").splitlines()]
+    kr = [f for f in funnel if f["market"] == "KR"][-1]
+    dropped = {d["symbol"]: d["stage"] for d in kr.get("dropped", [])}
+    assert dropped.get("900001") == "margin"
+    assert "900002" not in dropped
+
+
+# ── 11) 신규 진입 하드캡(_CapAgent) — LLM 이 여러 개 내도 코드가 자른다 ──────────
+def _wl3():
+    return {
+        "900001": _entry(name="1등", conviction=0.5, fair_low_pct=30.0,
+                         metrics={"price": 1000.0}, composite_value=0.9),
+        "900002": _entry(name="2등", conviction=0.8, fair_low_pct=30.0,
+                         metrics={"price": 1000.0}, composite_value=0.5),
+        "900003": _entry(name="3등", conviction=0.9, fair_low_pct=30.0,
+                         metrics={"price": 1000.0}, composite_value=0.1),
+    }
+
+
+def test_cap_one_keeps_only_top_score(tmp_path):
+    """LLM 이 3종 BUY 를 내도 자리가 1개면 **Score 1등만** 체결된다(확신도 아님)."""
+    runner, store = _build_runner(tmp_path, _wl3())
+    # 슬리브 600,000 중 350,000 사용 → room 250,000, 최소 티켓 150,000 → 캡 1
+    store.open_position("000001", "KR", 350, 1000.0, strategy="value",
+                        meta={"source": "value"})
+    summary = runner.run()
+    assert summary["markets"]["KR"]["filled"] == 1
+    held = {r["symbol"] for r in store.get_open_positions()}
+    assert "900001" in held                       # composite 1등
+    assert "900002" not in held and "900003" not in held
+    funnel = [json.loads(l) for l in
+              (tmp_path / "value_funnel.jsonl").read_text(encoding="utf-8").splitlines()]
+    kr = [f for f in funnel if f["market"] == "KR"][-1]
+    assert kr["effective_new_cap"] == 1
+    drops = {d["symbol"]: d for d in kr["cap_drops"]}
+    assert set(drops) == {"900002", "900003"}
+    assert drops["900002"]["llm_proposal_rank"] is not None   # LLM 순위도 남는다
+
+
+def test_cap_zero_blocks_all_and_charges_no_cooldown(tmp_path):
+    """자리가 0이면 전부 보류 — 그리고 그건 종목 탓이 아니므로 벌점도 없다."""
+    from src.value_ops import load_cooldown
+    runner, store = _build_runner(tmp_path, _wl3())
+    # room 100,000 < 최소 티켓 150,000 → 캡 0(진입 불가, 슬리브는 아직 남음)
+    store.open_position("000001", "KR", 500, 1000.0, strategy="value",
+                        meta={"source": "value"})
+    summary = runner.run()
+    assert summary["markets"]["KR"]["filled"] == 0
+    cd = load_cooldown(runner.cooldown_path)
+    assert all((cd.get(s) or {}).get("streak", 0) == 0
+               for s in ("900001", "900002", "900003"))
+
+
+def test_fractional_markets_default_and_sizing():
+    """미장은 소수점이라 고단가주도 정상 비중으로 산다 — KR 은 정수 유지."""
+    from src.risk import RiskManager
+    cfg = load_config()
+    cfg.raw["value_trade"] = {"enabled": True}
+    assert value_trade_cfg(cfg)["fractional_markets"] == ["US"]
+    r = RiskManager(capital={"KR": 2_000_000, "US": 725})
+    # override=True(밸류 경로) → 소수점, False(뇌·프리장) → 정수 0주
+    assert r.size_buy("US", 517.5, 0.18, base_equity=725,
+                      allow_fractional=True) == pytest.approx(0.2521, abs=1e-4)
+    assert r.size_buy("US", 517.5, 0.18, base_equity=725,
+                      allow_fractional=False) == 0
+    assert r.size_buy("KR", 450_500, 0.18, base_equity=2_000_000,
+                      allow_fractional=False) == 0
