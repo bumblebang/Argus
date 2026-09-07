@@ -575,7 +575,7 @@ class CycleRunner:
         val_llm = self.val_llm_factory(candidates) if self.val_llm_factory else llm
         constraints = {"capital": self.cfg.risk.get("capital", {}),
                        "max_position_pct": self.cfg.risk.get("max_position_pct", 0.2),
-                       "max_positions": self.cfg.risk.get("max_positions", 5),
+                       "max_positions": self.cfg.risk.get("max_positions"),   # None = 무제한
                        "open_positions": self.account.open_count}
         # 트랙레코드(라이브 성과 귀속) + 최근 중대 공시(워처가 잡은 것)를 함께 실어
         # 뇌가 자기 과거 성과와 방금 뜬 재료를 보고 판단하게 한다.

@@ -280,17 +280,26 @@ def apply_post_cycle_cooldown(
 def effective_new_entries_cap(
     *,
     ceiling: int,
-    remaining_slots: int,
+    remaining_slots: int | None,
     sleeve_room: float,
     min_ticket: float,
 ) -> int:
-    """정상 티켓 기준. min_ticket<=0 또는 room 부족 → 0."""
-    if ceiling <= 0 or remaining_slots <= 0:
+    """정상 티켓 기준 신규 진입 상한.
+
+    remaining_slots=None 이면 칸 제약 없음(개수는 자본이 정한다).
+    min_ticket<=0 또는 room 부족 → 0.
+    """
+    if ceiling <= 0:
+        return 0
+    if remaining_slots is not None and remaining_slots <= 0:
         return 0
     if min_ticket <= 0 or sleeve_room < min_ticket:
         return 0
     by_room = int(sleeve_room // min_ticket)
-    return max(0, min(int(ceiling), int(remaining_slots), by_room))
+    caps = [int(ceiling), by_room]
+    if remaining_slots is not None:
+        caps.append(int(remaining_slots))
+    return max(0, min(caps))
 
 
 def truncate_buys_by_score(

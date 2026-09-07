@@ -25,7 +25,7 @@ def risk_manager_from_cfg(risk_cfg: dict | None) -> "RiskManager":
     return RiskManager(
         capital=dict(rc.get("capital") or {}),
         max_position_pct=float(rc.get("max_position_pct", 0.25)),
-        max_positions=_normalize_max_positions(rc.get("max_positions", 5)),
+        max_positions=_normalize_max_positions(rc.get("max_positions")),
         daily_loss_limit_pct=float(rc.get("daily_loss_limit_pct", 0.05)),
         allow_fractional=rc.get("allow_fractional", False),
         fractional_decimals=int(rc.get("fractional_decimals", 4)),
@@ -55,10 +55,7 @@ class RiskManager:
     def __post_init__(self):
         from .risk_gate import _normalize_max_positions
         self.allow_fractional = _normalize_fractional(self.allow_fractional)
-        if self.max_positions is None:
-            self.max_positions = {"KR": 5, "US": 5}
-        else:
-            self.max_positions = _normalize_max_positions(self.max_positions)
+        self.max_positions = _normalize_max_positions(self.max_positions)
 
     def fractional_for(self, market: str | None = None) -> bool:
         """이 시장에서 소수점 수량이 되는가. dict 미설정 시장은 False(정수)."""
@@ -67,14 +64,18 @@ class RiskManager:
             return bool(af.get(str(market).upper(), False)) if market else False
         return bool(af)
 
-    def max_positions_for(self, market: str | None = None) -> int:
-        mp = self.max_positions if isinstance(self.max_positions, dict) else {"KR": 5, "US": 5}
-        if market is None:
-            return int(min(mp.values()) if mp else 5)
-        m = str(market).upper()
-        if m in mp:
-            return int(mp[m])
-        return int(min(mp.values()) if mp else 5)
+    def max_positions_for(self, market: str | None = None) -> int | None:
+        """동시 보유 종목 수 상한. **None = 무제한**(자본 정책이 개수를 정한다)."""
+        mp = self.max_positions if isinstance(self.max_positions, dict) else {}
+        if market is not None:
+            m = str(market).upper()
+            if m in mp:
+                v = mp[m]
+                return None if v is None else int(v)
+        vals = list(mp.values())
+        if not vals or any(v is None for v in vals):
+            return None
+        return int(min(vals))
 
     def capital_of(self, market: str) -> float:
         return float(self.capital.get(market, 0) or 0)
@@ -138,7 +139,8 @@ class RiskManager:
         return qty
 
     def can_open_new(self, open_positions: int, market: str | None = None) -> bool:
-        return open_positions < self.max_positions_for(market)
+        cap = self.max_positions_for(market)
+        return cap is None or open_positions < cap
 
     def daily_loss_exceeded(self, market: str, realized_pnl: float,
                             *, budget_base: float | None = None) -> bool:

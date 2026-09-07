@@ -670,25 +670,25 @@ class ValueRunner:
             append_funnel(funnel, self.funnel_path)
             return res
 
-        # 밸류 전용 칸 예약은 두지 않는다 — 슬리브 60% ÷ 티켓 18~20% 가 이미 3종에서
-        # 멈추고, 그 결과 뇌에 2칸이 남는다. 같은 답을 칸 수로 한 번 더 적으면 두 곳에서
-        # 관리해야 하고, 기본비중을 바꿨을 때 두 규칙이 어긋난다.
-        # 여기 slot_cap 은 **계좌 하드게이트(뇌+밸류 합산)** 를 미리 반영해 어차피 거부될
-        # BUY 를 LLM 에 태우지 않기 위한 것이다.
-        acct_cap = self.risk.max_positions_for(market) if self.risk else 5
+        # 종목 수 상한은 두지 않는다 — 개수는 **자본 정책**이 정한다(슬리브 60% ·
+        # 종목당 20~25% · 뇌 몫 30% · 총노출 90%). 칸으로 한 번 더 막으면 뇌가 예약된
+        # 30% 를 갖고도 자리가 없어 못 쓰는 상태가 생겨 예약의 의미가 깨진다.
+        # 계좌 상한이 명시된 경우에만(레거시/테스트) 미리 반영해 어차피 거부될 BUY 를
+        # LLM 에 태우지 않는다.
+        acct_cap = self.risk.max_positions_for(market) if self.risk else None
         if cfg_v.get("max_positions") is not None:      # 명시 설정(레거시/테스트)
             slot_cap = int(cfg_v["max_positions"])
             n_held = len({_row_val(r, "symbol") for r in value_mkt})
         else:
-            slot_cap = int(acct_cap)
-            n_held = self._market_open_count(market)    # 뇌 포함 전체
-        remaining_slots = max(0, slot_cap - n_held)
-        # 뇌가 실제로 쓸 수 있는 여유 칸 — 막지 않고 **보이게** 한다(정책은 금액 하나).
+            slot_cap = acct_cap                          # None = 무제한
+            n_held = self._market_open_count(market)     # 뇌 포함 전체
+        remaining_slots = (None if slot_cap is None
+                           else max(0, int(slot_cap) - n_held))
         n_value = len({_row_val(r, "symbol") for r in value_mkt})
-        funnel["account_slot_cap"] = int(acct_cap)
+        funnel["account_slot_cap"] = acct_cap            # None = 무제한
         funnel["value_held"] = n_value
-        funnel["brain_slots_free"] = max(0, int(acct_cap) - self._market_open_count(market))
-        if remaining_slots <= 0:
+        funnel["market_open"] = self._market_open_count(market)
+        if remaining_slots is not None and remaining_slots <= 0:
             cands = [c for c in cands if c.get("_tranche")]
             if not cands:
                 res["skip"] = "max_positions"
@@ -711,9 +711,10 @@ class ValueRunner:
         funnel["slot_cap"] = slot_cap
         funnel["remaining_slots"] = remaining_slots
         funnel["min_ticket"] = round(min_ticket, 2)
-        log.info("[value_trade][%s] 밸류 %d종·계좌 %d/%d칸(뇌 여유 %d) · room %.0f · "
-                 "신규캡 %d", market, n_value, self._market_open_count(market),
-                 acct_cap, funnel["brain_slots_free"], sleeve.get("room") or 0, eff_cap)
+        log.info("[value_trade][%s] 밸류 %d종 / 시장 %d종(칸 상한 %s) · 슬리브 예산 %.0f "
+                 "중 잔여 %.0f · 신규캡 %d", market, n_value,
+                 funnel["market_open"], acct_cap if acct_cap is not None else "무제한",
+                 sleeve.get("budget") or 0, sleeve.get("room") or 0, eff_cap)
 
         # 3) 마진·타이밍 → review_per_run
         symbols = [c["symbol"] for c in cands]

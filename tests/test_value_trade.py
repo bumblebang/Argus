@@ -247,29 +247,42 @@ def test_sleeve_skips_when_max_positions_reached(tmp_path):
     assert summary["markets"]["KR"].get("skip") == "max_positions"
 
 
-def test_capital_alone_stops_at_three_and_leaves_brain_two_slots(tmp_path):
-    """종목 수 상한 없이 **금액만으로** 3종에서 멈추고, 계좌 5칸 중 2칸이 남는다.
+def test_capital_not_slots_limits_new_entries(tmp_path):
+    """종목 수 상한은 없다 — 신규를 막는 건 **자금**뿐.
 
-    base 1,000,000 · 슬리브 60%(=600,000) · 티켓 18~20%(180,000~200,000) ·
-    신규 진입 최소 요건 150,000. 3종(540,000) 뒤 잔여 60,000 < 150,000 → 신규 0.
+    base 1,000,000 · 슬리브 60%(=600,000) · 신규 진입 최소 요건 150,000.
+    3종(540,000) 뒤 잔여 60,000 < 150,000 → 신규 0. 칸이 남아서가 아니라 돈이 없어서다.
     """
     wl = {"900001": _entry(name="밸류1", conviction=0.7, fair_low_pct=30.0,
-                           metrics={"price": 1000.0})}
+                           metrics={"price": 1000.0}, composite_value=0.5)}
     runner, store = _build_runner(tmp_path, wl)
-    assert value_trade_cfg(runner.cfg)["max_positions"] is None      # 칸 상한 없음
-    for i, sym in enumerate(("000001", "000002", "000003")):
+    assert value_trade_cfg(runner.cfg)["max_positions"] is None      # 밸류 칸 상한 없음
+    assert runner.risk.max_positions_for("KR") is None               # 계좌 칸 상한도 없음
+    for sym in ("000001", "000002", "000003"):
         store.open_position(sym, "KR", 180, 1000.0, strategy="value",
-                            meta={"source": "value"})               # 각 180,000
+                            meta={"source": "value"})                # 각 180,000
     summary = runner.run()
-    kr = summary["markets"]["KR"]
-    assert kr["filled"] == 0                                        # 4번째는 자금이 막는다
+    assert summary["markets"]["KR"]["filled"] == 0
     assert runner._market_open_count("KR") == 3
-    assert runner.risk.max_positions_for("KR") - 3 == 2             # 뇌 여유 2칸
     funnel = [json.loads(l) for l in
               (tmp_path / "value_funnel.jsonl").read_text(encoding="utf-8").splitlines()]
-    kr_rows = [f for f in funnel if f["market"] == "KR"]
-    assert kr_rows[-1]["brain_slots_free"] == 2
-    assert kr_rows[-1].get("effective_new_cap", 0) == 0 or kr_rows[-1].get("skip")
+    kr = [f for f in funnel if f["market"] == "KR"][-1]
+    assert kr["account_slot_cap"] is None                             # 무제한
+    assert kr.get("effective_new_cap", 0) == 0                        # 자금이 막았다
+    assert kr.get("skip") != "max_positions"
+
+
+def test_slots_do_not_block_when_capital_remains(tmp_path):
+    """대조군: 이미 여러 종목을 들고 있어도 자금이 남으면 신규가 들어간다."""
+    wl = {"900001": _entry(name="밸류1", conviction=0.7, fair_low_pct=30.0,
+                           metrics={"price": 1000.0}, composite_value=0.5)}
+    runner, store = _build_runner(tmp_path, wl)
+    for sym in ("000001", "000002", "000003", "000004", "000005"):
+        store.open_position(sym, "KR", 30, 1000.0, strategy="value",
+                            meta={"source": "value"})                # 각 30,000 = 150,000
+    summary = runner.run()
+    assert summary["markets"]["KR"]["filled"] == 1                    # 6종째도 자금이 있으면 진입
+    assert runner._market_open_count("KR") == 6
 
 
 def test_high_priced_symbol_dropped_before_llm(tmp_path):

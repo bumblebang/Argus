@@ -88,7 +88,7 @@ def build_paper_core(cfg: AppConfig, *, live_client=None, account_seq=None,
         sell_tax_rate=paper_cfg.get("sell_tax_rate", {}))
     gate = RiskGate({"capital": risk_cfg.get("capital", {}),
                      "max_position_pct": risk_cfg.get("max_position_pct", 0.2),
-                     "max_positions": risk_cfg.get("max_positions", 5),
+                     "max_positions": risk_cfg.get("max_positions"),   # None = 무제한
                      "daily_loss_limit_pct": risk_cfg.get("daily_loss_limit_pct", 0.05),
                      "max_order_notional": risk_cfg.get("max_order_notional", {}),
                      "kill_switch_file": risk_cfg.get("kill_switch_file", "data/state/HALT"),

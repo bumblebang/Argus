@@ -93,6 +93,16 @@ def test_kill_switch_blocks(tmp_path):
     assert not d.approved and "킬스위치" in d.reason
 
 
+def test_engage_halt_writes_reason_and_blocks(tmp_path):
+    gate, acct = _gate(tmp_path), _acct(tmp_path)
+    p = gate.engage_halt("live_sync_failed: boom")
+    assert p.exists()
+    assert "live_sync_failed" in p.read_text(encoding="utf-8")
+    assert gate.is_globally_halted()
+    d = gate.check(Order("005930", "KR", "BUY", 1, 100), acct)
+    assert not d.approved and "킬스위치" in d.reason
+
+
 # ── 포트폴리오 수준 감독관 (총 익스포저 · 섹터 집중도) ────────────────
 def test_gross_exposure_blocks_overinvestment(tmp_path):
     gate = _gate(tmp_path, max_gross_exposure=0.9, max_position_pct=1.0,
@@ -476,3 +486,19 @@ def test_zero_capital_warns_and_skips_limits(tmp_path, caplog):
     acct = _acct(tmp_path)
     d = gate.check(Order("005930", "KR", "BUY", 9000, 100), acct)  # 90만 > 1% 비중
     assert d.approved
+
+
+# ── 종목 수 상한 없음(자본이 개수를 정한다) ──────────────────────
+def test_max_positions_none_means_unlimited():
+    """null/0/미설정 = 무제한. 칸으로 막으면 뇌가 예약된 30% 를 못 쓴다."""
+    from src.risk_gate import _normalize_max_positions
+    from src.risk import RiskManager
+    assert _normalize_max_positions(None) == {"KR": None, "US": None}
+    assert _normalize_max_positions(0) == {"KR": None, "US": None}
+    assert _normalize_max_positions({"KR": 5, "US": None}) == {"KR": 5, "US": None}
+    r = RiskManager(capital={"KR": 1_000_000}, max_positions=None)
+    assert r.max_positions_for("KR") is None
+    assert r.can_open_new(999, "KR") is True                    # 몇 종목이든 통과
+    r2 = RiskManager(capital={"KR": 1_000_000}, max_positions=3)
+    assert r2.max_positions_for("KR") == 3
+    assert r2.can_open_new(3, "KR") is False                    # 명시하면 기존대로 막힌다
