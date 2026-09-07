@@ -42,6 +42,9 @@ trading_sessions:
 trailing:
   enabled: true
   base_pct: 0.05
+  # 밸류 전용 폭 — 목표가(적정가 하단)에서 트레일이 켜지는데 논지는 상단까지 본다.
+  # 스윙 폭(3~8%)이면 상단으로 가는 정상 눌림에 털린다.
+  value_base_pct: 0.12
   regime_mult:
     risk_off: 0.6
     neutral: 1.0
@@ -404,13 +407,35 @@ value_scan:
   news_per_symbol: 3
   model: "sonnet"
   timeout: 240
+  # S0 주간 재무 백필 — 마지막 리포트가 N일보다 오래되면 스캔 주기에 얹어 실행.
+  # 0 이면 비활성(수동 `argus value-fin-backfill` 만).
+  fin_backfill_days: 7
+  # S0/S1 종합 Score(정렬 전환은 S2). 병기·백필 커버리지용.
+  value_score:
+    quintile_n_min: 20
+    # 밸류는 넉 달을 들고 간다 — 후보 신선도 감쇠는 순위 보조용으로만(바닥 0.5).
+    half_life_days: 30
+    age_decay_floor: 0.5
+    # 낙폭 역U자: 이 구간이 최고점, 더 깊으면 '떨어지는 칼'로 감점(컷라인에서 0.2).
+    dd_peak: [-50, -35]
+    dd_deep_floor: 0.2
+    weights: { val: 0.50, dd: 0.35, q: 0.15 }
 
 value_trade:
   enabled: true
   sleeve_pct: 0.60
   brain_reserve_pct: 0.30
-  max_per_run: 2
-  max_positions: 3
+  review_per_run: 10
+  new_entries_per_run: 1
+  new_entries_ceiling: 2
+  # 종목 수 상한은 두지 않는다 — 슬리브 60% ÷ 티켓 18~20% 가 3종에서 멈추고
+  # 뇌에 2칸이 남는다(계좌 max_positions 는 최종 안전판). allow_min_lot 은 밸류 off.
+  # 미장 정규장은 소수점 매수가 되므로 고단가주도 정상 비중으로 산다(밸류는 정규장
+  # 창에만 돌아 안전). 뇌는 프리/애프터도 돌아서 전역 risk.allow_fractional 은 끈 채 둔다.
+  fractional_markets: [US]
+  sort_key: composite_value
+  cooldown_hold_n: 3
+  cooldown_days: 5
   min_dossier_conviction: 0.4
   dossier_ttl_hours: 400
   hard_stop_pct: 0.20
