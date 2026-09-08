@@ -20,6 +20,7 @@ scripts/screen.py 의 발굴 헬퍼(_discover_kr/_discover_us)를 여기로 이�
 from __future__ import annotations
 
 import os
+import re
 import time
 from pathlib import Path
 from typing import Callable
@@ -34,6 +35,8 @@ from .screener import screen, liquidity_core_pick, liquidity_core_pick_light, co
 from .gem_screen import gem_candidates
 from .datasources import discovery
 from .datasources.history import fetch_history
+from .datasources.sector_class import ensure_sectors, sector_for
+from .sector_taxonomy import normalize_sector
 
 log = get_logger("src.universe_roll")
 
@@ -213,24 +216,56 @@ def _static_us(cfg) -> list[dict]:
 
 _SECTOR_MAP_PATH = ROOT / "config" / "sector_map.yaml"
 _UNIVERSE_PATH = ROOT / "data" / "universe.yaml"
-_ETF_NAME_MARKERS = ("TIGER", "KODEX", "ETF", "SPDR", "ISHARES", "INVESCO")
+# 이름으로 ETF 를 알아보는 마커. **토큰 단위**로 봐야 한다 — 부분문자열로 보면
+# "NETFLIX" 안의 "ETF" 가 걸려 NFLX 가 ETF 로 분류된다(실제 발생했던 오분류).
+_ETF_NAME_MARKERS = ("TIGER", "KODEX", "ETF", "ETN", "SPDR", "ISHARES", "INVESCO")
+_TOKEN_SPLIT = re.compile(r"[^0-9A-Z가-힣]+")
 
 
 def _infer_sector(item: dict) -> str | None:
-    name = str(item.get("name") or "").upper()
-    if any(m in name for m in _ETF_NAME_MARKERS):
+    """이름만 보고 ETF 판정(마지막 폴백). 산업 섹터는 추측하지 않는다."""
+    tokens = set(_TOKEN_SPLIT.split(str(item.get("name") or "").upper()))
+    if tokens & set(_ETF_NAME_MARKERS):
         return "ETF"
     return None
 
 
-def _sector_lookup(cfg) -> dict[str, str]:
-    """symbol→sector: config 정적 + sector_map.yaml + 기존 universe.yaml."""
+def _sector_lookup(cfg, market: str | None = None,
+                   symbols: list[str] | None = None) -> dict[str, str]:
+    """symbol→sector(11섹터 정규화). 우선순위: 수기 > 실데이터 > 정적 > 이월.
+
+    - `config/sector_map.yaml`: 사람이 지정한 오버라이드 — 항상 최우선.
+    - `data/sector_cache.json`: KRX 업종분류현황·Finnhub profile2 실데이터.
+      `symbols` 를 주면 캐시 miss 를 그 자리에서 채운다(네트워크, fail-soft).
+    - `config.yaml` 정적 universe / 기존 `data/universe.yaml` 이월분: 레거시
+      자유문자열이라 정규화를 태운다(정규화 실패 = 버림 — 옛 오분류가 고착되지 않게).
+    """
     out: dict[str, str] = {}
+
+    def _add(sym, raw) -> None:
+        sec = normalize_sector(raw)
+        if sym and sec:
+            out[str(sym)] = sec
+
+    # 낮은 우선순위부터 넣어 뒤에 오는 소스가 덮어쓰게 한다.
+    if _UNIVERSE_PATH.is_file():
+        try:
+            live = yaml.safe_load(_UNIVERSE_PATH.read_text(encoding="utf-8")) or {}
+            for lst in live.values():
+                for it in lst or []:
+                    _add(it.get("symbol"), it.get("sector"))
+        except (OSError, ValueError, yaml.YAMLError) as e:
+            log.warning("universe.yaml sector 로드 실패(무시): %s", e)
     for lst in _static_universe(cfg).values():
         for it in lst or []:
-            sym, sec = it.get("symbol"), it.get("sector")
-            if sym and sec:
-                out[str(sym)] = str(sec)
+            _add(it.get("symbol"), it.get("sector"))
+    if market and symbols is not None:
+        try:
+            cache = ensure_sectors({str(market).upper(): symbols})
+            for sym in symbols:
+                _add(sym, sector_for(cache, market, sym))
+        except Exception as e:
+            log.warning("[%s] 섹터 캐시 조회 실패(무시): %s", market, e)
     if _SECTOR_MAP_PATH.is_file():
         try:
             extra = yaml.safe_load(_SECTOR_MAP_PATH.read_text(encoding="utf-8")) or {}
@@ -238,31 +273,27 @@ def _sector_lookup(cfg) -> dict[str, str]:
                 if not isinstance(lst, dict):
                     continue
                 for sym, sec in lst.items():
-                    if sym and sec:
-                        out[str(sym)] = str(sec)
+                    _add(sym, sec)
         except (OSError, ValueError, yaml.YAMLError) as e:
             log.warning("sector_map.yaml 로드 실패(무시): %s", e)
-    if _UNIVERSE_PATH.is_file():
-        try:
-            live = yaml.safe_load(_UNIVERSE_PATH.read_text(encoding="utf-8")) or {}
-            for lst in live.values():
-                for it in lst or []:
-                    sym, sec = it.get("symbol"), it.get("sector")
-                    if sym and sec:
-                        out[str(sym)] = str(sec)
-        except (OSError, ValueError, yaml.YAMLError) as e:
-            log.warning("universe.yaml sector 로드 실패(무시): %s", e)
     return out
 
 
-def _annotate_sectors(cfg, items: list[dict]) -> None:
-    """동적 선정 종목에 sector 전파(in-place)."""
-    lookup = _sector_lookup(cfg)
+def _annotate_sectors(cfg, items: list[dict], market: str | None = None) -> None:
+    """동적 선정 종목에 sector 전파(in-place). 값은 11섹터 표준 라벨로 정규화."""
+    symbols = [str(it.get("symbol")) for it in items if it.get("symbol")]
+    lookup = _sector_lookup(cfg, market, symbols if market else None)
     for it in items:
         sym = str(it.get("symbol") or "")
-        sec = it.get("sector") or lookup.get(sym) or _infer_sector(it)
+        # lookup 이 우선 — 후보가 들고 온 sector 는 옛 유니버스에서 딸려온 값일 수 있고,
+        # lookup 은 수기 오버라이드 > 실데이터 순으로 이미 정렬돼 있다.
+        sec = (lookup.get(sym) or normalize_sector(it.get("sector"))
+               or _infer_sector(it))
         if sec:
             it["sector"] = sec
+        elif it.get("sector"):
+            # 정규화 불가한 옛 라벨은 버린다 — 잘못된 버킷이 캡을 왜곡한다.
+            it.pop("sector", None)
 
 
 # ── yaml 쓰기(코어·무버 공유, 원자적) ─────────────────────────────────────
@@ -445,7 +476,7 @@ def core_refresh(cfg, market: str, store=None, *, now_fn=time.time) -> dict | No
         return None
 
     now = now_fn()
-    _annotate_sectors(cfg, items)
+    _annotate_sectors(cfg, items, market)
     new_items = [_tag(it, "core", now) for it in items]
 
     # 기존 파일에서 그 시장 부분과 타 시장을 분리. 타 시장은 그대로 보존.
@@ -470,7 +501,7 @@ def core_refresh(cfg, market: str, store=None, *, now_fn=time.time) -> dict | No
             gems = []
         gems = [g for g in gems if g["symbol"] not in new_syms]   # 방어적 중복 제거
         if gems:
-            _annotate_sectors(cfg, gems)
+            _annotate_sectors(cfg, gems, market)
             for g in gems:
                 new_items.append(_tag(g, "core", now))   # source:"gem" 은 _tag 가 보존
                 new_syms.add(g["symbol"])
@@ -585,7 +616,7 @@ def mover_scan(cfg, market: str, *, now_fn=time.time) -> list[str]:
     picked = picks.get(market, [])
     if not picked:
         return []
-    _annotate_sectors(cfg, picked)
+    _annotate_sectors(cfg, picked, market)
 
     now = now_fn()
     added: list[str] = []

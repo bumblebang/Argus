@@ -138,6 +138,15 @@
       "priority": "P2",
       "asof": "T+0 EOD",
       "params": ["trdDd"]
+    },
+    {
+      "id": "krx_sector_class",
+      "bld": "dbms/MDC/STAT/standard/MDCSTAT03901",
+      "slot": "optional",
+      "priority": "P2",
+      "asof": "T+0 EOD",
+      "params": ["mktId", "trdDd"],
+      "note": "업종분류현황 — ISU_SRT_CD/IDX_IND_NM. 섹터 집중도 감독용 KR 업종 공급"
     }
   ]
 }

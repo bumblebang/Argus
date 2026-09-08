@@ -90,16 +90,63 @@ def restart() -> None:
         subprocess.run(argv, capture_output=True)
 
 
+REV_STATE = ROOT / "data" / "state" / "watchdog_rev.json"
+DIRTY_STABLE_RUNS = 2      # 미커밋 변경은 연속 N회 같은 지문일 때만 재기동
+
+
+def _rev_state() -> dict:
+    try:
+        d = json.loads(REV_STATE.read_text(encoding="utf-8"))
+        return d if isinstance(d, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_rev_state(d: dict) -> None:
+    try:
+        REV_STATE.parent.mkdir(parents=True, exist_ok=True)
+        REV_STATE.write_text(json.dumps(d), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _dirty_settled(live: str) -> bool:
+    """같은 dirty 지문을 연속 DIRTY_STABLE_RUNS 회 봤는가.
+
+    편집 도중(반쯤 저장된 파일)에 라이브 데몬을 재기동하지 않기 위한 안정화.
+    워치독이 15분 주기이므로 실질적으로 '15분 이상 변화가 멈춘 뒤' 재기동한다.
+    """
+    st = _rev_state()
+    seen = int(st.get("seen") or 0) + 1 if st.get("rev") == live else 1
+    _save_rev_state({"rev": live, "seen": seen, "ts": time.time()})
+    return seen >= DIRTY_STABLE_RUNS
+
+
 def code_rev_stale(hb: dict | None) -> tuple[bool, str, str]:
-    """디스크 HEAD 와 프로세스 기동 rev 불일치. (stale, proc_rev, live_rev)."""
+    """디스크 코드와 프로세스 기동 rev 불일치. (stale, proc_rev, live_rev).
+
+    HEAD 불일치(머지/풀)는 즉시 재기동. 미커밋 변경(dirty 지문)만 다르면 편집이
+    끝난 뒤 재기동하도록 연속 관측을 요구한다.
+    """
     sys.path.insert(0, str(ROOT))
-    from src.code_rev import current_code_rev
+    from src.code_rev import current_code_rev, split_rev
 
     live = current_code_rev(ROOT)
     proc = str((hb or {}).get("code_rev") or "").strip()
     if live == "unknown" or not proc:
         return False, proc, live
-    return live != proc, proc, live
+    if live == proc:
+        if REV_STATE.exists():
+            _save_rev_state({})          # 동기 상태 — 관측 카운터 초기화
+        return False, proc, live
+    live_head, live_dirty = split_rev(live)
+    proc_head, _proc_dirty = split_rev(proc)
+    if live_head != proc_head:
+        return True, proc, live          # 커밋이 다르다 — 즉시
+    if not live_dirty:
+        # 디스크는 깨끗한데 프로세스는 미커밋본 — 커밋/되돌림 직후. 즉시 재기동.
+        return True, proc, live
+    return _dirty_settled(live), proc, live
 
 
 def main() -> int:
@@ -113,6 +160,7 @@ def main() -> int:
     stale_rev, proc_rev, live_rev = code_rev_stale(hb)
     if stale_rev:
         log(f"[watchdog] code_rev stale proc={proc_rev} live={live_rev} -> restart")
+        _save_rev_state({})              # 재기동 직후 다시 세지 않도록 카운터 비움
         restart(); return 0
     # age 는 신선해도 장중 polled=0 이면 가짜 초록 — 재기동은 안 하고 경보만(alert_check).
     should = list(hb.get("should_be_open") or [])

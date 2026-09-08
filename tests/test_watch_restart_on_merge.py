@@ -13,11 +13,16 @@ sys.path.insert(0, str(ROOT / "scripts"))
 
 
 def test_current_code_rev_from_git():
-    from src.code_rev import current_code_rev
+    """HEAD 또는 `<HEAD>+<워킹트리 지문>`. 지문 상세는 test_code_rev.py."""
+    from src.code_rev import current_code_rev, split_rev
 
     current_code_rev.cache_clear()
     rev = current_code_rev(ROOT)
-    assert rev == "unknown" or (len(rev) >= 7 and rev.isalnum())
+    if rev == "unknown":
+        return
+    head, dirty = split_rev(rev)
+    assert len(head) >= 7 and head.isalnum()
+    assert dirty == "" or dirty.isalnum()
 
 
 def test_post_merge_skips_unrelated_paths(monkeypatch):

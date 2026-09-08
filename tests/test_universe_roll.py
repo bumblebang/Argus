@@ -525,9 +525,13 @@ def test_static_universe_without_operator_config(monkeypatch, tmp_path):
 
 
 def test_annotate_sectors_from_map_and_etf_name(tmp_path, monkeypatch):
-    """sector_map + ETF 이름 휴리스틱으로 동적 종목 sector 전파."""
+    """sector_map(수기) + ETF 이름 휴리스틱으로 동적 종목 sector 전파.
+
+    값은 11섹터 표준 라벨로 정규화된다 — KR/US 가 같은 축을 써야 섹터 집중도 캡이
+    의미를 가진다(자유문자열이면 같은 산업이 다른 버킷으로 흩어져 캡이 안 걸린다).
+    """
     map_path = tmp_path / "sector_map.yaml"
-    map_path.write_text('KR:\n  "999999": "테스트"\n', encoding="utf-8")
+    map_path.write_text('KR:\n  "999999": "제약"\n', encoding="utf-8")
     monkeypatch.setattr(UR, "_SECTOR_MAP_PATH", map_path)
     monkeypatch.setattr(UR, "_UNIVERSE_PATH", tmp_path / "missing_universe.yaml")
 
@@ -537,6 +541,24 @@ def test_annotate_sectors_from_map_and_etf_name(tmp_path, monkeypatch):
         {"symbol": "005930", "sector": "반도체"},
     ]
     UR._annotate_sectors(None, items)
-    assert items[0]["sector"] == "테스트"
+    assert items[0]["sector"] == "헬스케어"
     assert items[1]["sector"] == "ETF"
-    assert items[2]["sector"] == "반도체"
+    assert items[2]["sector"] == "정보기술"
+
+
+def test_etf_marker_matches_tokens_not_substrings(tmp_path, monkeypatch):
+    """'NETFLIX' 안의 'ETF' 로 NFLX 가 ETF 로 분류되던 오분류 회귀 방지."""
+    monkeypatch.setattr(UR, "_SECTOR_MAP_PATH", tmp_path / "no_map.yaml")
+    monkeypatch.setattr(UR, "_UNIVERSE_PATH", tmp_path / "no_universe.yaml")
+    assert UR._infer_sector({"symbol": "NFLX", "name": "Netflix, Inc."}) is None
+    assert UR._infer_sector({"symbol": "232080", "name": "TIGER 코스닥150"}) == "ETF"
+    assert UR._infer_sector({"symbol": "SPY", "name": "SPDR S&P 500 ETF"}) == "ETF"
+
+
+def test_annotate_sectors_drops_unnormalizable_legacy_label(tmp_path, monkeypatch):
+    """정규화 불가한 옛 라벨은 버린다 — 잘못된 버킷이 캡을 왜곡하는 게 더 나쁘다."""
+    monkeypatch.setattr(UR, "_SECTOR_MAP_PATH", tmp_path / "no_map.yaml")
+    monkeypatch.setattr(UR, "_UNIVERSE_PATH", tmp_path / "no_universe.yaml")
+    items = [{"symbol": "777777", "name": "정체불명", "sector": "듣보업종"}]
+    UR._annotate_sectors(None, items)
+    assert "sector" not in items[0]
