@@ -589,3 +589,76 @@ def test_fractional_markets_default_and_sizing():
                       allow_fractional=False) == 0
     assert r.size_buy("KR", 450_500, 0.18, base_equity=2_000_000,
                       allow_fractional=False) == 0
+
+
+# ── 11) 밸류 코드 루브릭 확신도 ────────────────────────────────────
+def _conv_code(tmp_path):
+    """value_decisions.jsonl 마지막 줄의 conviction_code 블록."""
+    lines = [ln for ln in (tmp_path / "value_decisions.jsonl")
+             .read_text(encoding="utf-8").splitlines() if ln.strip()]
+    return json.loads(lines[-1]).get("conviction_code") or {}
+
+
+def test_code_rubric_overrides_llm_self_score(tmp_path):
+    """LLM 자가채점(0.7)은 사이징에 쓰이지 않는다 — audit 에만 남는다."""
+    wl = {"900001": _entry(name="밸류1", conviction=0.7, fair_low_pct=30.0,
+                           composite_value=0.80, metrics={"price": 1000.0})}
+    runner, _store = _build_runner(tmp_path, wl)
+    runner.run()
+    audit = _conv_code(tmp_path)["900001"]
+    assert audit["llm"] == 0.7            # LLM 원점수 보존
+    assert audit["code"] != 0.7           # 코드가 덮어씀
+    # 저평가도(p90 수준) + 안전마진(18%) 둘 다 가산으로 잡혀야 한다
+    joined = " ".join(audit["parts"])
+    assert "저평가도" in joined and "안전마진" in joined
+    assert audit["snap"]["composite_value"] == 0.80
+
+
+def test_code_rubric_docks_dilution_headline(tmp_path):
+    """감점항은 스윙과 공유 — 유상증자 헤드라인이 확신도를 깎는다."""
+    common = dict(name="밸류1", conviction=0.7, fair_low_pct=30.0,
+                  composite_value=0.60, metrics={"price": 1000.0})
+    (tmp_path / "a").mkdir()
+    (tmp_path / "b").mkdir()
+    clean, _ = _build_runner(tmp_path / "a", {"900001": _entry(**common)})
+    clean.run()
+    dirty, _ = _build_runner(
+        tmp_path / "b",
+        {"900001": _entry(**common,
+                          recent_news=[{"title": "2000억 유상증자 결정"}])})
+    dirty.run()
+    a = _conv_code(tmp_path / "a")["900001"]["code"]
+    b = _conv_code(tmp_path / "b")["900001"]["code"]
+    assert b < a
+
+
+def test_context_does_not_leak_conviction_threshold(tmp_path):
+    """임계값을 컨텍스트로 흘리면 프롬프트만 고쳐도 소용없다."""
+    wl = {"900001": _entry(name="밸류1", conviction=0.7, fair_low_pct=30.0)}
+    runner, _store = _build_runner(tmp_path, wl)
+    gated = [{"symbol": "900001", "name": "밸류1", "market": "KR",
+              "_current_price": 1000.0, "stance": "undervalued", "conviction": 0.7,
+              "thesis": "저평가", "risks": [], "evidence": [], "fundamentals": {},
+              "recent_news": [], "metrics": {"price": 1000.0}, "_timing": {},
+              "ts": _OPEN_NOW, "fair_low_pct": 30.0, "fair_high_pct": 50.0}]
+    ctx = json.loads(runner._build_context(
+        "KR", value_trade_cfg(runner.cfg),
+        {"budget": 100000, "room": 50000, "invested": 0}, gated, [], _OPEN_NOW))
+    assert "min_conviction" not in ctx["constraints"]
+    assert "max_position_pct" in ctx["constraints"]
+
+
+def test_gated_candidate_carries_fair_low(tmp_path):
+    """안전마진 축의 입력 — 게이트가 계산한 값을 후보에 실어 채점에 넘긴다."""
+    wl = {"900001": _entry(name="밸류1", conviction=0.7, fair_low_pct=30.0,
+                           metrics={"price": 1000.0})}
+    runner, _store = _build_runner(tmp_path, wl)
+    runner.run()
+    snap = _conv_code(tmp_path)["900001"]["snap"]
+    assert snap["fair_low"] == 1300.0
+    assert snap["margin"] is not None and snap["margin"] > 0
+
+
+def test_code_conviction_floor_default():
+    cfg = load_config()
+    assert value_trade_cfg(cfg)["code_conviction_floor"] == 0.35

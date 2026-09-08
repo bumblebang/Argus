@@ -1,4 +1,9 @@
-"""뇌 BUY 확신도 — 사이징용. 매수 봉인이 아니다.
+"""BUY 확신도 — 사이징용. 매수 봉인이 아니다.
+
+트랙별 루브릭 2종. **"왜 사는가"는 트랙마다 다르고, "사면 안 되는 이유"는 공통이다** —
+가산항만 갈라지고 감점항(_event_parts: 법적·희석 공시, 실적 미스)은 공유한다.
+  · 스윙/단타 `score_buy`  — 손익비·안정화·수급·셋업·무효화 (진입 정밀도가 수익을 가른다)
+  · 밸류     `score_value_buy` — 저평가도(composite_value)·안전마진 (넉 달을 들고 간다)
 
 사이징: base_position_pct × (floor + span × conviction), 기본 floor=0.75·span=0.25
 → 확신 0~1 에서 목표비중의 75~100%(소폭 ±). 배율·기본비중은 config risk.* 로 조정.
@@ -59,6 +64,24 @@ SETUP_WR_SPAN = 0.10     # 승률 40%→−1, 60%→+1
 EARN_MISS_SCALE = 20.0   # |하회| 20% 가 분명한 미스
 RSI_OS = 40.0
 RSI_OS_SPAN = 8.0        # RSI 32 가 분명한 과매도
+
+# ── 밸류 트랙 루브릭 ──────────────────────────────────────────────
+# 스윙과 축이 다르다. **가산은 트랙 고유(저평가도·안전마진), 감점은 공유(_event_parts).**
+# 손익비·무효화·bullish 도시에·안정화·수급·셋업은 밸류에 넣지 않는다 — ValueDossier 에
+# 레벨(entry/invalidation/target)이 없고, 안정화는 timing_gate 가 하드 요구라 후보 전원이
+# 통과해 변별력이 0이며, 일간 수급·셋업 승률은 time_stop_days=120 보유엔 노이즈다.
+# 재무(ROE·부채·성장)는 composite_value 안의 quality_tilt 가 이미 0.15 가중으로 보고
+# 있으니 여기서 또 깎지 않는다(이중계상 금지) — 감점은 **이벤트항만**.
+VALUE_BASE = 0.45
+VALUE_FLOOR = 0.25
+VALUE_CAP = 0.85
+W_VALUE_CHEAP = 0.14   # composite_value. 이 루브릭 최대 연속항(스윙 W_STAB 에 대응)
+W_VALUE_MARGIN = 0.12  # 안전마진. 편도(+) — 음수 구간은 passes_margin_guard 가 이미 자름
+# 중심·포화폭은 후보 풀(undervalued·conviction>=0.4) 관측 분포로 잡는다.
+# 2026-09-08 n=178: mean 0.616 · p50 0.633 · sd 0.153 · p10~p90 = 0.418~0.815.
+CV_MID = 0.60
+CV_SPAN = 0.20         # ±0.20 에서 포화(≈p10/p90)
+MARGIN_SCALE = 0.15    # 안전마진 15% 가 분명한 마진(tanh)
 
 # 사이징에 넣는 공시만. 공급계약·수주·자기주식·잠정실적 제목은 여기 없다
 # (호재 스탬프가 되거나, 실적은 surprise 숫자로만 본다).
@@ -429,6 +452,53 @@ def score_buy(proposal, *, price: float | None, dossier: dict | None,
     return ConvictionScore(value=value, llm=llm, parts=parts)
 
 
+def value_margin(price: float | None, fair_low: float | None) -> float | None:
+    """안전마진 = (적정가 하단 − 현재가) / 현재가. 결손·비양수면 None."""
+    p, f = _f(price), _f(fair_low)
+    if p is None or f is None or p <= 0 or f <= 0:
+        return None
+    return (f - p) / p
+
+
+def score_value_buy(proposal, *, price: float | None, dossier: dict | None,
+                    zone_tol: float = 0.005,
+                    features: dict | None = None) -> ConvictionScore:
+    """밸류 BUY 확신도 — 사이징용. 스윙 score_buy 와 축이 다르다.
+
+    dossier 는 value_watchlist 항목(+ 셀렉터가 붙인 `_fair_low`). zone_tol 은
+    score_buy 와 시그니처를 맞추기 위한 자리이며 쓰지 않는다(밸류엔 진입존이 없다).
+    결측은 0 기여 — 스윙과 같은 규약.
+    """
+    parts = [f"base {VALUE_BASE:.2f}"]
+    v = VALUE_BASE
+    d = dossier if isinstance(dossier, dict) else {}
+
+    cv = _f(d.get("composite_value"))
+    if cv is not None:
+        t = max(-1.0, min(1.0, (cv - CV_MID) / CV_SPAN))
+        if abs(t) > 1e-9:
+            delta = W_VALUE_CHEAP * t
+            v += delta
+            parts.append(f"저평가도 {cv:.3f} {delta:+.2f}")
+
+    margin = value_margin(price, d.get("_fair_low"))
+    if margin is not None and margin > 0:
+        mag = unit_intensity(margin, MARGIN_SCALE)
+        if mag > 0:
+            delta = W_VALUE_MARGIN * mag
+            v += delta
+            parts.append(f"안전마진 {margin:.1%} {delta:+.2f}")
+
+    for delta, label in _event_parts(features if isinstance(features, dict) else {}):
+        v += delta
+        parts.append(label)
+
+    value = round(min(VALUE_CAP, max(VALUE_FLOOR, v)), 2)
+    parts.append(f"→ {value:.2f}")
+    return ConvictionScore(
+        value=value, llm=float(getattr(proposal, "conviction", 0) or 0), parts=parts)
+
+
 def _zone_loc(price: float | None, dossier: dict | None) -> str | None:
     if not price or not isinstance(dossier, dict):
         return None
@@ -507,19 +577,70 @@ def freeze_snap(proposal, *, price: float | None, dossier: dict | None,
     }
 
 
+def freeze_value_snap(proposal, *, price: float | None, dossier: dict | None,
+                      features: dict | None = None) -> dict:
+    """밸류 채점 입력 + 사후 대조용 밸류 축 동결(스윙 freeze_snap 과 필드가 다르다).
+
+    pb/roe/debt_ratio 는 지금 채점에 **쓰이지 않는다**(quality_tilt 가 composite_value
+    안에서 이미 본다). 그래도 남기는 이유는, 나중에 코드 점수와 실현손익을 대조할 때
+    "이 축을 따로 넣었어야 했나"를 되짚을 재료가 필요하기 때문이다.
+    가중치 자동 갱신은 없다 — 채점 시점 입력이 그대로 남아 있어야 사후 분석이 된다.
+    """
+    feat = features if isinstance(features, dict) else {}
+    d = dossier if isinstance(dossier, dict) else {}
+    funds = d.get("fundamentals") if isinstance(d.get("fundamentals"), dict) else {}
+    metrics = d.get("metrics") if isinstance(d.get("metrics"), dict) else {}
+    news = [str(n["title"]) for n in (feat.get("news") or [])[:3]
+            if isinstance(n, dict) and n.get("title")]
+    px = _f(price)
+    fair_low = _f(d.get("_fair_low"))
+    margin = value_margin(px, fair_low)
+    return {
+        "price": px,
+        "horizon": (getattr(proposal, "horizon", None) or "position"),
+        "stance": d.get("stance"),
+        "conviction_scan": _f(d.get("conviction")),
+        "composite_value": _f(d.get("composite_value")),
+        "value_factor": _f(d.get("value_factor")),
+        "dd_component": _f(d.get("dd_component")),
+        "quality_tilt": _f(d.get("quality_tilt")),
+        "age_decay": _f(d.get("age_decay")),
+        "fair_low": fair_low,
+        "fair_low_pct": _f(d.get("fair_low_pct")),
+        "fair_high_pct": _f(d.get("fair_high_pct")),
+        "margin": round(margin, 4) if margin is not None else None,
+        "scan_price": _f(metrics.get("price")),
+        "drawdown_1y_pct": _f(metrics.get("drawdown_1y_pct")),
+        "pb": _f(funds.get("pb")),
+        "pe_trailing": _f(funds.get("pe_trailing")),
+        "net_margin": _f(funds.get("net_margin")),
+        "debt_ratio": _f(funds.get("debt_ratio")),
+        "roe": _f(funds.get("roe")),
+        "news": news,
+    }
+
+
 def apply_buy_conviction(decision, price_lookup: dict, brief_fn=None,
-                         zone_tol: float = 0.005, features_by_sym: dict | None = None) -> dict:
+                         zone_tol: float = 0.005, features_by_sym: dict | None = None,
+                         score_fn=None, snap_fn=None) -> dict:
+    """BUY 확신도를 코드 점수로 덮어쓰고 채점 감사를 반환한다.
+
+    score_fn/snap_fn 으로 트랙별 루브릭을 주입한다. 기본은 스윙(score_buy·freeze_snap),
+    밸류는 score_value_buy·freeze_value_snap — 둘은 가산 축이 다르고 감점만 공유한다.
+    """
     audit: dict = {}
     lookup = price_lookup or {}
     feats = features_by_sym or {}
+    score = score_fn or score_buy
+    snap = snap_fn or freeze_snap
     for p in decision.proposals:
         if getattr(p, "side", None) != "BUY":
             continue
         brief = brief_fn(p.symbol) if brief_fn else None
         feat = feats.get(p.symbol)
         px = lookup.get(p.symbol)
-        sc = score_buy(p, price=px, dossier=brief, zone_tol=zone_tol, features=feat)
+        sc = score(p, price=px, dossier=brief, zone_tol=zone_tol, features=feat)
         audit[p.symbol] = {"llm": sc.llm, "code": sc.value, "parts": sc.parts,
-                           "snap": freeze_snap(p, price=px, dossier=brief, features=feat)}
+                           "snap": snap(p, price=px, dossier=brief, features=feat)}
         p.conviction = sc.value
     return audit

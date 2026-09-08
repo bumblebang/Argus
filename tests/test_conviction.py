@@ -277,3 +277,159 @@ def test_attach_event_features_by_symbol():
     assert feats["005930"]["disclosures"][0]["keyword"] == "유상증자"
     assert feats["000660"]["earnings_results"][0]["op_profit_surprise_pct"] == -12.0
     assert "earnings_results" not in feats["005930"]
+
+
+# ── 밸류 트랙 루브릭 ──────────────────────────────────────────────
+# 스윙과 축이 다르다: 가산은 고유(저평가도·안전마진), 감점은 공유(_event_parts).
+from src.agents.conviction import (  # noqa: E402
+    score_value_buy, freeze_value_snap, value_margin,
+    VALUE_BASE, VALUE_FLOOR, VALUE_CAP,
+    W_VALUE_CHEAP, W_VALUE_MARGIN, CV_MID, CV_SPAN, MARGIN_SCALE,
+    W_DISC_LEGAL, W_DISC_DILUTE,
+)
+
+
+def _vbuy(**kw):
+    base = dict(symbol="005930", market="KR", side="BUY", conviction=0.62,
+                horizon="position", target_weight=0.0, thesis="t", key_risks=[])
+    base.update(kw)
+    return Proposal(**base)
+
+
+def _cand(**extra):
+    """value_watchlist 항목 + 셀렉터가 붙이는 _fair_low."""
+    d = {"stance": "undervalued", "conviction": 0.5,
+         "composite_value": CV_MID, "_fair_low": None,
+         "fair_low_pct": 12.0, "metrics": {"price": 100.0},
+         "fundamentals": {"pb": 0.6, "pe_trailing": 5.0}}
+    d.update(extra)
+    return d
+
+
+def test_value_base_when_all_missing():
+    """결측은 0 기여 — 스윙과 같은 규약."""
+    sc = score_value_buy(_vbuy(), price=100, dossier=None)
+    assert sc.value == round(VALUE_BASE, 2)
+    assert sc.llm == 0.62
+
+
+def test_value_cheapness_axis_signed_and_saturates():
+    lo = score_value_buy(_vbuy(), price=100,
+                         dossier=_cand(composite_value=CV_MID - CV_SPAN))
+    mid = score_value_buy(_vbuy(), price=100, dossier=_cand())
+    hi = score_value_buy(_vbuy(), price=100,
+                         dossier=_cand(composite_value=CV_MID + CV_SPAN))
+    assert lo.value == round(VALUE_BASE - W_VALUE_CHEAP, 2)
+    assert mid.value == round(VALUE_BASE, 2)
+    assert hi.value == round(VALUE_BASE + W_VALUE_CHEAP, 2)
+    # 포화: span 밖으로 더 나가도 한도를 넘지 않는다
+    way_hi = score_value_buy(_vbuy(), price=100,
+                             dossier=_cand(composite_value=1.0))
+    assert way_hi.value == hi.value
+
+
+def test_value_margin_axis_is_one_sided():
+    """안전마진은 편도(+) — 음수 구간은 passes_margin_guard 가 이미 자른다."""
+    none_m = score_value_buy(_vbuy(), price=100, dossier=_cand(_fair_low=None))
+    thin = score_value_buy(_vbuy(), price=100, dossier=_cand(_fair_low=105.0))
+    fat = score_value_buy(_vbuy(), price=100, dossier=_cand(_fair_low=130.0))
+    assert none_m.value == round(VALUE_BASE, 2)
+    assert thin.value > none_m.value
+    assert fat.value > thin.value
+    assert fat.value <= round(VALUE_BASE + W_VALUE_MARGIN, 2)
+    # 이미 적정가 위 → 가산 없음(게이트가 거른 케이스라도 점수는 중립)
+    over = score_value_buy(_vbuy(), price=140, dossier=_cand(_fair_low=130.0))
+    assert over.value == round(VALUE_BASE, 2)
+
+
+def test_value_margin_matches_scale():
+    d = _cand(_fair_low=115.0)
+    sc = score_value_buy(_vbuy(), price=100, dossier=d)
+    expected = VALUE_BASE + W_VALUE_MARGIN * unit_intensity(0.15, MARGIN_SCALE)
+    assert sc.value == round(expected, 2)
+
+
+def test_value_shares_event_haircuts():
+    """감점항은 스윙과 공유 — 법적 공시 > 희석."""
+    legal = score_value_buy(_vbuy(), price=100, dossier=_cand(),
+                            features={"news": [{"title": "대표 횡령 혐의 피소"}]})
+    dilute = score_value_buy(_vbuy(), price=100, dossier=_cand(),
+                             features={"news": [{"title": "1500억 유상증자 결정"}]})
+    assert legal.value == round(VALUE_BASE + W_DISC_LEGAL, 2)
+    assert dilute.value == round(VALUE_BASE + W_DISC_DILUTE, 2)
+    assert legal.value < dilute.value
+
+
+def test_value_ignores_swing_axes():
+    """스윙 축이 밸류로 새지 않는다 — 두 루브릭 분리의 계약.
+
+    안정화는 timing_gate 가 하드 요구라 전원 통과(변별력 0)이고, 일간 수급·셋업
+    승률은 넉 달 보유엔 노이즈다. 재무는 composite_value 의 quality_tilt 가 이미 본다.
+    """
+    plain = score_value_buy(_vbuy(), price=100, dossier=_cand())
+    noisy = score_value_buy(_vbuy(), price=100, dossier=_cand(), features={
+        "stabilizing": {"ok": True, "above_ma20": True, "ret_20d_pct": 9.0},
+        "flows": {"foreign_net": 5_000_000}, "volume": 10_000_000,
+        "base_rates": {"s": {"win_rate": 0.9, "n": 50, "avg_ret_pct": 5.0}},
+        "fundamentals": {"net_margin": -0.40},
+        "rsi": 20.0,
+    })
+    assert noisy.value == plain.value
+
+
+def test_value_rr_and_invalidation_absent():
+    """ValueDossier 에 레벨이 없다 — 스윙의 손익비·무효화 항이 발화하면 안 된다."""
+    sc = score_value_buy(_vbuy(), price=100,
+                         dossier=_cand(entry_low=90, entry_high=110,
+                                       invalidation=120, target=200, rr=3.0))
+    assert sc.value == round(VALUE_BASE, 2)
+
+
+def test_value_clamped_both_ends():
+    floor_hit = score_value_buy(_vbuy(), price=100, dossier=_cand(
+        composite_value=0.0), features={"news": [{"title": "상장폐지 심사 착수"}]})
+    assert floor_hit.value == VALUE_FLOOR
+    cap_hit = score_value_buy(_vbuy(), price=1, dossier=_cand(
+        composite_value=1.0, _fair_low=10.0))
+    assert cap_hit.value <= VALUE_CAP
+
+
+def test_value_margin_helper():
+    assert value_margin(100, 120) == 0.2
+    assert value_margin(100, None) is None
+    assert value_margin(0, 120) is None
+    assert value_margin(None, 120) is None
+
+
+def test_value_snap_freezes_value_axes():
+    snap = freeze_value_snap(_vbuy(), price=100,
+                             dossier=_cand(_fair_low=112.0),
+                             features={"news": [{"title": "실적 발표"}]})
+    assert snap["composite_value"] == CV_MID
+    assert snap["fair_low"] == 112.0
+    assert snap["margin"] == 0.12
+    assert snap["horizon"] == "position"
+    assert snap["news"] == ["실적 발표"]
+    # 스윙 전용 필드는 밸류 snap 에 없다
+    assert "zone" not in snap and "rr" not in snap
+
+
+def test_apply_buy_conviction_accepts_track_rubric():
+    """score_fn/snap_fn 주입 — LLM 자가채점은 audit.llm 으로만 남는다."""
+    p = _vbuy(conviction=0.62)
+    dec = DecisionOutput(market_view="v", proposals=[p])
+    audit = apply_buy_conviction(
+        dec, {"005930": 100}, lambda s: _cand(_fair_low=130.0),
+        score_fn=score_value_buy, snap_fn=freeze_value_snap)
+    assert p.conviction == audit["005930"]["code"]
+    assert p.conviction != 0.62
+    assert audit["005930"]["llm"] == 0.62
+    assert "composite_value" in audit["005930"]["snap"]
+
+
+def test_apply_buy_conviction_defaults_to_swing():
+    p = _buy()
+    dec = DecisionOutput(market_view="v", proposals=[p])
+    audit = apply_buy_conviction(dec, {"005930": 100}, lambda s: _zone())
+    assert p.conviction == round(BASE + W_RR_HI, 2)
+    assert "zone" in audit["005930"]["snap"]

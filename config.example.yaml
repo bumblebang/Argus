@@ -437,6 +437,9 @@ value_trade:
   cooldown_hold_n: 3
   cooldown_days: 5
   min_dossier_conviction: 0.4
+  # 코드 루브릭(score_value_buy) 확신도의 결정적 하한. LLM 자가채점 임계가 아니다
+  # — 밸류 BUY 확신도는 저평가도·안전마진·공시로 코드가 산출한다(base 0.45).
+  code_conviction_floor: 0.35
   dossier_ttl_hours: 400
   hard_stop_pct: 0.20
   time_stop_days: 120

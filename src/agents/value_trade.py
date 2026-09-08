@@ -25,6 +25,7 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 
+from .conviction import freeze_value_snap, score_value_buy
 from .cycle import run_cycle
 from .schemas import DecisionOutput
 from .validation_agent import ValidationAgent
@@ -138,6 +139,10 @@ def value_trade_cfg(cfg: AppConfig) -> dict:
         "cooldown_cap_bump_n": int(raw.get("cooldown_cap_bump_n", 8)),
         "cooldown_days": float(raw.get("cooldown_days", 5)),
         "cooldown_streak_ttl_days": float(raw.get("cooldown_streak_ttl_days", 5)),
+        # 코드 산출 확신도의 결정적 하한. LLM 자가채점 임계(agents.min_conviction)를
+        # 대체한다 — 채점자에게 임계값을 알려주면 그 바로 위에 붙는다(관측: BUY 11건
+        # 전부 0.61~0.64). score_value_buy 는 base 0.45 라 스케일이 다르다.
+        "code_conviction_floor": float(raw.get("code_conviction_floor", 0.35)),
     }
 
 
@@ -404,8 +409,9 @@ VALUE_TRADE_SYSTEM = """\
 - horizon 은 반드시 "position"(중장기).
 - strategy/params 는 지정하지 마라(전략 매매가 아닌 가치투자 진입이다).
 - target_weight 는 사이징에 미반영이니 형식만 맞추면 된다(예: 0 또는 {max_position_pct}).
-- conviction 은 보수적으로 매겨라 — 0.6 미만이면 검증 에이전트가 자동 거부한다. 확신이
-  부족하면 억지 BUY 대신 HOLD 가 정답이다.
+- conviction 은 이 판단에 대한 네 확신을 **솔직하게** 매겨라. 사이징에는 쓰이지 않는다 —
+  매수 크기는 코드 루브릭(저평가도·안전마진·공시)이 정한다. 특정 임계값을 겨냥해 점수를
+  맞추지 마라. 확신이 부족하면 억지 BUY 대신 HOLD 가 정답이다.
 - market_view 에 이번 판단의 밸류 슬리브 상태(예산/잔여)와 시장 국면 요약을 한두 문장으로.
 
 오직 주어진 데이터에 근거해 판단하라. 데이터에 없는 사실을 지어내지 마라."""
@@ -768,6 +774,8 @@ class ValueRunner:
                 continue
             c["_current_price"] = float(price)
             c["_timing"] = timing
+            # 확신도 채점의 안전마진 축 — 게이트가 이미 계산한 값을 재활용한다.
+            c["_fair_low"] = fair_price_low(c)
             gated.append(c)
             if len(gated) >= review_n:
                 break
@@ -862,11 +870,24 @@ class ValueRunner:
 
         capped_agent = _CapAgent(decision_agent, gated, eff_cap, funnel)
 
+        # 확신도는 코드 루브릭(score_value_buy)이 산출한다 — LLM 자가채점은 저널에
+        # conviction_code[sym].llm 으로만 남는다. brief 는 도시에 대신 후보 항목 자체이고
+        # (composite_value·_fair_low), features 는 공유 감점항(_event_parts)의 입력이다.
+        brief_by_sym = {c["symbol"]: c for c in gated}
+        value_features = {c["symbol"]: {"news": c.get("recent_news") or []}
+                          for c in gated}
         cyc = run_cycle(
             context_json=context,
             decision_agent=capped_agent,
-            validation_agent=ValidationAgent(val_llm, min_conviction=self.min_conviction),
+            validation_agent=ValidationAgent(
+                val_llm, min_conviction=self.min_conviction,
+                code_floor=float(cfg_v["code_conviction_floor"])),
             broker=self.broker, risk=self.risk, price_lookup=price_lookup,
+            apply_code_conviction=True,
+            conviction_score_fn=score_value_buy,
+            conviction_snap_fn=freeze_value_snap,
+            dossier_brief_fn=brief_by_sym.get,
+            features_by_sym=value_features,
             journal_path=self.journal_path,
             arm_fn=None, dossier_fn=None, zone_fn=None, conviction_sizing=True,
             min_lot_conviction=float(mlc) if mlc is not None else None,
@@ -957,7 +978,9 @@ class ValueRunner:
                "portfolio_value_positions": portfolio,
                "constraints": {
                    "max_position_pct": self.max_position_pct,
-                   "min_conviction": self.min_conviction,
+                   # min_conviction 은 싣지 않는다 — 확신도 임계를 채점자에게 알려주면
+                   # 그 바로 위에 붙는다(관측: BUY 11건 전부 0.61~0.64). 사이징·거부는
+                   # 코드 루브릭(score_value_buy)이 맡는다.
                    "new_entries_target": cfg_v.get("new_entries_per_run", 1),
                    "new_entries_ceiling": cfg_v.get("new_entries_ceiling", 2),
                }}
