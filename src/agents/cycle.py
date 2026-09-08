@@ -136,6 +136,8 @@ def run_cycle(*, context_json: str, decision_agent, validation_agent, broker, ri
               conviction_sizing: bool = False,
               min_lot_conviction: float | None = None,
               apply_code_conviction: bool = False,
+              conviction_score_fn=None,
+              conviction_snap_fn=None,
               dossier_brief_fn=None,
               features_by_sym: dict | None = None,
               market_fn=None,
@@ -187,6 +189,8 @@ def run_cycle(*, context_json: str, decision_agent, validation_agent, broker, ri
     (LLM 자가채점은 사이징에 쓰지 않음). dossier_brief_fn(symbol)->dict 와
     features_by_sym 이 가감 입력. 연속량은 부호×강도로 W_* 한도 안에 접고,
     희석·법적 공시·실적 미스·적자만 계단 감점한다.
+    conviction_score_fn/conviction_snap_fn 으로 **트랙별 루브릭**을 주입한다 — 기본은
+    스윙(score_buy·freeze_snap), 밸류는 score_value_buy·freeze_value_snap.
     """
     journal_path = _paths.resolve("decisions", configured=journal_path)
     decision = decision_agent.decide(context_json)
@@ -195,7 +199,8 @@ def run_cycle(*, context_json: str, decision_agent, validation_agent, broker, ri
         conv_audit = apply_buy_conviction(
             decision, price_lookup, dossier_brief_fn,
             zone_tol=entry_zone_tolerance_pct,
-            features_by_sym=features_by_sym)
+            features_by_sym=features_by_sym,
+            score_fn=conviction_score_fn, snap_fn=conviction_snap_fn)
         log.info("확신도 코드 %s", conv_audit)
     validation = validation_agent.review(context_json, decision)
     verdict_by_sym = {v.symbol: v for v in validation.verdicts}

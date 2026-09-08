@@ -376,3 +376,49 @@ def test_value_owned_empty_without_store():
     r.store = None
     assert r._value_owned_symbols() == set()
     assert r._sell_block_reason("A") is None
+
+
+# ── 밸류 트랙: 코드 루브릭 확신도의 결정적 하한(code_floor) ──────────
+def test_code_floor_replaces_self_report_threshold():
+    """code_floor 를 주면 사전거부 임계가 그것으로 바뀐다.
+
+    코드 루브릭 점수는 base 0.45 라 LLM 자가채점 임계(0.6)와 스케일이 다르다 —
+    그대로 두면 게이트를 통과한 BUY 가 전량 자동 거부된다.
+    """
+    llm = MockLLM(_responder(_decision_buy(0.50), approve=True))
+    agent = ValidationAgent(llm, min_conviction=0.6, code_floor=0.35)
+    out = agent.review("{}", _decision_buy(0.50))
+    assert out.verdicts[0].approved is True
+
+    low = ValidationAgent(llm, min_conviction=0.6, code_floor=0.35)
+    out2 = low.review("{}", _decision_buy(0.30))
+    assert out2.verdicts[0].approved is False
+    assert "rule6:conviction" in out2.verdicts[0].concerns
+
+
+def test_code_floor_hides_threshold_from_validation_llm():
+    """rule6 은 사전거부가 처리했다 — LLM 에는 0 을 보내 이중 임계를 막는다."""
+    seen = {}
+
+    def r(schema, system, user):
+        if schema is ValidationOutput:
+            seen["payload"] = json.loads(user)
+            return ValidationOutput(verdicts=[ValidationVerdict(
+                symbol="005930", approved=True, reason="ok")])
+        raise AssertionError(schema)
+
+    ValidationAgent(MockLLM(r), min_conviction=0.6,
+                    code_floor=0.35).review("{}", _decision_buy(0.50))
+    assert seen["payload"]["min_conviction"] == 0
+
+    seen.clear()
+    ValidationAgent(MockLLM(r), min_conviction=0.6).review("{}", _decision_buy(0.80))
+    assert seen["payload"]["min_conviction"] == 0.6
+
+
+def test_value_prompt_and_context_do_not_leak_threshold():
+    """확신도 임계를 채점자에게 알려주면 그 바로 위에 붙는다(관측: BUY 전부 0.61~0.64)."""
+    from src.agents.value_trade import VALUE_TRADE_SYSTEM
+    assert "자동 거부" not in VALUE_TRADE_SYSTEM
+    assert "0.6" not in VALUE_TRADE_SYSTEM
+    assert "사이징에는 쓰이지 않는다" in VALUE_TRADE_SYSTEM

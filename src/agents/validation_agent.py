@@ -85,9 +85,18 @@ focus.lenses 에 gap_rebound 가 있으면:
 class ValidationAgent:
     SYSTEM = SYSTEM  # manager_id 해시용
 
-    def __init__(self, llm, min_conviction: float = 0.6):
+    def __init__(self, llm, min_conviction: float = 0.6, *,
+                 code_floor: float | None = None):
+        """code_floor: **코드 산출** 확신도의 결정적 하한(밸류 트랙).
+
+        주면 사전거부는 이 값으로 하되, LLM 페이로드의 min_conviction 은 0 으로 보내
+        rule6 을 적용하지 않게 한다 — LLM 자가채점이 아니라 코드 루브릭 점수라서,
+        검증 LLM 이 그 숫자를 자기 기준으로 다시 재단하면 이중 임계값이 된다.
+        서술 거부 사유(1–5·7–11)는 그대로 살아 있다.
+        """
         self.llm = llm
         self.min_conviction = min_conviction
+        self.code_floor = code_floor
 
     def review(self, context_json: str, decision: DecisionOutput) -> ValidationOutput:
         # 1) 결정적 사전검사: 확신도 미달은 LLM 호출 없이 즉시 거부 후보로 표시
@@ -98,11 +107,12 @@ class ValidationAgent:
                 continue
             # 확신도 사전거부는 '신규 위험을 더하는' BUY 에만 적용한다. SELL(위험 축소·thesis
             # 청산)은 확신도 미달이라고 막지 않는다 — 깨진 thesis 를 못 닫는 게 더 위험하다.
-            if (self.min_conviction > 0 and p.side == "BUY"
-                    and p.conviction < self.min_conviction):
+            floor = (self.code_floor if self.code_floor is not None
+                     else self.min_conviction)
+            if floor > 0 and p.side == "BUY" and p.conviction < floor:
                 pre_rejects[p.symbol] = ValidationVerdict(
                     symbol=p.symbol, approved=False,
-                    reason=f"확신도 미달 ({p.conviction:.2f} < {self.min_conviction})",
+                    reason=f"확신도 미달 ({p.conviction:.2f} < {floor})",
                     concerns=["rule6:conviction"])
             else:
                 actionable.append(p)
@@ -111,7 +121,9 @@ class ValidationAgent:
         # 2) 나머지는 LLM 독립 검토
         if actionable:
             payload = json.dumps({
-                "min_conviction": self.min_conviction,
+                # 코드 루브릭 트랙은 0 — rule6 은 사전거부가 이미 처리했다.
+                "min_conviction": (0 if self.code_floor is not None
+                                   else self.min_conviction),
                 "proposals": [p.model_dump() for p in actionable],
                 "context": json.loads(context_json),
             }, ensure_ascii=False)
