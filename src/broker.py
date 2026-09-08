@@ -454,14 +454,23 @@ class Broker:
         """
         if self.store is None:
             return
-        applied_notional = float(filled_qty) * float(avg_px or 0.0)
+        # avg 없으면 원장 미반영(고스트/place 직후) — applied_* 는 0. avg 있으면
+        # 호출부가 이미 apply_fill 한 수량으로 본다(J3 증분 귀속).
+        if avg_px and float(avg_px) > 0:
+            applied_qty = float(filled_qty)
+            applied_notional = applied_qty * float(avg_px)
+            applied_fee = float(fee)
+        else:
+            applied_qty = 0.0
+            applied_notional = 0.0
+            applied_fee = 0.0
         try:
             self.store.upsert_working_order(
                 order_id=order_id, symbol=order.symbol, market=order.market,
                 side=order.side, qty=float(order.qty), price=float(order.price),
                 status=status, filled_qty=float(filled_qty), filled_avg=avg_px,
-                fee=float(fee), applied_qty=float(filled_qty),
-                applied_notional=applied_notional, applied_fee=float(fee),
+                fee=float(fee), applied_qty=applied_qty,
+                applied_notional=applied_notional, applied_fee=applied_fee,
                 reason=reason)
         except Exception as e:
             log.error("미체결 주문 기록 실패 — 고아 주문 위험 id=%s: %s", order_id, e)
@@ -523,17 +532,32 @@ class Broker:
         return released
 
     def _cancel_opposing_working(self, order: Order) -> None:
-        """반대 방향 미체결 취소(SELL→BUY). 실패해도 본 주문은 막지 않는다."""
-        if order.side != "SELL" or self.store is None:
+        """반대 방향 미체결 취소(SELL→BUY). 실패해도 본 주문은 막지 않는다.
+
+        place→get_order 폴링 구간에는 store working 이 아직 없을 수 있다.
+        그 창에서 손절 SELL 이 나가면 실주문 BUY+SELL 이 동시에 산다 → inflight
+        반대편 order_id 도 같이 취소한다.
+        """
+        if order.side != "SELL":
             return
         if self.client is None or self.account_seq is None:
             return
-        try:
-            rows = self.store.get_working_orders(
-                order.symbol, side="BUY", settled=False)
-        except Exception as e:
-            log.warning("반대편 미체결 조회 실패 %s: %s", order.symbol, e)
-            return
+        rows: list = []
+        if self.store is not None:
+            try:
+                rows = list(self.store.get_working_orders(
+                    order.symbol, side="BUY", settled=False) or [])
+            except Exception as e:
+                log.warning("반대편 미체결 조회 실패 %s: %s", order.symbol, e)
+        # place-poll 창: store 반영 전 inflight BUY
+        cur = self._inflight.get(order.symbol)
+        if (cur is not None and str(cur.side).upper() == "BUY" and cur.order_id
+                and not any(r.get("order_id") == cur.order_id for r in rows)):
+            rows.append({
+                "order_id": cur.order_id, "symbol": order.symbol,
+                "market": order.market or cur.market, "side": "BUY",
+                "qty": float(cur.qty), "price": float(cur.price),
+            })
         for row in rows:
             log.info("[LIVE] 청산 전 반대편 BUY 취소 id=%s %s x%s @ %s",
                      row["order_id"], row["symbol"], row["qty"], row.get("price"))
@@ -733,8 +757,15 @@ class Broker:
             try:
                 ok, block_reason = self.tradable_fn(order.symbol, order.market)
             except Exception as e:
-                log.warning("[매수가드] 판정 예외(fail-open, 매수 허용) %s: %s", order.symbol, e)
-                ok, block_reason = True, ""
+                if self.mode == "live":
+                    # 라이브: 가드를 못 보면 사는 쪽이 더 위험(정지/주의 종목).
+                    log.error("[매수가드] 판정 예외(fail-closed, 매수 차단) %s: %s",
+                              order.symbol, e)
+                    ok, block_reason = False, f"매수가드 예외: {e}"
+                else:
+                    log.warning("[매수가드] 판정 예외(fail-open, 매수 허용) %s: %s",
+                                order.symbol, e)
+                    ok, block_reason = True, ""
             if not ok:
                 self.last_reject_reason = block_reason or "매수가드 차단"
                 log.warning("[매수차단] %s %s — %s", order.side, order.symbol, block_reason)
@@ -752,6 +783,8 @@ class Broker:
         if order_id is None:
             return None
         self._mark_inflight(order, order_id)  # place 직후(락 안) — 중복 주문 race 차단
+        # place→poll 창에 working 이 비면 반대 SELL 이 취소를 못 함 → 즉시 등록.
+        self._register_working_order(order, order_id, "PENDING", 0.0, reason)
         return {"kind": "live", "order_id": order_id, "base_kw": base_kw,
                 "qty_before": qty_before}
 
@@ -795,16 +828,40 @@ class Broker:
                 self._register_working_order(order, order_id, status,
                                              filled_qty, reason,
                                              avg_px=avg_px, fee=fee)
+            elif self.store is not None:
+                # place 직후 PENDING 등록분 — 전량 체결이면 레지스트리에서 제거.
+                self._store_call(self.store.delete_working_order, order_id)
             self.last_result = ExecuteResult.from_fill(
                 fill_qty=filled_qty, fill_price=avg_px, fee=fee,
                 order_qty=order.qty, limit_price=order.price,
                 status=status, order_id=order_id, side=order.side)
             return self.last_result
 
+        # 체결수량만 있고 평균가 없음 → 원장 미반영(고스트) 금지. working 유지해
+        # sweep/재조회가 avg 를 받을 때까지 추적. FILLED 여도 _TRACK_WORKING 밖이면
+        # UNKNOWN 으로 남겨 종결 삭제되지 않게 한다.
+        if filled_qty > 0:
+            track_status = status if status in _TRACK_WORKING else "UNKNOWN"
+            self._register_working_order(order, order_id, track_status,
+                                         filled_qty, reason, avg_px=None, fee=fee)
+            log.error("[LIVE] 체결가 미수신 id=%s status=%s filled=%s — 원장 보류(working 유지)",
+                      order_id, status, filled_qty)
+            self._emit("live_order_avg_missing", order, {
+                "symbol": order.symbol, "side": order.side, "qty": filled_qty,
+                "order_id": order_id, "status": status, "reason": reason,
+                **({"exit_reason": exit_reason} if exit_reason else {}),
+            })
+            self.last_result = ExecuteResult.rejected(
+                f"체결가 미수신({status})", order_qty=order.qty, limit_price=order.price)
+            return self.last_result
+
         # UNKNOWN 도 표에 남긴다. 이벤트는 조회 실패를 드러내 live_order_error.
+        # place 직후 PENDING 등록분이 있으므로: 추적 대상이면 upsert, 확정 종결(거부 등)이면 삭제.
         kind = "live_order_pending" if status in _PENDING else "live_order_error"
         if status in _TRACK_WORKING:
             self._register_working_order(order, order_id, status, 0.0, reason)
+        elif status in _TERMINAL and self.store is not None:
+            self._store_call(self.store.delete_working_order, order_id)
         log.warning("[LIVE] 미체결 id=%s status=%s — 원장 무변(주기 재대사가 반영): %s %s x%s",
                     order_id, status, order.side, order.symbol, order.qty)
         self._emit(kind, order,

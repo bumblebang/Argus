@@ -153,6 +153,18 @@ def test_check_fetch_exception_fail_open(monkeypatch, tmp_path):
     assert ok is True and reason == ""                          # fail-open
 
 
+def test_check_fetch_exception_fail_closed(monkeypatch, tmp_path):
+    """부재(P0): fail_closed=True 이면 조회 실패 시 매수 차단."""
+    monkeypatch.chdir(tmp_path)
+    client = _FakeClient(info_exc=RuntimeError("network down"),
+                         warn_exc=RuntimeError("network down"))
+    ok, reason = check_tradable("005930", "KR", client=client,
+                                info_cache={}, warn_cache={}, now=1_000_000.0,
+                                fail_closed=True)
+    assert ok is False
+    assert "StockInfo" in reason
+
+
 def test_check_blocks_etf_from_info(monkeypatch, tmp_path):
     monkeypatch.chdir(tmp_path)
     client = _FakeClient(info=[{"symbol": "069500", "status": "ACTIVE",

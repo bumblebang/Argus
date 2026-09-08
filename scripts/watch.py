@@ -70,7 +70,8 @@ from src.agents.pipeline import (CycleRunner, select_backend, build_live_llm,
 from src.agents.llm import ClaudeCLIClient
 from src.agents.value_trade import ValueRunner, value_trade_cfg
 from src.broker_sync import (apply_reconcile_from_live,
-                             fetch_live_account_data, should_sync)
+                             fetch_live_account_data, halt_after_live_sync_failure,
+                             should_sync)
 
 log = get_logger("watch")
 
@@ -703,26 +704,28 @@ def main() -> int:
     broker, risk = build_paper_core(cfg, live_client=live_client,
                                     account_seq=broker_cfg.get("account_seq"), store=store)
     # 라이브 전환 시 실계좌 → 봇 원장/store 미러링(감시 루프가 broker 를 쓰기 전에 1회).
-    # 페이퍼면 스킵(config 초기값 유지). 라이브에서 동기화 실패는 심각 → ERROR + 이벤트,
-    # 단 데몬은 계속(다음 사이클에 뇌가 어긋난 상태로 판단하지 않도록 로그로 크게 알린다).
+    # 페이퍼면 스킵(config 초기값 유지). 라이브 동기화 실패는 심각 → ERROR + 전역 HALT
+    # (어긋난 원장으로 주문 금지). 운영자가 HALT 파일 삭제 후 재기동/재동기화.
     if should_sync(broker):
         try:
             _sync = broker.sync_from_live(gateway, store, markets=tuple(markets))
             log.info("실계좌 동기화 완료 — 현금=%s, 보유=%d종목", _sync["cash"], _sync["synced"])
             store.log_event("live_sync", None, _sync)
         except Exception as e:
-            log.error("실계좌 동기화 실패(라이브에서 심각) — 데몬은 계속: %s", e)
-            store.log_event("error", None, {"where": "live_sync", "error": str(e)})
+            halt_after_live_sync_failure(broker, store, e)
     # 매수 안전가드 배선: 부적격 종목(관리/거래정지/상폐예정/ETF·ETN 등) 매수를 차단한다.
     # gateway.client(단일 토큰) 로만 조회. 키 없음/dry 면 주입 안 함(가드 비활성, 페이퍼 순수).
-    # 캐시 dict 는 프로세스 내 공유(로드/세이브). 조회 실패는 fail-open(check_tradable 내부).
+    # 캐시 dict 는 프로세스 내 공유(로드/세이브). 라이브는 fail_closed(조회 실패=차단).
     _guard_gw = None if args.dry else gateway
     if _guard_gw is not None and getattr(_guard_gw, "client", None) is not None:
         _info_cache = load_info_cache()
         _warn_cache = load_warn_cache()
+        _fail_closed = bool(getattr(broker, "mode", "") == "live")
         broker.tradable_fn = lambda sym, mkt: _guard_gw.check_tradable(
-            sym, mkt, info_cache=_info_cache, warn_cache=_warn_cache)
-        log.info("매수가드=on(warnings/stockinfo) — 부적격 종목 매수 차단 활성")
+            sym, mkt, info_cache=_info_cache, warn_cache=_warn_cache,
+            fail_closed=_fail_closed)
+        log.info("매수가드=on(warnings/stockinfo, fail_closed=%s) — 부적격 종목 매수 차단 활성",
+                 _fail_closed)
         # 합성 매도세 면제(국내 ETF/ETN) — 같은 StockInfo 캐시를 재사용(네트워크 추가 없음).
         # 라이브는 체결 대사에서 실세금을 받으므로 이 경로를 타지 않는다(페이퍼 비용모델용).
         broker.account.sell_tax_exempt_fn = lambda sym, mkt: is_sell_tax_exempt(

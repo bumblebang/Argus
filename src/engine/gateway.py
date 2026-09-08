@@ -145,11 +145,13 @@ class TossGateway:
         with self._lock:
             return refresh_sessions(self.client, markets)
 
-    def check_tradable(self, sym: str, mkt: str, *, info_cache, warn_cache) -> tuple[bool, str]:
+    def check_tradable(self, sym: str, mkt: str, *, info_cache, warn_cache,
+                       fail_closed: bool = False) -> tuple[bool, str]:
         from ..datasources.stock_info import check_tradable
         with self._lock:
             return check_tradable(sym, mkt, client=self.client,
-                                  info_cache=info_cache, warn_cache=warn_cache)
+                                  info_cache=info_cache, warn_cache=warn_cache,
+                                  fail_closed=fail_closed)
 
     def get_accounts(self) -> list:
         """doctor 등 일회성 스크립트용 — rate limiter·락 경유."""

@@ -189,6 +189,37 @@ def test_should_sync_gates_on_broker_mode(tmp_path):
     assert client.holdings_calls == 0 and client.bp_calls == []
 
 
+def test_halt_after_live_sync_failure_blocks_orders(tmp_path):
+    """부재(P0 L3): sync 실패 핸들러 → HALT 파일 + 게이트 BUY/SELL 거부."""
+    from src.broker import Broker
+    from src.broker_sync import halt_after_live_sync_failure
+    from src.risk_gate import RiskGate, Order
+
+    halt = tmp_path / "HALT"
+    gate = RiskGate({"capital": {"KR": 1_000_000}, "max_position_pct": 0.5,
+                     "max_positions": 5, "daily_loss_limit_pct": 0.05,
+                     "max_order_notional": {"KR": 500_000},
+                     "kill_switch_file": str(halt)})
+    acct = _acct(tmp_path, cash={"KR": 1_000_000})
+    store = Store(tmp_path / "bot.db")
+    broker = Broker(account=acct, gate=gate, mode="live", store=store,
+                    live_markets=["KR"])
+    path = halt_after_live_sync_failure(broker, store, RuntimeError("holdings down"))
+    assert halt.exists()
+    assert path == str(halt)
+    assert "live_sync_failed" in halt.read_text(encoding="utf-8")
+    assert gate.is_globally_halted()
+    buy = gate.check(Order("005930", "KR", "BUY", 1, 70000), acct)
+    sell = gate.check(Order("005930", "KR", "SELL", 1, 70000), acct)
+    assert not buy.approved and "킬스위치" in buy.reason
+    assert not sell.approved and "킬스위치" in sell.reason
+    evs = store.recent_events("error", 0)
+    assert len(evs) >= 1
+    payload = json.loads(evs[0]["payload"])
+    assert payload["where"] == "live_sync" and "halt" in payload
+    store.close()
+
+
 # ── 주기 재대사(reconcile_from_live) — 병합 규율 ────────────────────────────
 # 기동 동기화(전면 교체)와 달리, 봇이 관리 중인 포지션의 thesis/손절/목표는 보존하고
 # 수량·평단만 실계좌로 맞춘다. 고아는 채택, 유령은 청산.

@@ -180,21 +180,29 @@ def _get_warnings(symbol: str, client, cache: dict, now: float) -> list[dict] | 
 
 
 def check_tradable(symbol: str, market: str, *, client, info_cache: dict,
-                   warn_cache: dict, now: float | None = None) -> tuple[bool, str]:
+                   warn_cache: dict, now: float | None = None,
+                   fail_closed: bool = False) -> tuple[bool, str]:
     """매수 적격성 판정. (매수가능, 사유). 캐시 우선, miss 면 client 조회 후 캐시.
 
     StockInfo(정적)로 status/securityType 를, StockWarning(동적)으로 진행중 위험경고를
-    검사한다. 조회 실패(네트워크 등)는 fail-open(True) — 로깅만 남기고 매수는 막지 않는다.
-    US 종목은 warnings 가 대개 빈 배열이라 그대로 통과한다.
+    검사한다. 기본은 조회 실패 fail-open(True). ``fail_closed=True``(라이브 권장)이면
+    info/warnings 조회 실패 시 매수를 막는다 — 가드를 못 볼 때 사는 쪽이 더 위험.
+    US 종목은 warnings 가 대개 빈 배열이라 그대로 통과한다(조회 성공 시).
     """
     now = time.time() if now is None else now
     info = _get_info(symbol, client, info_cache, now)
-    if info is not None:
+    if info is None:
+        if fail_closed:
+            return False, "매수가드: StockInfo 조회 실패"
+    else:
         ok, reason = _is_tradable_info(info)
         if not ok:
             return False, reason
     warnings = _get_warnings(symbol, client, warn_cache, now)
-    if warnings is not None:
+    if warnings is None:
+        if fail_closed:
+            return False, "매수가드: Warning 조회 실패"
+    else:
         active = _active_warnings(warnings, _kst_today(now))
         if active:
             return False, f"경고: {active[0]}"
