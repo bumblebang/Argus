@@ -17,14 +17,16 @@ from typing import Any
 
 import requests
 
-from .config import TossCredentials
+from .config import ROOT, TossCredentials
 from .logging_setup import get_logger
 
 log = get_logger("toss.client")
 
 # 토큰을 디스크에 캐시 -> 스크립트/실행마다 재발급하지 않고 1개를 재사용한다.
 # (재발급 폭주가 BASIC tier rate limit/쿨다운을 유발하므로 반드시 캐시할 것)
-_TOKEN_CACHE = Path("data/.token.json")
+# cwd 상대경로 금지 — doctor/watch/스크립트가 다른 cwd 로 뜨면 캐시가 갈라져
+# 상호 무효화(401 thrash)가 난다. 항상 리포 ROOT 아래 고정.
+_TOKEN_CACHE = ROOT / "data" / ".token.json"
 
 # 실제 스펙 기준 엔드포인트 (data/openapi.json 에서 확정)
 EP = {
@@ -101,6 +103,13 @@ class TossClient:
             return False
         if d.get("client_id") == self.creds.client_id and self._valid(d.get("access_token"), d.get("exp", 0)):
             self._token, self._token_exp = d["access_token"], d["exp"]
+            # issued_at 복원 — 없으면 '방금 로드'로 취급(age≈0). 구캐시가 0으로
+            # 남으면 401 직후 age>60 로 잘못 재발급 thrash 한다.
+            issued = d.get("issued_at")
+            try:
+                self._token_issued_at = float(issued) if issued is not None else time.time()
+            except (TypeError, ValueError):
+                self._token_issued_at = time.time()
             return True
         return False
 
@@ -145,7 +154,8 @@ class TossClient:
             _TOKEN_CACHE.parent.mkdir(parents=True, exist_ok=True)
             _TOKEN_CACHE.write_text(json.dumps(
                 {"client_id": self.creds.client_id, "access_token": self._token,
-                 "exp": self._token_exp}), encoding="utf-8")
+                 "exp": self._token_exp, "issued_at": self._token_issued_at}),
+                encoding="utf-8")
         except OSError as e:
             log.warning("토큰 캐시 저장 실패: %s", e)
         log.info("토큰 신규 발급 (만료 %ss)", data.get("expires_in"))
@@ -160,6 +170,7 @@ class TossClient:
         """
         self._token = None
         self._token_exp = 0.0
+        self._token_issued_at = 0.0
         try:
             _TOKEN_CACHE.unlink(missing_ok=True)
         except OSError as e:

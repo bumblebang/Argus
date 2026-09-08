@@ -79,6 +79,7 @@ def test_guard_none_backward_compat(tmp_path):
 
 
 def test_guard_exception_fail_open(tmp_path):
+    """페이퍼: 가드 예외 시 fail-open(하위호환)."""
     def boom(s, m):
         raise RuntimeError("guard exploded")
 
@@ -86,3 +87,22 @@ def test_guard_exception_fail_open(tmp_path):
     ok = b.execute(Order("005930", "KR", "BUY", 1, 70000.0), "test")
     assert ok                                             # fail-open → 체결
     assert b.account.position("005930").qty == 1
+
+
+def test_guard_exception_fail_closed_live(tmp_path):
+    """부재(P0): live 모드 가드 예외 → BUY 차단·원장 무변."""
+    def boom(s, m):
+        raise RuntimeError("guard exploded")
+
+    store = Store(tmp_path / "t.db")
+    acct = PaperAccount(cash={"KR": 1_000_000, "US": 100_000},
+                        state_path=tmp_path / "pa.json")
+    b = Broker(account=acct, gate=_gate(tmp_path), mode="live",
+               store=store, tradable_fn=boom, client=object(), account_seq="1",
+               live_markets=["KR"])
+    # place 전에 가드에서 막혀야 함 — client 는 더미여도 됨
+    ok = b.execute(Order("005930", "KR", "BUY", 1, 70000.0), "test")
+    assert not ok
+    assert b.account.position("005930").qty == 0
+    assert "매수가드" in (b.last_reject_reason or "")
+    assert store.recent_events("buy_blocked", 0)

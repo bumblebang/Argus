@@ -84,6 +84,26 @@ def should_sync(broker) -> bool:
     return getattr(broker, "mode", "paper") == "live"
 
 
+def halt_after_live_sync_failure(broker, store, error: BaseException) -> str:
+    """라이브 기동 동기화 실패 → 전역 HALT + 이벤트. HALT 경로 문자열 반환.
+
+    원장이 실계좌와 어긋난 채 주문이 나가면 안 된다. 데몬은 떠 있어도 게이트가
+    BUY/SELL 을 전부 막는다. 운영자가 HALT 파일을 지우고 재동기화해야 한다.
+    """
+    gate = getattr(broker, "gate", None)
+    if gate is None or not hasattr(gate, "engage_halt"):
+        raise RuntimeError("broker.gate.engage_halt 없음 — HALT 불가") from error
+    halt_path = gate.engage_halt(f"live_sync_failed: {error}")
+    log.error("실계좌 동기화 실패 — 전역 HALT 활성(%s): %s", halt_path, error)
+    if store is not None:
+        try:
+            store.log_event("error", None, {
+                "where": "live_sync", "error": str(error), "halt": str(halt_path)})
+        except Exception as e:
+            log.warning("live_sync HALT 이벤트 기록 실패: %s", e)
+    return str(halt_path)
+
+
 def _last_sell_price(account, symbol: str) -> float | None:
     for f in reversed(account.journal):
         if f.symbol == symbol and f.side == "SELL":

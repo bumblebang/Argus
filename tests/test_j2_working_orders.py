@@ -587,3 +587,52 @@ def test_upsert_is_idempotent(tmp_path):
     rows = store.get_working_orders()
     assert len(rows) == 1
     assert rows[0]["status"] == "PARTIAL_FILLED" and rows[0]["filled_qty"] == 5.0
+
+
+def test_filled_without_avg_keeps_working_no_ledger(tmp_path):
+    """부재(P0 L1): filled>0 · avg 없음 → 원장 무변 + working 유지(고스트 방지)."""
+    store = Store(tmp_path / "t.db")
+    client = _Client({"status": "FILLED",
+                      "execution": {"filledQuantity": 1,
+                                    "averageFilledPrice": None}})
+    broker = _broker(tmp_path, store, client)
+    res = broker.execute(Order("005930", "KR", "BUY", 1, 70_000), "entry")
+    assert not res.ok
+    assert broker.account.position("005930").qty == 0
+    rows = store.get_working_orders()
+    assert len(rows) == 1
+    assert rows[0]["filled_qty"] == 1.0
+    assert rows[0]["status"] == "UNKNOWN"  # FILLED지만 avg 없어 추적 유지
+    evs = store.recent_events("live_order_avg_missing", 0)
+    assert len(evs) == 1
+
+
+def test_place_registers_working_before_poll(tmp_path):
+    """부재(P0 L2): place 직후 PENDING working — poll 전에 반대 취소 가능."""
+    store = Store(tmp_path / "t.db")
+    placed = {}
+
+    class _Slow(_Client):
+        def get_order(self, account_seq, order_id):
+            placed["rows"] = store.get_working_orders()
+            return super().get_order(account_seq, order_id)
+
+    client = _Slow({"status": "PENDING", "execution": {"filledQuantity": 0}})
+    broker = _broker(tmp_path, store, client)
+    broker.execute(Order("005930", "KR", "BUY", 1, 70_000), "entry")
+    assert len(placed["rows"]) == 1
+    assert placed["rows"][0]["status"] == "PENDING"
+
+
+def test_sell_cancels_inflight_buy_order_id(tmp_path):
+    """부재(P0 L2): store working 없어도 inflight BUY order_id 취소."""
+    store = Store(tmp_path / "t.db")
+    client = _Client({"status": "PENDING", "execution": {"filledQuantity": 0}})
+    client.details_after_cancel = {"status": "CANCELED",
+                                   "execution": {"filledQuantity": 0}}
+    broker = _broker(tmp_path, store, client)
+    broker.account.apply_fill("005930", "KR", "BUY", 2, 70_000, 0.0, "seed")
+    broker._mark_inflight(Order("005930", "KR", "BUY", 1, 70_000), "OID-BUY")
+    assert not (store.get_working_orders("005930", side="BUY", settled=False) or [])
+    broker._cancel_opposing_working(Order("005930", "KR", "SELL", 1, 69_000))
+    assert "OID-BUY" in client.canceled
