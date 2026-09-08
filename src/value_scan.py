@@ -445,6 +445,13 @@ _FIN_CACHE_KEYS = ("revenue", "operating_income", "net_income", "equity",
                    "current_assets", "current_liabilities", "fiscal_year")
 
 
+def _year_complete(entry: dict | None) -> bool:
+    """연도 캐시가 DART 응답으로 채워졌는지 — equity 키·값 존재(0 포함)."""
+    if not isinstance(entry, dict):
+        return False
+    return "equity" in entry and entry.get("equity") is not None
+
+
 def _growth(cur, prev) -> float | None:
     """전년 대비 성장률(prev 기준, |prev|로 나눠 부호 보존). 분모 0/None 안전 → None."""
     if cur is None or prev is None or prev == 0:
@@ -478,8 +485,8 @@ def _kr_fundamentals(api_key: str, corp_map: dict, code: str, market_cap: float 
     ce = cache.setdefault(corp, {})
 
     def _year_fin(y: int) -> dict | None:
-        """해당 연도 재무 — 캐시 hit 우선(DART 미호출), miss 면 조회 후 적재. 없으면 None."""
-        if str(y) in ce:
+        """해당 연도 재무 — 완전 캐시 hit 우선, 불완전/miss 면 조회 후 적재."""
+        if str(y) in ce and _year_complete(ce[str(y)]):
             return ce[str(y)]
         got = fetch_fn(api_key, corp, y)
         if got:
@@ -489,19 +496,23 @@ def _kr_fundamentals(api_key: str, corp_map: dict, code: str, market_cap: float 
         return None
 
     fin = None
-    for y in years:                        # 당해(최근 사업보고서) — 캐시 hit 우선(DART 미호출)
-        if str(y) in ce:
+    for y in years:                        # 완전 캐시 hit만 채택(불완전 → 폴백/재조회)
+        if str(y) in ce and _year_complete(ce[str(y)]):
             fin = ce[str(y)]
             break
-    if fin is None:                        # miss → DART 조회(2025 우선, 폴백 2024)
+    if fin is None:                        # miss/불완전 → DART 조회(최근년 우선)
         for y in years:
             fin = _year_fin(y)
-            if fin:
+            if fin and _year_complete(fin):
                 break
+            fin = None
     if fin is None:
         return None
     fy = fin.get("fiscal_year")
-    prev = _year_fin(fy - 1) if fy else None   # 성장률용 전년(없으면 성장률만 None)
+    prev = None
+    if fy:
+        raw_prev = _year_fin(fy - 1)
+        prev = raw_prev if _year_complete(raw_prev) else None
 
     revenue, net_income, equity = fin.get("revenue"), fin.get("net_income"), fin.get("equity")
     op_income, total_assets = fin.get("operating_income"), fin.get("total_assets")
@@ -545,6 +556,7 @@ def run_scan(cfg, llm, *, limit: int | None = None,
              news_us_fn: Callable | None = None,
              news_kr_fn: Callable | None = None,
              fin_kr_fn: Callable | None = None,
+             fin_us_fn: Callable | None = None,
              watchlist_path: str | Path = WATCHLIST,
              held_symbols: set[str] | None = None,
              now_fn: Callable[[], float] = time.time) -> dict:
@@ -601,6 +613,25 @@ def run_scan(cfg, llm, *, limit: int | None = None,
         else:
             log.warning("[value] DART_API_KEY 없음 — KR 펀더멘털 스킵")
     kr_fund_on = bool(dart_key) and corp_map is not None
+    if fin_us_fn is None:
+        from .datasources.finnhub import fetch_basic_financials as fin_us_fn
+    us_quality_on = bool(finnhub_key) and "US" in (vcfg.get("markets") or [])
+    if "US" in (vcfg.get("markets") or []) and not finnhub_key:
+        log.warning("[value] FINNHUB_API_KEY 없음 — US 품질지표 스킵(QualityTilt 중립)")
+    # S0: 주간 재무 백필(마지막 리포트가 오래됐을 때만). 새로 시총 풀에 편입된 종목이
+    # 재무 결측으로 남지 않게 스캔 주기에 얹는다 — miss-only 라 평시 DART 호출 소량.
+    if kr_fund_on:
+        try:
+            from .value_fin_backfill import maybe_weekly_backfill
+            bf = maybe_weekly_backfill(
+                cfg, now=now_fn(), api_key=dart_key,
+                report_path=(Path(watchlist_path).parent
+                             / "value_fin_backfill_report.json"))
+            if not bf.get("ran"):
+                log.debug("[value] 주간 백필 스킵: %s", bf.get("why"))
+        except Exception as e:
+            log.warning("[value] 주간 백필 실패(스캔은 계속): %s", e)
+    # 백필 직후에 읽어야 이번 스캔부터 새 재무가 반영된다.
     fin_cache = _load_fin_cache() if kr_fund_on else {}
     fin_cache_orig = json.dumps(fin_cache, ensure_ascii=False, sort_keys=True)
 
@@ -649,6 +680,15 @@ def run_scan(cfg, llm, *, limit: int | None = None,
             c["recent_news"] = news
         # KR 펀더멘털 주입(#19b 3단계) — US 는 이미 scan_candidates 에서 fundamentals 를
         # 받았으니 건드리지 않는다("아직 없으면" 가드). 예외는 삼켜 스캔을 죽이지 않는다.
+        # US 재무 건전성(ROE·부채·성장) — 스크리너엔 PER/PBR 뿐이라 QualityTilt 가 0 이
+        # 된다. KR(DART)과 같은 키로 채워 Score 가 시장 구분 없이 읽게 한다.
+        if us_quality_on and c["market"] == "US":
+            try:
+                extra = fin_us_fn(finnhub_key, sym)
+                if extra:
+                    c.setdefault("fundamentals", {}).update(extra)
+            except Exception as e:
+                log.debug("[value][%s] US 재무 조회 실패(스킵): %s", sym, e)
         if kr_fund_on and c["market"] == "KR" and "fundamentals" not in c:
             try:
                 f = fin_kr_fn(dart_key, corp_map, sym, c.get("market_cap"), fin_cache)
@@ -668,15 +708,30 @@ def run_scan(cfg, llm, *, limit: int | None = None,
             failed += 1
             log.error("[value][%s] 도시에 생성 실패(스킵): %s", sym, e)
             continue
-        watchlist[sym] = {
+        prior = dict(watchlist.get(sym) or {})
+        metrics = {k: c[k] for k in ("price", "drawdown_1y_pct", "ret_20d_pct",
+                                     "ret_60d_pct", "avg_turnover_20d",
+                                     "turnover_unit", "mcap_rank", "score")
+                   if k in c}
+        if c.get("market_cap") is not None:
+            metrics["market_cap"] = c.get("market_cap")
+        entry = {
             "name": c["name"], "market": c["market"], "ts": now_fn(),
             "stance": out.stance, "conviction": out.conviction,
             "fair_low_pct": out.fair_low_pct, "fair_high_pct": out.fair_high_pct,
             "thesis": out.thesis, "risks": out.risks, "evidence": out.evidence,
-            "metrics": {k: c[k] for k in ("price", "drawdown_1y_pct", "ret_20d_pct",
-                                          "ret_60d_pct", "avg_turnover_20d",
-                                          "turnover_unit", "mcap_rank", "score")},
+            "metrics": metrics,
         }
+        if prior.get("first_seen_at") is not None:
+            entry["first_seen_at"] = prior["first_seen_at"]
+        if prior.get("left_undervalued_at") is not None:
+            entry["left_undervalued_at"] = prior["left_undervalued_at"]
+        from .value_ops import apply_first_seen
+        clear_days = float((cfg.raw.get("value_scan") or {})
+                           .get("first_seen_clear_days", 3))
+        entry = apply_first_seen(entry, stance=out.stance, now=now_fn(),
+                                 clear_after_days=clear_days)
+        watchlist[sym] = entry
         if c.get("fundamentals"):       # US 밸류에이션 지표 — 후속(대시보드/gem/Athena)용
             watchlist[sym]["fundamentals"] = c["fundamentals"]
         if c.get("recent_news"):        # 주입된 하락 촉매 헤드라인 — 후속 활용용 보존
@@ -685,6 +740,30 @@ def run_scan(cfg, llm, *, limit: int | None = None,
         done += 1
         log.info("[value][%s] %s (conv %.2f): %s",
                  sym, out.stance, out.conviction, out.thesis[:60])
+
+    # S1: 전체 지도 Score 병기(정렬은 trade 쪽 S2).
+    try:
+        from .value_ops import annotate_watchlist_scores, update_jaccard_state
+        vs = (cfg.raw.get("value_scan") or {}).get("value_score") or {}
+        peak = vs.get("dd_peak") or [-50, -35]
+        annotate_watchlist_scores(
+            watchlist, now=now_fn(),
+            n_min=int(vs.get("quintile_n_min", 20)),
+            weights=vs.get("weights"),
+            half_life_days=float(vs.get("half_life_days", 30)),
+            age_decay_floor=float(vs.get("age_decay_floor", 0.5)),
+            dd_peak=(float(peak[0]), float(peak[1])),
+            dd_deep_floor=float(vs.get("dd_deep_floor", 0.2)),
+        )
+        save_watchlist(watchlist, watchlist_path)
+        # 자카드 상태는 watchlist 와 같은 디렉터리 — 테스트가 라이브 data/ 의
+        # 베이스라인을 비우지 않도록(모듈 기본 경로 금지).
+        jac_path = Path(watchlist_path).parent / "value_top10_jaccard.json"
+        for mkt in vcfg.get("markets") or []:
+            update_jaccard_state(watchlist, market=mkt, now=now_fn(),
+                                 path=jac_path)
+    except Exception as e:
+        log.warning("[value] Score 병기/자카드 실패(스킵): %s", e)
 
     # 새로 조회한 KR 재무가 있으면 캐시 영속(변화 없으면 파일 미접촉 — 테스트 격리에도 유리).
     if kr_fund_on and json.dumps(fin_cache, ensure_ascii=False, sort_keys=True) != fin_cache_orig:

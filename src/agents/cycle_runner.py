@@ -202,11 +202,46 @@ class CycleRunner:
                     m = {}
                 if isinstance(m, dict) and m.get("trail_active"):
                     item["trail_active"] = True
+                if ((isinstance(m, dict) and m.get("source") == "value")
+                        or str(row["strategy"] or "").lower() == "value"):
+                    # 소유권 표시 — 매도 제안을 내도 코드가 차단한다(토큰·저널 낭비 방지).
+                    item["owner"] = "value"
+                    item["sellable_by_brain"] = False
             e = earnings.get(s)
             if earnings_near(e):
                 item["earnings"] = with_fresh_dday(e)
             positions.append(item)
         return {"cash": self.account.cash, "positions": positions}
+
+    def _value_owned_symbols(self) -> set[str]:
+        """밸류 트랙이 연 포지션 — 뇌의 매도 대상이 아니다."""
+        if not self.store:
+            return set()
+        try:
+            rows = self.store.get_open_positions()
+        except Exception:
+            return set()
+        out = set()
+        for r in rows:
+            try:
+                m = json.loads(r["meta"]) if r["meta"] else {}
+            except (ValueError, TypeError):
+                m = {}
+            if (isinstance(m, dict) and m.get("source") == "value") or                     str(r["strategy"] or "").lower() == "value":
+                if r["symbol"]:
+                    out.add(r["symbol"])
+        return out
+
+    def _sell_block_reason(self, symbol: str) -> str | None:
+        """뇌의 SELL 차단 사유. 밸류 포지션은 밸류 트랙만 청산한다.
+
+        사는 판단자와 파는 판단자가 다르면 논지가 일관되지 않는다 — 뇌는 시간축이 짧아
+        몇 주 안 움직이는 밸류 포지션을 매력 없다고 보기 쉽다. 코드 바닥(하드스톱·
+        트레일링·빠른손 트리거)은 이 가드와 무관하게 계속 청산할 수 있다.
+        """
+        if symbol and symbol in self._value_owned_symbols():
+            return "밸류 트랙 소유 포지션 — 청산은 밸류 판단자/코드 바닥만(뇌 매도 차단)"
+        return None
 
     def _recent_disclosures(self, hours: float = 6.0, limit: int = 10) -> list[dict]:
         """워처가 events 에 남긴 최근 중대 공시(각성/큐 라우팅분) — 뇌 입력용."""
@@ -540,7 +575,7 @@ class CycleRunner:
         val_llm = self.val_llm_factory(candidates) if self.val_llm_factory else llm
         constraints = {"capital": self.cfg.risk.get("capital", {}),
                        "max_position_pct": self.cfg.risk.get("max_position_pct", 0.2),
-                       "max_positions": self.cfg.risk.get("max_positions", 5),
+                       "max_positions": self.cfg.risk.get("max_positions"),   # None = 무제한
                        "open_positions": self.account.open_count}
         # 트랙레코드(라이브 성과 귀속) + 최근 중대 공시(워처가 잡은 것)를 함께 실어
         # 뇌가 자기 과거 성과와 방금 뜬 재료를 보고 판단하게 한다.
@@ -638,6 +673,7 @@ class CycleRunner:
                         dossier_brief_fn=(self._dossier_brief if self.store else None),
                         features_by_sym=feat_map,
                         market_fn=self.market_of,
+                        sell_block_fn=self._sell_block_reason,
                         resolve_price_fn=self._resolve_price,
                         store=self.store,
                         wake_reason=wake_reason)

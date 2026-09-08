@@ -89,20 +89,29 @@ def warn_capital_coverage(capital: dict, markets: list[str], *,
             label, m)
 
 
-def _normalize_max_positions(raw) -> dict[str, int]:
-    """int → {KR,US: n}; dict → 시장별 int. 빈/이상값은 기본 5."""
+# 동시 보유 **종목 수** 상한을 두지 않는다는 표식. 포지션 개수는 자본 정책이 정한다
+# (총노출 90% · 종목당 20~25% · 밸류 슬리브 60% · 뇌 몫 30%). 칸 수로 한 번 더 막으면
+# 뇌가 예약된 30% 를 갖고도 자리가 없어 못 쓰는 상태가 생긴다 — 예약의 의미가 깨진다.
+UNLIMITED_POSITIONS = None
+
+
+def _normalize_max_positions(raw) -> dict[str, int | None]:
+    """int → {KR,US: n}; dict → 시장별. null/0/음수/파싱불가 = **무제한(None)**."""
+    def _one(v):
+        if v is None:
+            return None
+        try:
+            n = int(v)
+        except (TypeError, ValueError):
+            return None
+        return n if n > 0 else None
+
     if isinstance(raw, dict):
-        out: dict[str, int] = {}
+        out: dict[str, int | None] = {}
         for k, v in raw.items():
-            try:
-                out[str(k).upper()] = int(v)
-            except (TypeError, ValueError):
-                continue
-        return out or {"KR": 5, "US": 5}
-    try:
-        n = int(raw)
-    except (TypeError, ValueError):
-        n = 5
+            out[str(k).upper()] = _one(v)
+        return out or {"KR": None, "US": None}
+    n = _one(raw)
     return {"KR": n, "US": n}
 
 
@@ -128,7 +137,7 @@ class RiskGate:
                     "비활성입니다.",
                     mkt, val)
         self.max_position_pct = float(limits.get("max_position_pct", 0.20))
-        self.max_positions = _normalize_max_positions(limits.get("max_positions", 5))
+        self.max_positions = _normalize_max_positions(limits.get("max_positions"))
         self.daily_loss_limit_pct = float(limits.get("daily_loss_limit_pct", 0.05))
         # 일손실 판정에 SoD equity 델타를 함께 볼지. realized_pnl 을 우회한 체결
         # (폴링 밖 체결 → 재대사 흡수)을 잡는다. False 면 실현손익만(구 동작).
@@ -171,14 +180,17 @@ class RiskGate:
             except Exception as e:
                 log.warning("blocked_symbols_file 로드 실패: %s", e)
 
-    def max_positions_for(self, market: str) -> int:
+    def max_positions_for(self, market: str) -> int | None:
+        """동시 보유 종목 수 상한. **None = 무제한**(자본 정책이 개수를 정한다)."""
         m = str(market or "").upper()
         if m in self.max_positions:
-            return int(self.max_positions[m])
-        # 미지정 시장: dict 값 중 최소(보수) 또는 기본 5
-        if self.max_positions:
-            return int(min(self.max_positions.values()))
-        return 5
+            v = self.max_positions[m]
+            return None if v is None else int(v)
+        # 미지정 시장: 하나라도 무제한이면 무제한, 아니면 최소(보수)
+        vals = [v for v in self.max_positions.values()]
+        if not vals or any(v is None for v in vals):
+            return None
+        return int(min(vals))
 
     def _halt_path(self) -> Path:
         return _paths.resolve("halt", configured=self.kill_switch_file)
@@ -189,6 +201,17 @@ class RiskGate:
 
     def is_globally_halted(self) -> bool:
         return self._halt_path().exists()
+
+    def engage_halt(self, reason: str = "") -> Path:
+        """전역 HALT 파일 생성(BUY/SELL 전부 차단). 운영자가 파일을 지울 때까지 유지.
+
+        라이브 동기화 실패 등 '원장이 실계좌와 어긋날 수 있는' 상황에서 호출한다.
+        """
+        p = self._halt_path()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        text = (reason or "halt").strip() + "\n"
+        p.write_text(text, encoding="utf-8")
+        return p
 
     def is_market_paused(self, market: str) -> bool:
         return _paths.halt_pause_exists(market, configured=self.kill_switch_file)
@@ -436,7 +459,7 @@ class RiskGate:
                     open_n = int(account.open_count)
                 open_n += self._reserved_new_symbols(reserved, account, m)
                 cap = self.max_positions_for(m)
-                if open_n >= cap:
+                if cap is not None and open_n >= cap:
                     return GateDecision(False,
                         f"최대 보유종목 수 초과 ({open_n}/{cap} {m})")
 

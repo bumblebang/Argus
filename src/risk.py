@@ -11,6 +11,13 @@ import math
 from dataclasses import dataclass
 
 
+def _normalize_fractional(raw) -> dict | bool:
+    """bool | {KR: bool, US: bool} → 시장별 dict(대문자 키). bool 이면 그대로."""
+    if isinstance(raw, dict):
+        return {str(k).upper(): bool(v) for k, v in raw.items()}
+    return bool(raw)
+
+
 def risk_manager_from_cfg(risk_cfg: dict | None) -> "RiskManager":
     """config.risk 블록 → RiskManager. 키 빠져도 기본값으로 안전 기동."""
     from .risk_gate import _normalize_max_positions
@@ -18,9 +25,10 @@ def risk_manager_from_cfg(risk_cfg: dict | None) -> "RiskManager":
     return RiskManager(
         capital=dict(rc.get("capital") or {}),
         max_position_pct=float(rc.get("max_position_pct", 0.25)),
-        max_positions=_normalize_max_positions(rc.get("max_positions", 5)),
+        max_positions=_normalize_max_positions(rc.get("max_positions")),
         daily_loss_limit_pct=float(rc.get("daily_loss_limit_pct", 0.05)),
-        allow_fractional=bool(rc.get("allow_fractional", False)),
+        allow_fractional=rc.get("allow_fractional", False),
+        fractional_decimals=int(rc.get("fractional_decimals", 4)),
         base_position_pct=float(rc.get("base_position_pct", 0.20)),
         sizing_base=str(rc.get("sizing_base", "equity")).lower(),
         conviction_size_floor=float(rc.get("conviction_size_floor", 0.75)),
@@ -34,7 +42,10 @@ class RiskManager:
     max_position_pct: float = 0.25
     max_positions: dict | int = None  # type: ignore[assignment]
     daily_loss_limit_pct: float = 0.05
-    allow_fractional: bool = False
+    # bool 또는 시장별 dict({"KR": false, "US": true}) — 미장은 정규장 소수점 매수가 되므로
+    # 고단가주도 '되는 만큼' 정상 비중으로 살 수 있다. KR 은 소수점 거래가 없어 false.
+    allow_fractional: bool | dict = False
+    fractional_decimals: int = 4
     # 사이징 정책(config 로 조정) — 기본 총자산 20%, 확신도 75~100% 배율
     base_position_pct: float = 0.20
     sizing_base: str = "equity"          # "equity" | "capital"
@@ -43,19 +54,28 @@ class RiskManager:
 
     def __post_init__(self):
         from .risk_gate import _normalize_max_positions
-        if self.max_positions is None:
-            self.max_positions = {"KR": 5, "US": 5}
-        else:
-            self.max_positions = _normalize_max_positions(self.max_positions)
+        self.allow_fractional = _normalize_fractional(self.allow_fractional)
+        self.max_positions = _normalize_max_positions(self.max_positions)
 
-    def max_positions_for(self, market: str | None = None) -> int:
-        mp = self.max_positions if isinstance(self.max_positions, dict) else {"KR": 5, "US": 5}
-        if market is None:
-            return int(min(mp.values()) if mp else 5)
-        m = str(market).upper()
-        if m in mp:
-            return int(mp[m])
-        return int(min(mp.values()) if mp else 5)
+    def fractional_for(self, market: str | None = None) -> bool:
+        """이 시장에서 소수점 수량이 되는가. dict 미설정 시장은 False(정수)."""
+        af = self.allow_fractional
+        if isinstance(af, dict):
+            return bool(af.get(str(market).upper(), False)) if market else False
+        return bool(af)
+
+    def max_positions_for(self, market: str | None = None) -> int | None:
+        """동시 보유 종목 수 상한. **None = 무제한**(자본 정책이 개수를 정한다)."""
+        mp = self.max_positions if isinstance(self.max_positions, dict) else {}
+        if market is not None:
+            m = str(market).upper()
+            if m in mp:
+                v = mp[m]
+                return None if v is None else int(v)
+        vals = list(mp.values())
+        if not vals or any(v is None for v in vals):
+            return None
+        return int(min(vals))
 
     def capital_of(self, market: str) -> float:
         return float(self.capital.get(market, 0) or 0)
@@ -78,11 +98,14 @@ class RiskManager:
     def size_buy(self, market: str, price: float, weight: float | None = None,
                  *, min_qty: float = 0.0,
                  base_equity: float | None = None,
-                 notional_cap: float | None = None) -> float:
+                 notional_cap: float | None = None,
+                 allow_fractional: bool | None = None) -> float:
         """매수 수량. weight 미지정 시 base_position_pct.
 
         base_equity 가 양수면 그 값을 분모로 쓰고, 없으면 capital[market].
         notional_cap 이 있으면 예산을 그 금액 이하로 클립(슬리브 room·종목 잔여한도).
+        allow_fractional 을 주면 config 시장 설정을 덮어쓴다 — 소수점 매수가 **정규장
+        한정**이라, 정규장에만 도는 트랙(밸류)만 켜고 프리/애프터도 도는 뇌는 끄기 위함.
         min_qty>0 이면 floor=0 구멍일 때 하한(자본/분모로 살 수 있을 때만).
         """
         if price <= 0:
@@ -98,19 +121,26 @@ class RiskManager:
                 cap_n = -1.0
             if cap_n >= 0:
                 budget = min(budget, cap_n)
+        frac = (self.fractional_for(market) if allow_fractional is None
+                else bool(allow_fractional))
         qty = budget / price if price else 0.0
-        if not self.allow_fractional:
+        if not frac:
             qty = math.floor(qty)
+        else:
+            # 예산을 넘지 않도록 **내림** 반올림(round 는 예산 초과 가능).
+            f = 10 ** int(self.fractional_decimals)
+            qty = math.floor(qty * f) / f
         qty = max(qty, 0.0)
         # 최소 1주 부활은 **예산 안에서만**. 분모(base)만 보면 notional_cap(종목 잔여
         # 한도·슬리브 room)이 0 이어도 1주가 되살아나 한도를 우회한다 — 이미 목표비중을
         # 채운 고단가 종목에 1주씩 계속 얹히는 경로가 여기였다.
         if min_qty > 0 and qty < min_qty and price * min_qty <= min(base, budget):
-            qty = float(min_qty) if self.allow_fractional else float(math.floor(min_qty))
+            qty = float(min_qty) if frac else float(math.floor(min_qty))
         return qty
 
     def can_open_new(self, open_positions: int, market: str | None = None) -> bool:
-        return open_positions < self.max_positions_for(market)
+        cap = self.max_positions_for(market)
+        return cap is None or open_positions < cap
 
     def daily_loss_exceeded(self, market: str, realized_pnl: float,
                             *, budget_base: float | None = None) -> bool:

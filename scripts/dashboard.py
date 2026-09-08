@@ -166,7 +166,7 @@ def _risk_control_meta(paper: dict | None = None) -> dict:
         pause = "none"
         try:
             from src.risk_gate import _normalize_max_positions
-            max_pos = _normalize_max_positions(5)
+            max_pos = _normalize_max_positions(None)
         except Exception:
             pass
     open_n = {"KR": 0, "US": 0}
@@ -2510,7 +2510,8 @@ def _asset_html(d: dict) -> str:
                 return f"${float(v):,.2f}"
             def _ms(v):
                 return f"${float(v):+,.2f}"
-        slot_max = int(max_pos.get(mk, 5) or 5)
+        _sm = max_pos.get(mk)                      # None = 무제한(자본이 개수를 정한다)
+        slot_max = int(_sm) if _sm else None
         slot_open = int(open_n.get(mk, 0) or 0)
         pcls_b = "pos" if (pnl_v or 0) >= 0 else "neg"
         dcls_b = "pos" if (dpnl or 0) >= 0 else "neg"
@@ -2520,7 +2521,8 @@ def _asset_html(d: dict) -> str:
         dpnl_s = _ms(dpnl) if dpnl is not None else "–"
         p.append("<div class=asset-book>")
         p.append(f"<div class=bk-hd><span class=bk-title>{mk} · {escape(ccy)}</span>"
-                 f"<span class=bk-slot>슬롯 {slot_open}/{slot_max}</span></div>")
+                 f"<span class=bk-slot>보유 {slot_open}"
+                 f"{'' if slot_max is None else '/' + str(slot_max)}</span></div>")
         p.append(f"<div class=bk-row><span class=k>자산</span><span>{_m(eq_v)}</span></div>")
         p.append(f"<div class=bk-row><span class=k>현금</span><span>{_m(cash_v)}</span></div>")
         p.append(f"<div class=bk-row><span class=k>평가</span><span>{_m(mv_v)}</span></div>")
