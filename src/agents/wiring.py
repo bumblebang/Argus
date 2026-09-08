@@ -18,6 +18,7 @@ from ..strategies import REGISTRY, validate_params
 from ..paper_account import PaperAccount
 from ..risk import RiskManager, risk_manager_from_cfg
 from ..risk_gate import RiskGate, warn_capital_coverage
+from ..sector_taxonomy import normalize_sector
 from ..broker import Broker
 from ..datasources.earnings import dday_of
 from . import (LLMClient, ClaudeCLIClient, MockLLM,
@@ -47,12 +48,15 @@ def resolve_execution_mode(*, broker_mode: str, dry_run: bool,
 def sector_map_from_universe(cfg: AppConfig) -> dict:
     """config.universe 의 symbol→sector 매핑(포트폴리오 감독관의 섹터 집중도용).
 
-    item 에 sector 가 없으면 제외(그 종목은 섹터 검사에서 빠짐 — 비활성, 안전).
+    값은 `sector_taxonomy` 의 11섹터 표준 라벨로 정규화한다 — KR/US 가 같은 축의
+    버킷을 써야 캡이 의미를 가진다. 정규화 불가·미지정이면 제외(그 종목은 섹터
+    검사에서 빠짐 — 비활성, 안전). 유니버스 sector 는 universe_roll 이 KRX 업종
+    분류현황·Finnhub profile2 실데이터로 채운다.
     """
     out: dict[str, str] = {}
     for _market, lst in (cfg.universe or {}).items():
         for it in (lst or []):
-            sym, sec = it.get("symbol"), it.get("sector")
+            sym, sec = it.get("symbol"), normalize_sector(it.get("sector"))
             if sym and sec:
                 out[sym] = sec
     return out
@@ -78,9 +82,12 @@ def build_paper_core(cfg: AppConfig, *, live_client=None, account_seq=None,
     if risk_cfg.get("max_sector_pct") is not None:
         n_syms = sum(len(lst or []) for lst in (cfg.universe or {}).values())
         if len(sector_map) < n_syms:      # 조용한 비활성 방지 — 커버리지를 크게 알린다
-            log.warning("섹터 집중도 감독: universe %d종목 중 %d종목만 sector 지정 — "
-                        "미지정 종목은 검사에서 제외됩니다(동적 유니버스면 screen.py 의 "
-                        "sector 미기록이 원인).", n_syms, len(sector_map))
+            pct = 100.0 * len(sector_map) / n_syms if n_syms else 0.0
+            log.warning("섹터 집중도 감독: universe %d종목 중 %d종목만 sector 지정"
+                        "(커버리지 %.0f%%) — 미지정 종목은 검사에서 제외됩니다. "
+                        "커버리지가 낮으면 scripts/refresh_sectors.py 로 "
+                        "data/sector_cache.json 을 채우세요.",
+                        n_syms, len(sector_map), pct)
     account = PaperAccount(
         cash=paper_cfg.get("cash", {"KR": 10_000_000, "US": 10_000}),
         fee_rate=paper_cfg.get("fee_rate", {}),
