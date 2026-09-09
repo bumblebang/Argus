@@ -14,6 +14,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import requests
+from dotenv import load_dotenv
 
 from .logging_setup import get_logger
 from .market_hours import (
@@ -25,6 +26,8 @@ from .market_hours import (
 )
 
 log = get_logger("src.market_status_crosscheck")
+
+load_dotenv(Path(__file__).resolve().parents[1] / ".env")
 
 _KST = ZoneInfo("Asia/Seoul")
 _FINNHUB_BASE = "https://finnhub.io/api/v1"
@@ -94,9 +97,11 @@ def _yahoo_regular_open(url: str, *, timeout: float = 8) -> bool | None:
         state = str((results[0].get("meta") or {}).get("marketState") or "").upper()
         if state == "REGULAR":
             return True
-        if state in ("PRE", "PREPRE", "POST", "POSTPOST", "CLOSED", ""):
+        if state in ("PRE", "PREPRE", "POST", "POSTPOST", "CLOSED"):
             return False
-        return False
+        # Yahoo chart 응답에서 marketState가 누락되는 경우가 있다. 누락·미지 상태를
+        # CLOSED로 오판하면 열린 장에 거짓 경보가 나므로 조회 불가(None)로 fail-open.
+        return None
     except Exception as e:
         log.debug("Yahoo marketState 실패(%s): %s", url, e)
         return None

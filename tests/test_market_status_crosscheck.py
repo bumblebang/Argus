@@ -60,6 +60,28 @@ def test_us_regular_open_yahoo_regular(monkeypatch):
     assert msc.us_regular_open_yahoo() is True
 
 
+def test_us_regular_open_yahoo_missing_state_is_unavailable(monkeypatch):
+    """marketState 누락을 CLOSED로 오판하지 않고 fail-open 한다."""
+    class _Resp:
+        status_code = 200
+
+        @staticmethod
+        def json():
+            return {"chart": {"result": [{"meta": {"regularMarketPrice": 100}}]}}
+
+    monkeypatch.setattr(msc.requests, "get", lambda *a, **k: _Resp())
+    assert msc.us_regular_open_yahoo() is None
+
+
+def test_external_us_prefers_finnhub(monkeypatch):
+    monkeypatch.setattr(msc, "us_regular_open_finnhub", lambda: True)
+    monkeypatch.setattr(
+        msc, "us_regular_open_yahoo",
+        lambda: (_ for _ in ()).throw(AssertionError("Yahoo fallback called")),
+    )
+    assert msc.external_regular_open("US") is True
+
+
 def test_kr_regular_open_yahoo_regular(monkeypatch):
     monkeypatch.setattr(msc, "_yahoo_regular_open",
                         lambda url, timeout=8: True if "KS11" in url else None)
