@@ -173,6 +173,48 @@ def test_live_us_fractional_buy_uses_market_order_amount(tmp_path):
     assert "price" not in client.calls[0]
 
 
+def test_live_us_buy_floors_fractional_to_whole_shares(tmp_path):
+    """1주 값 < 예산이면 소수점을 온주로 절사 — 소수점 제한 종목(422) 거부 방지."""
+    store = Store(tmp_path / "t.db")
+    client = _MockClient(
+        resp={"orderId": "FB2"},
+        orderbook={"asks": [{"price": "5.51", "volume": "1000"}],
+                   "bids": [{"price": "5.50", "volume": "1000"}]},
+        order_detail=_filled(24, 5.51),
+    )
+    b = _live_broker(
+        tmp_path, client, store=store, live_markets=["US"],
+        cash={"KR": 0, "US": 1_000},
+        capital={"KR": 0, "US": 1_000},
+        notional={"KR": 0, "US": 500},
+    )
+    ok = b.execute(Order("INTR", "US", "BUY", 24.498, 5.51), "test")
+    assert ok
+    assert client.calls[0]["order_type"] == "LIMIT"      # 금액 시장가 아님
+    assert client.calls[0]["qty"] == 24
+    assert "order_amount" not in client.calls[0]
+    assert len(store.recent_events("fractional_floored", 0)) == 1
+
+
+def test_live_us_buy_keeps_fraction_when_under_one_share(tmp_path):
+    """1주 값 > 예산이면 소수점 금액 주문이 유일한 매수 수단 — 그대로 둔다."""
+    client = _MockClient(
+        resp={"orderId": "FB3"},
+        orderbook={"asks": [{"price": "100", "volume": "10"}],
+                   "bids": [{"price": "99.9", "volume": "10"}]},
+        order_detail=_filled(0.5, 100),
+    )
+    b = _live_broker(
+        tmp_path, client, live_markets=["US"],
+        cash={"KR": 0, "US": 1_000},
+        capital={"KR": 0, "US": 1_000},
+        notional={"KR": 0, "US": 500},
+    )
+    assert b.execute(Order("AAPL", "US", "BUY", 0.5, 100.0), "test")
+    assert client.calls[0]["order_type"] == "MARKET"
+    assert client.calls[0]["order_amount"] == "50.00"
+
+
 # ── 1e) SELL: 실 매도가능 수량으로 클램프 ────────────────────────────────
 def test_live_sell_clamped_to_sellable(tmp_path):
     store = Store(tmp_path / "t.db")

@@ -13,6 +13,7 @@ account→store 를 즉시 맞춘다(부분체결 포함).
 from __future__ import annotations
 
 from decimal import Decimal, ROUND_DOWN
+import math
 import threading
 import time
 from typing import Any, Callable
@@ -65,6 +66,22 @@ def _is_fractional_qty(qty: float) -> bool:
     """부동소수점 잡음을 제외하고 실제 소수점 수량인지 판별."""
     q = float(qty)
     return abs(q - round(q)) > 1e-9
+
+
+def whole_share_buy_qty(order) -> float | None:
+    """소수점 BUY 를 온주로 절사한 수량. 절사할 필요가 없으면 None.
+
+    토스는 종목 단위로 소수점 거래를 막는다(422 `stock-restricted`). 1주 값이 예산보다
+    싸면(=수량 1 이상) 소수점을 고집할 이유가 없으니 온주 지정가로 내린다. 수량 1 미만
+    (1주 값 > 예산)일 때만 소수점 금액 주문이 유일한 매수 수단이라 그대로 둔다.
+    SELL 은 보유한 소수점 잔량을 털어야 하므로 손대지 않는다.
+    """
+    if str(order.side).upper() != "BUY":
+        return None
+    q = float(order.qty)
+    if not _is_fractional_qty(q) or q < 1:
+        return None
+    return float(math.floor(q))
 
 
 def _usd_order_amount(qty: float, price: float) -> str:
@@ -189,6 +206,17 @@ class Broker:
                 exit_reason: str | None = None) -> ExecuteResult:
         """주문 집행. store 가 주어지면 apply_fill 과 mirror 를 **같은 락 구간**에서 처리."""
         mirror_st = store if store is not None else None
+        whole = whole_share_buy_qty(order)
+        if whole is not None:
+            # 사이징을 안 거친 경로(뇌 지정 수량 등)까지 막는 마지막 관문.
+            log.info("[주문] 소수점 매수 → 온주 절사 %s %s %.4f → %.0f주"
+                     " (소수점 거래 제한 종목 대비)",
+                     order.market, order.symbol, order.qty, whole)
+            self._emit_symbol("fractional_floored", order.symbol, {
+                "market": order.market, "side": order.side,
+                "requested_qty": float(order.qty), "qty": whole,
+                "price": float(order.price)})
+            order.qty = whole
         base_kw = {"order_qty": float(order.qty), "limit_price": float(order.price)}
 
         with self._lock:

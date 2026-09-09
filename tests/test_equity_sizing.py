@@ -138,3 +138,24 @@ def test_cycle_tranche_weight_scales(tmp_path):
     assert res.executed[0]["status"] == "filled"
     # 0.20 × 0.5 = 0.10 → 100주
     assert broker.account.position("005930").qty == 100
+
+
+def test_size_buy_floors_to_whole_shares_when_affordable():
+    """소수점 시장이라도 예산으로 1주 이상이면 온주 — 소수점 제한 종목 거부 방지."""
+    risk = RiskManager(capital={"US": 1_000}, base_position_pct=0.20,
+                       allow_fractional={"US": True})
+    # 실제 거부 사례: INTR $5.51, 예산 $134.98 → 24.498주 → 24주
+    assert risk.size_buy("US", 5.51, base_equity=674.9,
+                         notional_cap=134.98) == 24
+    # 1주 값이 예산보다 비싼 고단가주만 소수점 유지
+    assert risk.size_buy("US", 517.5, 0.18, base_equity=725) < 1
+    assert risk.size_buy("US", 517.5, 0.18, base_equity=725) > 0
+    # 예산으로 정확히 1주면 온주 1주
+    assert risk.size_buy("US", 100.0, 1.0, base_equity=100.0) == 1
+
+
+def test_size_buy_whole_share_never_exceeds_budget():
+    risk = RiskManager(capital={"US": 1_000}, allow_fractional=True)
+    qty = risk.size_buy("US", 33.33, 0.20, base_equity=1_000)
+    assert qty == 6                       # 200 / 33.33 = 6.0006 → 6주
+    assert qty * 33.33 <= 200 + 1e-9

@@ -444,6 +444,8 @@ value_trade:
   # 뇌에 2칸이 남는다(계좌 max_positions 는 최종 안전판). allow_min_lot 은 밸류 off.
   # 미장 정규장은 소수점 매수가 되므로 고단가주도 정상 비중으로 산다(밸류는 정규장
   # 창에만 돌아 안전). 뇌는 프리/애프터도 돌아서 전역 risk.allow_fractional 은 끈 채 둔다.
+  # 단, 소수점이 켜져도 **예산으로 1주 이상**이면 온주로 잘라 주문한다 — 종목별로
+  # 소수점 거래가 막혀 있으면(422 stock-restricted) 금액 주문이 통째로 거부된다.
   fractional_markets: [US]
   sort_key: composite_value
   cooldown_hold_n: 3
