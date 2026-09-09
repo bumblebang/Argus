@@ -280,18 +280,26 @@ class TossClient:
         return rows[0] if rows else None
 
     # ── 주문 ──────────────────────────────────────────────
-    def place_order(self, *, account_seq: int | str, symbol: str, side: str, qty,
+    def place_order(self, *, account_seq: int | str, symbol: str, side: str,
+                    qty=None, order_amount=None,
                     order_type: str = "MARKET", price: float | None = None,
                     time_in_force: str = "DAY", client_order_id: str | None = None) -> dict:
-        """side: BUY/SELL, order_type: MARKET/LIMIT. quantity 는 문자열로 전송."""
+        """주문 생성. ``qty``와 ``order_amount`` 중 정확히 하나만 문자열로 전송."""
+        if (qty is None) == (order_amount is None):
+            raise ValueError("qty와 order_amount 중 정확히 하나가 필요합니다")
         body: dict[str, Any] = {
             "symbol": symbol,
             "side": side,
             "orderType": order_type,
-            "quantity": str(qty),
-            "timeInForce": time_in_force,
         }
-        if order_type == "LIMIT" and price is not None:
+        if order_amount is not None:
+            if order_type != "MARKET":
+                raise ValueError("order_amount 주문은 MARKET만 지원합니다")
+            body["orderAmount"] = str(order_amount)
+        else:
+            body["quantity"] = str(qty)
+            body["timeInForce"] = time_in_force
+        if order_amount is None and order_type == "LIMIT" and price is not None:
             body["price"] = str(price)
         if client_order_id:
             body["clientOrderId"] = client_order_id

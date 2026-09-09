@@ -231,3 +231,43 @@ def test_request_429_retries_per_attempt(tmp_path, monkeypatch):
     assert out == {"ok": True}
     assert len(acquires) == 2
     assert acquires[0] == "ACCOUNT"
+
+
+def test_place_order_amount_sends_us_market_amount_only():
+    """소수점 BUY용 금액 주문은 quantity/price/timeInForce를 섞지 않는다."""
+    client = TossClient(_creds(), rate_limiter=None)
+    seen = {}
+
+    def fake_request(name, **kw):
+        seen["name"] = name
+        seen.update(kw)
+        return {"orderId": "A1"}
+
+    client._request = fake_request
+    out = client.place_order(
+        account_seq=1, symbol="AAPL", side="BUY",
+        order_amount="50.00", order_type="MARKET")
+
+    assert out == {"orderId": "A1"}
+    assert seen["name"] == "order_create"
+    assert seen["json"] == {
+        "symbol": "AAPL",
+        "side": "BUY",
+        "orderType": "MARKET",
+        "orderAmount": "50.00",
+    }
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {},
+        {"qty": 1, "order_amount": "100"},
+        {"order_amount": "100", "order_type": "LIMIT"},
+    ],
+)
+def test_place_order_rejects_invalid_quantity_amount_combinations(kwargs):
+    client = TossClient(_creds(), rate_limiter=None)
+    with pytest.raises(ValueError):
+        client.place_order(
+            account_seq=1, symbol="AAPL", side="BUY", **kwargs)
