@@ -44,6 +44,7 @@ class RiskManager:
     daily_loss_limit_pct: float = 0.05
     # bool 또는 시장별 dict({"KR": false, "US": true}) — 미장은 정규장 소수점 매수가 되므로
     # 고단가주도 '되는 만큼' 정상 비중으로 살 수 있다. KR 은 소수점 거래가 없어 false.
+    # 켜져 있어도 예산으로 1주 이상이면 온주로 자른다(size_buy) — 소수점 거래 제한 종목.
     allow_fractional: bool | dict = False
     fractional_decimals: int = 4
     # 사이징 정책(config 로 조정) — 기본 총자산 20%, 확신도 75~100% 배율
@@ -107,6 +108,8 @@ class RiskManager:
         allow_fractional 을 주면 config 시장 설정을 덮어쓴다 — 소수점 매수가 **정규장
         한정**이라, 정규장에만 도는 트랙(밸류)만 켜고 프리/애프터도 도는 뇌는 끄기 위함.
         min_qty>0 이면 floor=0 구멍일 때 하한(자본/분모로 살 수 있을 때만).
+        소수점이 허용돼도 예산으로 1주 이상 살 수 있으면 **온주**로 자른다 — 소수점
+        거래가 제한된 종목이 섞여 있어 주문 자체가 거부되기 때문.
         """
         if price <= 0:
             return 0.0
@@ -123,13 +126,18 @@ class RiskManager:
                 budget = min(budget, cap_n)
         frac = (self.fractional_for(market) if allow_fractional is None
                 else bool(allow_fractional))
-        qty = budget / price if price else 0.0
-        if not frac:
-            qty = math.floor(qty)
+        raw_qty = budget / price if price else 0.0
+        whole = math.floor(raw_qty)
+        if not frac or whole >= 1:
+            # 소수점 시장이라도 **예산으로 1주 이상** 살 수 있으면 온주로 자른다.
+            # 토스는 종목 단위로 소수점 거래를 막고(422 stock-restricted) 그런 종목은
+            # 금액 주문 자체가 거부된다 — 예: INTR $5.51 × 24.498주. 소수점은
+            # '1주 값 > 예산'이라 온주로는 0주가 되는 고단가주에만 남긴다.
+            qty = float(whole)
         else:
             # 예산을 넘지 않도록 **내림** 반올림(round 는 예산 초과 가능).
             f = 10 ** int(self.fractional_decimals)
-            qty = math.floor(qty * f) / f
+            qty = math.floor(raw_qty * f) / f
         qty = max(qty, 0.0)
         # 최소 1주 부활은 **예산 안에서만**. 분모(base)만 보면 notional_cap(종목 잔여
         # 한도·슬리브 room)이 0 이어도 1주가 되살아나 한도를 우회한다 — 이미 목표비중을
