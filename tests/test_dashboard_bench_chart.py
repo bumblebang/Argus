@@ -47,17 +47,37 @@ def test_equity_vs_kospi_builds_series(monkeypatch):
     monkeypatch.setattr("scripts.dashboard._chart_cache", {})
 
     paper = {
-        "start_cash": {"KR": 1_000_000},
-        "cash": {"KR": 900_000},
-        "positions": {"AAA": {"qty": 10.0, "avg_price": 100.0}},
-        "journal": [{
-            "ts": "2026-08-03T01:00:00+00:00", "symbol": "AAA", "market": "KR",
-            "side": "BUY", "qty": 10.0, "price": 100.0, "fee": 0,
-        }],
+        "start_cash": {"KR": 1_000_000, "US": 1_000},
+        "cash": {"KR": 900_000, "US": 900},
+        "symbol_market": {"AAA": "KR", "BBB": "US"},
+        "positions": {
+            "AAA": {"qty": 10.0, "avg_price": 100.0},
+            "BBB": {"qty": 1.0, "avg_price": 100.0},
+        },
+        "journal": [
+            {
+                "ts": "2026-08-03T01:00:00+00:00", "symbol": "AAA", "market": "KR",
+                "side": "BUY", "qty": 10.0, "price": 100.0, "fee": 0,
+            },
+            {
+                "ts": "2026-08-03T01:00:00+00:00", "symbol": "BBB", "market": "US",
+                "side": "BUY", "qty": 1.0, "price": 100.0, "fee": 0,
+            },
+        ],
     }
-    snap = {"ts": 1.0, "cash": {"KR": 900_000}, "market_value": {"KR": 1200.0}}
+    # 통산 원금 1,100,000원, 현재자산 1,155,000원 → +5%
+    snap = {
+        "ts": 1.0,
+        "cash": {"KR": 900_000, "US": 900},
+        "market_value": {"KR": 1200.0, "US": 100.0},
+        "totals": {"equity_krw": 1_155_000.0},
+        "fx": {"USDKRW": 100.0},
+    }
     out = _equity_vs_kospi(paper, snap, store_rows=[], latest_px={"AAA": 120})
     assert out is not None
+    assert abs(out["port_now"] - 5.0) < 1e-9
+    assert out["portfolio_name"] == "Argus 통산"
+    assert out["fx_note"] == "현재환율 고정 환산"
     assert len(out["dates"]) >= 2
     assert len(out["port"]) == len(out["dates"])
     assert "alpha_now" in out
@@ -121,5 +141,6 @@ def test_equity_vs_kospi_refreshes_stale_spy(monkeypatch):
     assert "bc-tip" in html
     assert "bc-data" in html
     assert "2026-08-02" in html
+    assert "Argus 통산" in html
     assert "S&P500" in html
     assert "코스피" in html
