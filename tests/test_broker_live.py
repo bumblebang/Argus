@@ -3,8 +3,8 @@
 핵심 불변식:
   - 원장 fill 은 **실체결 대사(get_order.execution)**로만 기록한다 — 거부/미체결/펜딩은
     원장에 남지 않고, 부분체결은 체결분만, 실체결가·실수수료로 기록한다.
-  - 라이브 주문은 **지정가(마켓터블 리밋)**로 나간다(호가북 기반). SELL 은 실 매도가능
-    수량으로 클램프한다(오버셀·고아 방지).
+  - 라이브 주문은 기본 **지정가(마켓터블 리밋)**다. 단, US 소수점 BUY는 금액 시장가,
+    US 소수점 SELL은 수량 시장가로 나간다. SELL은 실 매도가능 수량으로 클램프한다.
   - live_markets 밖·orderId 없음·킬스위치는 실주문/체결이 남지 않는다.
 build_paper_core 는 live_client 를 명시 주입한 프로세스만 라이브로 켠다(심층 방어).
 """
@@ -150,6 +150,29 @@ def test_live_marketable_limit_walks_book_within_cap(tmp_path):
     assert client.calls[0]["price"] == 70500.0
 
 
+def test_live_us_fractional_buy_uses_market_order_amount(tmp_path):
+    """US 소수점 BUY는 quantity 지정가가 아니라 금액 시장가로 전송."""
+    client = _MockClient(
+        resp={"orderId": "FB1"},
+        orderbook={"asks": [{"price": "100", "volume": "10"}],
+                   "bids": [{"price": "99.9", "volume": "10"}]},
+        order_detail=_filled(0.5, 100),
+    )
+    b = _live_broker(
+        tmp_path, client, live_markets=["US"],
+        cash={"KR": 0, "US": 1_000},
+        capital={"KR": 0, "US": 1_000},
+        notional={"KR": 0, "US": 500},
+    )
+    ok = b.execute(Order("AAPL", "US", "BUY", 0.5, 100.0), "test")
+    assert ok
+    assert client.calls[0]["side"] == "BUY"
+    assert client.calls[0]["order_type"] == "MARKET"
+    assert client.calls[0]["order_amount"] == "50.00"
+    assert "qty" not in client.calls[0]
+    assert "price" not in client.calls[0]
+
+
 # ── 1e) SELL: 실 매도가능 수량으로 클램프 ────────────────────────────────
 def test_live_sell_clamped_to_sellable(tmp_path):
     store = Store(tmp_path / "t.db")
@@ -163,6 +186,31 @@ def test_live_sell_clamped_to_sellable(tmp_path):
     assert ok
     assert client.calls[0]["qty"] == 3                             # 실 매도가능 3주로 클램프
     assert client.calls[0]["side"] == "SELL"
+
+
+def test_live_us_fractional_sell_uses_market_quantity(tmp_path):
+    """US 소수점 SELL은 금액이 아닌 수량 시장가로 전송."""
+    client = _MockClient(
+        resp={"orderId": "FS1"},
+        orderbook={"asks": [{"price": "100.1", "volume": "10"}],
+                   "bids": [{"price": "100", "volume": "10"}]},
+        sellable={"sellableQuantity": "0.5"},
+        order_detail=_filled(0.5, 100),
+    )
+    b = _live_broker(
+        tmp_path, client, live_markets=["US"],
+        cash={"KR": 0, "US": 1_000},
+        capital={"KR": 0, "US": 1_000},
+        notional={"KR": 0, "US": 500},
+        positions={"AAPL": (0.5, 90.0, "US")},
+    )
+    ok = b.execute(Order("AAPL", "US", "SELL", 0.5, 100.0), "test")
+    assert ok
+    assert client.calls[0]["side"] == "SELL"
+    assert client.calls[0]["order_type"] == "MARKET"
+    assert client.calls[0]["qty"] == 0.5
+    assert client.calls[0]["price"] is None
+    assert "order_amount" not in client.calls[0]
 
 
 def test_live_sell_sellable_zero_skips(tmp_path):

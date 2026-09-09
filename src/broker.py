@@ -12,6 +12,7 @@ account→store 를 즉시 맞춘다(부분체결 포함).
 """
 from __future__ import annotations
 
+from decimal import Decimal, ROUND_DOWN
 import threading
 import time
 from typing import Any, Callable
@@ -58,6 +59,18 @@ def _num(v: Any) -> float | None:
         return float(s) if s else None
     except (TypeError, ValueError):
         return None
+
+
+def _is_fractional_qty(qty: float) -> bool:
+    """부동소수점 잡음을 제외하고 실제 소수점 수량인지 판별."""
+    q = float(qty)
+    return abs(q - round(q)) > 1e-9
+
+
+def _usd_order_amount(qty: float, price: float) -> str:
+    """소수점 BUY의 승인 명목을 센트 단위로 내림해 문자열로 반환."""
+    amount = Decimal(str(qty)) * Decimal(str(price))
+    return format(amount.quantize(Decimal("0.01"), rounding=ROUND_DOWN), "f")
 
 
 def _field(obj: Any, *keys: str) -> Any:
@@ -915,7 +928,8 @@ class Broker:
         - SELL: 실 매도가능 수량(get_sellable)으로 클램프 — 원장 드리프트로 인한 오버셀·
           고아 포지션을 막는다. 매도가능 0 이면 스킵.
         - 시간외 세션: 호가 스프레드가 상한을 넘으면 스킵(얇은 호가 방어).
-        - 주문가: 호가북 마켓터블 리밋가로 갱신(없으면 기존 견적가 유지, 폴백).
+        - 주문가/금액 산정 기준: 호가북 마켓터블 리밋가로 갱신
+          (없으면 기존 견적가 유지, 폴백).
         """
         if self.client is None or self.account_seq is None:
             log.error("live 모드인데 client/account_seq 가 없습니다. 집행 중단.")
@@ -1062,14 +1076,40 @@ class Broker:
     def _place_live_order(self, order: Order, reason: str) -> str | None:
         """라이브 주문 접수만(락 안). orderId 또는 None(실패 시 last_result 설정)."""
         base_kw = {"order_qty": float(order.qty), "limit_price": float(order.price)}
+        fractional_us = (
+            str(order.market).upper() == "US"
+            and _is_fractional_qty(order.qty)
+        )
+        order_type = "MARKET" if fractional_us else "LIMIT"
+        order_amount = (
+            _usd_order_amount(order.qty, order.price)
+            if fractional_us and order.side == "BUY"
+            else None
+        )
+        request_meta = {
+            "side": order.side,
+            "qty": order.qty,
+            "order_type": order_type,
+            **({"order_amount": order_amount} if order_amount is not None else {}),
+        }
         try:
-            resp = self.client.place_order(
-                account_seq=self.account_seq, symbol=order.symbol, side=order.side,
-                qty=order.qty, order_type="LIMIT", price=order.price)
+            if order_amount is not None:
+                # 토스 US 소수점 BUY는 MARKET+orderAmount만 허용한다.
+                resp = self.client.place_order(
+                    account_seq=self.account_seq, symbol=order.symbol, side=order.side,
+                    order_amount=order_amount, order_type=order_type)
+            else:
+                # 정수 주문은 기존 지정가 수량 주문. US 소수점 SELL만 시장가 수량 주문.
+                resp = self.client.place_order(
+                    account_seq=self.account_seq, symbol=order.symbol, side=order.side,
+                    qty=order.qty, order_type=order_type,
+                    price=(order.price if order_type == "LIMIT" else None))
         except Exception as e:
-            log.error("[LIVE] 주문 전송 실패 — %s %s x%s @ %.2f: %s",
-                      order.side, order.symbol, order.qty, order.price, e)
-            self._emit("live_order_error", order, {"error": str(e), "reason": reason})
+            log.error("[LIVE] 주문 전송 실패 — %s %s x%s @ %.2f (%s%s): %s",
+                      order.side, order.symbol, order.qty, order.price, order_type,
+                      f", amount={order_amount}" if order_amount is not None else "", e)
+            self._emit("live_order_error", order, {
+                **request_meta, "error": str(e), "reason": reason})
             self.last_result = ExecuteResult.rejected(
                 "주문 전송 실패", **base_kw)
             return None
@@ -1078,7 +1118,8 @@ class Broker:
         if order_id is None:
             log.error("[LIVE] 주문 응답에 주문식별자(orderId) 없음 — 실패 처리: %s", resp)
             self._emit("live_order_error", order,
-                       {"error": "응답에 orderId 없음", "resp": str(resp)[:300],
+                       {**request_meta, "error": "응답에 orderId 없음",
+                        "resp": str(resp)[:300],
                         "reason": reason})
             self.last_result = ExecuteResult.rejected("orderId 없음", **base_kw)
             return None
