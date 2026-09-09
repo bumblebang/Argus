@@ -171,25 +171,35 @@ def test_load_missing_returns_none(tmp_path, monkeypatch):
 
 
 # ── 대시보드 자산 패널 렌더 스모크(예외 없이 렌더) ─────────────────────
-def _base_d(snap, live_trades=None, live_mode=True):
+def _base_d(snap, live_trades=None, live_mode=True, paper=None):
     return {"now": time.time(), "snapshot": snap, "live_mode": live_mode,
             "live_trades": live_trades or [], "names": {"005930": "삼성전자"},
             "risk_control": {"max_positions": {"KR": 5, "US": 3},
                              "open": {"KR": 0, "US": 0}, "pause": "none"},
-            "fx": None}
+            "fx": None, "paper": paper}
 
 
 def test_asset_html_renders_snapshot():
     client = _FakeClient({"KR": {"cashBuyingPower": "732463"}}, _HOLDINGS)
     snap = acc.fetch_account_snapshot(client, 1)
-    html = dash._asset_html(_base_d(snap))
+    html = dash._asset_html(_base_d(snap, paper={"start_cash": {"KR": 1_000_000}}))
     assert "실계좌 자산 관제" in html
     assert "LIVE" in html                    # live_mode=True 배지
     assert "삼성전자" in html                 # 보유 종목
     # 총자산 = 현금 732,463 + 평가 273,500 = 1,005,963
     assert "1,005,963" in html
+    assert "누적수익률" in html and "+0.60%" in html
+    assert "원금 ₩1,000,000" in html
     assert "+2.24%" in html                  # 평가손익률
     assert "10,500" in html                  # 일손익 금액
+
+
+def test_asset_html_total_return_requires_fx_for_us_seed():
+    client = _FakeClient({"KR": {"cashBuyingPower": "732463"}}, _HOLDINGS)
+    snap = acc.fetch_account_snapshot(client, 1)
+    html = dash._asset_html(_base_d(
+        snap, paper={"start_cash": {"KR": 1_000_000, "US": 100}}))
+    assert "원금 또는 FX 없음" in html
 
 
 def test_asset_html_empty_snapshot_graceful():

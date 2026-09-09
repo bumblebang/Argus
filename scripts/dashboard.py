@@ -1050,30 +1050,35 @@ def _hist_closes(symbol: str, market: str = "KR", *,
     return out
 
 
-def _kr_journal_fills(paper: dict, store_rows: list | None = None) -> list[dict]:
-    """KR 체결 타임라인. 저널 누락 보유는 store opened_at·평단으로 가상 매수 보강."""
+def _journal_fills(paper: dict, store_rows: list | None = None,
+                   markets: tuple[str, ...] = ("KR", "US")) -> list[dict]:
+    """시장별 체결 타임라인. 저널 누락 보유는 store 진입시각·평단으로 보강."""
     fills = []
+    allowed = {str(m).upper() for m in markets}
+    symbol_market = paper.get("symbol_market") or {}
     for j in paper.get("journal") or []:
-        if (j.get("market") or "KR") != "KR":
+        market = str(j.get("market") or symbol_market.get(str(j.get("symbol"))) or "KR").upper()
+        if market not in allowed:
             continue
         dt = _parse_jts(j.get("ts"))
         if not dt:
             continue
         fills.append({
-            "dt": dt, "symbol": str(j["symbol"]), "side": j["side"],
+            "dt": dt, "symbol": str(j["symbol"]), "market": market, "side": j["side"],
             "qty": float(j["qty"]), "price": float(j["price"]),
             "fee": float(j.get("fee") or 0),
         })
-    seen = {f["symbol"] for f in fills if f["side"] == "BUY"}
+    seen = {(f["market"], f["symbol"]) for f in fills if f["side"] == "BUY"}
     # 저널에 매수가 없는 현재 보유 → store 평단·진입시각으로 보강
     paper_pos = paper.get("positions") or {}
     for row in store_rows or []:
-        if (row.get("market") or "KR") != "KR":
+        market = str(row.get("market") or symbol_market.get(str(row.get("symbol"))) or "KR").upper()
+        if market not in allowed:
             continue
         if row.get("state") != "open":
             continue
         sym = str(row.get("symbol") or "")
-        if not sym or sym in seen or sym not in paper_pos:
+        if not sym or (market, sym) in seen or sym not in paper_pos:
             continue
         qty = float((paper_pos.get(sym) or {}).get("qty") or row.get("qty") or 0)
         px = float((paper_pos.get(sym) or {}).get("avg_price") or row.get("avg_price") or 0)
@@ -1087,21 +1092,26 @@ def _kr_journal_fills(paper: dict, store_rows: list | None = None) -> list[dict]
             dt = _parse_jts(paper["journal"][0].get("ts"))
         if dt is None:
             continue
-        fills.append({"dt": dt, "symbol": sym, "side": "BUY", "qty": qty,
+        fills.append({"dt": dt, "symbol": sym, "market": market, "side": "BUY", "qty": qty,
                       "price": px, "fee": 0.0})
-        seen.add(sym)
+        seen.add((market, sym))
     fills.sort(key=lambda f: f["dt"])
     return fills
+
+
+def _kr_journal_fills(paper: dict, store_rows: list | None = None) -> list[dict]:
+    """하위 호환용 KR 체결 타임라인."""
+    return _journal_fills(paper, store_rows, markets=("KR",))
 
 
 def _equity_vs_kospi(paper: dict | None, snap: dict | None,
                      store_rows: list | None = None,
                      latest_px: dict | None = None) -> dict | None:
-    """KR 포트 평가수익률 vs 코스피(+S&P) 누적 수익률 시계열.
+    """KR+US 통산 평가수익률 vs 코스피(+S&P) 누적 수익률 시계열.
 
     반환: {dates, port, bench, bench2?, port_now, bench_now, bench2_now?,
            alpha_now, since, bench_name, bench2_name?}
-    포인트는 일별(%). 데이터 부족 시 None.
+    US 원장과 원금은 현재 USDKRW 로 정규화한다(환율 손익 제외). 포인트는 일별(%).
     """
     now = time.time()
     hit = _chart_cache.get("KR")
@@ -1112,16 +1122,26 @@ def _equity_vs_kospi(paper: dict | None, snap: dict | None,
 
     if not paper:
         return None
-    start_cash = float((paper.get("start_cash") or {}).get("KR") or 0)
+    starts = paper.get("start_cash") or {}
+    start_kr = float(starts.get("KR") or 0)
+    start_us = float(starts.get("US") or 0)
+    fx_blob = (snap or {}).get("fx") or {}
+    fx_rate = float(fx_blob.get("USDKRW") or 0) if isinstance(fx_blob, dict) else 0.0
+    if start_us > 0 and fx_rate <= 0:
+        return None
+    start_cash = start_kr + start_us * fx_rate
     if start_cash <= 0:
         return None
-    fills = _kr_journal_fills(paper, store_rows)
+    fills = _journal_fills(paper, store_rows)
     if not fills and not (paper.get("positions") or {}):
         return None
 
     # 심볼별 일봉
-    syms = {f["symbol"] for f in fills} | set((paper.get("positions") or {}).keys())
-    closes = {s: _hist_closes(s, "KR", max_age_hours=24) for s in syms}
+    symbol_market = paper.get("symbol_market") or {}
+    sym_markets = {(f["symbol"], f["market"]) for f in fills}
+    for sym in (paper.get("positions") or {}):
+        sym_markets.add((str(sym), str(symbol_market.get(sym) or "KR").upper()))
+    closes = {(s, m): _hist_closes(s, m, max_age_hours=24) for s, m in sym_markets}
     bsym, bname = BENCH["KR"]
     bcloses = _hist_closes(bsym, "KR", max_age_hours=24)
     if not bcloses:
@@ -1147,15 +1167,15 @@ def _equity_vs_kospi(paper: dict | None, snap: dict | None,
     if not days:
         return None
 
-    def _px(sym: str, day: str, holdings_px: dict) -> float | None:
-        c = closes.get(sym) or {}
+    def _px(sym: str, market: str, day: str, holdings_px: dict) -> float | None:
+        c = closes.get((sym, market)) or {}
         if day in c:
             return c[day]
         # ffill: day 이전 마지막 종가
         prev = [c[d] for d in sorted(c) if d <= day]
         if prev:
             return prev[-1]
-        return holdings_px.get(sym)
+        return holdings_px.get((market, sym))
 
     def _ffill_close(closes_map: dict[str, float], day: str) -> float | None:
         if not closes_map:
@@ -1165,9 +1185,9 @@ def _equity_vs_kospi(paper: dict | None, snap: dict | None,
         prev = [closes_map[d] for d in sorted(closes_map) if d <= day]
         return prev[-1] if prev else None
 
-    cash = start_cash
-    hold: dict[str, float] = {}
-    hold_px: dict[str, float] = {}
+    cash = {"KR": start_kr, "US": start_us}
+    hold: dict[tuple[str, str], float] = {}
+    hold_px: dict[tuple[str, str], float] = {}
     fi = 0
     dates: list[str] = []
     port: list[float] = []
@@ -1181,23 +1201,25 @@ def _equity_vs_kospi(paper: dict | None, snap: dict | None,
         # 당일 체결 반영(그날 종가 평가 전에)
         while fi < len(fills) and fills[fi]["dt"].strftime("%Y-%m-%d") <= day:
             f = fills[fi]; fi += 1
-            q, px, fee = f["qty"], f["price"], f["fee"]
+            q, px, fee, market = f["qty"], f["price"], f["fee"], f["market"]
+            key = (market, f["symbol"])
             if f["side"] == "BUY":
-                cash -= q * px + fee
-                hold[f["symbol"]] = hold.get(f["symbol"], 0.0) + q
-                hold_px[f["symbol"]] = px
+                cash[market] = cash.get(market, 0.0) - q * px - fee
+                hold[key] = hold.get(key, 0.0) + q
+                hold_px[key] = px
             else:
-                take = min(q, hold.get(f["symbol"], 0.0))
-                cash += take * px - fee
-                hold[f["symbol"]] = hold.get(f["symbol"], 0.0) - take
-                if hold.get(f["symbol"], 0) <= 1e-9:
-                    hold.pop(f["symbol"], None)
-        eq = cash
-        for s, q in hold.items():
-            px = _px(s, day, hold_px)
+                take = min(q, hold.get(key, 0.0))
+                cash[market] = cash.get(market, 0.0) + take * px - fee
+                hold[key] = hold.get(key, 0.0) - take
+                if hold.get(key, 0) <= 1e-9:
+                    hold.pop(key, None)
+        eq_by_market = dict(cash)
+        for (market, s), q in hold.items():
+            px = _px(s, market, day, hold_px)
             if px is None:
-                px = hold_px.get(s, 0)
-            eq += q * float(px)
+                px = hold_px.get((market, s), 0)
+            eq_by_market[market] = eq_by_market.get(market, 0.0) + q * float(px)
+        eq = eq_by_market.get("KR", 0.0) + eq_by_market.get("US", 0.0) * fx_rate
         pret = (eq / start_cash - 1.0) * 100.0
         bc = bcloses.get(day)
         if bc is None:
@@ -1223,8 +1245,14 @@ def _equity_vs_kospi(paper: dict | None, snap: dict | None,
     # 오늘 실계좌 스냅샷으로 종점 보정(저널 누락·미실현 반영)
     if snap and dates:
         try:
-            live_eq = (float((snap.get("cash") or {}).get("KR") or 0)
-                       + float((snap.get("market_value") or {}).get("KR") or 0))
+            live_eq = (float(((snap.get("totals") or {}).get("equity_krw") or 0)))
+            if live_eq <= 0:
+                live_eq = (
+                    float((snap.get("cash") or {}).get("KR") or 0)
+                    + float((snap.get("market_value") or {}).get("KR") or 0)
+                    + (float((snap.get("cash") or {}).get("US") or 0)
+                       + float((snap.get("market_value") or {}).get("US") or 0)) * fx_rate
+                )
             if live_eq > 0:
                 today = datetime.now().strftime("%Y-%m-%d")
                 live_ret = (live_eq / start_cash - 1.0) * 100.0
@@ -1241,10 +1269,18 @@ def _equity_vs_kospi(paper: dict | None, snap: dict | None,
             pass
     # latest_px 로도 종점 보강(스냅 없을 때)
     elif latest_px and dates:
-        eq = float((paper.get("cash") or {}).get("KR") or 0)
+        eq_by_market = {
+            "KR": float((paper.get("cash") or {}).get("KR") or 0),
+            "US": float((paper.get("cash") or {}).get("US") or 0),
+        }
         for s, p in (paper.get("positions") or {}).items():
             px = latest_px.get(s) or p.get("avg_price") or 0
-            eq += float(p.get("qty") or 0) * float(px)
+            market = str(symbol_market.get(s) or "KR").upper()
+            eq_by_market[market] = (
+                eq_by_market.get(market, 0.0)
+                + float(p.get("qty") or 0) * float(px)
+            )
+        eq = eq_by_market.get("KR", 0.0) + eq_by_market.get("US", 0.0) * fx_rate
         port[-1] = (eq / start_cash - 1.0) * 100.0
 
     if len(dates) < 2:
@@ -1257,6 +1293,7 @@ def _equity_vs_kospi(paper: dict | None, snap: dict | None,
         "port_now": port[-1], "bench_now": bench[-1],
         "alpha_now": port[-1] - bench[-1],
         "since": since, "bench_name": bname, "snap_ts": snap_ts,
+        "portfolio_name": "Argus 통산", "fx_note": "현재환율 고정 환산",
     }
     if bench2:
         payload["bench2"] = bench2
@@ -2317,11 +2354,11 @@ def _snap_name(it: dict, names: dict) -> str:
 # ───────────────────────── 자산 관제 패널(탭 위) ─────────────────────────
 
 def _bench_chart_html(d: dict) -> str:
-    """메인 상단: Argus vs 코스피·S&P 누적 수익률 차트."""
+    """메인 상단: Argus 통산 vs 코스피·S&P 누적 수익률 차트."""
     s = d.get("bench_chart")
     if not s:
         return ("<div class=bench-chart><div class=bc-hd>"
-                "<span class=bc-ttl>수익률 · Argus vs 코스피 · S&P</span></div>"
+                "<span class=bc-ttl>수익률 · Argus 통산 vs 코스피 · S&P</span></div>"
                 "<span class=muted>차트 데이터 준비중(체결·지수 히스토리 부족).</span></div>")
     svg = _ret_chart_svg(s)
     if not svg:
@@ -2332,6 +2369,8 @@ def _bench_chart_html(d: dict) -> str:
     ac = "pos" if an >= 0 else "neg"
     bname_raw = str(s.get("bench_name") or "코스피")
     bname = escape(bname_raw)
+    pname_raw = str(s.get("portfolio_name") or "Argus 통산")
+    pname = escape(pname_raw)
     u2_raw = s.get("bench2_name")
     u2 = escape(str(u2_raw)) if u2_raw else ""
     has2 = bool(s.get("bench2")) and u2_raw
@@ -2342,14 +2381,14 @@ def _bench_chart_html(d: dict) -> str:
     tip_data = json.dumps(tip_meta, ensure_ascii=False)
     leg = (
         "<span class=bc-leg>"
-        "<span><i style='background:#5aa9ff'></i>Argus</span>"
+        f"<span><i style='background:#5aa9ff'></i>{pname}</span>"
         f"<span><i style='background:#ffb454'></i>{bname}</span>"
     )
     if has2:
         leg += f"<span><i style='background:#7ee787'></i>{u2}</span>"
     leg += "</span>"
     stats = (
-        f"<span><span class=k>Argus</span><span class='mono {pc}'>{pn:+.2f}%</span></span>"
+        f"<span><span class=k>{pname}</span><span class='mono {pc}'>{pn:+.2f}%</span></span>"
         f"<span><span class=k>{bname}</span><span class='mono {bc}'>{bn:+.2f}%</span></span>"
     )
     if has2:
@@ -2369,12 +2408,16 @@ def _bench_chart_html(d: dict) -> str:
             f"<span><span class=k>알파</span>"
             f"<span class='mono {ac}'><b>{an:+.2f}%p</b></span></span>"
         )
-    title = f"수익률 · Argus vs {bname}" + (f" · {u2}" if has2 else "")
+    title = f"수익률 · {pname} vs {bname}" + (f" · {u2}" if has2 else "")
+    fx_note = escape(str(s.get("fx_note") or ""))
+    period_note = f"첫 체결 {escape(s.get('since') or '')}~ · 평가 기준"
+    if fx_note:
+        period_note += f" · {fx_note}"
     return (
         "<div class=bench-chart>"
         "<div class=bc-hd>"
         f"<span class=bc-ttl>{title}</span>"
-        f"<span class=muted>첫 체결 {escape(s.get('since') or '')}~ · 평가 기준</span>"
+        f"<span class=muted>{period_note}</span>"
         f"{leg}</div>"
         "<div class=bc-wrap>"
         f"<script type='application/json' class=bc-data>{tip_data}</script>"
@@ -2465,6 +2508,26 @@ def _asset_html(d: dict) -> str:
     elif d.get("fx"):
         fx_rate = float(d["fx"])
 
+    # 실계좌 전체 누적수익률. account_snapshot.profit 은 현재 보유분의 평가손익뿐이라
+    # 실현손익을 놓친다. 라이브와 함께 움직이는 paper 미러의 최초 원금을 분모로 삼고,
+    # 현재 총자산과 같은 기준이 되도록 US 원금도 현재 USDKRW 로 환산한다.
+    start_cash = ((d.get("paper") or {}).get("start_cash") or {})
+    seed_krw = None
+    total_ret = None
+    try:
+        seed_kr = float(start_cash.get("KR") or 0)
+        seed_us = float(start_cash.get("US") or 0)
+        if seed_us > 0 and not fx_rate:
+            seed_krw = None
+        else:
+            seed_krw = seed_kr + seed_us * (fx_rate or 0)
+            if seed_krw <= 0:
+                seed_krw = None
+        if eq_krw is not None and seed_krw is not None:
+            total_ret = float(eq_krw) / seed_krw - 1.0
+    except (TypeError, ValueError):
+        seed_krw = total_ret = None
+
     p.append("<div class=asset-grid>")
     if eq_krw is not None:
         fx_bit = f" · USDKRW {fx_rate:,.2f}" if fx_rate else ""
@@ -2475,6 +2538,12 @@ def _asset_html(d: dict) -> str:
         p.append("<div><div class=k>총자산 <small>₩환산</small></div>"
                  "<div class=big>–</div>"
                  f"<div class='sub2 muted'>{escape(fx_note or 'FX 없음 — 원장만 표시')}</div></div>")
+    rcls = "pos" if (total_ret or 0) >= 0 else "neg"
+    ret_disp = f"{total_ret:+.2%}" if total_ret is not None else "–"
+    seed_disp = f"원금 ₩{seed_krw:,.0f} · 현재환율 환산" if seed_krw is not None else "원금 또는 FX 없음"
+    p.append(f"<div><div class=k>누적수익률 <small>원금대비</small></div>"
+             f"<div class='big {rcls}'>{ret_disp}</div>"
+             f"<div class='sub2 muted'>{seed_disp}</div></div>")
     pcls = "pos" if (pnl_krw or 0) >= 0 else "neg"
     dcls = "pos" if (daily_krw or 0) >= 0 else "neg"
     pnl_disp = f"₩{float(pnl_krw):+,.0f}" if pnl_krw is not None else "–"
