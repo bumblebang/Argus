@@ -360,3 +360,42 @@ def test_paper_begin_registers_inflight_before_finish(tmp_path):
         broker._mark_inflight(Order("005930", "KR", "BUY", 1, 70000.0))
     dup = broker.execute(Order("005930", "KR", "BUY", 1, 70000.0), "dup")
     assert not dup.ok and "in-flight" in (dup.reject_reason or "")
+
+
+# ── 진입 근거 스탬프 (2026-09-09) ─────────────────────────────
+def test_signal_entry_stamps_basis_signal(tmp_path):
+    """전략 BUY 신호로 진입한 자리 → basis=signal (신호 청산 대칭 ON)."""
+    from src.engine.entry_basis import BASIS_SIGNAL, basis_of, signal_exit_allowed
+    store = Store(tmp_path / "t.db")
+    broker = _broker(tmp_path)
+    risk = RiskManager(capital={"KR": 1_000_000}, max_position_pct=0.2)
+    _arm(store)
+    gw = FakeGW(_ohlcv([float(x) for x in range(60, 20, -1)]))
+    ex = EntryExecutor(gw, broker, risk, store,
+                       plan_fn=lambda p, h, params: (round(p * 0.98, 2), round(p * 1.03, 2)))
+    assert ex.evaluate(dict(store.get_armed()[0]), "KR")["executed"] is True
+
+    pos = dict(store.get_open_positions()[0])
+    assert basis_of(pos) == BASIS_SIGNAL
+    assert signal_exit_allowed(pos)[0] is True
+
+
+def test_zone_entry_stamps_basis_zone(tmp_path):
+    """도시에 진입존으로 들어간 자리 → basis=zone (신호 청산 OFF)."""
+    from src.engine.entry_basis import BASIS_ZONE, basis_of, signal_exit_allowed
+    store = Store(tmp_path / "t.db")
+    broker = _broker(tmp_path)
+    risk = RiskManager(capital={"KR": 1_000_000}, max_position_pct=0.2)
+    store.arm_candidate(
+        "005930", "KR", strategy="macd",
+        meta={"horizon": "swing", "target_weight": 0.2,
+              "params": {"fast": 12, "slow": 26, "signal": 9},
+              "entry_zone": {"low": 60000, "high": 72000, "invalidation": 55000,
+                             "target": 90000}})
+    ex = EntryExecutor(FakeGW(_ohlcv([1, 2, 3])), broker, risk, store)
+    assert ex.evaluate(dict(store.get_armed()[0]), "KR", price=68000)["executed"] is True
+
+    pos = dict(store.get_open_positions()[0])
+    assert basis_of(pos) == BASIS_ZONE
+    assert signal_exit_allowed(pos)[0] is False   # macd 라벨이어도 데드크로스로 안 판다
+    assert pos["strategy"] == "macd"              # 라벨·파라미터는 그대로 둔다

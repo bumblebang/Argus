@@ -131,7 +131,9 @@ def mirror_symbol_to_store(
             return "updated"
         return "noop"
 
-    meta = {"source": "fill_mirror", "entry_thesis": RECONCILE_THESIS}
+    # 진입 논거 미상 — 전략 신호 청산은 보수적으로 끈다(engine.entry_basis).
+    meta = {"source": "fill_mirror", "entry_thesis": RECONCILE_THESIS,
+            "entry_basis": "orphan"}
     store.open_position(symbol, market, qty, avg,
                         strategy=None, thesis=RECONCILE_THESIS,
                         target_price=None, stop_price=None, meta=meta)

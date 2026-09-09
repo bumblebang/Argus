@@ -120,6 +120,22 @@ def patch_live_price(df: pd.DataFrame, price: float | None, *,
     return out
 
 
+def drop_unclosed_bar(df: pd.DataFrame, market: str = "KR") -> pd.DataFrame:
+    """미완성 당봉을 떼어 **확정봉만** 남긴다(크로스형 신호 판정용).
+
+    마지막 봉의 거래일이 오늘이면 그 봉은 아직 진행 중이다 — 크로스는 직전봉 대비
+    부호 전환이라, 진행 중인 봉으로 판정하면 장중 흔들림만으로 신호가 켜졌다 꺼진다.
+    time 열이 없어 판정이 불가하면 원본을 그대로 돌린다(호출측이 실시간가 패치를
+    이미 건너뛰므로 최소한 틱 단위 깜빡임은 없다).
+    """
+    if df is None or len(df) == 0:
+        return df
+    bar_day = last_bar_trading_date(df, market)
+    if bar_day is None or bar_day != trading_date(market):
+        return df
+    return df.iloc[:-1].reset_index(drop=True)
+
+
 def order_price(live: float | None, df: pd.DataFrame) -> float:
     """주문·사이징 가격 — patch_live_price 가 skip 해도 라이브가 우선."""
     if live is not None and live > 0:

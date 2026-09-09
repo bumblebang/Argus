@@ -21,6 +21,7 @@ from ..strategies import build_strategy, REGISTRY
 from ..strategies.base import Action, Position
 from ..agents.conviction import size_weight, min_lot_adjust, skip_position_headroom
 from ..agents.wiring import combine_stop_target
+from .entry_basis import BASIS_SIGNAL, BASIS_ZONE
 
 log = get_logger("engine.execution")
 
@@ -86,6 +87,19 @@ def _sizing_equity(risk, broker, market: str) -> float:
     if hasattr(risk, "sizing_base_amount"):
         return float(risk.sizing_base_amount(broker, market))
     return float(getattr(risk, "capital", {}).get(market, 0) or 0)
+
+
+def _stamp_basis(store, armed: dict, meta: dict, basis: str) -> None:
+    """armed 행 meta 에 진입 근거를 찍는다 — promote_armed 가 meta 를 보존하므로
+    체결 후 포지션에 그대로 남는다. **주문 전에** 찍어야 체결 미러(락 안)와 경합하지 않는다.
+    실패해도 진입은 막지 않는다(basis 는 추론 폴백이 있다).
+    """
+    if meta.get("entry_basis") == basis:
+        return
+    try:
+        store.update_position(int(armed["id"]), meta={**meta, "entry_basis": basis})
+    except Exception as e:  # 스탬프 실패로 진입을 막지 않는다
+        log.warning("entry_basis 스탬프 실패 %s: %s", armed.get("symbol"), e)
 
 
 class ExitExecutor:
@@ -180,6 +194,7 @@ class EntryExecutor:
         if sig.action != Action.BUY:
             return {"action": sig.action.value, "executed": False, "reason": sig.reason}
 
+        _stamp_basis(self.store, armed, meta, BASIS_SIGNAL)
         exec_px = order_price(price, df)
         equity = _sizing_equity(self.risk, self.broker, market)
         weight, min_qty = _entry_lot(meta, market, exec_px, self.risk, sig.target_weight,
@@ -236,6 +251,7 @@ class EntryExecutor:
             return {"action": "disarm", "executed": False, "reason": "도시에 만료"}
 
         if zone["low"] <= price <= zone["high"]:
+            _stamp_basis(self.store, armed, meta, BASIS_ZONE)
             equity = _sizing_equity(self.risk, self.broker, market)
             weight, min_qty = _entry_lot(meta, market, price, self.risk, equity=equity)
             qty = self.risk.size_buy(

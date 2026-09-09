@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 import src.engine.loop as loopmod
+from src.engine.entry_basis import parse_signal_exit
 from src.engine.loop import WatchLoop, WatchConfig
 from src.engine.store import Store
 
@@ -526,3 +527,65 @@ def test_on_prices_callback_receives_live_prices(tmp_path, monkeypatch):
                      on_prices=lambda px: seen.append(dict(px)))
     loop.run_once()
     assert seen == [{"005930": 70000}]
+
+
+# ── 강등된 전략 반대신호 → 청산이 아니라 뇌 각성 (2026-09-09) ──────────
+class _DemotingSR:
+    """진입 근거가 달라 신호 청산이 강등된 StrategyRunner 흉내."""
+    def __init__(self, n=99):
+        self.left = n
+
+    def evaluate(self, pos, market, price=None):
+        if self.left <= 0:
+            return {"action": "hold", "executed": False}
+        self.left -= 1
+        return {"action": "sell", "executed": False, "demoted": True,
+                "strategy": "macd", "basis": "zone",
+                "reason": "MACD 데드크로스 (12/26/9)"}
+
+
+def _demote_loop(tmp_path, monkeypatch, wakes, cooldown=1800.0):
+    _only_kr_open(monkeypatch)
+    store = Store(tmp_path / "t.db")
+    gw = FakeGateway({"066570": 205000})
+    pos = {"symbol": "066570", "market": "KR", "qty": 1, "avg_price": 205500,
+           "stop_price": 193000, "target_price": 232000}
+    cfg = WatchConfig(strategy_exit=parse_signal_exit(
+        {"strategy_exit": {"wake_cooldown_sec": cooldown}}))
+    loop = WatchLoop(gw, store, lambda: {"KR": {"positions": [pos], "candidates": []}},
+                     strategy_runner=_DemotingSR(), config=cfg,
+                     on_wake=lambda kind, trigs, **kw: wakes.append((kind, trigs)))
+    return loop, store
+
+
+def test_demoted_signal_wakes_brain_instead_of_selling(tmp_path, monkeypatch):
+    wakes = []
+    loop, store = _demote_loop(tmp_path, monkeypatch, wakes)
+    res = loop.run_once()
+
+    assert res.exits == []                        # 코드가 팔지 않았다
+    assert res.woke is True and len(wakes) == 1
+    kinds = [t.kind for t in res.triggers]
+    assert "strategy_signal" in kinds
+    t = next(t for t in res.triggers if t.kind == "strategy_signal")
+    assert t.urgency == "act" and t.payload["entry_basis"] == "zone"
+    rows = [dict(r) for r in store.conn.execute(
+        "SELECT kind, payload FROM events WHERE kind='trigger'")]
+    assert any("strategy_signal" in r["payload"] for r in rows)
+
+
+def test_demoted_signal_wake_is_cooled_down(tmp_path, monkeypatch):
+    """신호는 조건이 유지되는 동안 매 틱 반복된다 — 쿨다운이 LLM 세션을 지킨다."""
+    wakes = []
+    loop, _ = _demote_loop(tmp_path, monkeypatch, wakes)
+    for _ in range(5):
+        loop.run_once()
+    assert len(wakes) == 1                        # 5틱 반복 신호에 각성 1회
+
+
+def test_demoted_signal_refires_after_cooldown(tmp_path, monkeypatch):
+    wakes = []
+    loop, _ = _demote_loop(tmp_path, monkeypatch, wakes, cooldown=0.0)
+    loop.run_once()
+    loop.run_once()
+    assert len(wakes) == 2                        # 쿨다운 0 이면 매 틱 각성

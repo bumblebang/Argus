@@ -15,6 +15,7 @@ class MACrossover(Strategy):
     """이동평균 크로스: 단기MA가 장기MA 상향(골든) 시 매수, 하향(데드) 시 매도. 추세 추종."""
     name = "ma_crossover"
     horizon = "position"
+    closed_bar_signal = True     # 크로스형 — 확정봉으로만 판정
     PARAMS = (
         ParamSpec("short", 5, 2, 60, "int", "단기 이동평균 기간"),
         ParamSpec("long", 20, 3, 240, "int", "장기 이동평균 기간"),

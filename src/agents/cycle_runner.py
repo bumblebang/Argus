@@ -11,6 +11,7 @@ from ..config import AppConfig
 from ..logging_setup import get_logger
 from ..risk import RiskManager, risk_manager_from_cfg
 from ..broker import Broker
+from ..engine.entry_basis import BASIS_THESIS
 from .features import assemble, filter_gap_rebound_candidates, wake_has_gap_scan
 from .context import build_context
 from .conviction import attach_event_features
@@ -774,6 +775,8 @@ class CycleRunner:
                         pos.avg_price, horizon, params,
                         (d or {}).get("invalidation"), (d or {}).get("target"))
                     meta = {"horizon": horizon, "params": params,
+                            # 뇌 즉시 체결 — 도시에 논거로 산 자리다(전략 신호 청산 OFF)
+                            "entry_basis": BASIS_THESIS,
                             "entry_regime": self._regime_now.get(market),
                             "dossier_id": (d["id"] if d else None),
                             "conviction": getattr(prop, "conviction", None) if prop else None,
@@ -808,6 +811,7 @@ class CycleRunner:
                 pos.avg_price, horizon, params,
                 (d or {}).get("invalidation"), (d or {}).get("target"))
             meta = {"horizon": horizon, "params": params,
+                    "entry_basis": BASIS_THESIS,
                     "entry_regime": self._regime_now.get(market),
                     "dossier_id": (d["id"] if d else None),
                     "conviction": getattr(prop, "conviction", None) if prop else None,

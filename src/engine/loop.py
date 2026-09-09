@@ -33,6 +33,7 @@ from ..market_hours import current_session, is_tradable, near_session_end, marke
 from .gateway import TossGateway
 from .store import Store
 from . import triggers as T
+from .entry_basis import SignalExitConfig, parse_signal_exit
 from .exit_policy import (ExitPolicyConfig, time_stop_trigger, thesis_inval_trigger,
                           close_scan_exit_trigger)
 from .wake_request import consume_brain_wake
@@ -151,6 +152,8 @@ class WatchConfig:
     exit_policy: "ExitPolicyConfig | None" = None
     # Athena Phase 2 — 갭/무효화 임박 → athena_queue (athena.phase2 블록).
     athena_phase2: dict = field(default_factory=dict)
+    # 신호 청산 정책(진입근거 바인딩·최소보유·확정봉). 최상위 strategy_exit 블록.
+    strategy_exit: SignalExitConfig = field(default_factory=SignalExitConfig)
 
     @staticmethod
     def _parse_exit_policy(raw: dict) -> "ExitPolicyConfig":
@@ -235,6 +238,7 @@ class WatchConfig:
             trailing=cls._parse_trailing(raw),
             exit_policy=cls._parse_exit_policy(raw),
             athena_phase2=cls._parse_athena_phase2(raw),
+            strategy_exit=parse_signal_exit(raw),
         )
 
     @staticmethod
@@ -442,6 +446,8 @@ class WatchLoop:
         self._hist: dict[str, deque] = defaultdict(lambda: deque(maxlen=self.cfg.vol_window))
         # regime_flip 중복 각성 방지: 심볼→마지막으로 각성시킨 국면(인메모리, 재시작 시 1회 재평가).
         self._regime_acked: dict[str, str] = {}
+        # 강등된 전략 반대신호의 마지막 각성 시각 {(symbol, strategy): ts} — 쿨다운.
+        self._signal_woke: dict[tuple[str, str], float] = {}
         self._last_brain_wake = 0.0    # 주기 각성 타이머(개장 첫 틱에 바로 1회 발화)
         self._rr = 0                   # per_tick 상한 라운드로빈 오프셋(기아 방지)
         self._last_session: dict[str, str] = {}     # 세션 경계 리셋용: 시장→직전 틱 세션명
@@ -576,6 +582,24 @@ class WatchLoop:
             except Exception as e:
                 log.error("진입대기 해제 실패 %s: %s", sym, e)
                 self.store.log_event("error", sym, {"where": "disarm", "err": str(e)})
+
+    def _demoted_signal(self, sym: str, res: dict, now: float) -> "T.Trigger | None":
+        """강등된 전략 반대신호 → 각성 트리거. 종목·전략 단위 쿨다운으로 폭주를 막는다.
+
+        신호는 조건이 유지되는 동안 매 틱 반복해서 뜬다(크로스는 확정봉이 바뀔 때까지
+        같은 값). 쿨다운이 없으면 LLM 세션 한도를 그대로 태운다 — CONTEXT.md 운영 리스크.
+        """
+        name = str(res.get("strategy") or "")
+        key = (sym, name)
+        cd = float(getattr(self.cfg.strategy_exit, "wake_cooldown_sec", 0.0) or 0.0)
+        last = self._signal_woke.get(key)
+        if cd > 0 and last is not None and (now - last) < cd:
+            return None
+        self._signal_woke[key] = now
+        t = T.strategy_signal_trigger(sym, name, str(res.get("reason") or ""),
+                                      str(res.get("basis") or ""))
+        self.store.log_event("trigger", sym, t.as_event())
+        return t
 
     # ── 트레일링 스톱(목표가 도달 시 전량 청산 대신 이익 태우기) ──────────
     def _is_trail_target(self, pos: dict) -> bool:
@@ -946,15 +970,40 @@ class WatchLoop:
         # 캔들 호출이라 틱당 상한으로 CHART 예산 보호. 라운드로빈으로 기아 방지
         # (상한보다 보유가 많아도 모든 종목이 차례로 평가된다).
         self._rr += 1
+        demoted: list[T.Trigger] = []
         if self.strategy_runner:
             for market, sym, pos in _rotated(managed, self._rr)[: self.cfg.strategy_per_tick]:
                 try:
                     r = self.strategy_runner.evaluate(pos, market, live_price.get(sym))
                     if r.get("executed"):
                         res.exits.append(sym)
+                    elif r.get("demoted"):
+                        t = self._demoted_signal(sym, r, now_ts)
+                        if t:
+                            demoted.append(t)
                 except Exception as e:
                     log.error("전략 실행 실패 %s: %s", sym, e)
                     self.store.log_event("error", sym, {"where": "strategy", "err": str(e)})
+
+        # 강등된 반대신호 → 코드가 팔지 않고 뇌를 깨워 진입 논거를 재평가시킨다.
+        # 이번 틱에 이미 깼으면 트리거만 남긴다(같은 틱 LLM 이중 호출 방지) — 뇌는
+        # 어차피 보유 포지션 전체를 컨텍스트로 받으므로 이 신호를 놓치지 않는다.
+        if demoted:
+            res.triggers.extend(demoted)
+            if self.on_wake and not res.woke:
+                res.woke = True
+                payload = [t.as_event() | {"symbol": t.symbol} for t in demoted]
+                self.store.log_event("wake", None, {"triggers": payload,
+                                                    "reason": "strategy_signal"})
+                try:
+                    from ..agents.context import infer_wake_market
+                    self._call_on_wake(
+                        "wake_triggers", demoted,
+                        market=infer_wake_market(None, None, triggers=demoted))
+                except Exception as e:
+                    log.error("강등신호 각성 실패: %s", e)
+                    self.store.log_event("error", None,
+                                         {"where": "on_wake_signal", "err": str(e)})
 
         # 진입 실행(빠른손): armed 종목에 배정전략 BUY 신호 시 코드가 진입(armed→open).
         # 뇌가 "BUY→즉시 시장가"가 아니라 코드가 진입 타이밍을 잡는다. 실시간가 패치로 1초 반응.
