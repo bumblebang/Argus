@@ -62,6 +62,7 @@ from src.engine.universe_provider import UniverseProvider
 from src.engine.brain import BrainWorker
 from src.engine.execution import ExitExecutor, EntryExecutor
 from src.engine.strategy_runner import StrategyRunner
+from src.engine.entry_basis import parse_signal_exit
 from src.agents.pipeline import (CycleRunner, select_backend, build_live_llm,
                                  build_brain_llm_factories,
                                  synth_candles, history_candles_1y, dry_llm_factory,
@@ -754,7 +755,8 @@ def main() -> int:
     # 밸류 트랙 워커(하루 1회 저평가주 진입) — 데몬 공유 broker/risk 로 페이퍼 단일 원칙 유지.
     value_worker = _build_value_worker(cfg, gateway, store, broker, risk, args)
     executor = ExitExecutor(broker, store)
-    strategy_runner = StrategyRunner(gateway, broker, store)
+    strategy_runner = StrategyRunner(gateway, broker, store,
+                                     cfg=parse_signal_exit(cfg.raw))
     # 코드 자율 진입: armed 종목에 전략 BUY 신호 시 매수(진입가 기준 손절/목표 확정).
     entry_executor = EntryExecutor(
         gateway, broker, risk, store,

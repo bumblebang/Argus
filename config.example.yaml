@@ -61,6 +61,18 @@ exit_policy:
       position: { max_days: 120 }
     exclude_strategy: ["value"]
 
+strategy_exit:
+  # 전략 신호 청산(데드크로스 등)은 **그 전략 신호로 진입한 자리**에만 적용한다.
+  # 도시에 진입존·뇌 논거·밸류로 산 자리는 신호가 떠도 팔지 않고 뇌를 깨워 재평가.
+  # false 로 두면 구 동작(strategy 라벨만 있으면 청산) — 롤백 스위치.
+  bind_to_entry_basis: true
+  # 진입 직후 반대신호 방어(초). 손절/목표·세션종료 청산은 이 가드와 무관하다.
+  min_hold_sec: 60
+  # 크로스형(macd·ma_crossover) 신호는 확정봉으로만 판정 — 미완성 당봉 금지.
+  closed_bar_only: true
+  # 강등된 반대신호로 뇌를 깨우는 최소 간격(종목·전략 단위, 초). LLM 세션 보호.
+  wake_cooldown_sec: 1800
+
 watch:
   watch_interval_sec: 1
   idle_interval_sec: 60

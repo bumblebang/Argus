@@ -147,6 +147,20 @@ def regime_flip_trigger(symbol: str, entry_regime: str | None,
     return None
 
 
+def strategy_signal_trigger(symbol: str, strategy: str, reason: str,
+                            basis: str) -> Trigger:
+    """배정 전략이 SELL 신호를 냈지만 진입 근거가 그 전략이 아닐 때 — 각성(act).
+
+    regime_flip 과 같은 처리다: 코드가 팔지 않고 뇌를 깨워 "전략 신호는 꺾였는데 산
+    논거(도시에 진입존·무효화·밸류)는 아직 유효한가?"를 다시 묻는다. 신호를 버리지도,
+    진입 논거와 무관한 룰로 집행하지도 않는다.
+    """
+    return Trigger("strategy_signal", symbol, "act",
+                   f"{strategy} 반대신호({reason}) — 진입 근거 {basis} 재평가",
+                   {"strategy": strategy, "signal_reason": reason,
+                    "entry_basis": basis})
+
+
 def max_urgency(triggers: Sequence[Trigger]) -> str | None:
     """트리거 목록에서 최고 긴급도 등급 반환(없으면 None)."""
     if not triggers:

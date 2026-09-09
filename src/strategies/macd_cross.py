@@ -16,6 +16,7 @@ class MACDCross(Strategy):
     """MACD 크로스: MACD선이 시그널선 상향 돌파 매수, 하향 매도. 모멘텀 전환. 단기 스윙."""
     name = "macd"
     horizon = "swing"
+    closed_bar_signal = True     # 크로스형 — 확정봉으로만 판정
     PARAMS = (
         ParamSpec("fast", 12, 3, 40, "int", "단기 EMA 기간"),
         ParamSpec("slow", 26, 10, 100, "int", "장기 EMA 기간"),

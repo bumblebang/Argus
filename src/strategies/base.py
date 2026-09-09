@@ -86,6 +86,11 @@ class Strategy(ABC):
     PASSTHROUGH_KEYS: frozenset[str] = frozenset({
         "candle_interval", "exit_at_session_end",
     })
+    # True 면 이 전략의 신호는 **확정봉**으로만 판정해야 한다(미완성 당봉 금지).
+    # 크로스형(직전봉 대비 부호 전환)이 여기 해당 — 미완성 봉에 실시간가를 덮으면
+    # 장중 흔들림만으로 크로스가 켜졌다 꺼졌다 하며 진입 직후 반대신호가 뜬다.
+    # 레벨형(RSI>70·돌파·밴드 복귀 등)은 False — 실시간가 반응이 설계 의도다.
+    closed_bar_signal: bool = False
 
     def __init__(self, params: dict):
         clamped, violations = self.validate(params or {})

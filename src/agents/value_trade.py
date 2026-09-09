@@ -30,6 +30,7 @@ from .cycle import run_cycle
 from .schemas import DecisionOutput
 from .validation_agent import ValidationAgent
 from ..config import AppConfig, ROOT
+from ..engine.entry_basis import BASIS_VALUE
 from ..focus import build_focus, attach_krx_fields
 from ..lessons import build_symbol_lessons
 from ..logging_setup import get_logger
@@ -1031,6 +1032,7 @@ class ValueRunner:
                 fpl = fair_price_low(cand)
                 fph = fair_price_high(cand)
                 promote_meta = {"source": "value", "horizon": "position",
+                        "entry_basis": BASIS_VALUE,
                         "entry_thesis": (prop.thesis if prop else cand.get("thesis")),
                         "fair_low": fpl, "fair_high": fph,
                         "scan_ts": cand.get("ts"),
@@ -1050,6 +1052,7 @@ class ValueRunner:
             fpl = fair_price_low(cand)
             fph = fair_price_high(cand)
             meta = {"source": "value", "horizon": "position",
+                    "entry_basis": BASIS_VALUE,
                     "entry_thesis": (prop.thesis if prop else cand.get("thesis")),
                     "fair_low": fpl, "fair_high": fph,
                     "scan_ts": cand.get("ts"),

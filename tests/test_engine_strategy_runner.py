@@ -1,4 +1,9 @@
-"""engine.strategy_runner — 보유분에 배정전략을 돌려 신호기반 청산 집행."""
+"""engine.strategy_runner — 보유분에 배정전략을 돌려 신호기반 청산 집행.
+
+신호 청산 권한은 진입 근거에 묶인다(engine.entry_basis) — 전략 신호로 진입한
+자리만 신호로 청산한다. 여기 테스트는 그 계약을 고정한다.
+"""
+from src.engine.entry_basis import SignalExitConfig
 from src.engine.strategy_runner import StrategyRunner
 from src.engine.store import Store
 from src.paper_account import PaperAccount
@@ -31,9 +36,10 @@ def test_exits_on_strategy_sell_signal(tmp_path):
     broker = _broker(tmp_path)
     broker.account.fill("005930", "KR", "BUY", 3, 40)
     store.open_position("005930", "KR", 3, 40, strategy="rsi_reversion",
-                        meta={"params": {"period": 14, "oversold": 30, "overbought": 70}})
+                        meta={"entry_basis": "signal",
+                              "params": {"period": 14, "oversold": 30, "overbought": 70}})
     gw = FakeGW(_ohlcv([float(x) for x in range(20, 60)]))   # 지속 상승 -> RSI 과매수
-    sr = StrategyRunner(gw, broker, store)
+    sr = StrategyRunner(gw, broker, store, cfg=SignalExitConfig(min_hold_sec=0))
 
     pos = dict(store.get_open_positions()[0])
     r = sr.evaluate(pos, "KR")
@@ -49,10 +55,11 @@ def test_holds_when_signal_not_sell(tmp_path):
     broker = _broker(tmp_path)
     broker.account.fill("005930", "KR", "BUY", 3, 50)
     store.open_position("005930", "KR", 3, 50, strategy="rsi_reversion",
-                        meta={"params": {"period": 14, "overbought": 70}})
+                        meta={"entry_basis": "signal",
+                              "params": {"period": 14, "overbought": 70}})
     gw = FakeGW(_ohlcv([50, 51, 49, 50, 51, 49, 50, 51, 49, 50,
                         51, 49, 50, 51, 49, 50, 51, 49, 50, 51]))   # 횡보 -> RSI 중립
-    sr = StrategyRunner(gw, broker, store)
+    sr = StrategyRunner(gw, broker, store, cfg=SignalExitConfig(min_hold_sec=0))
     r = sr.evaluate(dict(store.get_open_positions()[0]), "KR")
     assert r["executed"] is False
     assert broker.position("005930").qty == 3
