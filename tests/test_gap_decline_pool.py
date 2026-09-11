@@ -34,6 +34,8 @@ def test_items_for_gap_scan_gap_plus_held():
         assert syms == ["085620", "005930"]
         assert "000660" not in syms
         assert out[1].get("force_include")
+        # YAML 행에 market 없어도 사이클 필터용으로 KR 을 채운다(KeyError 회귀 방지).
+        assert all(it.get("market") == "KR" for it in out)
     finally:
         gdp.trading_date = orig
 
@@ -134,6 +136,7 @@ def test_refresh_sorts_by_fluctuation(tmp_path, monkeypatch):
     loaded = load_gap_decline_pool(tmp_path / "gap.yaml")
     assert loaded["KR"][0]["pool"] == "gap_decline"
     assert loaded["KR"][0]["source"] == "gap_rebound"
+    assert loaded["KR"][0]["market"] == "KR"
     assert loaded["KR"][0]["pool_date"] == "2026-08-29"
     assert gap_pool_date(loaded, "KR") == "2026-08-29"
     assert loaded["_meta"]["pool_date"] == "2026-08-29"

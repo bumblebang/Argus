@@ -121,7 +121,10 @@ def items_for_gap_scan(wake_reason: str, *,
         if sym in seen:
             continue
         seen.add(sym)
-        chosen.append(it)
+        row = dict(it)
+        # YAML 은 KR: 버킷만 두고 row.market 을 안 쓰는 경우가 있다 — 사이클 필터용으로 채운다.
+        row.setdefault("market", market)
+        chosen.append(row)
 
     for sym in held or []:
         s = str(sym).strip()
@@ -131,6 +134,7 @@ def items_for_gap_scan(wake_reason: str, *,
         base = by_sym.get(s)
         if base is not None:
             row = dict(base)
+            row.setdefault("market", market)
             row["force_include"] = True
             chosen.append(row)
         else:
@@ -169,6 +173,7 @@ def merge_all_pools(swing: dict | None, day: dict | None,
             row = dict(it)
             row["pool"] = "gap_decline"
             row.setdefault("source", _GAP_SOURCE)
+            row.setdefault("market", m)
             bucket.append(row)
             have.add(sym)
     return out
@@ -235,6 +240,7 @@ def refresh_gap_decline_pool(fetch_top: Callable[..., list], cfg, market: str = 
         items.append({
             "symbol": sym,
             "name": r.get("name") or sym,
+            "market": market,
             "strategy": strategy,
             "layer": "gap_decline",
             "pool": "gap_decline",

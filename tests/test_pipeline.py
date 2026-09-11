@@ -400,6 +400,52 @@ def test_athena_done_us_market_only(tmp_path):
     assert seen == [["AAPL"]]
 
 
+def test_gap_rebound_wake_no_keyerror_without_item_market(tmp_path, monkeypatch):
+    """라이브 회귀(09-02~): gap_decline YAML 행에 market 키가 없어도 15:20 사이클이 죽지 않는다."""
+    store = Store(tmp_path / "t.db")
+    seen = []
+
+    def fake_items(wake_reason, *, universe_items, held=None, gap_data=None, now_fn=None):
+        # 실제 data/gap_decline_pool.yaml 형태 — 상위 KR 버킷만, row.market 없음
+        return [
+            {"symbol": "085620", "name": "미래에셋생명", "pool": "gap_decline",
+             "source": "gap_rebound", "fluctuation": -10.0},
+        ]
+
+    monkeypatch.setattr("src.gap_decline_pool.items_for_gap_scan", fake_items)
+    uni = lambda: {"KR": [{"symbol": "005930", "market": "KR"}],
+                   "US": [{"symbol": "AAPL", "market": "US"}]}
+    r = _runner_open_filter(tmp_path, store, _capture_symbols_factory(seen),
+                            universe_fn=uni, open_markets_fn=lambda: ["KR"])
+    # KeyError 없이 끝나야 함. market 미기재 행은 필터에서 탈락 → 후보 [].
+    r.run(wake={"reason": "gap_rebound_scan"})
+    assert seen == [[]]
+
+
+def test_gap_rebound_wake_keeps_stamped_market_rows(tmp_path, monkeypatch):
+    """items_for_gap_scan 이 market 을 채운 뒤에는 열린 KR 장에서 후보가 남는다."""
+    store = Store(tmp_path / "t.db")
+    seen = []
+
+    def fake_items(wake_reason, *, universe_items, held=None, gap_data=None, now_fn=None):
+        return [
+            {"symbol": "085620", "name": "미래에셋생명", "market": "KR",
+             "pool": "gap_decline", "source": "gap_rebound", "fluctuation": -10.0},
+        ]
+
+    monkeypatch.setattr("src.gap_decline_pool.items_for_gap_scan", fake_items)
+    # NXT/바닥 필터가 비우지 않도록 통과 스텁
+    monkeypatch.setattr("src.agents.cycle_runner.filter_items_for_gap_scan",
+                        lambda items, reason, nxt: items)
+    monkeypatch.setattr("src.agents.cycle_runner.filter_gap_rebound_candidates",
+                        lambda cands, held=None: cands)
+    uni = lambda: {"KR": [{"symbol": "005930", "market": "KR"}]}
+    r = _runner_open_filter(tmp_path, store, _capture_symbols_factory(seen),
+                            universe_fn=uni, open_markets_fn=lambda: ["KR"])
+    r.run(wake={"reason": "gap_rebound_scan"})
+    assert seen and "085620" in seen[0]
+
+
 # ── 유동성 필터: illiquid_fn 주면 시간외 체결정지 종목을 후보에서 제외(opt-in) ──
 def _runner_illiquid(tmp_path, store, factory, universe_fn, illiquid_fn):
     cfg = load_config()
