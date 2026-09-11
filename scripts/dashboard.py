@@ -28,6 +28,7 @@ sys.path.insert(0, str(ROOT))
 from src.market_hours import is_open, current_session, is_tradable  # noqa: E402
 from src.engine.singleton import _pid_alive  # noqa: E402
 from src.agents.value_trade import compute_sleeve  # noqa: E402
+from src.exit_reasons import exit_reason_ko, refine_exit_reason  # noqa: E402
 from src import paths as _paths  # noqa: E402
 
 # configured=레거시 문자열 유지 → G0 경로 계약 + dual-resolve(컷오버 후 state/)
@@ -903,7 +904,7 @@ def _store_trade_stats(closed_pos: list[dict] | None, *,
             "ts": c.get("closed_at"),
             "ret_pct": (pnl / cost * 100) if cost > 0 else None,
             "strategy": c.get("strategy"),
-            "exit_reason": c.get("exit_reason"),
+            "exit_reason": refine_exit_reason(c.get("exit_reason"), c.get("meta")),
             "name": c.get("name"),
         })
     # 표시는 오래된→최신(테이블에서 reversed 로 최신 우선이던 기존과 맞춤)
@@ -1702,25 +1703,17 @@ def _safe_json(s) -> dict:
         return {}
 
 
-_EXIT_REASON_KO = {
-    "stop_hit": "손절",
-    "target_hit": "목표가 도달",
-    "session_end": "종가 청산",
-    "time_stop": "시간손절",
-    "brain": "뇌 판단",
-    "partial_exit": "부분 청산",
-    "exit": "청산",
-}
+def _reason_label(exit_reason: str | None, reason: str | None, meta=None) -> str:
+    """exit_reason·broker reason 을 사람이 읽게. 둘 다 없으면 빈 문자열.
 
-
-def _reason_label(exit_reason: str | None, reason: str | None) -> str:
-    """exit_reason·broker reason 을 사람이 읽게. 둘 다 없으면 빈 문자열."""
+    meta(청산 포지션 행) 를 주면 라벨을 보정한다 — 트레일 활성 중 닫힌 stop_hit 은
+    손절이 아니라 트레일링 스톱(이익 확정)이다. 원문 대조는 보정 전 값으로 해야
+    "[exit] stop_hit" 이 군더더기로 붙지 않는다.
+    """
     er = (exit_reason or "").strip()
     raw = (reason or "").strip()
     if er:
-        label = _EXIT_REASON_KO.get(er, er)
-        if er.startswith("strategy:"):
-            label = f"전략신호 ({er.split(':', 1)[1]})"
+        label = exit_reason_ko(er, meta)
         # reason 이 exit 태그 이상이면 같이 붙임
         if raw and raw not in (er, f"[exit] {er}") and not raw.startswith(f"[exit] {er}"):
             extra = raw
@@ -1733,8 +1726,7 @@ def _reason_label(exit_reason: str | None, reason: str | None) -> str:
         return ""
     # "[exit] stop_hit" / "[strategy:rsi] …" / "brain" 등
     if raw.startswith("[exit] "):
-        kind = raw[7:].strip()
-        return _EXIT_REASON_KO.get(kind, kind)
+        return exit_reason_ko(raw[7:].strip(), meta)
     if raw.startswith("[strategy:"):
         return f"전략신호 — {raw}"
     if raw.startswith("[entry"):
@@ -1742,23 +1734,26 @@ def _reason_label(exit_reason: str | None, reason: str | None) -> str:
     return raw
 
 
-def _lookup_closed_exit(d: dict, symbol: str | None, ts: float) -> str:
-    """구 live_order 에 reason 없을 때 청산 원장 exit_reason 으로 보강."""
+def _lookup_closed_row(d: dict, symbol: str | None, ts: float) -> dict:
+    """체결 시각에 가장 가까운(10분 이내) 청산 원장 행. 없으면 빈 dict.
+
+    exit_reason 보강(구 live_order 에 reason 없음)과 meta 기반 라벨 보정
+    (trail_active) 둘 다 이 행이 필요하다.
+    """
     if not symbol or not ts:
-        return ""
-    best, best_dt = "", 1e18
+        return {}
+    best, best_dt = {}, 1e18
     for row in d.get("closed_pos") or []:
         if str(row.get("symbol") or "") != str(symbol):
             continue
-        closed = row.get("closed_at")
         try:
-            ct = float(closed)
+            ct = float(row.get("closed_at"))
         except (TypeError, ValueError):
             continue
         dt = abs(ct - float(ts))
         if dt < best_dt and dt <= 600:  # 10분 이내
             best_dt = dt
-            best = str(row.get("exit_reason") or "")
+            best = row
     return best
 
 
@@ -1831,10 +1826,13 @@ def _live_trade_why_thesis(e: dict, pl: dict, d: dict) -> tuple[str, str]:
 
     side = str(pl.get("side") or "").upper()
     exit_raw = str(pl.get("exit_reason") or "").strip()
-    why = _reason_label(exit_raw, pl.get("reason"))
-    if not why and side == "SELL":
-        exit_raw = _lookup_closed_exit(d, e.get("symbol"), e.get("ts"))
-        why = _reason_label(exit_raw, None)
+    # 매도는 청산 원장 행을 붙여 본다 — reason 보강 + trail_active 라벨 보정.
+    closed = _lookup_closed_row(d, e.get("symbol"), e.get("ts")) if side == "SELL" else {}
+    if not exit_raw and side == "SELL":
+        exit_raw = str(closed.get("exit_reason") or "").strip()
+        why = _reason_label(exit_raw, None, closed.get("meta"))
+    else:
+        why = _reason_label(exit_raw, pl.get("reason"), closed.get("meta"))
 
     thesis = ""
     want_thesis = (not why) or why in ("뇌 판단", "brain", "시간손절") or exit_raw == "time_stop"
@@ -3558,7 +3556,7 @@ def _perf_html(d: dict) -> str:
     # 거래별 실현손익 (store 청산 — 전략별 성과와 동일 원천)
     p.append("<div class=sec>실현손익 (거래별)</div><div class=panel>")
     if t and t["closed"]:
-        p.append("<table><tr><th>거래일자</th><th>시장</th><th>종목명</th>"
+        p.append("<table><tr><th>거래일자</th><th>시장</th><th>종목명</th><th>전략</th>"
                  "<th>매수가</th><th>매도가</th><th>실현손익</th><th>수익률</th></tr>")
         for c in reversed(t["closed"]):
             cls = "pos" if c["net"] > 0 else "neg"
@@ -3568,8 +3566,9 @@ def _perf_html(d: dict) -> str:
             sell_s = _fmt(c.get("exit_price"), dp) if c.get("exit_price") is not None else "–"
             val = f"${c['net']:,.2f}" if mk == "US" else f"{c['net']:,.0f}"
             rp = ("%+.2f%%" % c["ret_pct"]) if c.get("ret_pct") is not None else "–"
+            strat = c.get("strategy") or "–"
             p.append(f"<tr><td class=mono>{_fmt_ts(c.get('ts'))}</td><td>{escape(mk)}</td>"
-                     f"<td>{_pos_name(c, names)}</td>"
+                     f"<td>{_pos_name(c, names)}</td><td>{escape(str(strat))}</td>"
                      f"<td class=mono>{buy_s}</td><td class=mono>{sell_s}</td>"
                      f"<td class='mono {cls}'>{val}</td><td class='mono {cls}'>{rp}</td></tr>")
         p.append("</table>")

@@ -12,6 +12,7 @@ from __future__ import annotations
 import time
 from datetime import datetime, timezone
 
+from .exit_reasons import refine_exit_reason
 from .logging_setup import get_logger
 
 log = get_logger("attribution")
@@ -79,7 +80,10 @@ def recent_trades(store, limit: int = 10) -> list[dict]:
                 "symbol": row["symbol"], "market": row["market"],
                 "strategy": row["strategy"], "pnl": 0.0, "_cost": 0.0,
                 "opened_at": row["opened_at"], "closed_at": row["closed_at"],
-                "exit_reason": row["exit_reason"],
+                # 트레일링 청산은 stop_hit 이 아니다 — 뇌 track_record 가 이걸 읽는다.
+                "exit_reason": refine_exit_reason(
+                    row["exit_reason"],
+                    row["meta"] if "meta" in row.keys() else None),
             }
             order.append(gid)
         g = groups[gid]

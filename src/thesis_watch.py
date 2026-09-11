@@ -105,9 +105,12 @@ def audit_position(pos: dict, *, price: float | None, now: float,
             meta = {}
     if not isinstance(meta, dict):
         meta = {}
-    # 레거시: stop/dossier invalidation 만 있으면 price 스펙으로 승격
+    # 레거시: stop/dossier invalidation 만 있으면 price 스펙으로 승격.
+    # 단 트레일 활성 포지션의 stop 은 무효화가가 아니라 **이익 보호선**이다(래칫으로
+    # 진입가 위까지 올라간다) — 승격하면 수익 청산이 'thesis 사망'으로 찍혀 각성·회고가
+    # 오염된다. 그 되돌림은 trail_stop 트리거가 이미 집행한다.
     spec = parse_invalidation_spec(meta)
-    if "price" not in spec and pos.get("stop_price"):
+    if "price" not in spec and pos.get("stop_price") and not meta.get("trail_active"):
         try:
             spec["price"] = float(pos["stop_price"])
         except (TypeError, ValueError):

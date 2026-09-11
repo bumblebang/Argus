@@ -37,7 +37,8 @@ def test_perf_html_shows_samsung_loss_not_zero():
     d = {
         "trades": _store_trade_stats(
             [{"symbol": "005930", "market": "KR", "qty": 1, "avg_price": 267500,
-              "exit_price": 252000, "pnl": -15500, "closed_at": 1787615918.0}],
+              "exit_price": 252000, "pnl": -15500, "closed_at": 1787615918.0,
+              "strategy": "rsi"}],
             paper={"start_cash": {"KR": 1_000_000}}, fx=1400),
         "names": {"005930": "삼성전자"},
         "closed_pos": [],
@@ -50,9 +51,13 @@ def test_perf_html_shows_samsung_loss_not_zero():
     assert "-15,500" in html
     assert "-5.79%" in html
     assert "실현손익 (거래별)" in html
+    assert "<th>전략</th>" in html
+    assert ">rsi<" in html
     assert "<th>매수가</th>" in html and "<th>매도가</th>" in html
     assert "267,500" in html and "252,000" in html
+    i_name = html.index("<th>종목명</th>")
+    i_strat = html.index("<th>전략</th>")
     i_buy = html.index("<th>매수가</th>")
     i_sell = html.index("<th>매도가</th>")
     i_pnl = html.index("<th>실현손익</th>")
-    assert i_buy < i_sell < i_pnl
+    assert i_name < i_strat < i_buy < i_sell < i_pnl

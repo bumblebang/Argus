@@ -47,6 +47,7 @@ for _s in (sys.stdout, sys.stderr):
 
 from src.agents.llm import is_bridge_armed  # noqa: E402
 from src.engine import brain_mode as bm  # noqa: E402
+from src.exit_reasons import exit_reason_ko  # noqa: E402
 from src.market_status_crosscheck import crosscheck_reasons  # noqa: E402
 from src.session_policy import any_market_tradable, trading_sessions_from_raw  # noqa: E402
 from src.ops_playbook import actions_for, format_push_body  # noqa: E402
@@ -269,15 +270,6 @@ def _save_push_state(state: dict) -> None:
         pass
 
 
-_EXIT_REASON_KO = {
-    "stop_hit": "손절",
-    "target_hit": "목표가 도달",
-    "session_end": "종가 청산",
-    "time_stop": "시간손절",
-    "brain": "뇌 판단",
-    "partial_exit": "부분 청산",
-    "exit": "청산",
-}
 _SIDE_KO = {"BUY": "매수", "SELL": "매도"}
 
 
@@ -330,13 +322,14 @@ def _display_name(symbol: str, names: dict[str, str]) -> str:
 
 
 def _order_why(p: dict) -> str:
-    """exit_reason·broker reason → 사람이 읽는 근거 한 줄."""
+    """exit_reason·broker reason → 사람이 읽는 근거 한 줄.
+
+    라벨 정의는 src.exit_reasons 하나뿐 — 대시보드와 푸시가 갈라지지 않게.
+    """
     er = str(p.get("exit_reason") or "").strip()
     raw = str(p.get("reason") or "").strip()
     if er:
-        label = _EXIT_REASON_KO.get(er, er)
-        if er.startswith("strategy:"):
-            label = f"전략신호 ({er.split(':', 1)[1]})"
+        label = exit_reason_ko(er)
         if raw and raw not in (er, f"[exit] {er}") and not raw.startswith(f"[exit] {er}"):
             extra = raw[7:].strip() if raw.startswith("[exit] ") else raw
             if extra and extra != er:
@@ -345,8 +338,7 @@ def _order_why(p: dict) -> str:
     if not raw:
         return ""
     if raw.startswith("[exit] "):
-        kind = raw[7:].strip()
-        return _EXIT_REASON_KO.get(kind, kind)
+        return exit_reason_ko(raw[7:].strip())
     return raw
 
 

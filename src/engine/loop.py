@@ -409,7 +409,7 @@ class TickResult:
 
 
 # 코드(빠른손)가 즉시 처리하는 청산 트리거 — 뇌를 거치지 않는다.
-_EXIT_KINDS = {"stop_hit", "target_hit", "time_stop", "close_scan_exit"}
+_EXIT_KINDS = {"stop_hit", "trail_stop", "target_hit", "time_stop", "close_scan_exit"}
 
 
 class WatchLoop:
@@ -651,7 +651,7 @@ class WatchLoop:
         """트레일 대상 포지션의 상태기계 갱신(활성화 / 최고가 래칫). 손절가는 올리기만.
 
         빠른손 청산 트리거 평가 '전에' 호출된다 — 여기서 stop_price 를 끌어올려 두면 같은 틱의
-        position_triggers 가 그 트레일링 스톱으로 stop_hit 을 낸다(별도 청산 경로 불필요).
+        position_triggers 가 그 트레일링 스톱으로 trail_stop 을 낸다(별도 청산 경로 불필요).
           1) 미활성 + price>=target → 활성화: trail_active, trail_peak=price, 손절가 상향.
           2) 활성 + price>trail_peak → trail_peak 갱신, 손절가 래칫업(올라갔을 때만 영속).
         손절가는 항상 max(현재 stop, peak×(1-trail_pct)) — 절대 내리지 않는다(래칫 불변식).
@@ -852,14 +852,17 @@ class WatchLoop:
                         trigs.append(ti)
                     # 트레일링: 목표가 도달 시 전량 청산 대신 손절가를 끌어올려(래칫) 이익을
                     # 태운다. 청산 트리거 평가 '전에' stop_price 를 갱신해야 같은 틱의
-                    # position_triggers 가 그 트레일링 스톱으로 stop_hit 을 낸다. 트레일 대상은
+                    # position_triggers 가 그 트레일링 스톱으로 trail_stop 을 낸다. 트레일 대상은
                     # target_hit 을 억제(목표가는 청산가가 아니라 활성화 지점).
                     suppress_target = self._is_trail_target(positions[sym])
                     if suppress_target:
                         self._update_trailing(positions[sym], price, market, cur_regime)
+                    # 래칫된 stop 을 깨는 건 손절이 아니라 이익 확정 — kind=trail_stop.
+                    trail_on = bool(_meta_dict(positions[sym]).get("trail_active"))
                     trigs += T.position_triggers(positions[sym], price,
                                                  stop_buffer_pct=self.cfg.stop_buffer_pct,
-                                                 suppress_target=suppress_target)
+                                                 suppress_target=suppress_target,
+                                                 trailing_active=trail_on)
                     # 국면 반전 → 뇌 각성(thesis 재평가). 연속 반전 동안 1회만(인메모리 dedup).
                     # 반전이 해소되면(같은 국면 복귀/neutral) ack 을 비워 다음 반전이 재발화.
                     rt = T.regime_flip_trigger(sym, _entry_regime_of(positions[sym]),
