@@ -449,8 +449,11 @@ class CycleRunner:
                     keep = {str(m).upper() for m in (broker_live or trade or ["KR"])}
                 items = [i for i in items if str(i.get("market") or "").upper() in keep]
             else:
-                open_mkts = set(self.open_markets_fn())
-                items = [i for i in items if i["market"] in open_mkts]
+                # gap_decline_pool YAML 행은 상위 키(KR:)만 있고 item.market 이 없을 수 있다.
+                # i["market"] 강참조는 15:20/19:50 갭 각성마다 KeyError 로 사이클 전체를 죽였다.
+                open_mkts = {str(m).upper() for m in self.open_markets_fn()}
+                items = [i for i in items
+                         if str(i.get("market") or "").upper() in open_mkts]
         # 유동성 필터(opt-in): 시간외 세션에서 체결이 멈춘 종목은 신규진입 후보에서 제외.
         if self.illiquid_fn is not None:
             stale = self.illiquid_fn()
