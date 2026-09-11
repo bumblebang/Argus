@@ -9,7 +9,17 @@ from __future__ import annotations
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
+from .exit_reasons import refine_exit_reason
+
 _KST = ZoneInfo("Asia/Seoul")
+
+
+def _row_get(row, key):
+    """sqlite3.Row 는 없는 키에 IndexError, dict 는 KeyError — 둘 다 None 으로."""
+    try:
+        return row[key]
+    except (KeyError, IndexError):
+        return None
 
 
 def _pnl_pct(pnl, qty, avg_price) -> float | None:
@@ -44,7 +54,9 @@ def _summarize_group(rows: list) -> dict:
         "held_days": _held_days(row["opened_at"], row["closed_at"]),
         "pnl_pct": (round(total_pnl / total_cost * 100, 1)
                     if has_pnl and total_cost else None),
-        "exit": row["exit_reason"] or "unknown",
+        # 트레일링 청산을 stop_hit 으로 보여주면 뇌가 '직전에 손절당한 종목'으로 읽는다.
+        "exit": refine_exit_reason(row["exit_reason"],
+                                   _row_get(row, "meta")) or "unknown",
         "strategy": row["strategy"],
     }
     thesis = row["thesis"]

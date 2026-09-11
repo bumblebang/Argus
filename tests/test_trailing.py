@@ -1,9 +1,9 @@
 """트레일링 스톱 — 목표가 도달 시 전량 청산 대신 이익 태우기(국면 연동, LLM 0콜) 검증.
 
 설계: 목표가는 더는 청산가가 아니라 '트레일 활성화 지점'이다. 넘으면 손절가를 최고가 대비
-trail_pct 아래로 끌어올리고(래칫, 절대 안 내림), 되돌리면 기존 stop_hit → ExitExecutor
-경로가 그대로 전량 청산한다. test_engine_loop / test_engine_triggers 스타일(가짜 store·주입,
-네트워크 0)을 따른다.
+trail_pct 아래로 끌어올리고(래칫, 절대 안 내림), 되돌리면 ExitExecutor 경로가 그대로 전량
+청산한다 — 단 사유는 stop_hit(손실 차단)이 아니라 trail_stop(이익 확정)이다.
+test_engine_loop / test_engine_triggers 스타일(가짜 store·주입, 네트워크 0)을 따른다.
 """
 import json
 
@@ -88,6 +88,28 @@ def test_suppress_target_omits_target_hit_keeps_stop_hit():
     assert [t.kind for t in T.position_triggers(pos, 111)] == ["target_hit"]
 
 
+def test_trailing_active_renames_stop_kind_and_reason():
+    """래칫된 스톱을 깨면 손절이 아니라 trail_stop — 사유 문구도 '트레일링 스톱'."""
+    pos = {"symbol": "X", "stop_price": 114, "target_price": 110}
+    hit = T.position_triggers(pos, 113, suppress_target=True, trailing_active=True)
+    assert [t.kind for t in hit] == ["trail_stop"]
+    assert "트레일링 스톱" in hit[0].reason and hit[0].payload["trailing"] is True
+
+    near = T.position_triggers(pos, 114.5, suppress_target=True, trailing_active=True)
+    assert [t.kind for t in near] == ["stop_approach"]      # 임박 kind 는 그대로
+    assert "트레일링 스톱" in near[0].reason                 # 문구만 트레일 기준
+
+    # 트레일 미활성(진짜 손절)은 기존 kind·문구 유지
+    plain = T.position_triggers(pos, 113, suppress_target=True)
+    assert [t.kind for t in plain] == ["stop_hit"]
+    assert "손절가" in plain[0].reason and "trailing" not in plain[0].payload
+
+
+def test_trail_stop_is_code_exit_kind():
+    """trail_stop 이 빠른손 청산 집합에 있어야 뇌 각성이 아니라 즉시 청산된다."""
+    assert "trail_stop" in loopmod._EXIT_KINDS
+
+
 # ── 2) 목표가 도달 → 활성화(청산 아님) ──────────────────────────
 def test_target_cross_activates_trail_no_exit(tmp_path, monkeypatch):
     _only_kr_open(monkeypatch)
@@ -132,8 +154,8 @@ def test_peak_and_stop_ratchet_up_then_hold(tmp_path, monkeypatch):
     assert row["stop_price"] == pytest.approx(114.0)      # stop 안 내려감(래칫)
 
 
-# ── 4) 트레일링 스톱 아래로 되돌림 → stop_hit 전량 청산(기존 경로) ──
-def test_pullback_below_trailing_stop_exits_via_stop_hit(tmp_path, monkeypatch):
+# ── 4) 트레일링 스톱 아래로 되돌림 → trail_stop 전량 청산(같은 집행 경로) ──
+def test_pullback_below_trailing_stop_exits_via_trail_stop(tmp_path, monkeypatch):
     _only_kr_open(monkeypatch)
     store = Store(tmp_path / "t.db")
     store.open_position("X", "KR", qty=1, avg_price=100, strategy="s", thesis="t",
@@ -149,7 +171,7 @@ def test_pullback_below_trailing_stop_exits_via_stop_hit(tmp_path, monkeypatch):
 
     gw.prices["X"] = 113                               # 트레일링 스톱(114) 아래로 되돌림
     res = loop.run_once()
-    assert [c[2] for c in calls] == ["stop_hit"]       # 기존 stop_hit 경로가 집행
+    assert [c[2] for c in calls] == ["trail_stop"]     # 이익 확정 — 손절로 기록 안 함
     assert res.exits == ["X"]
 
 

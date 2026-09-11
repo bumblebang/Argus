@@ -15,6 +15,8 @@ import math
 from dataclasses import dataclass, field
 from typing import Sequence
 
+from ..exit_reasons import STOP_HIT, TRAIL_STOP
+
 URGENCY = {"info": 0, "watch": 1, "act": 2}
 
 
@@ -32,7 +34,7 @@ def _level(value) -> float | None:
 
 @dataclass
 class Trigger:
-    kind: str           # stop_hit / stop_approach / target_hit / vol_spike / limit_reached
+    kind: str           # stop_hit / trail_stop / stop_approach / target_hit / vol_spike / limit_reached
     symbol: str
     urgency: str        # info / watch / act
     reason: str
@@ -45,14 +47,18 @@ class Trigger:
 
 def position_triggers(pos: dict, price: float | None,
                       stop_buffer_pct: float = 0.005,
-                      *, suppress_target: bool = False) -> list[Trigger]:
+                      *, suppress_target: bool = False,
+                      trailing_active: bool = False) -> list[Trigger]:
     """보유 포지션 1건 + 현재가 -> 손절/익절 트리거.
 
     pos: {symbol, qty, avg_price, stop_price, target_price, ...}
     stop_buffer_pct: 손절가에 이만큼 근접하면 '임박(watch)'으로 본다(기본 0.5%).
     suppress_target: True 면 target_hit 을 아예 내지 않는다(트레일링 대상 — 목표가는
-      청산가가 아니라 트레일링 활성화 지점일 뿐이다. 되돌림 청산은 트레일링 스톱=stop_hit
-      이 집행). 이 함수는 순수 유지: 대상 판정·상태 영속은 호출측(루프)이 한다.
+      청산가가 아니라 트레일링 활성화 지점일 뿐이다. 되돌림 청산은 트레일링 스톱이
+      집행). 이 함수는 순수 유지: 대상 판정·상태 영속은 호출측(루프)이 한다.
+    trailing_active: 이 포지션의 stop_price 가 트레일 래칫으로 올라간 값이면 True.
+      그때 스톱 터치는 손실 차단이 아니라 **고점 대비 되돌림 이익 확정**이므로
+      kind 를 trail_stop 으로 낸다 — 그 값이 그대로 원장 exit_reason 이 된다.
     """
     if not pos or price is None:
         return []
@@ -67,14 +73,16 @@ def position_triggers(pos: dict, price: float | None,
                            f"손절가 비정상 {raw_stop!r} — 손절 트리거 불가",
                            {"stop_raw": repr(raw_stop), "price": price}))
     if stop:
+        stop_ko = "트레일링 스톱" if trailing_active else "손절가"
+        extra = {"trailing": True} if trailing_active else {}
         if price <= stop:
-            out.append(Trigger("stop_hit", sym, "act",
-                               f"가격 {price} <= 손절가 {stop}",
-                               {"price": price, "stop": stop}))
+            out.append(Trigger(TRAIL_STOP if trailing_active else STOP_HIT, sym, "act",
+                               f"가격 {price} <= {stop_ko} {stop}",
+                               {"price": price, "stop": stop, **extra}))
         elif price <= stop * (1 + stop_buffer_pct):
             out.append(Trigger("stop_approach", sym, "watch",
-                               f"가격 {price} 손절가 {stop} 근접",
-                               {"price": price, "stop": stop}))
+                               f"가격 {price} {stop_ko} {stop} 근접",
+                               {"price": price, "stop": stop, **extra}))
     if target and price >= target and not suppress_target:
         out.append(Trigger("target_hit", sym, "act",
                            f"가격 {price} >= 목표가 {target}",
