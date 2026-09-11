@@ -36,8 +36,14 @@ def log(msg: str) -> None:
             f.write(f"{time.strftime('%Y-%m-%d %H:%M:%S')} {msg}\n")
     except OSError:
         pass
-    if sys.stdout is not None:
+    if sys.stdout is None:
+        return
+    # 출력 실패가 재기동을 막으면 안 된다 — log() 는 restart() 바로 앞에서 불린다.
+    # (cp949 콘솔에 em dash 를 찍다 UnicodeEncodeError 로 죽은 사례: post-merge 훅)
+    try:
         print(msg)
+    except (UnicodeEncodeError, OSError, ValueError):
+        pass
 
 
 def _heartbeat_path() -> Path:
