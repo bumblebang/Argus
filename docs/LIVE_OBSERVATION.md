@@ -2,7 +2,7 @@
 
 > **목적:** 템플릿 고도화·배선 수정 **전에** 무엇을 얼마나 봤는지 기록한다.
 > **판단 금지선:** 전략×시장 **거래수 n&lt;5** → `small_sample`, 승률 해석·코드 변경 보류.
-> **갱신:** 2026-08-30
+> **갱신:** 2026-09-12 (09-11 LIVE 관찰 · #53 갭 KeyError)
 
 ---
 
@@ -107,9 +107,26 @@ LIVE: OK / 이슈( )
 오늘 체결: n=  차단: n=
 전략별 n (brain만): 
   rsi_reversion KR n= wr=
-  ...
+   ...
 3번 mismatch 이번 주: n=  예시 심볼:
 다음 액션: 관찰 유지 / 배선 검토 / ( )
+```
+
+### 기록
+
+**2026-09-11 (재확인 09-12)**
+
+```
+날짜: 2026-09-11 (~20:47 KST) / 재확인 2026-09-12
+LIVE: 주문·보유·hb OK / 이슈(갭 KeyError는 당일 15:20·19:50 — #53 전; 21:21 이후 수정본 로드)
+오늘 체결: n=2 (NVDA brain SELL, 001820 trail/stop_hit)  차단: n=0  주문에러: n=0
+보유: 8 (value KR5+US1, macd US2) · stop/target null 없음 · armed 0
+전략별 n (brain, store pnl): macd|KR 3, macd|US 2, ma_crossover|US 2, value|KR 2,
+  volatility_breakout|KR 1, rsi_reversion|KR 1 — 전부 small_sample
+3번 mismatch 14일: n=32 actionable (fit=volatility_breakout → assigned=macd; HOOD/010120/…)
+갭: 풀 갱신 OK · 뇌 사이클 KeyError(09-02~11) · 원장 갭 BUY 0건
+#53: 09-11 머지 · 09-11 21:21 `3e1413f…` · 09-12 20:54 main tip `2567fd8…` 재기동 — 실전 갭 슬롯 검증은 다음 거래일
+다음 액션: 월 15:20/19:50 갭 확인 → 관찰 유지 (승격 금지) → mismatch는 갭 정상화 후 재집계
 ```
 
 ---
@@ -117,5 +134,14 @@ LIVE: OK / 이슈( )
 ## 관련 문서
 
 - `docs/JUDGMENT_BACKLOG.md` — 실행·측정 J1~J13 adopt (2026-08-27)
-- `CONTEXT.md` — 운용 SSOT
+- `CONTEXT.md` — 운용 SSOT (**로컬 전용**, gitignore — 세션 맥락은 여기·아래 Next Up)
 - `.cursor/rules/quant-thin-sample.mdc` — quant 승격 금지 (Argus 템플릿과 별개)
+
+## Next Up (2026-09-12)
+
+1. 다음 거래일 15:20/19:50 — #53 갭 각성 KeyError 없음·사이클 진행 확인
+2. LIVE 관찰 유지 — 전략×시장 n&lt;5 승격 금지
+3. Athena P2 · 지정가/재대사 · `strategy_signal` 관찰
+4. 갭 정상화 후 `wiring_mismatch` 재집계 (지금은 코드 손대기 보류)
+5. 소픽스 후보: 예산 표시 999% · Toss count&gt;100 · gap wake sector_map · bot.db 비대화
+6. PM 백로그: 밸류 V3 · 풀·뇌 B안 · capital/cash · M4 …
