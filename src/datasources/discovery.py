@@ -109,6 +109,10 @@ def parse_toss_rankings_payload(payload: dict | None) -> list[dict]:
     return out
 
 
+# Toss GET /rankings count 상한(클라이언트·게이트웨이와 동일). pool>상한은 캐시 보충.
+_TOSS_RANKINGS_MAX = 100
+
+
 def top_kr_by_toss_trading_value(
     count: int = 100,
     pool: int | None = None,
@@ -124,13 +128,18 @@ def top_kr_by_toss_trading_value(
 
     fetch_rankings(rank_type, market_country, duration, count) → API payload.
     개장 전 realtime 이 비면 1d(전일) + ranking_cache 폴백.
+    Toss count 상한 100 — pool/count 가 더 크면 API엔 100만 요청하고 부족분은 캐시.
     """
     pool = int(pool or max(count, 100))
     count = int(count)
+    api_count = min(max(pool, count), _TOSS_RANKINGS_MAX)
+    if pool > _TOSS_RANKINGS_MAX or count > _TOSS_RANKINGS_MAX:
+        log.info("Toss KR 랭킹 API count=%d (요청 pool=%d count=%d 상한 %d)",
+                 api_count, pool, count, _TOSS_RANKINGS_MAX)
     rows: list[dict] = []
     try:
         live = parse_toss_rankings_payload(
-            fetch_rankings(rank_type, "KR", duration_live, pool))
+            fetch_rankings(rank_type, "KR", duration_live, api_count))
     except Exception as e:
         log.warning("Toss KR 라이브 랭킹 실패: %s", e)
         live = []
@@ -140,7 +149,7 @@ def top_kr_by_toss_trading_value(
     if not rows:
         try:
             fb = parse_toss_rankings_payload(
-                fetch_rankings(rank_type, "KR", duration_fallback, pool))
+                fetch_rankings(rank_type, "KR", duration_fallback, api_count))
         except Exception as e:
             log.warning("Toss KR %s 폴백 랭킹 실패: %s", duration_fallback, e)
             fb = []

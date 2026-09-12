@@ -3791,10 +3791,12 @@ def _ops_card_html(d: dict) -> str:
     budget_line = escape(str(budget.get("line") or "—"))
     sest = budget.get("session_est") or {}
     pct = sest.get("pct")
+    over_cap = bool(sest.get("over_cap"))
     if pct is not None:
         pct_col = "#3ddc84" if pct < 70 else ("#ffb454" if pct < 90 else "#ff5c63")
+        pct_txt = ">100%" if over_cap else f"{float(pct):.0f}%"
         pct_html = (f"<span class=mono style='color:{pct_col}'>"
-                    f"추정 {float(pct):.0f}%</span>"
+                    f"추정 {pct_txt}</span>"
                     f" <span class=muted>({escape(_fmt_tok_ops(sest.get('used')))}"
                     f" / {escape(_fmt_tok_ops(sest.get('cap')))}"
                     f", 최근 {int((sest.get('window_sec') or 18000) // 3600)}h)</span>")

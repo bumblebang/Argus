@@ -68,6 +68,21 @@ def test_estimate_session_pct_cap_override():
     assert est["pct"] == 25.0
     assert est["cap"] == 10_000
     assert "추정 25%" in est["label"]
+    assert est["over_cap"] is False
+
+
+def test_estimate_session_pct_over_cap_shows_gt_100_not_999():
+    """mode=ok 인데 추정 999%로 보이던 표시 — >100% + pct 클램프."""
+    est = estimate_session_pct(
+        now=1.0,
+        cfg={"agents": {"claude_budget": {"session_token_cap": 1_000}}},
+        usage_fn=lambda **kw: {"used": 50_000, "n_events": 20},
+    )
+    assert est["raw_pct"] == 5000.0
+    assert est["pct"] == 100.0
+    assert est["over_cap"] is True
+    assert "추정 >100%" in est["label"]
+    assert "999" not in est["label"]
 
 
 def test_parse_claude_line_and_tokens_since(tmp_path):

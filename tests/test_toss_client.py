@@ -271,3 +271,26 @@ def test_place_order_rejects_invalid_quantity_amount_combinations(kwargs):
     with pytest.raises(ValueError):
         client.place_order(
             account_seq=1, symbol="AAPL", side="BUY", **kwargs)
+
+
+def test_get_rankings_clamps_count_over_100(monkeypatch):
+    """API count>100 → 400 방지: 요청은 100으로 클램프."""
+    client = TossClient(_creds(), rate_limiter=None)
+    seen = {}
+
+    def fake_request(key, *, params=None, **_kw):
+        seen["key"] = key
+        seen["params"] = params
+        return {"rankings": []}
+
+    monkeypatch.setattr(client, "_request", fake_request)
+    out = client.get_rankings(
+        rank_type="MARKET_TRADING_AMOUNT",
+        market_country="KR",
+        duration="realtime",
+        count=250,
+    )
+    assert out == {"rankings": []}
+    assert seen["key"] == "rankings"
+    assert seen["params"]["count"] == TossClient.MAX_RANKINGS_COUNT
+    assert seen["params"]["type"] == "MARKET_TRADING_AMOUNT"
