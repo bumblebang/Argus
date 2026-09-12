@@ -2,7 +2,7 @@
 
 > **목적:** 템플릿 고도화·배선 수정 **전에** 무엇을 얼마나 봤는지 기록한다.
 > **판단 금지선:** 전략×시장 **거래수 n&lt;5** → `small_sample`, 승률 해석·코드 변경 보류.
-> **갱신:** 2026-08-30
+> **갱신:** 2026-09-12 (09-11 LIVE 관찰 · #53 갭 KeyError)
 
 ---
 
@@ -134,5 +134,14 @@ LIVE: 주문·보유·hb OK / 이슈(갭 KeyError는 당일 15:20·19:50 — #53
 ## 관련 문서
 
 - `docs/JUDGMENT_BACKLOG.md` — 실행·측정 J1~J13 adopt (2026-08-27)
-- `CONTEXT.md` — 운용 SSOT
+- `CONTEXT.md` — 운용 SSOT (**로컬 전용**, gitignore — 세션 맥락은 여기·아래 Next Up)
 - `.cursor/rules/quant-thin-sample.mdc` — quant 승격 금지 (Argus 템플릿과 별개)
+
+## Next Up (2026-09-12)
+
+1. 다음 거래일 15:20/19:50 — #53 갭 각성 KeyError 없음·사이클 진행 확인
+2. LIVE 관찰 유지 — 전략×시장 n&lt;5 승격 금지
+3. Athena P2 · 지정가/재대사 · `strategy_signal` 관찰
+4. 갭 정상화 후 `wiring_mismatch` 재집계 (지금은 코드 손대기 보류)
+5. 소픽스 후보: 예산 표시 999% · Toss count&gt;100 · gap wake sector_map · bot.db 비대화
+6. PM 백로그: 밸류 V3 · 풀·뇌 B안 · capital/cash · M4 …
