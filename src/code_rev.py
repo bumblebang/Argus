@@ -27,8 +27,10 @@ CODE_PATHS: tuple[str, ...] = ("src", "scripts", "main.py")
 def _git(base: Path, *args: str) -> str | None:
     """git 호출. 실패·타임아웃이면 None(호출부가 스킵 판단)."""
     try:
-        r = subprocess.run(["git", *args], cwd=base, capture_output=True,
-                           timeout=10, check=False)
+        kw: dict = {"cwd": base, "capture_output": True, "timeout": 10, "check": False}
+        if hasattr(subprocess, "CREATE_NO_WINDOW"):
+            kw["creationflags"] = subprocess.CREATE_NO_WINDOW
+        r = subprocess.run(["git", *args], **kw)
     except (OSError, subprocess.TimeoutExpired):
         return None
     if r.returncode != 0:

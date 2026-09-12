@@ -74,3 +74,39 @@ def test_watchdog_log_does_not_raise_on_bad_console(monkeypatch, tmp_path):
     monkeypatch.setattr(wd.sys, "stdout", _Cp949Stream())
     wd.log("[watchdog] poll unhealthy — alert-check 담당")   # 예외 없음
     assert "alert-check" in (tmp_path / "watchdog.log").read_text(encoding="utf-8")
+
+
+def test_restart_watch_hides_powershell_on_windows(monkeypatch):
+    """재기동 powershell 이 콘솔 창을 띄우지 않는다(CREATE_NO_WINDOW + Hidden)."""
+    if not sys.platform.startswith("win"):
+        return
+    seen = {}
+
+    def fake_run(argv, **kw):
+        seen["argv"] = list(argv)
+        seen["kw"] = kw
+        class R:
+            returncode = 0
+            stderr = ""
+            stdout = ""
+        return R()
+
+    monkeypatch.setattr(pmr.subprocess, "run", fake_run)
+    assert pmr.restart_watch() is True
+    assert seen["argv"][0] == "powershell"
+    assert "-WindowStyle" in seen["argv"] and "Hidden" in seen["argv"]
+    assert seen["kw"].get("creationflags") == pmr.subprocess.CREATE_NO_WINDOW
+
+
+def test_watchdog_restart_uses_no_window_on_windows(monkeypatch):
+    if not sys.platform.startswith("win"):
+        return
+    flags = []
+
+    def fake_run(argv, **kw):
+        flags.append(kw.get("creationflags"))
+
+    monkeypatch.setattr(wd.subprocess, "run", fake_run)
+    monkeypatch.setattr(wd.sys, "platform", "win32")
+    wd.restart()
+    assert flags and all(f == wd.subprocess.CREATE_NO_WINDOW for f in flags)
