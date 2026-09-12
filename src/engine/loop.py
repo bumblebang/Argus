@@ -154,6 +154,12 @@ class WatchConfig:
     athena_phase2: dict = field(default_factory=dict)
     # 신호 청산 정책(진입근거 바인딩·최소보유·확정봉). 최상위 strategy_exit 블록.
     strategy_exit: SignalExitConfig = field(default_factory=SignalExitConfig)
+    # snapshots 보존 초(기본 24h). 0=prune 비활성. 장기 백테는 Yahoo/캔들.
+    snapshots_retain_sec: float = 86400.0
+    # prune 시도 주기(초). 배치 삭제로 한 번에 못 지워도 다음 주기에 이어감.
+    snapshots_prune_interval_sec: float = 3600.0
+    # prune 1배치당 최대 행 수(틱 블로킹 상한).
+    snapshots_prune_batch: int = 200_000
 
     @staticmethod
     def _parse_exit_policy(raw: dict) -> "ExitPolicyConfig":
@@ -239,6 +245,12 @@ class WatchConfig:
             exit_policy=cls._parse_exit_policy(raw),
             athena_phase2=cls._parse_athena_phase2(raw),
             strategy_exit=parse_signal_exit(raw),
+            snapshots_retain_sec=float(
+                w.get("snapshots_retain_sec", d.snapshots_retain_sec)),
+            snapshots_prune_interval_sec=float(
+                w.get("snapshots_prune_interval_sec", d.snapshots_prune_interval_sec)),
+            snapshots_prune_batch=int(
+                w.get("snapshots_prune_batch", d.snapshots_prune_batch)),
         )
 
     @staticmethod
@@ -454,6 +466,7 @@ class WatchLoop:
         self._extra_fired: dict[tuple[str, str], str] = ews.load_fired(
             self.cfg.extra_wake_state_path or None)
         self._extra_grace_until = 0.0   # run_forever 기동 시 grace_until 설정
+        self._last_snapshots_prune = 0.0  # snapshots 만료 prune 타이머
         # 유동성 illiquid 집합(시간외 체결정지 종목). 이 루프 스레드가 매 틱 갱신하고
         # 뇌 워커(별도 스레드)가 illiquid_snapshot() 으로 읽는다 → 순회 중 크기 변경
         # (RuntimeError) 을 막으려면 양쪽 다 락을 거쳐야 한다.
@@ -465,6 +478,32 @@ class WatchLoop:
         self._ma20_fn = ma20_fn or ma20_reader(now_fn=now_fn)
         self._breadth_lock = threading.Lock()
         self._breadth: dict[str, dict] = {}
+
+    def _maybe_prune_snapshots(self) -> None:
+        """만료 snapshots 배치 삭제. retain_sec<=0 이면 끔."""
+        retain = float(self.cfg.snapshots_retain_sec or 0)
+        if retain <= 0:
+            return
+        interval = max(60.0, float(self.cfg.snapshots_prune_interval_sec or 3600.0))
+        now = self._now()
+        if self._last_snapshots_prune and (now - self._last_snapshots_prune) < interval:
+            return
+        self._last_snapshots_prune = now
+        try:
+            info = self.store.prune_snapshots(
+                older_than_sec=retain,
+                now=now,
+                batch_limit=int(self.cfg.snapshots_prune_batch or 200_000),
+            )
+        except Exception as e:
+            log.warning("snapshots prune 실패: %s", e)
+            self.store.log_event("error", None, {"where": "prune_snapshots", "err": str(e)})
+            return
+        deleted = int((info or {}).get("deleted") or 0)
+        if deleted:
+            log.info("snapshots prune: deleted=%s done=%s",
+                     deleted, (info or {}).get("done"))
+            self.store.log_event("snapshots_prune", None, info)
 
     def breadth_snapshot(self) -> dict:
         """열린 시장의 실시간 브레드스 스냅샷(스레드 안전).
@@ -1122,6 +1161,7 @@ class WatchLoop:
                 ticks += 1
                 self._ticks = ticks
                 self._beat(res, tick_error=tick_error)  # ok 포함 — polled=0 가짜 초록 방지
+                self._maybe_prune_snapshots()
                 interval = (self.cfg.watch_interval_sec if res.markets_open
                             else self.cfg.idle_interval_sec)
                 self._sleep(interval)

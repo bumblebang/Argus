@@ -377,6 +377,43 @@ def test_run_forever_respects_max_ticks_and_sleep(tmp_path, monkeypatch):
     assert {"loop_start", "loop_stop"} <= kinds
 
 
+def test_from_config_snapshots_retain_defaults():
+    bare = WatchConfig.from_config({"watch": {}})
+    assert bare.snapshots_retain_sec == 86400.0
+    assert bare.snapshots_prune_interval_sec == 3600.0
+    cfg = WatchConfig.from_config({"watch": {
+        "snapshots_retain_sec": 0,
+        "snapshots_prune_interval_sec": 120,
+        "snapshots_prune_batch": 1000,
+    }})
+    assert cfg.snapshots_retain_sec == 0.0
+    assert cfg.snapshots_prune_interval_sec == 120.0
+    assert cfg.snapshots_prune_batch == 1000
+
+
+def test_run_forever_prunes_old_snapshots(tmp_path, monkeypatch):
+    _all_closed(monkeypatch)
+    store = Store(tmp_path / "t.db")
+    now = 1_700_000_000.0
+    store.record_snapshots([{"symbol": "OLD", "price": 1.0}], ts=now - 200_000)
+    store.record_snapshots([{"symbol": "NEW", "price": 2.0}], ts=now - 10)
+    t = {"v": now}
+    loop = WatchLoop(
+        FakeGateway({}), store, lambda: {},
+        config=WatchConfig(
+            idle_interval_sec=1,
+            snapshots_retain_sec=86400,
+            snapshots_prune_interval_sec=60,
+            snapshots_prune_batch=1000,
+        ),
+        now_fn=lambda: t["v"],
+        sleep_fn=lambda _s: None,
+    )
+    loop.run_forever(max_ticks=1)
+    syms = [r[0] for r in store.conn.execute("SELECT symbol FROM snapshots").fetchall()]
+    assert syms == ["NEW"]
+
+
 # ── 종가 강제청산 (데이트레 오버나잇 금지) ─────────────────────────
 def _near_end(monkeypatch, value=True):
     monkeypatch.setattr(loopmod, "near_session_end",

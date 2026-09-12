@@ -1,4 +1,4 @@
-"""engine.store — SQLite 저장소 CRUD/상태기계 검증."""
+"""engine.store ? SQLite ??? CRUD/???? ??."""
 from src.engine.store import Store
 
 
@@ -22,7 +22,7 @@ def test_record_snapshots_batch(tmp_path):
 def test_position_lifecycle(tmp_path):
     s = Store(tmp_path / "t.db")
     pid = s.open_position("005930", "KR", qty=10, avg_price=70000,
-                          strategy="swing", thesis="반도체 반등", stop_price=68000)
+                          strategy="swing", thesis="??? ??", stop_price=68000)
     opens = s.get_open_positions()
     assert len(opens) == 1
     assert opens[0]["symbol"] == "005930"
@@ -42,19 +42,19 @@ def test_record_decision(tmp_path):
 
 def test_armed_lifecycle(tmp_path):
     s = Store(tmp_path / "t.db")
-    aid = s.arm_candidate("005930", "KR", strategy="rsi_reversion", thesis="데이트레",
+    aid = s.arm_candidate("005930", "KR", strategy="rsi_reversion", thesis="????",
                           meta={"horizon": "day", "params": {"period": 14}})
     assert aid > 0
     assert [r["symbol"] for r in s.get_armed()] == ["005930"]
-    assert s.get_open_positions() == []               # armed 는 보유가 아니므로 제외
-    # 진입 체결 -> open 승격, 진입가 기준 손절/목표 확정
+    assert s.get_open_positions() == []               # armed ? ??? ???? ??
+    # ?? ?? -> open ??, ??? ?? ??/?? ??
     s.promote_armed(aid, qty=5, avg_price=70000, stop_price=68600, target_price=72100)
     assert s.get_armed() == []
     opens = s.get_open_positions()
     assert len(opens) == 1
     assert opens[0]["state"] == "open" and opens[0]["qty"] == 5
     assert opens[0]["stop_price"] == 68600 and opens[0]["target_price"] == 72100
-    assert opens[0]["strategy"] == "rsi_reversion"    # 배정 전략 유지
+    assert opens[0]["strategy"] == "rsi_reversion"    # ?? ?? ??
 
 def test_closed_position_fidelity_separates_armed_cancel(tmp_path):
     s = Store(tmp_path / "t.db")
@@ -62,9 +62,50 @@ def test_closed_position_fidelity_separates_armed_cancel(tmp_path):
                           meta={"horizon": "day"})
     s.close_position(aid, reason="disarm:session_end")
     pid = s.open_position("000660", "KR", qty=10, avg_price=100.0)
-    s.close_position(pid, reason="broker_sync")  # exit_price ���� �� ��ü�� null
+    s.close_position(pid, reason="broker_sync")  # exit_price ???? ?? ??�?? null
     fid = s.closed_position_fidelity()
     assert fid["armed_cancelled"] == 1
     assert fid["filled_null_pnl"] == 1
     assert fid["by_reason"].get("disarm:session_end") == 1
     assert s.count_closed_null_pnl() == 1
+
+
+def test_prune_snapshots_keeps_recent(tmp_path):
+    s = Store(tmp_path / "t.db")
+    now = 1_700_000_000.0
+    s.record_snapshots([{"symbol": "OLD", "price": 1.0}], ts=now - 90000)
+    s.record_snapshots([{"symbol": "NEW", "price": 2.0}], ts=now - 60)
+    info = s.prune_snapshots(older_than_sec=86400, now=now, batch_limit=100)
+    assert info["done"] is True
+    assert info["deleted"] == 1
+    rows = s.conn.execute(
+        "SELECT symbol FROM snapshots ORDER BY symbol").fetchall()
+    assert [r[0] for r in rows] == ["NEW"]
+
+
+def test_prune_snapshots_batches_until_done(tmp_path):
+    s = Store(tmp_path / "t.db")
+    now = 1_700_000_000.0
+    for i in range(5):
+        s.record_snapshots(
+            [{"symbol": f"S{i}", "price": float(i)}], ts=now - 100_000)
+    s.record_snapshots([{"symbol": "KEEP", "price": 9.0}], ts=now - 10)
+    first = s.prune_snapshots(
+        older_than_sec=86400, now=now, batch_limit=2, max_batches=1)
+    assert first["deleted"] == 2
+    assert first["done"] is False
+    while True:
+        info = s.prune_snapshots(
+            older_than_sec=86400, now=now, batch_limit=2, max_batches=1)
+        if info["done"]:
+            break
+    left = s.conn.execute("SELECT symbol FROM snapshots").fetchall()
+    assert [r[0] for r in left] == ["KEEP"]
+
+
+def test_prune_snapshots_readonly_noop(tmp_path):
+    path = tmp_path / "t.db"
+    Store(path).record_snapshots([{"symbol": "A", "price": 1.0}], ts=1.0)
+    ro = Store(path, readonly=True)
+    info = ro.prune_snapshots(older_than_sec=1, now=10_000)
+    assert info["deleted"] == 0 and info["done"] is True
