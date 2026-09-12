@@ -340,17 +340,26 @@ class TossClient:
     def get_stock_warnings(self, symbol: str) -> list[dict]:
         return self._request("warnings", path_params={"symbol": symbol}) or []
 
+    # OpenAPI: count 상한 100. 초과 시 400 — 발굴 discover_pool(250 등)이 그대로 오면 실패.
+    MAX_RANKINGS_COUNT = 100
+
     def get_rankings(self, *, rank_type: str, market_country: str, duration: str,
                      count: int = 100, exclude_investment_caution: bool = True) -> dict:
         """GET /api/v1/rankings — 시장 거래대금/거래량·급등락·토스 체결 랭킹.
 
         데이트레 풀은 type=MARKET_TRADING_AMOUNT (주 수가 아닌 대금). 반환:
         {rankedAt, rankings:[{rank,symbol,tradingAmount,tradingVolume,price,...}]}.
+        count 는 API 상한(100)으로 클램프.
         """
+        want = max(1, int(count))
+        capped = min(want, self.MAX_RANKINGS_COUNT)
+        if want > self.MAX_RANKINGS_COUNT:
+            log.warning("rankings count=%d > %d — API 상한으로 클램프",
+                        want, self.MAX_RANKINGS_COUNT)
         return self._request("rankings", params={
             "type": rank_type,
             "marketCountry": market_country,
             "duration": duration,
-            "count": int(count),
+            "count": capped,
             "excludeInvestmentCaution": bool(exclude_investment_caution),
         }) or {}

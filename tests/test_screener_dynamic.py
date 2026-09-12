@@ -225,6 +225,25 @@ def test_top_kr_by_toss_trading_value_live_and_fallback():
     assert [r["symbol"] for r in out] == ["005930", "000660"]
 
 
+def test_top_kr_by_toss_clamps_api_count_when_pool_over_100():
+    """discover_pool=250 등이 API에 count=250으로 가면 400 — 상한 100만 요청."""
+    calls = []
+
+    def fetch(rank_type, market, duration, count):
+        calls.append(count)
+        return {"rankings": [
+            {"rank": i, "symbol": f"{i:06d}", "name": f"S{i}", "price": 10000,
+             "tradingAmount": str(1_000_000_000 * (200 - i))}
+            for i in range(1, 6)
+        ]}
+
+    out = top_kr_by_toss_trading_value(
+        count=250, pool=250, min_price=0, fetch_rankings=fetch,
+        allow_cache_fallback=False)
+    assert calls == [100]
+    assert len(out) == 5
+
+
 def test_fetch_us_actives_parses(monkeypatch):
     payload = {"finance": {"result": [{"quotes": [
         {"symbol": "AAPL", "shortName": "Apple Inc.", "regularMarketPrice": 283.78,

@@ -128,20 +128,34 @@ def estimate_session_pct(*, now: float | None = None,
             "window_sec": window,
         }
     used = int(raw.get("used") or 0)
-    pct = min(999.0, round(100.0 * used / cap, 1)) if cap else None
+    # 로컬 JSONL 합은 구독 잔량이 아님. cap(커뮤니티 추정) 초과해도 mode=ok 가능.
+    # 예전 min(999) 표시는 "버그처럼" 보여서, 게이지는 100% 클램프·라벨은 >100%.
+    raw_pct = round(100.0 * used / cap, 1) if cap else None
+    over_cap = bool(raw_pct is not None and raw_pct > 100.0)
+    pct = None if raw_pct is None else min(100.0, raw_pct)
+    if pct is None:
+        label = f"추정 — ({_fmt_tok(used)} / {_fmt_tok(cap)})"
+    elif over_cap:
+        label = (
+            f"추정 >100% ({_fmt_tok(used)} / {_fmt_tok(cap)}, "
+            f"최근 {int(window // 3600)}h · 근사 cap 초과)"
+        )
+    else:
+        label = (
+            f"추정 {pct:.0f}% ({_fmt_tok(used)} / {_fmt_tok(cap)}, "
+            f"최근 {int(window // 3600)}h)"
+        )
     return {
         "ok": True,
         "used": used,
         "cap": cap,
         "pct": pct,
+        "raw_pct": raw_pct,
+        "over_cap": over_cap,
         "window_sec": window,
         "n_events": int(raw.get("n_events") or 0),
         "approx": True,
-        "label": (
-            f"추정 {pct:.0f}% ({_fmt_tok(used)} / {_fmt_tok(cap)}, "
-            f"최근 {int(window // 3600)}h)"
-            if pct is not None else f"추정 — ({_fmt_tok(used)} / {_fmt_tok(cap)})"
-        ),
+        "label": label,
     }
 
 
