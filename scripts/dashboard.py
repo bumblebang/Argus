@@ -1601,8 +1601,9 @@ def _gather() -> dict:
     data["closed_pos"] = [dict(r) for r in cur.execute(
         "select symbol,market,strategy,qty,avg_price,exit_price,pnl,exit_reason,meta,closed_at "
         "from positions where state='closed' and pnl is not null order by closed_at desc")]
-    sr = cur.execute("select count(*) n, max(ts) m from snapshots").fetchone()
-    data["snap_count"], data["snap_last"] = sr["n"], sr["m"]
+    # snapshots 는 틱마다 쌓여 억 단위가 될 수 있다. count(*)/전표 max 스캔은
+    # 대시보드 요청을 수십 초 동안 멈추게 해서(체감=죽음) 여기서 돌리지 않는다.
+    # snap_count/snap_last 는 렌더에서도 미사용.
     try:
         data["paper"] = json.loads(PAPER.read_text(encoding="utf-8"))
     except (OSError, ValueError):
