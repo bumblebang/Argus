@@ -92,8 +92,11 @@ def restart() -> None:
     if not cmds:
         log(f"[watchdog] restart not wired for {sys.platform} — start watch.py yourself")
         return
+    kw: dict = {"capture_output": True}
+    if sys.platform.startswith("win") and hasattr(subprocess, "CREATE_NO_WINDOW"):
+        kw["creationflags"] = subprocess.CREATE_NO_WINDOW
     for argv in cmds:
-        subprocess.run(argv, capture_output=True)
+        subprocess.run(argv, **kw)
 
 
 REV_STATE = ROOT / "data" / "state" / "watchdog_rev.json"

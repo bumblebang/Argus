@@ -66,12 +66,20 @@ def paths_changed(prev_head: str) -> bool:
 def restart_watch() -> bool:
     if sys.platform.startswith("win"):
         ps1 = ROOT / "scripts" / "restart_watch.ps1"
+        # Hidden + CREATE_NO_WINDOW: git 훅/IDE에서 돌릴 때 검은 콘솔이 깜빡이지 않게.
+        # (claude CLI 무창과 별개 — 여기는 재기동용 powershell)
+        kw: dict = {
+            "cwd": ROOT,
+            "capture_output": True,
+            "text": True,
+            "check": False,
+        }
+        if hasattr(subprocess, "CREATE_NO_WINDOW"):
+            kw["creationflags"] = subprocess.CREATE_NO_WINDOW
         r = subprocess.run(
-            ["powershell", "-ExecutionPolicy", "Bypass", "-File", str(ps1), "-Quiet"],
-            cwd=ROOT,
-            capture_output=True,
-            text=True,
-            check=False,
+            ["powershell", "-NoProfile", "-WindowStyle", "Hidden",
+             "-ExecutionPolicy", "Bypass", "-File", str(ps1), "-Quiet"],
+            **kw,
         )
         if r.returncode != 0:
             say(f"post-merge: restart_watch 실패 — {r.stderr or r.stdout}", err=True)
