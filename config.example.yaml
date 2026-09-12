@@ -104,6 +104,10 @@ watch:
   market_state_refresh: true
   market_state_refresh_sec: 300
   account_snapshot_sec: 300
+  # snapshots(틱 가격) 보존 — 대시보드·단기 폴백만. 장기 백테는 Yahoo/캔들.
+  snapshots_retain_sec: 86400          # 24h. 0=prune 끔
+  snapshots_prune_interval_sec: 3600   # 1시간마다 배치 삭제 시도
+  snapshots_prune_batch: 200000        # 1회 호출당 배치 크기(×최대 5)
 
 alerts:
   ntfy_topic: ""             # .env NTFY_TOPIC 이 우선

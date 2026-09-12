@@ -6,7 +6,8 @@
 테이블:
   positions — 보유 포지션 + 상태기계(state) + thesis + 목표/손절가. 24h 트래킹의 심장.
   events    — 모든 트리거/판단/주문/검증 이벤트(타임스탬프). 사후 추적·디버깅.
-  snapshots — 가격·지표·시황 시계열. 학습·백테스트 재료.
+  snapshots — 가격 틱 관측(대시보드·섀도/Athena 폴백용 단기 캐시).
+              기본 보존 24h — 장기 백테는 Yahoo/캔들. prune_snapshots 로 만료분 삭제.
   decisions — LLM 판단 저널(action/conviction/thesis/verdict).
 
 ts 는 전부 unix epoch(REAL) — 정렬·범위쿼리가 쉽다.
@@ -65,6 +66,7 @@ CREATE TABLE IF NOT EXISTS snapshots (
     payload TEXT                            -- 지표/호가/시황 등 (JSON)
 );
 CREATE INDEX IF NOT EXISTS idx_snapshots_symbol_ts ON snapshots(symbol, ts);
+CREATE INDEX IF NOT EXISTS idx_snapshots_ts ON snapshots(ts);
 
 CREATE TABLE IF NOT EXISTS dossiers (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -209,6 +211,9 @@ class Store:
         self.conn.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_positions_one_open_per_symbol "
             "ON positions(symbol) WHERE state='open'")
+        # prune_snapshots(WHERE ts < ?) 용 — (symbol, ts) 복합만으로는 ts 범위 삭제가 비싸다.
+        self.conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_snapshots_ts ON snapshots(ts)")
 
     def _dedupe_open_positions(self) -> None:
         """symbol 당 open 2행 이상이면 최신 id만 남기고 나머지는 closed 처리."""
@@ -361,6 +366,48 @@ class Store:
                 "INSERT INTO snapshots(ts, symbol, price, payload) VALUES(?,?,?,?)", params)
             self.conn.commit()
         return len(params)
+
+    def prune_snapshots(self, *, older_than_sec: float = 86400.0,
+                        now: float | None = None,
+                        batch_limit: int = 200_000,
+                        max_batches: int = 5) -> dict:
+        """ts < now - older_than_sec 인 snapshots 를 배치 삭제.
+
+        기본 24h. 억 단위면 한 번에 지우지 않고 batch_limit 행씩 끊는다
+        (watch 틱을 오래 막지 않기 위해). 반환: {cutoff, deleted, batches, done}.
+        done=False 면 호출측이 다음 주기에 이어서 지우면 된다.
+        VACUUM 은 하지 않는다(장중 금지 — 별도 스크립트).
+        """
+        if self.readonly:
+            return {"cutoff": None, "deleted": 0, "batches": 0, "done": True}
+        retain = max(60.0, float(older_than_sec or 86400.0))
+        cutoff = float(now if now is not None else time.time()) - retain
+        limit = max(1, int(batch_limit or 200_000))
+        deleted = 0
+        batches = 0
+        # 한 호출에서 너무 오래 잡지 않게 최대 배치 수(watch 기본 ≈100만 행/회).
+        cap = max(1, int(max_batches or 5))
+        with self._lock:
+            while batches < cap:
+                cur = self.conn.execute(
+                    "DELETE FROM snapshots WHERE rowid IN ("
+                    "  SELECT rowid FROM snapshots WHERE ts < ? LIMIT ?"
+                    ")",
+                    (cutoff, limit),
+                )
+                n = int(cur.rowcount or 0)
+                self.conn.commit()
+                batches += 1
+                deleted += n
+                if n < limit:
+                    return {
+                        "cutoff": cutoff, "deleted": deleted,
+                        "batches": batches, "done": True,
+                    }
+        return {
+            "cutoff": cutoff, "deleted": deleted,
+            "batches": batches, "done": False,
+        }
 
     def nearest_snapshot_price(self, symbol: str, ts: float, *,
                                window_sec: float = 3600) -> float | None:
