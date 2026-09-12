@@ -107,9 +107,26 @@ LIVE: OK / 이슈( )
 오늘 체결: n=  차단: n=
 전략별 n (brain만): 
   rsi_reversion KR n= wr=
-  ...
+   ...
 3번 mismatch 이번 주: n=  예시 심볼:
 다음 액션: 관찰 유지 / 배선 검토 / ( )
+```
+
+### 기록
+
+**2026-09-11 (재확인 09-12)**
+
+```
+날짜: 2026-09-11 (~20:47 KST) / 재확인 2026-09-12
+LIVE: 주문·보유·hb OK / 이슈(갭 KeyError는 당일 15:20·19:50 — #53 전; 21:21 이후 수정본 로드)
+오늘 체결: n=2 (NVDA brain SELL, 001820 trail/stop_hit)  차단: n=0  주문에러: n=0
+보유: 8 (value KR5+US1, macd US2) · stop/target null 없음 · armed 0
+전략별 n (brain, store pnl): macd|KR 3, macd|US 2, ma_crossover|US 2, value|KR 2,
+  volatility_breakout|KR 1, rsi_reversion|KR 1 — 전부 small_sample
+3번 mismatch 14일: n=32 actionable (fit=volatility_breakout → assigned=macd; HOOD/010120/…)
+갭: 풀 갱신 OK · 뇌 사이클 KeyError(09-02~11) · 원장 갭 BUY 0건
+#53: 09-11 머지 · 09-11 21:21 `3e1413f…` · 09-12 20:54 main tip `2567fd8…` 재기동 — 실전 갭 슬롯 검증은 다음 거래일
+다음 액션: 월 15:20/19:50 갭 확인 → 관찰 유지 (승격 금지) → mismatch는 갭 정상화 후 재집계
 ```
 
 ---
