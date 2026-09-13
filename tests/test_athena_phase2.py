@@ -7,9 +7,10 @@ import pandas as pd
 
 from src.agents.athena import run_batch, select_symbols
 from src.agents.athena_phase2 import (
-    enqueue_athena, merge_level_refresh, prices_from_market_state,
-    resolve_symbol_prices, scan_athena_triggers, should_level_only,
-    sort_covered_by_zone, zone_loc, dossier_ref_price,
+    _athena_queued, enqueue_athena, merge_level_refresh,
+    prices_from_market_state, resolve_symbol_prices, scan_athena_triggers,
+    should_level_only, sort_covered_by_zone, was_recently_queued, zone_loc,
+    dossier_ref_price,
 )
 from src.agents.llm import MockLLM
 from src.agents.schemas import DossierLevelOutput, DossierOutput
@@ -123,6 +124,50 @@ def test_scan_athena_triggers_gap_and_invalidation(tmp_path):
     n3 = scan_athena_triggers(store, p2, {"NEAR": 100.5},
                               ma20={"NEAR": {"close": 100.0}})
     assert n3 == 1
+
+
+def test_queue_cooldown_survives_busy_queue(tmp_path):
+    """타 종목 이벤트가 창을 채워도 대상 종목 쿨다운은 동작해야 한다.
+
+    회귀: `was_recently_queued` 가 kind 전체에 행 limit(30)을 걸어, 6h 창에 큐
+    이벤트가 30건을 넘으면 대상 종목이 밀려 나가 쿨다운이 항상 False 가 됐다
+    → 틱마다 재등록 → 2026-09-11 하루 20.7만건.
+    """
+    store = Store(tmp_path / "t.db")
+    enqueue_athena(store, "TARGET", "KR", "gap", gap_pct=5.0)
+    for i in range(500):
+        enqueue_athena(store, f"NOISE{i}", "KR", "gap", gap_pct=5.0)
+
+    assert was_recently_queued(store, "TARGET", reason="gap", hours=6)
+    assert not was_recently_queued(store, "TARGET", reason="invalidation_near",
+                                   hours=6)
+    assert not was_recently_queued(store, "ABSENT", reason="gap", hours=6)
+
+    # 같은 조건으로 재스캔해도 쿨다운 안에서는 재등록되지 않는다.
+    p2 = {"enabled": True, "gap_pct": 4.0, "invalidation_near_pct": 0.02,
+          "queue_cooldown_hours": 6}
+    assert scan_athena_triggers(store, p2, {"TARGET": 105.0},
+                                ma20={"TARGET": {"close": 100.0}}) == 0
+
+
+def test_athena_queued_sees_every_symbol_in_window(tmp_path):
+    """큐 우선순위는 창 안에 등장한 종목 전량을 봐야 한다(행 limit 아님).
+
+    회귀: 행 기준 limit=80 이라 스팸 일자엔 "최근 80건"이 직전 수십 초만 덮어
+    24h 내 트리거 종목 대부분이 누락됐다(7일간 183종 중 69종 미리서치).
+    """
+    store = Store(tmp_path / "t.db")
+    enqueue_athena(store, "000001", "KR", "gap", gap_pct=5.0)
+    for i in range(300):
+        enqueue_athena(store, "999999", "KR", "gap", gap_pct=5.0, seq=i)
+    enqueue_athena(store, "NVDA", "US", "gap", gap_pct=5.0)
+
+    kr = _athena_queued(store, "KR")
+    assert "000001" in kr
+    assert "999999" in kr
+    assert "NVDA" not in kr
+    assert len(kr) == len(set(kr))            # 종목별 1회
+    assert _athena_queued(store, "US") == ["NVDA"]
 
 
 def test_should_level_only(tmp_path):

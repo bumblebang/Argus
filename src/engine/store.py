@@ -57,6 +57,9 @@ CREATE TABLE IF NOT EXISTS events (
 );
 CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts);
 CREATE INDEX IF NOT EXISTS idx_events_kind ON events(kind, ts);
+-- 종목별 최근 이벤트(쿨다운 판정·큐 집계) 용. (kind, ts) 만으로는 창 안의 전 행을
+-- 훑어야 해서 이벤트가 많은 kind 에서 비싸다.
+CREATE INDEX IF NOT EXISTS idx_events_kind_symbol ON events(kind, symbol, ts);
 
 CREATE TABLE IF NOT EXISTS snapshots (
     id      INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -781,12 +784,37 @@ class Store:
                 out.append(sym)
         return out
 
-    def recent_events(self, kind: str, since: float,
-                      limit: int = 20) -> list[sqlite3.Row]:
-        """특정 종류의 최근 이벤트(최신순) — 예: 뇌 컨텍스트에 실을 최근 공시."""
+    def recent_events(self, kind: str, since: float, limit: int = 20, *,
+                      symbol: str | None = None) -> list[sqlite3.Row]:
+        """특정 종류의 최근 이벤트(최신순) — 예: 뇌 컨텍스트에 실을 최근 공시.
+
+        symbol 을 주면 그 종목으로 먼저 좁힌다. 종목별 쿨다운 판정에서 limit 을
+        kind 전체에 걸면 이벤트가 많은 kind 는 대상 종목이 창에서 밀려 나가
+        쿨다운이 무력화된다(이벤트가 늘수록 더 나빠지는 양성 피드백).
+        """
+        sql = "SELECT * FROM events WHERE kind=? AND ts>=?"
+        params: list[Any] = [kind, since]
+        if symbol is not None:
+            sql += " AND symbol=?"
+            params.append(symbol)
+        sql += " ORDER BY ts DESC LIMIT ?"
+        params.append(limit)
+        with self._lock:
+            return self.conn.execute(sql, params).fetchall()
+
+    def recent_events_by_symbol(self, kind: str, since: float,
+                                limit: int = 200) -> list[sqlite3.Row]:
+        """창 안에서 **종목별 최신 1건**(최신순). 종목 수 기준 limit.
+
+        `recent_events(limit=N)` 은 행 기준이라 한 종목이 창을 가득 채우면 나머지
+        종목이 보이지 않는다. 큐 집계처럼 "창 안에 등장한 종목 전량"이 필요한
+        곳에서 쓴다. MAX(ts) 집계 쿼리의 bare column 은 그 최대 행의 값이다(SQLite).
+        """
         with self._lock:
             return self.conn.execute(
-                "SELECT * FROM events WHERE kind=? AND ts>=? ORDER BY ts DESC LIMIT ?",
+                "SELECT symbol, payload, MAX(ts) AS ts FROM events"
+                " WHERE kind=? AND ts>=? AND symbol IS NOT NULL"
+                " GROUP BY symbol ORDER BY ts DESC LIMIT ?",
                 (kind, since, limit)).fetchall()
 
     def decision_counts(self, since: float) -> list[sqlite3.Row]:
