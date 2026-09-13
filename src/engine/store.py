@@ -19,7 +19,7 @@ import sqlite3
 import threading
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 from ..logging_setup import get_logger
 from .. import paths as _paths
@@ -411,6 +411,51 @@ class Store:
             "cutoff": cutoff, "deleted": deleted,
             "batches": batches, "done": False,
         }
+
+    #: 고빈도 관측 이벤트 — 보존기간 지나면 지워도 원장·귀속에 영향 없음.
+    PRUNABLE_EVENT_KINDS = ("athena_queue", "athena_scan")
+
+    def prune_events(self, *, kinds: Iterable[str] | None = None,
+                     older_than_sec: float = 7 * 86400.0,
+                     now: float | None = None,
+                     batch_limit: int = 50_000,
+                     max_batches: int = 5) -> dict:
+        """지정 kind 의 만료 events 를 배치 삭제. 기본 7일·관측용 kind 만.
+
+        원장·귀속이 읽는 kind(decision·fill·live_order…)는 기본값에 없다.
+        prune_snapshots 와 같은 계약: {cutoff, deleted, batches, done, kinds}.
+        done=False 면 호출측이 다음 주기에 이어서 지운다. VACUUM 은 하지 않는다.
+        """
+        ks = [str(k) for k in (kinds if kinds is not None
+                               else self.PRUNABLE_EVENT_KINDS) if k]
+        if self.readonly or not ks:
+            return {"cutoff": None, "deleted": 0, "batches": 0, "done": True,
+                    "kinds": ks}
+        retain = max(60.0, float(older_than_sec or 7 * 86400.0))
+        cutoff = float(now if now is not None else time.time()) - retain
+        limit = max(1, int(batch_limit or 50_000))
+        cap = max(1, int(max_batches or 5))
+        marks = ",".join("?" for _ in ks)
+        deleted = 0
+        batches = 0
+        with self._lock:
+            while batches < cap:
+                cur = self.conn.execute(
+                    "DELETE FROM events WHERE rowid IN ("
+                    f"  SELECT rowid FROM events WHERE kind IN ({marks}) AND ts < ?"
+                    "  LIMIT ?"
+                    ")",
+                    (*ks, cutoff, limit),
+                )
+                n = int(cur.rowcount or 0)
+                self.conn.commit()
+                batches += 1
+                deleted += n
+                if n < limit:
+                    return {"cutoff": cutoff, "deleted": deleted,
+                            "batches": batches, "done": True, "kinds": ks}
+        return {"cutoff": cutoff, "deleted": deleted,
+                "batches": batches, "done": False, "kinds": ks}
 
     def nearest_snapshot_price(self, symbol: str, ts: float, *,
                                window_sec: float = 3600) -> float | None:

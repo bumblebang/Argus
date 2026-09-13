@@ -21,22 +21,26 @@
 
 ## 2. 실측 (2026-09-13(일) 16시, `data/state/bot.db`)
 
-### 2-1. 샷리스트 구성 — pad 는 이미 거의 죽어 있다
+> 측정 엔진 = `scripts/pool_brain_report.py` (B0-5). 보유 집합은
+> `store.get_open_positions()`(= `state NOT IN ('closed','armed')`) 기준.
+
+### 2-1. 샷리스트 구성 — pad 가 신규 후보 공급의 42%
 
 `select_scan_candidates` 를 실제 유니버스·보유·도시어로 재실행한 결과:
 
 | 항목 | 값 |
 |------|-----|
-| 유니버스 | 217 (KR 109 / US 108, core 177 + day 40) |
-| shortlist | 40 = **must 35 + pad 5** (`scan_cap: 40`) |
-| must 구성 | held∪armed 22 + (bullish ∩ 유니버스) 13 |
-| must 중 stub | **11** — 보유인데 유니버스(TV top100) 밖 → 피처 없는 `serve_stub` |
-| pad 점수 유효 종목 | **0 / 217** → pad 는 점수순이 아니라 **유니버스순 폴백** |
+| 유니버스 | 216 (KR/US, core + day 태그) |
+| shortlist | 40 = **must 23 + pad 17** (`scan_cap: 40`) |
+| must 구성 | held 10 + armed 0 + (bullish ∩ 유니버스) 17 에서 중복 제거 |
+| must 중 stub | **6** — 보유인데 유니버스(TV top100) 밖 → 피처 없는 `serve_stub` |
+| pad 점수 유효 종목 | **0 / 216** → pad 는 점수순이 아니라 **유니버스순 폴백** |
 | `strategy_scores` | asof 09-11 21:24, age **42.5h** > stale gate 36h → 로드 스킵 |
 
-→ **B안의 표면 항목("pad 축소/폐지")은 이미 no-op 에 가깝다.** pad 는 40칸 중 5칸이고,
-그 5칸조차 점수 랭킹이 아니다. 주말엔 `strategy_scores` 가 항상 stale 이다
-(금요일 개장 전 배치 → 월요일 개장 전까지 36h 초과).
+→ **"pad 축소/폐지"는 신규 후보 공급의 42%(17/40)를 끊는 변경이다.** 명세가
+"축소/폐지"를 가볍게 적어둔 것과 실제 비중이 다르다. 게다가 그 17칸은 지금
+점수 랭킹조차 아니다(유니버스순 폴백) — 즉 **pad 의 문제는 크기가 아니라 품질**이다.
+주말엔 `strategy_scores` 가 항상 stale 이다(금요일 개장 전 배치 → 월요일 개장 전까지 36h 초과).
 
 ### 2-2. 도시어 절벽 — B안의 실제 급소
 
@@ -51,21 +55,24 @@
 - Athena 창: KR 05:30~07:30 / US 17:00~21:50.
 
 → 금요일 배치가 일요일 18시경 전량 만료되고 월요일 05:30 배치까지 공백.
-A안은 pad 가 메워주지만, **B안(pad 폐지)이면 그 구간 shortlist = 보유 22종, 신규 후보 0.**
+A안은 pad 가 메워주지만, **B안(pad 폐지)이면 그 구간 shortlist = 보유 10종, 신규 후보 0.**
 일·월 US extra wake(00:30 / 02:30 / 04:30)는 전부 빈손이 된다. 연휴는 더 길다.
 
-### 2-3. 보유 도시어 커버리지 45% — "단일 진실" 전제가 성립하지 않음
+### 2-3. 보유 도시어 — any stance 는 90%, **bullish 는 50%**
 
 | 항목 | 값 |
 |------|-----|
-| 보유 (open positions, distinct) | 22 |
-| 보유 중 fresh 도시어(any stance) | **10 / 22** |
-| 보유 중 fresh bullish | **5 / 22** |
-| open positions `entry_basis` | None 20 / value 3 / thesis 1 / signal 1 |
+| 보유 (open positions) | 10 (KR 5 / US 5) |
+| 보유 중 fresh 도시어(any stance) | **9 / 10 (90%)** |
+| 보유 중 fresh bullish | **5 / 10 (50%)** |
+| 보유 중 유니버스(TV top100) 밖 | **6 / 10** → `serve_stub` |
+| `entry_basis` | None 6 / value 3 / thesis 1 |
 
-→ B안은 뇌 역할을 "집행·사이징·SELL·타이밍"으로 줄이는데, 그 근거가 될 도시어가
-보유의 절반 이하다. 12종은 단일 진실 없이 SELL 판단을 해야 한다.
-`entry_basis` 도 25건 중 20건 미기록(→ `entry_basis.py:69` inference 폴백 = thesis).
+→ Athena 가 보유를 최우선으로 리서치하므로 커버리지 자체(90%)는 충분하다.
+문제는 **bullish 가 절반**이라는 것 — B안이 퍼널을 bullish 도시어로 좁히면
+보유 관리와 신규 진입이 같은 좁은 집합을 공유하게 된다.
+`entry_basis` 도 10건 중 6건 미기록(→ `entry_basis.py:69` inference 폴백 = thesis)이라,
+"뇌 역할 = SELL·타이밍" 재정의 전에 스탬프 누락 경로를 먼저 확인해야 한다.
 
 ### 2-4. 선행 결함 — `athena_queue` 쿨다운 붕괴 (P0)
 
@@ -124,11 +131,12 @@ A안은 pad 가 메워주지만, **B안(pad 폐지)이면 그 구간 shortlist =
 
 ## 3. 설계 개선 결정
 
-### D1. B안의 1순위를 "pad 폐지" → "must 품질(도시어 커버리지)" 로 교체
+### D1. B안의 1순위를 "pad 폐지" → "pad 품질 교체" 로 바꾼다
 
-pad 는 5/40 칸이고 점수 랭킹도 아니다(§2-1). 폐지해도 얻는 게 없고, 잃는 건
-절벽 구간의 유일한 후보 공급원이다. **pad 는 폴백으로 남기고**, B안은
-`bullish 도시어 커버리지`·`보유 도시어 커버리지`를 올리는 쪽으로 정의한다.
+pad 는 40칸 중 17칸(42%)이다 — 폐지는 신규 후보 공급을 절반 가까이 끊는
+큰 변경이고, 절벽 구간(§2-2)에서는 **유일한** 공급원이다. 반면 그 17칸은 지금
+점수 랭킹이 아니라 유니버스순 폴백이다(§2-1). 즉 고칠 것은 크기가 아니라 소스다.
+**pad 는 유지하고 랭킹 소스를 도시어 기반으로 교체**한다(B3-1).
 
 ### D2. "단일 진실"의 범위를 명문화 — 논거·전략 라벨까지, 가격 레벨은 코드 권위 유지
 
@@ -154,6 +162,10 @@ bullish→neutral 강등을 하는 이유(LLM 레벨 신뢰 불가)와 동일한
 | G6 | 보유 도시어 커버리지(any stance) ≥ 80% 가 3 거래일 연속 |
 
 G1~G5 통과 전 B1 착수 금지. G6 는 B3 게이트.
+판정 엔진 = `python scripts/pool_brain_report.py` (`--strict` 로 exit code 판정).
+
+**2026-09-13 1회차:** G1·G2·G3·G6 PASS / **G4 FAIL**(207,613/일 — B0 픽스 대상) ·
+**G5 FAIL**(관측창에 갭 각성 0건 — #53 이후 첫 거래일이 09-14(월)).
 
 ### D4. 절벽 방어를 B안 필수 항목으로 승격
 
@@ -167,18 +179,36 @@ G1~G5 통과 전 B1 착수 금지. G6 는 B3 게이트.
 
 ## 4. 작업 분해
 
-### B0 — 선행 픽스 (B안과 무관하게 즉시 가능, P0)
+### B0 — 선행 픽스 (B안과 무관, P0) — **구현 완료**
 
-| # | 작업 | 파일 | 완료 기준 |
-|---|------|------|-----------|
-| B0-1 | `was_recently_queued` 를 심볼 스코프 조회로 교체 | `src/engine/store.py` (신규 `recent_events_for_symbol(kind, symbol, since, limit)` 또는 `recent_events(..., symbol=None)`) · `src/agents/athena_phase2.py:276-294` | 단위 테스트: 6h 창에 타 심볼 이벤트 500건이 있어도 대상 심볼 쿨다운이 동작 |
-| B0-2 | `_athena_queued` 를 `limit` 대신 **심볼 DISTINCT 집계**로 | `src/agents/athena_phase2.py:241-268` | 24h 내 트리거 심볼 전량이 후보로 반환(최신순 dedup), limit 은 심볼 수 기준 |
-| B0-3 | 큐 이벤트 보존 정책 | `scripts/prune_snapshots.py` 확장 또는 신규 `prune_events.py` | `athena_queue`/`athena_scan` 7일 보존 prune + VACUUM. 39만행 → 1만행 미만 |
-| B0-4 | 큐 경로도 `min_refresh_hours` 하한 적용 (보유는 예외 유지) | `src/agents/athena.py:399-457` | 비보유 심볼이 7일에 3회 이상 리서치되지 않음 |
-| B0-5 | 게이트 측정 스크립트 | 신규 `scripts/pool_brain_report.py` | G1~G6 를 한 번에 출력 (`brain_serve` 집계 · must/pad 분할 · 도시어 커버리지 · 큐 건수) |
+브랜치 `fix/athena-queue-cooldown`.
 
-B0-5 는 §2 의 측정을 재현 가능하게 만드는 것 — B안 게이트 판정의 기준 엔진.
-(§2 수치는 임시 스크립트로 뽑았고 커밋하지 않았다.)
+| # | 작업 | 구현 |
+|---|------|------|
+| B0-1 | 쿨다운을 심볼 스코프 조회로 | `Store.recent_events(..., symbol=)` keyword-only 추가 + `idx_events_kind_symbol(kind, symbol, ts)` · `was_recently_queued` 교체 |
+| B0-2 | 큐 조회를 심볼 집계로 | `Store.recent_events_by_symbol` 신설(창 안 종목별 최신 1건, 종목 수 기준 limit) · `_athena_queued(max_symbols=200)` |
+| B0-3 | 이벤트 보존 정책 | `Store.prune_events(kinds, older_than_sec=7d)` + `loop._maybe_prune_events` 타이머(`watch.events_*`, 기본 7일·1h 주기) + `scripts/prune_events.py`(일회성·`--stats`·`--vacuum`). 대상 = `Store.PRUNABLE_EVENT_KINDS` = `athena_queue`·`athena_scan` (원장·귀속 kind 제외) |
+| B0-4 | 큐 티어 예산 상한 | `_queued_for_refresh` — 보유 제외 + `athena.queue_max_per_run`(기본 10) 상한 |
+| B0-5 | 게이트 측정 엔진 | `scripts/pool_brain_report.py` — G1~G6 PASS/FAIL + brain_serve 일별·큐 일별·must/pad 분할·도시어 절벽 |
+
+**B0-4 가 B0-1·B0-2 와 같은 PR 에 있어야 하는 이유:** 쿨다운을 고치면 큐가 실제
+트리거 전량(7일 183종 ≈ 26종/일)을 담게 된다. `select_symbols` 는 큐를 미커버보다
+먼저 보므로, 상한이 없으면 **고친 큐가 30/run 예산을 다 먹어 미커버 발굴이 굶는다** —
+B안이 기대는 도시어 커버리지가 오히려 나빠진다.
+
+**철회한 설계:** 큐 경로에 `min_refresh_hours` 하한을 걸어 "비보유 종목 반복
+리서치(7일에 3~5회)"를 막으려 했으나, 큐가 min_refresh 를 우회하는 것은
+`test_select_symbols_queue_bypasses_min_refresh` 가 명시하는 **의도된 설계**다
+(새 재료엔 즉시 반응). 반복 리서치의 원인도 결국 B0-2 의 조회 버그였다 —
+큐가 임의의 소수만 반복해 담았기 때문. 상한만 두고 하한은 넣지 않았다.
+**남은 관찰거리:** 픽스 후에도 같은 비보유 종목이 매일 재리서치되는지
+(`pool_brain_report.py` + `dossier_report.py`). 지속되면 PM 결정 사항.
+
+**남은 잠재 결함(이번 스코프 밖):** `_disclosure_queued`·`_earnings_result_queued`
+(`athena.py:294`, `:330`)도 같은 "kind 전체 행 limit=50" 형태다. 현재 볼륨이
+낮아(14일 disclosure 120건 · earnings_result 22건) 증상은 없지만 구조는 동일하다.
+route 가 여러 값(queue/wake)이라 종목별 최신 1건으로 바꾸면 의미가 달라져서
+같이 고치지 않았다.
 
 ### B1 — 도시어 증거 확장 (관측 전용, 집행 미연결)
 

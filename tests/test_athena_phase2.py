@@ -5,7 +5,7 @@ import time
 import numpy as np
 import pandas as pd
 
-from src.agents.athena import run_batch, select_symbols
+from src.agents.athena import _queued_for_refresh, run_batch, select_symbols
 from src.agents.athena_phase2 import (
     _athena_queued, enqueue_athena, merge_level_refresh,
     prices_from_market_state, resolve_symbol_prices, scan_athena_triggers,
@@ -124,6 +124,43 @@ def test_scan_athena_triggers_gap_and_invalidation(tmp_path):
     n3 = scan_athena_triggers(store, p2, {"NEAR": 100.5},
                               ma20={"NEAR": {"close": 100.0}})
     assert n3 == 1
+
+
+def test_queued_for_refresh_excludes_held_and_caps():
+    """큐 티어: 보유 제외 + 슬롯 상한. min_refresh 는 일부러 적용하지 않는다."""
+    queued = ["HELD", "A", "B", "C"]
+    assert _queued_for_refresh(queued, held={"HELD"}, max_per_run=10) == \
+        ["A", "B", "C"]
+    assert _queued_for_refresh(queued, held={"HELD"}, max_per_run=2) == ["A", "B"]
+    assert _queued_for_refresh(queued, held=set(), max_per_run=0) == queued
+
+
+def test_select_symbols_queue_cap_leaves_room_for_uncovered(tmp_path):
+    """큐가 커져도 상한 덕에 미커버 발굴이 굶지 않는다.
+
+    쿨다운 픽스 후 큐는 24h 트리거 전량을 담는다. 큐는 미커버보다 먼저
+    보이므로 상한이 없으면 예산을 다 먹는다.
+    """
+    cfg = load_config()
+    cfg.raw.setdefault("athena", {})["min_refresh_hours"] = 48
+    cfg.raw["athena"]["queue_max_per_run"] = 2
+    cfg.universe["KR"] = [{"symbol": f"Q{i}", "name": "q"} for i in range(6)]
+    store = Store(tmp_path / "t.db")
+    for i in range(6):
+        enqueue_athena(store, f"Q{i}", "KR", "gap", gap_pct=5.0)
+        # 전부 방금 리서치됨 — 큐 우회 덕에 상한만큼은 그래도 앞에 온다.
+        store.save_dossier(f"Q{i}", "KR", thesis="t", ttl_hours=60,
+                           evidence={"stance": "neutral"})
+    cfg.universe["KR"] += [{"symbol": "UNCOV", "name": "u"}]
+
+    order = [t["symbol"] for t in select_symbols(cfg, store, "KR", prices={})]
+    assert len([s for s in order[:2] if s.startswith("Q")]) == 2   # 큐 2칸만
+    assert order[2] == "UNCOV"                                     # 미커버가 그 다음
+    assert len(order) == len(set(order))
+
+    cfg.raw["athena"]["queue_max_per_run"] = 0                     # 상한 끔
+    order2 = [t["symbol"] for t in select_symbols(cfg, store, "KR", prices={})]
+    assert order2.index("UNCOV") == 6                              # 큐 6종이 앞을 다 먹음
 
 
 def test_queue_cooldown_survives_busy_queue(tmp_path):
