@@ -406,11 +406,33 @@ def _min_refresh_hours(cfg) -> float:
 
 def _covered_for_refresh(symbols: list[str], covered_at: dict[str, float], *,
                          min_refresh_hours: float, now: float) -> list[str]:
-    """min_refresh_hours 안의 covered 는 순환 갱신에서 제외(보유·큐는 선행 단계)."""
+    """min_refresh_hours 안의 covered 는 순환 갱신에서 제외(보유는 선행 단계)."""
     if min_refresh_hours <= 0:
         return list(symbols)
     cutoff = now - min_refresh_hours * 3600
     return [s for s in symbols if float(covered_at.get(s, 0)) <= cutoff]
+
+
+def _queue_max_per_run(cfg) -> int:
+    """athena.queue_max_per_run — 1회 실행에서 큐 티어가 쓸 수 있는 슬롯 상한."""
+    raw = getattr(cfg, "raw", cfg) if not isinstance(cfg, dict) else cfg
+    if not isinstance(raw, dict):
+        return 10
+    return int((raw.get("athena") or {}).get("queue_max_per_run", 10))
+
+
+def _queued_for_refresh(queued: list[str], *, held: set[str],
+                        max_per_run: int) -> list[str]:
+    """큐 티어 후보 — 보유 제외(선행 단계에서 이미 잡음) + 슬롯 상한.
+
+    큐는 새 재료(갭·무효화 임박)에 **즉시 반응**하는 경로라 min_refresh 를 일부러
+    우회한다(`test_select_symbols_queue_bypasses_min_refresh`). 다만 상한은 필요하다:
+    쿨다운 픽스로 큐가 24h 트리거 전량(2026-09-13 실측 ≈26종/일)을 담게 되고,
+    `select_symbols` 는 큐를 미커버보다 먼저 보므로 상한이 없으면 큐가 max_per_run
+    예산을 다 먹어 **미커버 발굴이 굶는다**. 보유는 항상 리서치되므로 여기서 뺀다.
+    """
+    out = [s for s in queued if s not in held]
+    return out[:max_per_run] if max_per_run > 0 else out
 
 
 def select_symbols(cfg, store, market: str, limit: int | None = None, *,
@@ -420,7 +442,8 @@ def select_symbols(cfg, store, market: str, limit: int | None = None, *,
     """리서치 우선순위: 보유 > 이벤트큐 > 공시 > 실적 > 미커버 > 존근접 covered.
 
     covered 회전은 존 근접(in→below→above→unknown) 우선, 동순위는 오래된 도시에 먼저.
-    min_refresh_hours(기본 config) 이내 covered 는 순환에서 스킵 — 보유·큐·공시·실적은 예외.
+    min_refresh_hours 이내 covered 는 순환에서 스킵 — 보유·큐·공시·실적은 예외.
+    큐 티어만 `queue_max_per_run` 상한을 받는다(미커버 발굴 기아 방지).
     """
     p2 = phase2_cfg(cfg)
     min_refresh = _min_refresh_hours(cfg)
@@ -446,8 +469,9 @@ def select_symbols(cfg, store, market: str, limit: int | None = None, *,
     fresh_order: list[str] = []
     fresh_order += held_syms
     if p2.get("enabled", True):
-        fresh_order += _athena_queued(store, market,
-                                      since_hours=p2["queue_since_hours"])
+        fresh_order += _queued_for_refresh(
+            _athena_queued(store, market, since_hours=p2["queue_since_hours"]),
+            held=held_set, max_per_run=_queue_max_per_run(cfg))
     fresh_order += _disclosure_queued(store, market)              # 공시 재소환(KR/US)
     fresh_order += _earnings_result_queued(store, market)         # 실적결과 재소환
     fresh_order += [s for s in uni if s not in covered]           # 미커버

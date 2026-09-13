@@ -238,13 +238,18 @@ def sort_covered_by_zone(symbols: list[str], store, prices: dict[str, float],
     return sorted(symbols, key=_key)
 
 
-def _athena_queued(store, market: str, since_hours: float = 24.0) -> list[str]:
-    """athena_queue(route=queue) 종목 — held 다음 우선 재소환."""
+def _athena_queued(store, market: str, since_hours: float = 24.0,
+                   max_symbols: int = 200) -> list[str]:
+    """athena_queue(route=queue) 종목 — held 다음 우선 재소환.
+
+    창 안의 **종목별 최신 1건**을 본다. 행 기준 limit 을 쓰면 한 종목이 창을
+    채웠을 때 나머지 종목이 통째로 누락된다.
+    """
     mkt = str(market or "").upper()
     out: list[str] = []
     try:
-        rows = store.recent_events(
-            ATHENA_QUEUE_KIND, time.time() - since_hours * 3600, limit=80)
+        rows = store.recent_events_by_symbol(
+            ATHENA_QUEUE_KIND, time.time() - since_hours * 3600, limit=max_symbols)
         for r in rows:
             p = json.loads(r["payload"]) if r["payload"] else {}
             if p.get("route") != "queue":
@@ -275,9 +280,16 @@ def enqueue_athena(store, symbol: str, market: str, reason: str, **extra) -> Non
 
 def was_recently_queued(store, symbol: str, *, reason: str | None = None,
                         hours: float = 6.0) -> bool:
+    """해당 종목이 쿨다운 창 안에 이미 큐에 올랐는지.
+
+    조회를 **종목으로 먼저 좁힌다.** kind 전체에 행 limit 을 걸면 큐가 붐빌 때
+    대상 종목이 창에서 밀려 나가 쿨다운이 항상 False → 틱마다 재등록 → 이벤트가
+    늘수록 더 나빠지는 양성 피드백이 된다(2026-09-11 실측 20.7만건).
+    """
     try:
         rows = store.recent_events(
-            ATHENA_QUEUE_KIND, time.time() - hours * 3600, limit=30)
+            ATHENA_QUEUE_KIND, time.time() - hours * 3600, limit=30,
+            symbol=symbol)
     except Exception:
         return False
     for r in rows:

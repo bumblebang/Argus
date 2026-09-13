@@ -391,6 +391,71 @@ def test_from_config_snapshots_retain_defaults():
     assert cfg.snapshots_prune_batch == 1000
 
 
+def test_from_config_events_retain_defaults():
+    bare = WatchConfig.from_config({"watch": {}})
+    assert bare.events_retain_sec == 7 * 86400.0
+    assert bare.events_prune_interval_sec == 3600.0
+    assert bare.events_prune_batch == 50_000
+    cfg = WatchConfig.from_config({"watch": {
+        "events_retain_sec": 0,
+        "events_prune_interval_sec": 120,
+        "events_prune_batch": 1000,
+    }})
+    assert cfg.events_retain_sec == 0.0
+    assert cfg.events_prune_interval_sec == 120.0
+    assert cfg.events_prune_batch == 1000
+
+
+def test_run_forever_prunes_old_events(tmp_path, monkeypatch):
+    """athena_queue 같은 관측 이벤트만 지우고 원장 kind 는 남긴다."""
+    _all_closed(monkeypatch)
+    store = Store(tmp_path / "t.db")
+    now = 1_700_000_000.0
+    old = now - 30 * 86400
+    for kind in ("athena_queue", "athena_scan", "live_order"):
+        store.conn.execute(
+            "INSERT INTO events(ts, kind, symbol, payload) VALUES(?,?,?,?)",
+            (old, kind, "A", "{}"))
+    store.conn.commit()
+    t = {"v": now}
+    loop = WatchLoop(
+        FakeGateway({}), store, lambda: {},
+        config=WatchConfig(
+            idle_interval_sec=1,
+            snapshots_retain_sec=0,
+            events_retain_sec=7 * 86400,
+            events_prune_interval_sec=60,
+            events_prune_batch=1000,
+        ),
+        now_fn=lambda: t["v"],
+        sleep_fn=lambda _s: None,
+    )
+    loop.run_forever(max_ticks=1)
+    left = {r[0] for r in store.conn.execute(
+        "SELECT kind FROM events WHERE ts=?", (old,)).fetchall()}
+    assert left == {"live_order"}
+    assert store.recent_events("events_prune", 0)
+
+
+def test_run_forever_events_prune_off_when_retain_zero(tmp_path, monkeypatch):
+    _all_closed(monkeypatch)
+    store = Store(tmp_path / "t.db")
+    now = 1_700_000_000.0
+    store.conn.execute(
+        "INSERT INTO events(ts, kind, symbol, payload) VALUES(?,?,?,?)",
+        (now - 30 * 86400, "athena_queue", "A", "{}"))
+    store.conn.commit()
+    loop = WatchLoop(
+        FakeGateway({}), store, lambda: {},
+        config=WatchConfig(idle_interval_sec=1, snapshots_retain_sec=0,
+                           events_retain_sec=0),
+        now_fn=lambda: now,
+        sleep_fn=lambda _s: None,
+    )
+    loop.run_forever(max_ticks=1)
+    assert store.recent_events("athena_queue", 0)
+
+
 def test_run_forever_prunes_old_snapshots(tmp_path, monkeypatch):
     _all_closed(monkeypatch)
     store = Store(tmp_path / "t.db")

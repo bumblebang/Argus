@@ -160,6 +160,11 @@ class WatchConfig:
     snapshots_prune_interval_sec: float = 3600.0
     # prune 1배치당 최대 행 수(틱 블로킹 상한).
     snapshots_prune_batch: int = 200_000
+    # 관측용 events 보존 초(기본 7일). 0=prune 비활성.
+    # 원장·귀속이 읽는 kind 는 대상이 아니다(Store.PRUNABLE_EVENT_KINDS).
+    events_retain_sec: float = 7 * 86400.0
+    events_prune_interval_sec: float = 3600.0
+    events_prune_batch: int = 50_000
 
     @staticmethod
     def _parse_exit_policy(raw: dict) -> "ExitPolicyConfig":
@@ -251,6 +256,12 @@ class WatchConfig:
                 w.get("snapshots_prune_interval_sec", d.snapshots_prune_interval_sec)),
             snapshots_prune_batch=int(
                 w.get("snapshots_prune_batch", d.snapshots_prune_batch)),
+            events_retain_sec=float(
+                w.get("events_retain_sec", d.events_retain_sec)),
+            events_prune_interval_sec=float(
+                w.get("events_prune_interval_sec", d.events_prune_interval_sec)),
+            events_prune_batch=int(
+                w.get("events_prune_batch", d.events_prune_batch)),
         )
 
     @staticmethod
@@ -467,6 +478,7 @@ class WatchLoop:
             self.cfg.extra_wake_state_path or None)
         self._extra_grace_until = 0.0   # run_forever 기동 시 grace_until 설정
         self._last_snapshots_prune = 0.0  # snapshots 만료 prune 타이머
+        self._last_events_prune = 0.0     # 관측 events 만료 prune 타이머
         # 유동성 illiquid 집합(시간외 체결정지 종목). 이 루프 스레드가 매 틱 갱신하고
         # 뇌 워커(별도 스레드)가 illiquid_snapshot() 으로 읽는다 → 순회 중 크기 변경
         # (RuntimeError) 을 막으려면 양쪽 다 락을 거쳐야 한다.
@@ -504,6 +516,36 @@ class WatchLoop:
             log.info("snapshots prune: deleted=%s done=%s",
                      deleted, (info or {}).get("done"))
             self.store.log_event("snapshots_prune", None, info)
+
+    def _maybe_prune_events(self) -> None:
+        """만료 관측 events 배치 삭제. retain_sec<=0 이면 끔.
+
+        athena_queue 처럼 틱마다 쌓이는 kind 가 bot.db 를 비대화시킨다
+        (2026-09-13 실측: events 68만행 중 athena_queue 39만행).
+        """
+        retain = float(self.cfg.events_retain_sec or 0)
+        if retain <= 0:
+            return
+        interval = max(60.0, float(self.cfg.events_prune_interval_sec or 3600.0))
+        now = self._now()
+        if self._last_events_prune and (now - self._last_events_prune) < interval:
+            return
+        self._last_events_prune = now
+        try:
+            info = self.store.prune_events(
+                older_than_sec=retain,
+                now=now,
+                batch_limit=int(self.cfg.events_prune_batch or 50_000),
+            )
+        except Exception as e:
+            log.warning("events prune 실패: %s", e)
+            self.store.log_event("error", None, {"where": "prune_events", "err": str(e)})
+            return
+        deleted = int((info or {}).get("deleted") or 0)
+        if deleted:
+            log.info("events prune: deleted=%s done=%s",
+                     deleted, (info or {}).get("done"))
+            self.store.log_event("events_prune", None, info)
 
     def breadth_snapshot(self) -> dict:
         """열린 시장의 실시간 브레드스 스냅샷(스레드 안전).
@@ -1162,6 +1204,7 @@ class WatchLoop:
                 self._ticks = ticks
                 self._beat(res, tick_error=tick_error)  # ok 포함 — polled=0 가짜 초록 방지
                 self._maybe_prune_snapshots()
+                self._maybe_prune_events()
                 interval = (self.cfg.watch_interval_sec if res.markets_open
                             else self.cfg.idle_interval_sec)
                 self._sleep(interval)
