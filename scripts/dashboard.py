@@ -157,8 +157,12 @@ def _risk_control_meta(paper: dict | None = None) -> dict:
     try:
         from src.config import load_config
         from src.risk_gate import RiskGate, _normalize_max_positions
-        cfg = load_config().raw
-        risk = cfg.get("risk") or {}
+        from src.agents.wiring import sector_map_from_universe
+        cfg = load_config()
+        # risk 블록만 넘기면 sector_map 이 비어 RiskGate 가 매 갱신(30s)마다
+        # "섹터 집중도 사실상 비활성" 경고를 스팸한다 — 라이브 게이트와 같이 유니버스 맵을 싣는다.
+        risk = dict(cfg.raw.get("risk") or {})
+        risk["sector_map"] = sector_map_from_universe(cfg)
         gate = RiskGate(risk)
         max_pos = dict(gate.max_positions)
         pause = gate.pause_status()
