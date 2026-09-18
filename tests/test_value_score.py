@@ -4,8 +4,9 @@ from __future__ import annotations
 import pytest
 
 from src.value_score import (
-    NEUTRAL_VALUE_FACTOR, age_decay, composite_scores, drawdown_component,
-    quality_tilt, quintile_coverage_report, value_factors_mcap_quintile,
+    NEUTRAL_VALUE_FACTOR, _cheapness_ranks, age_decay, composite_scores,
+    drawdown_component, quality_tilt, quintile_coverage_report,
+    value_factors_mcap_quintile,
 )
 from src.value_fin_backfill import backfill_financials
 
@@ -33,6 +34,32 @@ class TestDrawdown:
     def test_밴드_안(self):
         assert drawdown_component(-40) > 0
         assert drawdown_component(-10) == 0.0
+
+    def test_결측은_중립(self):
+        assert drawdown_component(None) == NEUTRAL_VALUE_FACTOR
+
+    def test_결측이_밴드밖보다_높다(self):
+        assert drawdown_component(None) > drawdown_component(-10)
+        assert drawdown_component(None) > drawdown_component(-80)
+
+
+class TestCheapnessRanks:
+    def test_동점은_같은_점수(self):
+        ranks = _cheapness_ranks([1.0, 1.0, 2.0])
+        assert ranks[0] == ranks[1]
+        assert ranks[0] > ranks[2]
+
+    def test_전부_동점이면_중립(self):
+        ranks = _cheapness_ranks([1.5, 1.5, 1.5])
+        assert ranks == [0.5, 0.5, 0.5]
+
+    def test_입력순서_무관(self):
+        a = _cheapness_ranks([1.0, 2.0, 1.0])
+        b = _cheapness_ranks([2.0, 1.0, 1.0])
+        # 값 1.0 끼리 동일, 값 2.0 은 더 비쌈
+        assert a[0] == a[2] == b[1] == b[2]
+        assert a[1] == b[0]
+        assert a[0] > a[1]
 
 
 class TestValueFactorQuintile:
@@ -120,6 +147,22 @@ class TestComposite:
         assert "composite_value" in out[0]
         assert "value_factor" in out[0]
         assert 0 <= out[0]["age_decay"] <= 1
+
+    def test_낙폭결측_종합이_밴드밖보다_높다(self):
+        """낙폭 결측(중립) 종목이 밴드 밖(dd=0) 종목보다 종합 점수가 높다."""
+        now = 1_000_000.0
+        base = {
+            "market_cap": 1e12,
+            "first_seen_at": now,
+            "fundamentals": {"pb": 1.0, "pe_trailing": 10},
+        }
+        miss = {**base, "symbol": "MISS", "drawdown_1y_pct": None}
+        oob = {**base, "symbol": "OOB", "drawdown_1y_pct": -10}
+        out = composite_scores([miss, oob], now=now, n_min=1)
+        by_sym = {r["symbol"]: r for r in out}
+        assert by_sym["MISS"]["dd_component"] == NEUTRAL_VALUE_FACTOR
+        assert by_sym["OOB"]["dd_component"] == 0.0
+        assert by_sym["MISS"]["composite_value"] > by_sym["OOB"]["composite_value"]
 
 
 class TestCoverageReport:

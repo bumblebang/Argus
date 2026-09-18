@@ -154,8 +154,9 @@ class WatchConfig:
     athena_phase2: dict = field(default_factory=dict)
     # 신호 청산 정책(진입근거 바인딩·최소보유·확정봉). 최상위 strategy_exit 블록.
     strategy_exit: SignalExitConfig = field(default_factory=SignalExitConfig)
-    # snapshots 보존 초(기본 24h). 0=prune 비활성. 장기 백테는 Yahoo/캔들.
-    snapshots_retain_sec: float = 86400.0
+    # snapshots 보존 초(기본 7일, events 와 동일). shadow·다일 폴백에 필요.
+    # 틱 밀도가 높으면 DB 증가 주의 — 필요 시 단축하거나 prune_batch 조정.
+    snapshots_retain_sec: float = 7 * 86400.0
     # prune 시도 주기(초). 배치 삭제로 한 번에 못 지워도 다음 주기에 이어감.
     snapshots_prune_interval_sec: float = 3600.0
     # prune 1배치당 최대 행 수(틱 블로킹 상한).
@@ -432,7 +433,8 @@ class TickResult:
 
 
 # 코드(빠른손)가 즉시 처리하는 청산 트리거 — 뇌를 거치지 않는다.
-_EXIT_KINDS = {"stop_hit", "trail_stop", "target_hit", "time_stop", "close_scan_exit"}
+_EXIT_KINDS = {"stop_hit", "trail_stop", "target_hit", "time_stop",
+               "close_scan_exit", "value_fair_high"}
 
 
 class WatchLoop:
@@ -931,6 +933,10 @@ class WatchLoop:
                                               flow_streak=fstr)
                     if ti:
                         trigs.append(ti)
+                    # 밸류 적정가 상단 — 트레일/손절보다 먼저 넣어 청산 사유 우선권 확보.
+                    vf = T.value_fair_high_trigger(positions[sym], price)
+                    if vf:
+                        trigs.append(vf)
                     # 트레일링: 목표가 도달 시 전량 청산 대신 손절가를 끌어올려(래칫) 이익을
                     # 태운다. 청산 트리거 평가 '전에' stop_price 를 갱신해야 같은 틱의
                     # position_triggers 가 그 트레일링 스톱으로 trail_stop 을 낸다. 트레일 대상은

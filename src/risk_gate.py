@@ -11,6 +11,7 @@ from pathlib import Path
 
 from .logging_setup import get_logger
 from . import paths as _paths
+from .sector_taxonomy import UNCLASSIFIED
 
 log = get_logger("risk.gate")
 
@@ -151,10 +152,19 @@ class RiskGate:
         sector = limits.get("max_sector_pct")
         self.max_sector_pct = float(sector) if sector is not None else None
         self.sector_map = limits.get("sector_map", {}) or {}   # {symbol: sector}
-        if self.max_sector_pct is not None and not self.sector_map:
+        # 유니버스 핫리로드용 — check 시 최신 맵으로 갱신. None 이면 기동 스냅샷 고정.
+        self.sector_map_fn = limits.get("sector_map_fn")
+        # 미분류 버킷 한도 = max_sector_pct × 배수(기본 0.5). 맵 공백 때 조용히
+        # 캡이 꺼지는 대신 '미분류'로 모아 절반 캡. 1.0 이면 일반 섹터와 동일.
+        u_mult = limits.get("unclassified_sector_mult", 0.5)
+        try:
+            self.unclassified_sector_mult = float(u_mult)
+        except (TypeError, ValueError):
+            self.unclassified_sector_mult = 0.5
+        if self.max_sector_pct is not None and not self.sector_map and not self.sector_map_fn:
             log.warning("max_sector_pct=%s 설정됐지만 sector_map 이 비어 있음 — "
-                        "섹터 집중도 검사가 사실상 비활성입니다(유니버스에 sector 누락?).",
-                        self.max_sector_pct)
+                        "미분류 버킷(×%.2f)으로만 집중도 검사합니다.",
+                        self.max_sector_pct, self.unclassified_sector_mult)
         # 드로다운 브레이커(선택): 실현누적+미실현 손실이 SoD equity×한도 초과 시 신규 매수 차단.
         dd = limits.get("max_drawdown_pct")
         self.max_drawdown_pct = float(dd) if dd is not None else None
@@ -320,31 +330,74 @@ class RiskGate:
         """노출 한도 기준 금액(공개 API) — 밸류 슬리브가 게이트와 동일한 기준을 쓰도록."""
         return self._exposure_base(account, market)
 
-    def _invested(self, account, market: str, sector: str | None = None) -> float:
+    def _live_sector_map(self) -> dict:
+        """최신 symbol→sector. sector_map_fn 이 있으면 매 검사마다 재독(핫리로드).
+
+        실패 시 직전 self.sector_map 유지 — 맵이 사라져 캡이 꺼지지 않게.
+        """
+        fn = self.sector_map_fn
+        if fn is None:
+            return self.sector_map
+        try:
+            m = fn() or {}
+            if isinstance(m, dict):
+                self.sector_map = m
+        except Exception as e:
+            log.warning("sector_map_fn 실패(직전 맵 유지): %s", e)
+        return self.sector_map
+
+    def _sector_of(self, symbol: str, smap: dict | None = None) -> str | None:
+        """맵에 있으면 그 섹터, 없고 섹터캡이 켜져 있으면 미분류.
+
+        미지정 종목을 검사에서 빼면(예전 동작) 신규 편입·캐시 miss 가 캡을 조용히 끈다.
+        """
+        m = smap if smap is not None else self.sector_map
+        if not symbol:
+            return None
+        sec = m.get(symbol)
+        if sec:
+            return sec
+        if self.max_sector_pct is not None:
+            return UNCLASSIFIED
+        return None
+
+    def _sector_limit_pct(self, sector: str) -> float:
+        base = float(self.max_sector_pct or 0)
+        if sector == UNCLASSIFIED:
+            return base * max(0.0, float(self.unclassified_sector_mult))
+        return base
+
+    def _invested(self, account, market: str, sector: str | None = None,
+                  smap: dict | None = None) -> float:
         """시장(+섹터) 내 보유 익스포저 합(원가기준 qty×avg_price). 결정적·가격무관."""
+        smap = smap if smap is not None else self.sector_map
         total = 0.0
         for sym, p in getattr(account, "positions", {}).items():
             if not getattr(p, "is_open", False):
                 continue
             if account.symbol_market.get(sym) != market:
                 continue
-            if sector is not None and self.sector_map.get(sym) != sector:
+            if sector is not None and self._sector_of(sym, smap) != sector:
                 continue
             total += p.qty * p.avg_price
         return total
 
     def _reserved_notional(self, reserved, market: str,
-                           sector: str | None = None) -> float:
+                           sector: str | None = None,
+                           smap: dict | None = None) -> float:
         """예약된 BUY 명목 합. SELL 예약이 만들 현금은 세지 않는다(미체결일 수 있음)."""
         if not reserved:
             return 0.0
+        smap = smap if smap is not None else self.sector_map
         total = 0.0
         for r in reserved:
-            if r.side != "BUY" or r.market != market:
+            if getattr(r, "side", "BUY") != "BUY":
                 continue
-            if sector is not None and self.sector_map.get(r.symbol) != sector:
+            if getattr(r, "market", None) != market:
                 continue
-            total += r.notional
+            if sector is not None and self._sector_of(r.symbol, smap) != sector:
+                continue
+            total += float(getattr(r, "notional", 0) or 0)
         return total
 
     def _reserved_new_symbols(self, reserved, account, market: str | None = None) -> int:
@@ -473,13 +526,15 @@ class RiskGate:
                         f"총 익스포저 초과 (체결후 {post_gross:,.0f} > {limit:,.0f})")
 
             # 8) 섹터 집중도: 한 섹터에 과도하게 쏠리면 거부(상관 리스크 프록시).
-            sector = self.sector_map.get(order.symbol)
+            # 맵에 없는 종목은 미분류 버킷(한도 = max_sector_pct × unclassified_sector_mult).
+            smap = self._live_sector_map()
+            sector = self._sector_of(order.symbol, smap)
             if self.max_sector_pct is not None and sector and base > 0:
-                post_sector = (self._invested(account, m, sector)
-                               + self._reserved_notional(reserved, m, sector)
+                post_sector = (self._invested(account, m, sector, smap=smap)
+                               + self._reserved_notional(reserved, m, sector, smap=smap)
                                + order.notional)
-                limit = base * self.max_sector_pct
-                if post_sector > limit:
+                limit = base * self._sector_limit_pct(sector)
+                if limit > 0 and post_sector > limit:
                     return GateDecision(False,
                         f"섹터 집중 초과 [{sector}] (체결후 {post_sector:,.0f} > {limit:,.0f})")
 

@@ -10,8 +10,9 @@ meta.source="value" 로 미러링되어 감시 루프의 손절/성과귀속이 
 
 V2 로 두 가지가 붙었다: ①분할 매수(tranches — 남은 회차가 있는 보유분을 후보로 남기고
 회차 비중으로 target_weight 를 코드가 클램프. 기본 [1.0]=한 번에 전량이라 opt-in)
-②시간 손절(time_stop_days — 코드는 청산하지 않고 pipeline._portfolio 가 뇌 컨텍스트에
-플래그만 싣는다).
+②시간 손절(time_stop_days — 보유분 holdings 컨텍스트에 플래그를 싣고 **밸류 트랙 LLM**이
+SELL/HOLD 를 판단. 메인 뇌는 밸류 포지션 SELL 이 차단되므로 출구 소유권은 여기다).
+코드 바닥: hard_stop(-20%) · 트레일(fair_low 활성) · fair_high 도달 전량 청산.
 """
 from __future__ import annotations
 
@@ -134,9 +135,10 @@ def value_trade_cfg(cfg: AppConfig) -> dict:
         "model": raw.get("model", "fable"),
         "timeout": int(raw.get("timeout", 600)),
         "windows": dict(raw.get("windows", {"KR": "10:00", "US": "23:00"})),
-        "cooldown_hold_n": int(raw.get("cooldown_hold_n", 3)),
-        # "오늘 나보다 나은 후보가 있었다"는 그 종목에 대한 반증이 아니다 — 퇴짜(3회)와
-        # 같은 임계를 쓰면 준우승 종목이 순서대로 유배된다.
+        # "오늘 나보다 나은 후보가 있었다"는 그 종목에 대한 반증이 아니다 — 퇴짜와
+        # 같은 임계를 쓰면 준우승 종목이 순서대로 유배된다. llm_hold 도 cap_bump 와
+        # 같이 8회(건수가 훨씬 많은 쪽을 더 짧게 두면 벤치가 LLM 미선택으로 쏠린다).
+        "cooldown_hold_n": int(raw.get("cooldown_hold_n", 8)),
         "cooldown_cap_bump_n": int(raw.get("cooldown_cap_bump_n", 8)),
         "cooldown_days": float(raw.get("cooldown_days", 5)),
         "cooldown_streak_ttl_days": float(raw.get("cooldown_streak_ttl_days", 5)),
@@ -365,12 +367,61 @@ def passes_margin_guard(candidate: dict, current_price: float) -> bool:
     return current_price < fpl
 
 
+def build_value_holdings(rows, prices: dict, cfg_v: dict, now: float,
+                         market: str) -> list[dict]:
+    """밸류 보유분을 LLM 출구 판단용 holdings 컨텍스트로 만든다."""
+    tsd = int(cfg_v.get("time_stop_days") or 0)
+    out: list[dict] = []
+    for r in rows:
+        mkt = _row_val(r, "market") or _row_meta(r).get("market")
+        if mkt and str(mkt).upper() != str(market).upper():
+            continue
+        sym = _row_val(r, "symbol")
+        if not sym:
+            continue
+        meta = _row_meta(r)
+        px = prices.get(sym)
+        try:
+            px_f = float(px) if px is not None else None
+        except (TypeError, ValueError):
+            px_f = None
+        if px_f is not None and px_f <= 0:
+            px_f = None
+        avg = float(_row_val(r, "avg_price") or 0)
+        opened = float(_row_val(r, "opened_at") or 0)
+        days = (now - opened) / 86400.0 if opened else 0.0
+        item: dict = {
+            "symbol": sym,
+            "qty": _row_val(r, "qty"),
+            "avg_price": avg,
+            "current_price": px_f,
+            "days_held": round(days, 1),
+            "entry_thesis": (_row_val(r, "thesis")
+                             or meta.get("entry_thesis")),
+            "fair_low": meta.get("fair_low"),
+            "fair_high": meta.get("fair_high"),
+        }
+        if px_f and avg > 0:
+            item["unrealized_pnl_pct"] = round((px_f / avg - 1.0) * 100.0, 2)
+        if tsd > 0:
+            item["time_stop"] = {
+                "days_held": round(days, 1),
+                "threshold_days": tsd,
+                "exceeded": days >= tsd,
+            }
+        out.append(item)
+    return out
+
+
 # ── (d) 밸류 결정 에이전트 ─────────────────────────────────────────
 VALUE_TRADE_SYSTEM = """\
-당신은 자율 투자 시스템의 가치투자 진입 판단자다. 입력의 후보(candidates)들은 이미 밸류
-스캔이 '저평가(undervalued)'로 분류하고, 타이밍 게이트(20일선 위·모멘텀 양전환=바닥
-안정화)를 통과한 종목들이다. 너의 일은 이 중 실제로 지금 살 만한 것을 골라 BUY 로,
-아닌 것을 HOLD 로 판단하는 것이다.
+당신은 자율 투자 시스템의 가치투자 판단자다. 입력에 두 목록이 있다.
+- candidates: 저평가 스캔·타이밍 게이트를 통과한 **신규/추가매수** 후보
+- holdings: 이미 strategy=value 로 연 **보유분**(청산 판단 대상)
+
+## 후보(candidates) — BUY 또는 HOLD
+이미 밸류 스캔이 '저평가(undervalued)'로 분류하고, 타이밍 게이트(20일선 위·모멘텀
+양전환=바닥 안정화)를 통과한 종목들이다. 살 만한 것을 BUY, 아니면 HOLD.
 
 판단 순서:
 1. 안전마진 — current_price 대비 적정가 밴드(fair_price_low~fair_price_high)의 상승여력이
@@ -404,11 +455,21 @@ VALUE_TRADE_SYSTEM = """\
   target_weight 는 스키마 호환용이며 사이징에 쓰이지 않는다. 분할 회차 상한도 코드가
   강제한다. 너는 '지금 더 살 만한가'만 판단하면 된다.
 
-출력 규칙:
-- 각 후보에 대해 side 는 BUY 또는 HOLD 만 낸다(SELL 금지 — 청산은 코드/후속이 담당).
-- BUY 에는 bear_case·bear_rebuttal 을 반드시 채워라(위 5번). HOLD 는 비워도 된다.
+## 보유분(holdings) — SELL 또는 HOLD
+메인 스윙 뇌는 밸류 포지션을 팔 수 없다. **출구는 네가 담당한다.**
+1. time_stop.exceeded 가 true 면 가격 손절이 아니라 **논리가 시간으로 반증**된 것이다.
+   유지하려면 '왜 지금부터는 다른지' 새 근거를 thesis 에 대라. 근거 없으면 SELL.
+2. entry_thesis 가 무효화됐거나(촉매 소멸·밸류트랩 확정·실적 악화) SELL.
+3. current_price 가 fair_high 에 근접·돌파했고 추가 상승 여력이 빈약하면 SELL
+   (코드도 fair_high 도달 시 청산하지만, 근접 구간에서 먼저 판단해도 된다).
+4. 단기 노이즈·국면 약세만으로 팔지 마라. 하드스톱(-20%)·트레일은 코드가 맡는다.
+보유분에 BUY 를 내지 마라(추가매수는 candidates 의 tranche 경로만).
+
+## 출력 규칙
+- candidates: side 는 BUY 또는 HOLD. BUY 에는 bear_case·bear_rebuttal 필수.
+- holdings: side 는 SELL 또는 HOLD. SELL 의 thesis 에 청산 근거를 짧게.
 - horizon 은 반드시 "position"(중장기).
-- strategy/params 는 지정하지 마라(전략 매매가 아닌 가치투자 진입이다).
+- strategy/params 는 지정하지 마라(전략 매매가 아닌 가치투자다).
 - target_weight 는 사이징에 미반영이니 형식만 맞추면 된다(예: 0 또는 {max_position_pct}).
 - conviction 은 이 판단에 대한 네 확신을 **솔직하게** 매겨라. 사이징에는 쓰이지 않는다 —
   매수 크기는 코드 루브릭(저평가도·안전마진·공시)이 정한다. 특정 임계값을 겨냥해 점수를
@@ -654,9 +715,6 @@ class ValueRunner:
                   "cap_drops": [], "proposed": 0, "filled": 0, "vetoed": 0}
         res = {"candidates": len(cands), "gated": 0, "proposed": 0,
                "filled": 0, "vetoed": 0, "funnel": funnel}
-        if not cands:
-            append_funnel(funnel, self.funnel_path)
-            return res
 
         # 2) 슬리브·슬롯
         value_rows = self._value_positions()
@@ -671,11 +729,18 @@ class ValueRunner:
                        for r in value_rows):
                 value_mkt = list(value_rows)
         sleeve = self._sleeve(market, cfg_v, value_rows)
+        exit_only = False
         if sleeve["room"] <= 0:
-            res["skip"] = "sleeve_full"
-            funnel["skip"] = "sleeve_full"
-            append_funnel(funnel, self.funnel_path)
-            return res
+            if not value_mkt:
+                res["skip"] = "sleeve_full"
+                funnel["skip"] = "sleeve_full"
+                append_funnel(funnel, self.funnel_path)
+                return res
+            # 예산 소진 — 신규 진입은 막고 보유분 출구 판단만 돌린다.
+            exit_only = True
+            cands = []
+            funnel["exit_only"] = True
+            funnel["skip_entries"] = "sleeve_full"
 
         # 종목 수 상한은 두지 않는다 — 개수는 **자본 정책**이 정한다(슬리브 60% ·
         # 종목당 20~25% · 뇌 몫 30% · 총노출 90%). 칸으로 한 번 더 막으면 뇌가 예약된
@@ -697,11 +762,15 @@ class ValueRunner:
         funnel["market_open"] = self._market_open_count(market)
         if remaining_slots is not None and remaining_slots <= 0:
             cands = [c for c in cands if c.get("_tranche")]
-            if not cands:
+            if not cands and not value_mkt:
                 res["skip"] = "max_positions"
                 funnel["skip"] = "max_positions"
                 append_funnel(funnel, self.funnel_path)
                 return res
+            if not cands and value_mkt:
+                exit_only = True
+                funnel["exit_only"] = True
+                funnel["skip_entries"] = "max_positions"
 
         min_ticket = (float(sleeve.get("base") or 0)
                       * self.base_position_pct
@@ -713,6 +782,8 @@ class ValueRunner:
             sleeve_room=float(sleeve.get("room") or 0),
             min_ticket=min_ticket,
         )
+        if exit_only:
+            eff_cap = 0
         funnel["effective_new_cap"] = eff_cap
         funnel["new_entries_target"] = cfg_v["new_entries_per_run"]
         funnel["slot_cap"] = slot_cap
@@ -723,10 +794,12 @@ class ValueRunner:
                  funnel["market_open"], acct_cap if acct_cap is not None else "무제한",
                  sleeve.get("budget") or 0, sleeve.get("room") or 0, eff_cap)
 
-        # 3) 마진·타이밍 → review_per_run
-        symbols = [c["symbol"] for c in cands]
+        # 3) 마진·타이밍 → review_per_run (+ 보유분 시세)
+        hold_syms = [str(_row_val(r, "symbol")) for r in value_mkt
+                     if _row_val(r, "symbol")]
+        symbols = list(dict.fromkeys([c["symbol"] for c in cands] + hold_syms))
         prices: dict = {}
-        if self.price_fn is not None:
+        if self.price_fn is not None and symbols:
             try:
                 prices = self.price_fn(symbols, market) or {}
             except Exception as e:
@@ -782,13 +855,34 @@ class ValueRunner:
                 break
         res["gated"] = len(gated)
         funnel["gated"] = len(gated)
-        if not gated:
+
+        # 보유분 시세 — 히스토리 폴백(price_fn 실패·미포함)
+        hold_prices = dict(prices)
+        for sym in hold_syms:
+            if hold_prices.get(sym):
+                continue
+            try:
+                df = self.fetch_history_fn(sym, market)
+                px = _last_close(df)
+                if px:
+                    hold_prices[sym] = px
+            except Exception:
+                pass
+        holdings = build_value_holdings(value_mkt, hold_prices, cfg_v, now, market)
+        funnel["holdings"] = len(holdings)
+        res["holdings"] = len(holdings)
+
+        if not gated and not holdings:
             append_funnel(funnel, self.funnel_path)
             return res
 
         # 4) 컨텍스트
-        context = self._build_context(market, cfg_v, sleeve, gated, value_rows, now)
+        context = self._build_context(market, cfg_v, sleeve, gated, value_rows,
+                                      now, holdings=holdings)
         price_lookup = {c["symbol"]: c["_current_price"] for c in gated}
+        for h in holdings:
+            if h.get("current_price"):
+                price_lookup[h["symbol"]] = float(h["current_price"])
 
         # 5) LLM → BUY 절단 → run_cycle
         llm = self.llm_factory(gated)
@@ -859,7 +953,7 @@ class ValueRunner:
                     elif sym not in forced_hold:
                         record_cooldown_event(
                             cd, sym, kind="llm_hold", now=now,
-                            hold_n=cfg_v.get("cooldown_hold_n", 3),
+                            hold_n=cfg_v.get("cooldown_hold_n", 8),
                             cool_days=cfg_v.get("cooldown_days", 5),
                             streak_ttl_days=ttl)
                     # cap==0 강제 HOLD → 미가산
@@ -911,17 +1005,22 @@ class ValueRunner:
                               cfg=self.cfg.raw)
 
         res["proposed"] = sum(1 for p in cyc.decision.proposals if p.side == "BUY")
+        res["sold"] = sum(
+            1 for e in cyc.executed
+            if e.get("action") == "SELL" and e.get("status") in ("filled", "partial"))
         res["vetoed"] = sum(1 for e in cyc.executed if e.get("status") == "vetoed")
         res["filled"] = sum(
-            1 for e in cyc.executed if e.get("status") in ("filled", "partial"))
+            1 for e in cyc.executed if e.get("status") in ("filled", "partial")
+            and e.get("action") == "BUY")
         funnel["proposed"] = res["proposed"]
         funnel["filled"] = res["filled"]
+        funnel["sold"] = res["sold"]
         funnel["vetoed"] = res["vetoed"]
 
         # (b) reject 화이트리스트 + 체결 시 streak 리셋 (하드게이트 거부는 제외)
         apply_post_cycle_cooldown(
             cyc.executed, now=now,
-            hold_n=cfg_v.get("cooldown_hold_n", 3),
+            hold_n=cfg_v.get("cooldown_hold_n", 8),
             cool_days=cfg_v.get("cooldown_days", 5),
             streak_ttl_days=cfg_v.get("cooldown_streak_ttl_days", 5),
             path=self.cooldown_path)
@@ -931,9 +1030,13 @@ class ValueRunner:
         return res
 
     def _build_context(self, market: str, cfg_v: dict, sleeve: dict,
-                       gated: list[dict], value_rows: list, now: float) -> str:
+                       gated: list[dict], value_rows: list, now: float,
+                       *, holdings: list[dict] | None = None) -> str:
         # 종목별 과거 거래 회고(lessons) — 이력 있는 후보에만 부착(LLM 0콜).
-        lessons = (build_symbol_lessons(self.store, [c["symbol"] for c in gated])
+        lesson_syms = [c["symbol"] for c in gated]
+        if holdings:
+            lesson_syms += [h["symbol"] for h in holdings if h.get("symbol")]
+        lessons = (build_symbol_lessons(self.store, lesson_syms)
                    if self.store and self.cfg.raw.get("agents", {}).get("lessons", True)
                    else {})
         cand_ctx = []
@@ -964,6 +1067,13 @@ class ValueRunner:
             if c.get("_tranche"):            # 추가 트랜치(이미 보유 중인 종목의 추가 매수)
                 entry["tranche"] = c["_tranche"]
             cand_ctx.append(entry)
+        hold_ctx = []
+        for h in (holdings or []):
+            item = dict(h)
+            pt = lessons.get(h["symbol"])
+            if pt:
+                item["past_trades"] = pt
+            hold_ctx.append(item)
         portfolio = [{"symbol": r["symbol"], "market": r["market"], "qty": r["qty"],
                       "avg_price": r["avg_price"], "entry_thesis": r["thesis"]}
                      for r in value_rows]
@@ -976,6 +1086,7 @@ class ValueRunner:
                "asof": ms.get("asof"),
                "market_state": _market_block(ms),
                "sleeve": sleeve, "candidates": cand_ctx,
+               "holdings": hold_ctx,
                "portfolio_value_positions": portfolio,
                "constraints": {
                    "max_position_pct": self.max_position_pct,

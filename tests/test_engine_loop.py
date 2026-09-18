@@ -379,7 +379,7 @@ def test_run_forever_respects_max_ticks_and_sleep(tmp_path, monkeypatch):
 
 def test_from_config_snapshots_retain_defaults():
     bare = WatchConfig.from_config({"watch": {}})
-    assert bare.snapshots_retain_sec == 86400.0
+    assert bare.snapshots_retain_sec == 7 * 86400.0
     assert bare.snapshots_prune_interval_sec == 3600.0
     cfg = WatchConfig.from_config({"watch": {
         "snapshots_retain_sec": 0,

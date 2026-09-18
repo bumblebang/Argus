@@ -11,6 +11,7 @@ urgency 3단계:
 """
 from __future__ import annotations
 
+import json
 import math
 from dataclasses import dataclass, field
 from typing import Sequence
@@ -127,6 +128,38 @@ def limit_trigger(symbol: str, price: float | None, watch_level: float | None,
     return Trigger("limit_reached", symbol, "act",
                    f"가격 {price} {direction} 관심가 {watch_level}",
                    {"price": price, "level": watch_level, "dir": direction})
+
+
+def value_fair_high_trigger(pos: dict, price: float | None) -> Trigger | None:
+    """밸류 포지션이 적정가 상단(meta.fair_high)에 도달하면 코드 전량 청산.
+
+    목표가(fair_low)는 트레일 활성화 지점이고, 상단은 '저평가 해소 완료' 청산가다.
+    뇌/밸류 LLM 출구와 별도로 가격 축을 닫는다.
+    """
+    if price is None or not pos:
+        return None
+    meta = pos.get("meta")
+    if isinstance(meta, str):
+        try:
+            meta = json.loads(meta)
+        except (ValueError, TypeError):
+            meta = {}
+    if not isinstance(meta, dict):
+        meta = {}
+    is_value = (meta.get("source") == "value"
+                or str(pos.get("strategy") or "").lower() == "value")
+    if not is_value:
+        return None
+    fh = _level(meta.get("fair_high"))
+    if not fh:
+        return None
+    px = _level(price)
+    if px is None or px < fh:
+        return None
+    sym = pos.get("symbol") or ""
+    return Trigger("value_fair_high", sym, "act",
+                   f"가격 {px} >= 적정가 상단 {fh}",
+                   {"price": px, "fair_high": fh})
 
 
 def session_end_trigger(symbol: str, market: str) -> Trigger:
