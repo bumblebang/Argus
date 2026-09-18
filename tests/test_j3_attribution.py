@@ -370,6 +370,74 @@ def test_broker_sync_from_live_sweeps_then_applies_buy(tmp_path):
     assert broker.account.positions["005930"].qty == 15
 
 
+def test_startup_sync_attributes_settled_sell(tmp_path):
+    """기동 sync 가 holdings 덮기 전에 SELL 귀속 — 실현손익·저널 기입."""
+    from src.broker_sync import apply_sync_from_live
+    store, acct = Store(tmp_path / "t.db"), _acct(tmp_path)
+    _seed(store, acct, qty=10, avg=70_000)
+    _sell_working(store)
+    res = apply_sync_from_live(acct, store, _holdings([]), markets=("KR",))
+    assert res["attributed"]["005930"]["qty"] == 10.0
+    assert res["attributed"]["005930"]["price"] == 72_000.0
+    assert acct.realized_pnl["KR"] == 19_900.0
+    assert acct.journal[-1].side == "SELL"
+    assert acct.journal[-1].price == 72_000.0
+    assert not acct.position("005930").is_open
+    assert store.get_working_orders() == []
+    closed = _closed(store)
+    assert len(closed) == 1 and closed[0]["exit_price"] == 72_000.0
+
+
+def test_startup_sync_block_reconcile_defers_sell_holdings(tmp_path):
+    """sweep block_reconcile 이면 sell 대기 심볼 holdings 를 덮지 않는다."""
+    from src.broker_sync import apply_sync_from_live
+    store, acct = Store(tmp_path / "t.db"), _acct(tmp_path)
+    _seed(store, acct, qty=10, avg=70_000)
+    # 미결 SELL — 체결가 출처 없음. 덮으면 감소분 영구 소진.
+    store.upsert_working_order(
+        order_id="O1", symbol="005930", market="KR", side="SELL",
+        qty=10, price=71_000, status="PENDING", filled_qty=0)
+    res = apply_sync_from_live(
+        acct, store, _holdings([]), markets=("KR",),
+        defer_sell_holdings=True)
+    assert "005930" in res["deferred_sell_symbols"]
+    assert res["attributed"] == {}
+    assert acct.position("005930").qty == 10.0
+    assert store.get_open_positions()[0]["qty"] == 10.0
+    assert store.get_working_orders("005930", side="SELL")
+    assert _events(store, "unattributed_delta") == []
+    assert _events(store, "unattributed_fill") == []
+
+
+def test_broker_sync_from_live_defers_when_sweep_blocks(tmp_path):
+    """기동 sync: SELL 조회 실패(block_reconcile) → 해당 심볼 수량 유지."""
+    store = Store(tmp_path / "t.db")
+    acct = _acct(tmp_path)
+    _seed(store, acct, qty=10, avg=70_000)
+
+    class _FailSell:
+        def get_order(self, account_seq, order_id):
+            raise RuntimeError("api down")
+
+        def get_buying_power(self, seq, market):
+            return {"cashBuyingPower": "900000"}
+
+        def get_holdings(self, seq, symbol=None):
+            return {"items": []}  # 실계좌는 이미 청산
+
+    client = _FailSell()
+    broker = _broker(tmp_path, store, client, working_order_ttl_sec=-1.0)
+    broker.account = acct
+    store.upsert_working_order(
+        order_id="O1", symbol="005930", market="KR", side="SELL",
+        qty=10, price=71_000, status="PENDING", filled_qty=0)
+    out = broker.sync_from_live(client, store, markets=("KR",))
+    assert out["sweep"].get("block_reconcile") is True
+    assert "005930" in out.get("deferred_sell_symbols", [])
+    assert broker.account.positions["005930"].qty == 10.0
+    assert abs(broker.account.realized_pnl.get("KR", 0.0)) < 1e-9
+
+
 def test_increase_does_not_attribute(tmp_path):
     store, acct = Store(tmp_path / "t.db"), _acct(tmp_path)
     _seed(store, acct, qty=5)
