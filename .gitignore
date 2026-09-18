@@ -9,20 +9,20 @@ __pycache__/
 venv/
 .pytest_cache/
 
-# 운영자 로컬 — 실계좌 모드·경로·운영일지. 공개 저장소에는 example만 올린다.
+# ?�영??로컬 ???�계�?모드·경로·?�영?��?. 공개 ?�?�소?�는 example�??�린??
 config.yaml
 CONTEXT.md
 CONTEXT.local.md
 _chk_*.py
 
-# 퀀트 리서치 워크트리·산출물(절대경로·운영 메모가 섞임)
-# README 만 추적 — lab 스크립트/data 는 로컬 전용
+# ?�??리서�??�크?�리·?�출�??��?경로·?�영 메모가 ?�임)
+# README �?추적 ??lab ?�크립트/data ??로컬 ?�용
 research/**
 !research/README.md
 data/quant_review/
 
-# runtime data (생성물). 후보군(base_universe_*.txt)과 KRX bld 카탈로그는 추적함.
-# 이 폴더엔 실계좌 흔적이 들어 있다 — bot.db(포지션·체결·결정 전문), 원장, 토큰 캐시.
+# runtime data (?�성�?. ?�보�?base_universe_*.txt)�?KRX bld 카탈로그??추적??
+# ???�더???�계�??�적???�어 ?�다 ??bot.db(?��??�·체결·결???�문), ?�장, ?�큰 캐시.
 data/*.json
 !data/krx_bld_catalog.json
 data/*.jsonl*
@@ -37,11 +37,11 @@ data/watch.*
 data/research.csv
 data/universe.yaml
 data/day_pool.yaml
-data/history/
+data/gap_decline_pool.yaml`ndata/history/
 data/context_archive/
 data/krx_cache/
 data/llm_inbox/
-# Phase 2 레이아웃 — nested 원장/인박스/백업(git add -A 사고 방지)
+# Phase 2 ?�이?�웃 ??nested ?�장/?�박??백업(git add -A ?�고 방�?)
 data/state/
 data/inbox/
 data/ledgers/
@@ -49,10 +49,10 @@ data/archive/
 logs/
 *.log
 
-# 공개 페이지 생성물 — 발행은 별도 저장소로 나간다
+# 공개 ?�이지 ?�성�???발행?� 별도 ?�?�소�??�간??
 public/
 
-# 로컬 다이어그램 — README 미사용
+# 로컬 ?�이?�그????README 미사??
 argus_loop_final.png
 
 # os / editor / build
