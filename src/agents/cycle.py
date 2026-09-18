@@ -413,7 +413,8 @@ def run_cycle(*, context_json: str, decision_agent, validation_agent, broker, ri
                                or "리스크게이트 거부")
             # 공유 슬리브: 체결 명목 + (라이브) working 잔량×주문가 선차감.
             # FILLED/PARTIAL 안에만 두면 미체결(0주) BUY 가 같은 사이클 room 을
-            # 안 깎아 다음 종목이 재사용한다.
+            # 안 깎아 다음 종목이 재사용한다. 취소·거절(CANCELED 등)은
+            # _TRACK_WORKING 밖이라 잔량 선차감 안 함.
             if p.side == "BUY" and _sleeve_left is not None:
                 spent = 0.0
                 fq = float(res.filled_qty or 0)
@@ -421,9 +422,10 @@ def run_cycle(*, context_json: str, decision_agent, validation_agent, broker, ri
                     fill_px = float(res.avg_price or price or 0)
                     spent += fq * fill_px
                 if getattr(broker, "mode", None) == "live":
-                    # 접수된 주문만(order_id). 게이트 거부는 잔량 없음.
+                    from ..broker import _TRACK_WORKING
                     rem = max(0.0, float(res.order_qty or 0) - fq)
-                    if rem > 0 and res.order_id:
+                    if (rem > 0 and res.order_id
+                            and str(res.status or "").upper() in _TRACK_WORKING):
                         lim = float(res.limit_price or price or 0)
                         spent += rem * lim
                 if spent > 0:

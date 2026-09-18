@@ -1052,7 +1052,7 @@ class Broker:
             })
             self.last_result = ExecuteResult.rejected(
                 f"체결가 미수신({status})", order_qty=order.qty,
-                limit_price=order.price, order_id=order_id)
+                limit_price=order.price, order_id=order_id, status=track_status)
             return self.last_result
 
         # UNKNOWN 도 표에 남긴다. 이벤트는 조회 실패를 드러내 live_order_error.
@@ -1070,7 +1070,7 @@ class Broker:
                     **({"exit_reason": exit_reason} if exit_reason else {})})
         self.last_result = ExecuteResult.rejected(
             f"미체결({status})", order_qty=order.qty, limit_price=order.price,
-            order_id=order_id)
+            order_id=order_id, status=status)
         return self.last_result
 
     def _execute_locked(self, order: Order, reason: str) -> ExecuteResult:

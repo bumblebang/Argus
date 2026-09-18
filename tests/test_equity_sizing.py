@@ -150,6 +150,112 @@ def test_cycle_shared_sleeve_budget_consumed_across_symbols(tmp_path):
     assert q1 == 100 and q2 == 0  # 첫 종목이 room 전량 소진
 
 
+class _LivePendingClient:
+    """place 후 PENDING(0 체결) — 사이클 라이브 선차감 테스트용."""
+    def __init__(self, status="PENDING", filled=0, avg=None):
+        self.status = status
+        self.filled = filled
+        self.avg = avg
+        self.calls = []
+
+    def orderbook(self, symbol, market=None):
+        return {"asks": [{"price": "1000", "volume": "1000"}],
+                "bids": [{"price": "999", "volume": "1000"}]}
+
+    def place_order(self, **kw):
+        self.calls.append(kw)
+        return {"orderId": f"L{len(self.calls)}"}
+
+    def get_order(self, account_seq, order_id):
+        ex = {"filledQuantity": str(self.filled), "commission": "0", "tax": "0"}
+        if self.avg is not None:
+            ex["averageFilledPrice"] = str(self.avg)
+        return {"status": self.status, "execution": ex}
+
+    def get_sellable(self, account_seq, symbol):
+        return None
+
+    def cancel_order(self, account_seq, order_id):
+        return {"ok": True}
+
+
+def test_cycle_live_pending_buy_pre_deducts_sleeve(tmp_path):
+    """라이브 PENDING(0주) BUY 도 같은 사이클 room 을 선차감한다."""
+    from src.engine.store import Store
+    decision = DecisionOutput(market_view="x", proposals=[
+        Proposal(symbol="005930", market="KR", side="BUY", conviction=1.0,
+                 horizon="position", target_weight=0.99, thesis="a", key_risks=[]),
+        Proposal(symbol="000660", market="KR", side="BUY", conviction=1.0,
+                 horizon="position", target_weight=0.99, thesis="b", key_risks=[]),
+    ])
+    llm = MockLLM(_responder(decision))
+    store = Store(tmp_path / "t.db")
+    acct = PaperAccount(cash={"KR": 10_000_000}, fee_rate={"KR": 0.0},
+                        slippage_bps={"KR": 0.0}, state_path=tmp_path / "a.json")
+    gate = RiskGate({"capital": {"KR": 10_000_000}, "max_position_pct": 0.50,
+                     "max_positions": 10, "daily_loss_limit_pct": 0.05,
+                     "max_order_notional": {},
+                     "kill_switch_file": str(tmp_path / "HALT")})
+    client = _LivePendingClient(status="PENDING", filled=0)
+    broker = Broker(account=acct, gate=gate, client=client, mode="live",
+                    account_seq=1, live_markets=["KR"], store=store,
+                    reconcile_poll_attempts=1, reconcile_poll_sec=0.0,
+                    max_spread_pct_extended=0.0)
+    risk = RiskManager(capital={"KR": 10_000_000}, base_position_pct=0.20,
+                       max_position_pct=0.50)
+    room = 100_000
+    res = run_cycle(
+        context_json="{}", decision_agent=DecisionAgent(llm),
+        validation_agent=ValidationAgent(llm, min_conviction=0.0),
+        broker=broker, risk=risk, store=store,
+        price_lookup={"005930": 1000.0, "000660": 1000.0},
+        journal_path=tmp_path / "d.jsonl",
+        conviction_sizing=True,
+        budget_caps={"005930": room, "000660": room})
+    assert res.executed[0]["status"] == "gate_rejected"  # 미체결
+    assert len(client.calls) == 1
+    # 첫 PENDING 이 room 전량 선차감 → 둘째는 qty=0 거부(place 안 함)
+    assert res.executed[1]["status"] == "gate_rejected"
+
+
+def test_cycle_live_canceled_buy_does_not_pre_deduct_sleeve(tmp_path):
+    """접수 직후 CANCELED(0주)는 _TRACK_WORKING 밖 — room 선차감 안 함."""
+    from src.engine.store import Store
+    decision = DecisionOutput(market_view="x", proposals=[
+        Proposal(symbol="005930", market="KR", side="BUY", conviction=1.0,
+                 horizon="position", target_weight=0.99, thesis="a", key_risks=[]),
+        Proposal(symbol="000660", market="KR", side="BUY", conviction=1.0,
+                 horizon="position", target_weight=0.99, thesis="b", key_risks=[]),
+    ])
+    llm = MockLLM(_responder(decision))
+    store = Store(tmp_path / "t.db")
+    acct = PaperAccount(cash={"KR": 10_000_000}, fee_rate={"KR": 0.0},
+                        slippage_bps={"KR": 0.0}, state_path=tmp_path / "a.json")
+    gate = RiskGate({"capital": {"KR": 10_000_000}, "max_position_pct": 0.50,
+                     "max_positions": 10, "daily_loss_limit_pct": 0.05,
+                     "max_order_notional": {},
+                     "kill_switch_file": str(tmp_path / "HALT")})
+    client = _LivePendingClient(status="CANCELED", filled=0)
+    broker = Broker(account=acct, gate=gate, client=client, mode="live",
+                    account_seq=1, live_markets=["KR"], store=store,
+                    reconcile_poll_attempts=1, reconcile_poll_sec=0.0,
+                    max_spread_pct_extended=0.0)
+    risk = RiskManager(capital={"KR": 10_000_000}, base_position_pct=0.20,
+                       max_position_pct=0.50)
+    room = 100_000
+    res = run_cycle(
+        context_json="{}", decision_agent=DecisionAgent(llm),
+        validation_agent=ValidationAgent(llm, min_conviction=0.0),
+        broker=broker, risk=risk, store=store,
+        price_lookup={"005930": 1000.0, "000660": 1000.0},
+        journal_path=tmp_path / "d.jsonl",
+        conviction_sizing=True,
+        budget_caps={"005930": room, "000660": room})
+    # CANCELED 는 선차감 없음 → 둘째도 place 시도
+    assert len(client.calls) == 2
+    assert all(x["status"] == "gate_rejected" for x in res.executed)
+
+
 def test_cycle_tranche_weight_scales(tmp_path):
     decision = DecisionOutput(market_view="x", proposals=[Proposal(
         symbol="005930", market="KR", side="BUY", conviction=1.0,

@@ -471,6 +471,51 @@ def _emit(store, kind: str, symbol: str, payload: dict) -> None:
         log.warning("이벤트 기록 실패(무시) [%s %s]: %s", kind, symbol, e)
 
 
+def _sync_buy_working_applied(store, before: dict, live_pos: dict) -> None:
+    """재대사가 holdings 로 흡수한 BUY 증가분만큼 working.applied_qty 를 올린다.
+
+    finish_live 를 안 거친 체결(폴링 밖)은 원장 qty 만 늘고 applied 가 0 이라
+    room 이 invested+working 으로 이중 예약된다. 증가분을 filled−applied 에서
+    소비해 겹침을 줄인다(방향은 보수적 — 못 맞추면 예약이 남을 수 있음).
+    """
+    if store is None:
+        return
+    syms = set(before) | set(live_pos)
+    for sym in syms:
+        old_qty = float(before[sym][0]) if sym in before else 0.0
+        new_qty = float(live_pos[sym].qty) if sym in live_pos else 0.0
+        need = new_qty - old_qty
+        if need <= 1e-9:
+            continue
+        try:
+            rows = store.get_working_orders(sym, side="BUY", settled=False) or []
+        except Exception as e:
+            log.warning("재대사: BUY working 조회 실패 %s: %s", sym, e)
+            continue
+        for row in rows:
+            if need <= 1e-9:
+                break
+            filled = float(row.get("filled_qty") or 0.0)
+            applied = float(row.get("applied_qty") or 0.0)
+            avail = filled - applied
+            if avail <= 1e-9:
+                continue
+            take = min(avail, need)
+            avg = float(row.get("filled_avg") or row.get("price") or 0.0)
+            fee = float(row.get("fee") or 0.0)
+            fee_take = fee * (take / filled) if filled > 1e-9 else 0.0
+            try:
+                store.update_working_order(
+                    row["order_id"],
+                    applied_qty=applied + take,
+                    applied_notional=float(row.get("applied_notional") or 0.0) + avg * take,
+                    applied_fee=float(row.get("applied_fee") or 0.0) + fee_take)
+            except Exception as e:
+                log.warning("재대사: BUY applied 갱신 실패 %s: %s", row["order_id"], e)
+                continue
+            need -= take
+
+
 def apply_reconcile_from_live(account, store, data: dict,
                               *, markets=("KR", "US")) -> dict:
     """주기 재대사 apply — broker.run_locked/reconcile 안에서 호출."""
@@ -506,6 +551,7 @@ def apply_reconcile_from_live(account, store, data: dict,
     # store 병합 전에 귀속 — 저널에 실체결 매도가 먼저 들어가야 partial/close 의
     # pnl 이 그 가격을 쓴다.
     attributed = _attribute_exits(account, store, before, live_pos)
+    _sync_buy_working_applied(store, before, live_pos)
 
     adopted: list[str] = []
     updated: list[str] = []

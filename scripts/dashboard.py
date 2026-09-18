@@ -1678,39 +1678,43 @@ def _gather() -> dict:
     data["gate_postmortem"] = _read_gate_postmortem()
     # 측정층(그림자·캘리브레이션·매니저) — 실패해도 대시보드는 계속.
     # Store 는 readonly — migrate/open-dedupe 쓰기로 라이브 DB 를 건드리지 않는다.
+    # working BUY 명목은 instrumentation 과 **분리** — 측정 실패로 room 표시가
+    # 비지 않게 한다.
     _st = None
     try:
         from src.engine.store import Store
-        from src.shadow_ledger import shadow_stats
-        from src.calibration import conviction_calibration
-        from src.attribution import manager_epochs
         _st = Store(DB, readonly=True)
-        data["instrumentation"] = {
-            "shadow": shadow_stats(_st, since_days=90),
-            "calibration": conviction_calibration(_st, since_days=90),
-            "manager_epochs": manager_epochs(_st, since_days=30),
-            "recent_pending": [dict(r) for r in _st.get_pending_shadow_positions()[:8]],
-        }
-        # 밸류 room 표시용 — Store 는 아래에서 close 되므로 시장별 명목만 스냅.
+    except Exception:
+        _st = None
+    if _st is not None:
+        try:
+            from src.shadow_ledger import shadow_stats
+            from src.calibration import conviction_calibration
+            from src.attribution import manager_epochs
+            data["instrumentation"] = {
+                "shadow": shadow_stats(_st, since_days=90),
+                "calibration": conviction_calibration(_st, since_days=90),
+                "manager_epochs": manager_epochs(_st, since_days=30),
+                "recent_pending": [dict(r) for r in _st.get_pending_shadow_positions()[:8]],
+            }
+        except Exception:
+            data["instrumentation"] = None
         try:
             from src.agents.value_trade import working_buy_reserved_notional
             vcfg = data.get("value_cfg") or {}
-            exp = str(vcfg.get("exposure_base") or "capital")
             data["working_buy_notional"] = {
-                m: working_buy_reserved_notional(_st, m, exposure_base=exp)
+                m: working_buy_reserved_notional(_st, m)
                 for m in (vcfg.get("markets") or ["KR", "US"])
             }
         except Exception:
             data["working_buy_notional"] = {}
-    except Exception:
+        try:
+            _st.close()
+        except Exception:
+            pass
+    else:
         data["instrumentation"] = None
-        data.setdefault("working_buy_notional", {})
-    finally:
-        if _st is not None:
-            try:
-                _st.close()
-            except Exception:
-                pass
+        data["working_buy_notional"] = {}
     return data
 
 def _safe_json(s) -> dict:
