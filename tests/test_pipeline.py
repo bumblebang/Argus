@@ -366,6 +366,19 @@ def test_open_markets_fn_none_no_filter(tmp_path):
     assert seen == [["005930", "AAPL"]]      # 무필터: 정렬상 005930 < AAPL
 
 
+def test_open_markets_fn_excludes_closed_market_held_in_focus(tmp_path):
+    """국장 중 이벤트 각성(focus) — 닫힌 미장 보유분이 stub 으로 재주입되지 않음(09-18 11:00)."""
+    store = Store(tmp_path / "t.db")
+    seen = []
+    uni = lambda: {"KR": [{"symbol": "005930"}], "US": [{"symbol": "AAPL"}]}
+    r = _runner_open_filter(tmp_path, store, _capture_symbols_factory(seen),
+                            universe_fn=uni, open_markets_fn=lambda: ["KR"])
+    r.account.fill("AAPL", "US", "BUY", 1, 100.0)
+    r.run(wake={"reason": "wake_triggers", "market": "KR",
+                "triggers": [{"kind": "vol_spike", "symbol": "005930"}]})
+    assert seen == [["005930"]]              # 보유 AAPL(US 닫힘) 제외
+
+
 def test_open_markets_fn_empty_excludes_all(tmp_path):
     """양 시장 다 닫히면(빈 리스트) 후보 0 — 뇌는 신규 진입 후보를 못 받는다."""
     store = Store(tmp_path / "t.db")

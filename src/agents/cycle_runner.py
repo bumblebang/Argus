@@ -434,6 +434,8 @@ class CycleRunner:
         else:
             items = [i for i in items
                      if str(i.get("pool") or "") != "gap_decline"]
+        # 이번 사이클이 다루는 시장(None=필터 없음). 보유·armed 필수 종목에도 같이 적용한다.
+        serve_mkts: set[str] | None = None
         if self.open_markets_fn is not None:
             reason = str((wake or {}).get("reason") or "")
             if reason == "athena_done":
@@ -448,12 +450,14 @@ class CycleRunner:
                     trade = (self.cfg.raw.get("run") or {}).get("trade_markets")
                     keep = {str(m).upper() for m in (broker_live or trade or ["KR"])}
                 items = [i for i in items if str(i.get("market") or "").upper() in keep]
+                serve_mkts = keep
             else:
                 # gap_decline_pool YAML 행은 상위 키(KR:)만 있고 item.market 이 없을 수 있다.
                 # i["market"] 강참조는 15:20/19:50 갭 각성마다 KeyError 로 사이클 전체를 죽였다.
                 open_mkts = {str(m).upper() for m in self.open_markets_fn()}
                 items = [i for i in items
                          if str(i.get("market") or "").upper() in open_mkts]
+                serve_mkts = open_mkts
         # 유동성 필터(opt-in): 시간외 세션에서 체결이 멈춘 종목은 신규진입 후보에서 제외.
         if self.illiquid_fn is not None:
             stale = self.illiquid_fn()
@@ -479,7 +483,8 @@ class CycleRunner:
         n_items_before = len(items)
         items, tier = serve.select_candidates(
             items, wake, held=held, armed=armed, bullish=bullish,
-            scores=strat_scores, cfg=scfg)
+            scores=strat_scores, cfg=scfg,
+            markets=serve_mkts, market_fn=self.market_of)
         scan_shortlist = (
             tier == "scan" and scfg.get("scan_enabled", True)
             and not serve.scan_shortlist_exempt(wake))
