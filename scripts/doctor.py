@@ -196,8 +196,10 @@ def check_market_state_freshness(root: Path) -> None:
 
 def check_risk_capital(cfg) -> None:
     from src.risk_gate import capital_coverage_gaps, _normalize_capital
+    from src.capital_sync import capital_cash_seed_gaps
 
     risk_cfg = cfg.raw.get("risk") or {}
+    paper_cfg = cfg.raw.get("paper") or {}
     broker = cfg.raw.get("broker") or {}
     live_markets = broker.get("live_markets", ["KR"])
     universe_markets = [str(m).upper() for m in (cfg.universe or {}).keys()]
@@ -211,6 +213,20 @@ def check_risk_capital(cfg) -> None:
     for m in trade_markets:
         if m in norm and norm[m] <= 0:
             _warn("risk.capital", f"{m}=0 — 한도 비활성")
+    gaps = capital_cash_seed_gaps(
+        risk_cfg.get("capital"), paper_cfg.get("cash"), markets=trade_markets)
+    if gaps:
+        bits = ", ".join(
+            f"{g['market']}: capital={g['capital']:.0f} cash={g['paper_cash']:.0f}"
+            for g in gaps)
+        _warn(
+            "capital/cash",
+            f"config 시드 불일치 — {bits}. "
+            "둘 다 '배정 원금' 시드(런타임 여유현금≠capital 은 정상). "
+            "exposure_base=equity 면 사이징은 실자산, capital 은 폴백·동기화 대상.",
+        )
+    else:
+        _ok("capital/cash", "config 시드 정합(risk.capital ≈ paper.cash)")
 
 
 def check_research_boundary() -> None:

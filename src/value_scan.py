@@ -68,6 +68,9 @@ VALUE_SYSTEM = """\
       - op_margin(영업이익률)·current_ratio(유동비율): 본업 수익성·단기 지급능력 확인.
       - revenue_growth/op_income_growth/net_income_growth(전년 대비): **역성장이면 쇠퇴
         기업의 싼 값(밸류트랩) 신호** → 촉매 없이는 진입 신중.
+      - operating_cf/fcf(현금흐름, 원): **영업CF 음수** 또는 **만성 capex>영업CF(fcf 음수)**
+        이면 이익만 보고 싸다고 단정하지 마라(현금 창출력 의심 → 밸류트랩 경계).
+        fcf 는 영업CF−유형/무형취득 근사라 성장 capex 와 유지 capex 를 구분하지 않는다.
       - revenue_eok: 매출 규모(단위 **억원**).
     각 지표가 null(미제공)이면 그 지표는 무시하고 나머지로 판단하라. 시총은 현재가, 재무는
     작년(fiscal_year) 기준이라 시차가 있음을 evidence 에 명시하라.
@@ -439,17 +442,25 @@ def _save_fin_cache(data: dict, path: str | Path = FIN_CACHE) -> None:
         log.warning("[value] 재무 캐시 저장 실패(무시): %s", e)
 
 
-# fetch_financials 반환에서 캐시에 담는 계정 키(BS+IS) + fiscal_year.
+# fetch_financials(+optional CF) 캐시 키. fiscal_year 포함.
+# CF 키는 SinglAcntAll miss-only 백필로 채움 — _year_complete 는 BS equity 만 본다.
 _FIN_CACHE_KEYS = ("revenue", "operating_income", "net_income", "equity",
                    "total_assets", "total_liabilities",
-                   "current_assets", "current_liabilities", "fiscal_year")
+                   "current_assets", "current_liabilities", "fiscal_year",
+                   "operating_cf", "investing_cf", "financing_cf", "capex", "fcf")
+_CF_CACHE_KEYS = ("operating_cf", "investing_cf", "financing_cf", "capex", "fcf")
 
 
 def _year_complete(entry: dict | None) -> bool:
-    """연도 캐시가 DART 응답으로 채워졌는지 — equity 키·값 존재(0 포함)."""
+    """연도 캐시가 DART BS/IS 응답으로 채워졌는지 — equity 키·값 존재(0 포함)."""
     if not isinstance(entry, dict):
         return False
     return "equity" in entry and entry.get("equity") is not None
+
+
+def _cf_filled(entry: dict | None) -> bool:
+    """CF 백필 시도 여부 — operating_cf 키 존재(값이 None 이어도 '시도함')."""
+    return isinstance(entry, dict) and "operating_cf" in entry
 
 
 def _growth(cur, prev) -> float | None:
@@ -465,10 +476,13 @@ def _kr_fundamentals(api_key: str, corp_map: dict, code: str, market_cap: float 
     """DART 연결 재무로 KR 밸류에이션·건전성·성장 지표를 계산. 계산 불가면 None.
 
     반환 {pb, pe_trailing, net_margin, debt_ratio, current_ratio, roe, roa, op_margin,
-    revenue_growth, op_income_growth, net_income_growth, revenue_eok, fiscal_year}.
+    revenue_growth, op_income_growth, net_income_growth, revenue_eok, fiscal_year,
+    operating_cf, investing_cf, financing_cf, capex, fcf}.
     market_cap(현재 시총, 원)이 없거나 당해 재무를 못 구하면 None. 재무는 cache(hit 면 DART
     미접촉) → miss 면 years 순으로 fetch_fn 시도(2025 우선, 013 등으로 없으면 2024 폴백)하고
-    성공분을 cache 에 적재한다. 성장률용 전년(당해 직전 연도) 재무도 캐시 우선 확보하되,
+    성공분을 cache 에 적재한다. CF 는 SinglAcnt 에 없어 **캐시에 있으면 읽고**, 없으면
+    null(백필 `value_fin_backfill` 이 All 로 채움 — 스캔 경로에서 All 콜 안 함).
+    성장률용 전년(당해 직전 연도) 재무도 캐시 우선 확보하되,
     없으면 성장률만 None(당해로 나머지 지표는 계산). 분모 0/None 은 전부 None 안전.
     자본잠식(equity<=0)이면 pb·debt_ratio·roe=None, 적자(net_income<=0)면 pe_trailing=None.
     """
@@ -491,6 +505,10 @@ def _kr_fundamentals(api_key: str, corp_map: dict, code: str, market_cap: float 
         got = fetch_fn(api_key, corp, y)
         if got:
             entry = {k: got.get(k) for k in _FIN_CACHE_KEYS}
+            # CF 는 All 전용 — SinglAcnt 응답에 없으면 키를 안 넣어 백필 대상 표시
+            for ck in _CF_CACHE_KEYS:
+                if ck not in got:
+                    entry.pop(ck, None)
             ce[str(y)] = entry
             return entry
         return None
@@ -535,7 +553,7 @@ def _kr_fundamentals(api_key: str, corp_map: dict, code: str, market_cap: float 
                  if (revenue and op_income is not None) else None)
 
     prev = prev or {}
-    return {
+    out = {
         "pb": pb, "pe_trailing": pe,
         "net_margin": round(margin, 4) if margin is not None else None,
         "debt_ratio": debt_ratio, "current_ratio": current_ratio,
@@ -546,6 +564,10 @@ def _kr_fundamentals(api_key: str, corp_map: dict, code: str, market_cap: float 
         "revenue_eok": round(revenue / 1e8) if revenue else None,
         "fiscal_year": fy,
     }
+    for ck in _CF_CACHE_KEYS:
+        if ck in fin:
+            out[ck] = fin.get(ck)
+    return out
 
 
 # ── 실행 ─────────────────────────────────────────────────────────
@@ -636,6 +658,22 @@ def run_scan(cfg, llm, *, limit: int | None = None,
     fin_cache_orig = json.dumps(fin_cache, ensure_ascii=False, sort_keys=True)
 
     watchlist = load_watchlist(watchlist_path)
+    # US 품질(Finnhub) miss-only — LLM TTL 밖에 남은 지도도 QualityTilt 가 살게.
+    if us_quality_on:
+        try:
+            from .value_us_quality_backfill import maybe_us_quality_backfill
+            uq = maybe_us_quality_backfill(
+                cfg, watchlist=watchlist, watchlist_path=watchlist_path,
+                now=now_fn(), api_key=finnhub_key,
+                report_path=(Path(watchlist_path).parent
+                             / "value_us_quality_backfill_report.json"))
+            if not uq.get("ran"):
+                log.debug("[value] US 품질 백필 스킵: %s", uq.get("why"))
+            else:
+                # 저장본과 동기(annotate·디스크 반영 후 재로드 대신 in-place 유지)
+                pass
+        except Exception as e:
+            log.warning("[value] US 품질 백필 실패(스캔은 계속): %s", e)
     fresh = fresh_symbols(watchlist, vcfg["ttl_hours"], now=now)
     held = set(held_symbols or ())
     force = priority_refresh_symbols(
