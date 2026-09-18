@@ -48,6 +48,14 @@ def test_missing_stop_is_surfaced_not_silent():
     assert "전략 미배정" in h
 
 
+def test_provisional_stop_is_labeled_임시():
+    pos = dict(_POS_ADOPTED, stop_price=254125.0, target_price=294250.0,
+               meta='{"provisional_stop": true, "source": "reconcile_adopted"}')
+    h = _asset_html(_d([_SNAP_B], [pos]))
+    assert "임시" in h and "254,125" in h
+    assert "미설정" not in h
+
+
 def test_ledger_only_position_is_warned():
     # 원장엔 열려 있는데 스냅샷엔 없다 = 스냅샷 지연이거나 유령. 조용히 숨기면 안 된다.
     h = _asset_html(_d([_SNAP_B], [_POS_A, _POS_ADOPTED]))

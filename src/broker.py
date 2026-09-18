@@ -133,7 +133,8 @@ class Broker:
                  working_order_ttl_sec: float = 60.0,
                  block_on_working_order: bool = True,
                  attribution_ttl_sec: float = 1800.0,
-                 working_order_abandon_ttl_sec: float = 1800.0):
+                 working_order_abandon_ttl_sec: float = 1800.0,
+                 sync_stale_error_sec: float = 3600.0):
         self.account = account
         self.gate = gate
         self.client = client
@@ -186,6 +187,13 @@ class Broker:
         # 재대사가 실계좌 buying_power 로 cash 를 덮은 시각. 그 이전 미체결 BUY 는
         # 이미 BP 에 홀드돼 있어 _working_reservations 에서 빼면 이중 차감(과차단).
         self._cash_reconciled_at: float | None = None
+        # 실계좌 조회 건강도. 조회가 실패해도 봇은 마지막 성공 스냅샷으로 계속 돌지만,
+        # 그 사실이 어디에도 안 남으면 게이트·사이징이 낡은 값을 진실로 믿는다.
+        self.sync_health: dict = {
+            "cash_ok": True, "holdings_ok": True, "failed_markets": [],
+            "errors": {}, "last_ok_ts": None, "consecutive_failures": 0}
+        # 마지막 성공 조회가 이보다 오래되면 로그·이벤트를 error 로 승급.
+        self.sync_stale_error_sec = float(sync_stale_error_sec)
 
     # 게이트/러너가 참조하는 계좌 상태 위임
     def position(self, symbol: str) -> Position:
@@ -299,8 +307,37 @@ class Broker:
         """기동 동기화 — API fetch(락 밖) + apply( run_locked ). sync_from_live 직접 호출 금지."""
         from .broker_sync import apply_sync_from_live, fetch_live_account_data
         data = fetch_live_account_data(gateway, self.account_seq, markets=markets)
+        self.note_sync_result(data)
         return self.run_locked(
             lambda acct: apply_sync_from_live(acct, store, data, markets=markets))
+
+    def note_sync_result(self, data: dict) -> dict:
+        """실계좌 조회 결과의 실패 비트를 sync_health 에 기록. 갱신된 health 반환.
+
+        조회가 실패해도 주문을 막지는 않는다(마지막 성공 스냅샷으로 계속 운행).
+        대신 실패했다는 사실과 마지막 성공 시각은 반드시 남긴다 — 5분 낡은 현금과
+        6시간 낡은 현금이 구분되지 않으면 드리프트를 아무도 못 본다.
+        """
+        h = self.sync_health
+        cash_ok = bool(data.get("cash_ok", True))
+        holdings_ok = bool(data.get("holdings_ok", True))
+        h["cash_ok"] = cash_ok
+        h["holdings_ok"] = holdings_ok
+        h["failed_markets"] = list(data.get("failed_markets") or [])
+        h["errors"] = dict(data.get("errors") or {})
+        if cash_ok and holdings_ok:
+            h["last_ok_ts"] = time.time()
+            h["consecutive_failures"] = 0
+        else:
+            h["consecutive_failures"] = int(h.get("consecutive_failures", 0)) + 1
+        return dict(h)
+
+    def sync_stale_sec(self, now: float | None = None) -> float | None:
+        """마지막 성공 조회 이후 경과(초). 한 번도 성공한 적 없으면 None."""
+        ts = self.sync_health.get("last_ok_ts")
+        if not ts:
+            return None
+        return max(0.0, (now if now is not None else time.time()) - float(ts))
 
     def activity_generation(self) -> int:
         """주문 활동 세대(락 안 스냅샷). 재대사 fetch 직전 캡처용."""

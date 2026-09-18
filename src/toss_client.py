@@ -72,6 +72,13 @@ EP_GROUP = {
 
 _CCY = {"KR": "KRW", "US": "USD"}  # 시장 -> 통화
 
+_RETRY_ATTEMPTS = 4
+_BACKOFF_CAP_SEC = 8.0
+
+
+def _backoff_wait(attempt: int, cap: float = _BACKOFF_CAP_SEC) -> float:
+    return min(2 ** attempt, cap) + random.uniform(0, 0.5)
+
 
 class TossAPIError(RuntimeError):
     def __init__(self, status: int, body: Any):
@@ -194,10 +201,23 @@ class TossClient:
             path = path.format(**path_params)
         url = self.creds.base_url + path
         token_retried = False
-        for attempt in range(4):
+        for attempt in range(_RETRY_ATTEMPTS):
+            last_try = attempt == _RETRY_ATTEMPTS - 1
             self._acquire(key)                  # 재시도마다 토큰 소비(429 폭주 방지)
-            resp = self.session.request(method, url, params=params, json=json,
-                                        headers=self._headers(account_seq), timeout=self.timeout)
+            try:
+                resp = self.session.request(method, url, params=params, json=json,
+                                            headers=self._headers(account_seq),
+                                            timeout=self.timeout)
+            except requests.exceptions.RequestException as e:
+                # 타임아웃·연결 끊김·DNS 는 곧 회복되는 일과성 장애다. 여기서 그냥
+                # 튀면 계좌 동기화가 조회 1회 실패로 원장을 낡은 채 둔다.
+                if last_try:
+                    raise
+                wait = _backoff_wait(attempt)
+                log.warning("%s 요청 실패(%s: %s) -> %.1fs 후 재시도",
+                            key, type(e).__name__, e, wait)
+                time.sleep(wait)
+                continue
             if resp.status_code == 401 and "invalid-token" in resp.text:
                 # 401 invalid-token 은 (a)stale 토큰 또는 (b)BASIC tier 쓰로틀 신호다.
                 # 방금 발급한 토큰이 401 이면 쓰로틀/경합이므로 '재발급하지 말고' 백오프 후 같은
@@ -208,7 +228,7 @@ class TossClient:
                     self._invalidate_token()
                     token_retried = True
                     continue
-                wait = min(2 ** attempt, 8) + random.uniform(0, 0.5)
+                wait = _backoff_wait(attempt)
                 log.warning("401 invalid-token (쓰로틀 추정, 토큰 %.0fs 전 발급) -> 재발급 없이 %.1fs 백오프", age, wait)
                 time.sleep(wait)
                 continue
@@ -219,6 +239,15 @@ class TossClient:
                 wait = base + random.uniform(0, 0.5)
                 log.warning("429 rate limit (group=%s, Retry-After=%s) -> %.1fs 후 재시도",
                             resp.headers.get("X-RateLimit-Group", "?"), retry_after, wait)
+                time.sleep(wait)
+                continue
+            if resp.status_code >= 500:
+                # 서버측 일과성 오류 — 재시도 대상. 4xx(요청 오류)는 재시도해도 같다.
+                if last_try:
+                    raise TossAPIError(resp.status_code, resp.text)
+                wait = _backoff_wait(attempt)
+                log.warning("%s 서버 오류 %s -> %.1fs 후 재시도",
+                            key, resp.status_code, wait)
                 time.sleep(wait)
                 continue
             if resp.status_code >= 400:

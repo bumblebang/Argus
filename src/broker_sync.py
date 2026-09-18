@@ -8,8 +8,8 @@ import time
 from datetime import datetime
 
 from .logging_setup import get_logger
-from .store_sync import (RECONCILE_THESIS, SYNC_THESIS, sync_open_qty,
-                         _last_sell_fee)
+from .store_sync import (RECONCILE_THESIS, SYNC_THESIS, adopt_live_position,
+                         sync_open_qty, _last_sell_fee)
 from .strategies.base import Position
 
 log = get_logger("broker.sync")
@@ -104,6 +104,60 @@ def halt_after_live_sync_failure(broker, store, error: BaseException) -> str:
     return str(halt_path)
 
 
+def startup_sync_halt_reason(sync: dict, markets=()) -> str | None:
+    """기동 동기화 결과가 HALT 대상이면 사유 문자열, 아니면 None.
+
+    보유 조회 실패 또는 **요청한 모든 시장**의 현금 조회 실패 — 이때는 신뢰할
+    '마지막 성공 스냅샷'이 없다. 일부 시장만 실패면 경고만(주기 재대사가 이어서 재시도).
+    """
+    if not sync.get("holdings_ok", True):
+        err = (sync.get("errors") or {}).get("holdings") or "holdings fetch failed"
+        return str(err)
+    want = {str(m) for m in (markets or ())}
+    failed = {str(m) for m in (sync.get("failed_markets") or [])}
+    if want and failed >= want:
+        return f"cash fetch failed: {', '.join(sorted(failed))}"
+    return None
+
+
+def record_sync_visibility(broker, store, *, prev_failures: int = 0) -> None:
+    """주기 재대사 조회 건강도를 이벤트·로그로 남긴다. 주문은 막지 않는다."""
+    health = getattr(broker, "sync_health", None) or {}
+    cash_ok = bool(health.get("cash_ok", True))
+    holdings_ok = bool(health.get("holdings_ok", True))
+    age = broker.sync_stale_sec() if hasattr(broker, "sync_stale_sec") else None
+    stale_limit = float(getattr(broker, "sync_stale_error_sec", 3600.0) or 3600.0)
+    if cash_ok and holdings_ok:
+        if prev_failures > 0 and store is not None:
+            try:
+                store.log_event("sync_recovered", None, {
+                    "last_ok_age_sec": age,
+                    "prev_consecutive_failures": prev_failures})
+            except Exception as e:
+                log.warning("sync_recovered 이벤트 기록 실패: %s", e)
+        return
+    severity = "error" if (age is None or age >= stale_limit) else "warning"
+    payload = {
+        "cash_ok": cash_ok, "holdings_ok": holdings_ok,
+        "failed_markets": list(health.get("failed_markets") or []),
+        "errors": dict(health.get("errors") or {}),
+        "last_ok_age_sec": age,
+        "consecutive_failures": int(health.get("consecutive_failures") or 0),
+        "severity": severity,
+    }
+    msg = ("실계좌 조회 실패 — 마지막 성공 스냅샷으로 운행 "
+           "age=%s failed=%s holdings_ok=%s")
+    if severity == "error":
+        log.error(msg, age, payload["failed_markets"], holdings_ok)
+    else:
+        log.warning(msg, age, payload["failed_markets"], holdings_ok)
+    if store is not None:
+        try:
+            store.log_event("sync_degraded", None, payload)
+        except Exception as e:
+            log.warning("sync_degraded 이벤트 기록 실패: %s", e)
+
+
 def _last_sell_price(account, symbol: str) -> float | None:
     for f in reversed(account.journal):
         if f.symbol == symbol and f.side == "SELL":
@@ -131,30 +185,73 @@ def _recent_sell_price(account, symbol: str,
     return None
 
 
-def fetch_live_account_data(client, account_seq, *, markets=("KR", "US")) -> dict:
-    """실계좌 API 조회만(락 밖). client 또는 TossGateway."""
-    cash: dict[str, float] = {}
-    for market in markets:
+# HTTP 레이어(toss_client)가 이미 타임아웃·5xx·429 를 재시도한 뒤의 마지막 보루.
+# 토큰 재발급 경합처럼 한 박자 쉬면 풀리는 실패를 여기서 한 번 더 흡수한다.
+_FETCH_RETRY_WAITS: tuple[float, ...] = (0.5, 1.5)
+
+
+def _retry_fetch(what: str, fn):
+    """조회를 짧게 재시도. (값, 마지막 오류) — 성공이면 오류는 None."""
+    attempts = len(_FETCH_RETRY_WAITS) + 1
+    last_err: Exception | None = None
+    for i in range(attempts):
+        if i:
+            time.sleep(_FETCH_RETRY_WAITS[i - 1])
         try:
-            bp = client.get_buying_power(account_seq, market) or {}
-            c = _num(bp.get("cashBuyingPower"), default=None)
-            if c is None:
-                log.warning("조회: %s 매수가능금액 파싱 실패(%r)", market, bp)
-                continue
-            cash[market] = c
+            return fn(), None
         except Exception as e:
-            log.warning("조회: %s 매수가능금액 실패 — %s", market, e)
+            last_err = e
+            log.warning("조회: %s 실패(%d/%d) — %s", what, i + 1, attempts, e)
+    return None, last_err
 
-    holdings_ok = True
+
+def fetch_live_account_data(client, account_seq, *, markets=("KR", "US")) -> dict:
+    """실계좌 API 조회만(락 밖). client 또는 TossGateway.
+
+    실패는 반드시 cash_ok/holdings_ok/failed_markets 로 드러낸다. 현금 조회 실패가
+    표식 없이 넘어가면 게이트·사이징이 낡은 현금을 진실로 믿는다 — 보유 조회만
+    holdings_ok 를 달고 현금은 조용히 넘어가던 게 원장 드리프트의 출발점이었다.
+    """
+    cash: dict[str, float] = {}
+    failed_markets: list[str] = []
+    errors: dict[str, str] = {}
+    for market in markets:
+        bp, err = _retry_fetch(
+            f"{market} 매수가능금액",
+            lambda m=market: client.get_buying_power(account_seq, m) or {})
+        if err is not None:
+            failed_markets.append(market)
+            errors[market] = str(err)
+            continue
+        c = _num((bp or {}).get("cashBuyingPower"), default=None)
+        if c is None:
+            log.warning("조회: %s 매수가능금액 파싱 실패(%r)", market, bp)
+            failed_markets.append(market)
+            errors[market] = f"파싱 실패({bp!r})"
+            continue
+        cash[market] = c
+
+    holdings, herr = _retry_fetch(
+        "보유", lambda: client.get_holdings(account_seq) or {})
+    holdings_ok = herr is None
     items: list = []
-    try:
-        holdings = client.get_holdings(account_seq) or {}
-        items = holdings.get("items") or []
-    except Exception as e:
-        log.error("조회: 보유 실패 — %s", e)
-        holdings_ok = False
+    if holdings_ok:
+        items = (holdings or {}).get("items") or []
+    else:
+        log.error("조회: 보유 실패 — %s", herr)
+        errors["holdings"] = str(herr)
 
-    return {"cash": cash, "items": items, "holdings_ok": holdings_ok}
+    return {"cash": cash, "items": items, "holdings_ok": holdings_ok,
+            "cash_ok": not failed_markets, "failed_markets": failed_markets,
+            "errors": errors}
+
+
+def _health_fields(data: dict) -> dict:
+    """fetch 결과의 실패 비트만 추려 apply 반환에 그대로 실어 보낸다."""
+    return {"cash_ok": bool(data.get("cash_ok", True)),
+            "holdings_ok": bool(data.get("holdings_ok")),
+            "failed_markets": list(data.get("failed_markets") or []),
+            "errors": dict(data.get("errors") or {})}
 
 
 def _parse_holdings_items(items: list) -> tuple[dict, dict]:
@@ -216,7 +313,7 @@ def apply_sync_from_live(account, store, data: dict, *, markets=("KR", "US")) ->
     return {"cash": dict(account.cash),
             "positions": [{"symbol": s["symbol"], "qty": s["qty"], "avg": s["avg"]}
                           for s in synced],
-            "synced": len(synced)}
+            "synced": len(synced), **_health_fields(data)}
 
 
 def sync_from_live(client, account_seq, account, store=None,
@@ -227,7 +324,6 @@ def sync_from_live(client, account_seq, account, store=None,
 
 
 def _sync_store(store, synced: list[dict], account) -> None:
-    now = time.time()
     open_rows = {r["symbol"]: r for r in store.get_open_positions()}
     live_syms = set()
     for s in synced:
@@ -239,13 +335,9 @@ def _sync_store(store, synced: list[dict], account) -> None:
                 sync_open_qty(store, row, sym, s["qty"], s["avg"], account,
                               reason="live_sync")
                 continue
-            meta = {"source": "synced", "entry_thesis": SYNC_THESIS, "synced_ts": now}
-            store.open_position(sym, s["market"], s["qty"], s["avg"],
-                                strategy=None, thesis=SYNC_THESIS,
-                                target_price=None, stop_price=None, meta=meta)
-            store.disarm_symbol(sym)
-            from .shadow_ledger import cancel_shadow_on_fill
-            cancel_shadow_on_fill(store, sym)
+            adopt_live_position(
+                store, sym, s["market"], s["qty"], s["avg"],
+                source="synced", thesis=SYNC_THESIS)
         except Exception as e:
             log.warning("동기화: store 미러 실패(생략) %s: %s", sym, e)
     for sym, row in open_rows.items():
@@ -388,7 +480,8 @@ def apply_reconcile_from_live(account, store, data: dict,
         return {"cash": dict(account.cash), "holdings": 0,
                 "adopted": [], "updated": [], "closed": [], "attributed": {},
                 "external_cash": ext,
-                "error": data.get("error", "holdings fetch failed")}
+                "error": data.get("error", "holdings fetch failed"),
+                **_health_fields(data)}
 
     # 덮어쓰기 전 평균단가 스냅 — 손익 귀속의 원가 기준(덮으면 사라진다).
     before = {sym: (float(p.qty), float(p.avg_price),
@@ -427,14 +520,9 @@ def apply_reconcile_from_live(account, store, data: dict,
                     else:
                         store.disarm_symbol(sym)
                     continue
-                meta = {"source": "reconcile_adopted", "entry_thesis": RECONCILE_THESIS,
-                        "synced_ts": time.time()}
-                store.open_position(sym, live_mkt.get(sym, "KR"), pos.qty, pos.avg_price,
-                                    strategy=None, thesis=RECONCILE_THESIS,
-                                    target_price=None, stop_price=None, meta=meta)
-                store.disarm_symbol(sym)
-                from .shadow_ledger import cancel_shadow_on_fill
-                cancel_shadow_on_fill(store, sym)
+                adopt_live_position(
+                    store, sym, live_mkt.get(sym, "KR"), pos.qty, pos.avg_price,
+                    source="reconcile_adopted", thesis=RECONCILE_THESIS)
                 adopted.append(sym)
             except Exception as e:
                 log.warning("재대사: store 병합 실패(생략) %s: %s", sym, e)
@@ -452,7 +540,8 @@ def apply_reconcile_from_live(account, store, data: dict,
         log.info("재대사 병합 — 채택=%s, 청산(유령)=%s, 갱신=%s", adopted, closed, updated)
     return {"cash": dict(account.cash), "holdings": len(live_pos),
             "adopted": adopted, "updated": updated, "closed": closed,
-            "attributed": attributed, "external_cash": ext}
+            "attributed": attributed, "external_cash": ext,
+            **_health_fields(data)}
 
 
 def reconcile_from_live(client, account_seq, account, store=None,

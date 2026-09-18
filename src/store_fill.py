@@ -4,7 +4,7 @@ from __future__ import annotations
 import json
 from typing import Any, Callable
 
-from .store_sync import RECONCILE_THESIS
+from .store_sync import RECONCILE_THESIS, adopt_live_position
 from .fill_result import ExecuteResult
 from .logging_setup import get_logger
 
@@ -79,21 +79,29 @@ def mirror_symbol_to_store(
     market = broker.account.symbol_market.get(symbol, "KR")
     open_row = _open_row(store, symbol)
 
-    if acct.qty > 0:
+    # 이미 open 행이 있을 때만 stale armed 정리. open 이 없으면 armed 계획을
+    # adopt/promote 에 써야 하므로 여기서 닫으면 안 된다.
+    if acct.qty > 0 and open_row is not None:
         store.disarm_symbol(symbol, exclude_id=armed_id)
 
-    # 부분 매도 귀속 — fill.side 로 판별(account race 없이)
+    # 부분 매도 귀속 — fill.side 로 판별(account race 없이).
+    # slice 수량은 원장 감소분으로 클램프 — 주문 누적 filled_qty 가 원장 감소보다
+    # 크면 closed slice pnl 만 부풀고 open 은 뒤에서 덮여 정상처럼 보인다.
     if (open_row is not None and fill and fill.ok and fill.side == "SELL"
             and fill.filled_qty > 0 and fill.avg_price and acct.qty > 0):
         old_qty = float(open_row["qty"] or 0)
-        if old_qty > acct.qty + 1e-9:
-            fee = float(fill.fee) if fill and fill.fee else _last_sell_fee(broker.account, symbol)
+        ledger_drop = old_qty - float(acct.qty)
+        if ledger_drop > 1e-9:
+            slice_qty = min(float(fill.filled_qty), ledger_drop)
+            raw_fee = float(fill.fee) if fill.fee else _last_sell_fee(broker.account, symbol)
+            fee = (raw_fee * (slice_qty / float(fill.filled_qty))
+                   if float(fill.filled_qty) > 1e-9 else raw_fee)
             store.record_partial_exit(
-                int(open_row["id"]), fill.filled_qty, fill.avg_price,
+                int(open_row["id"]), slice_qty, fill.avg_price,
                 reason=exit_reason or "partial_exit", fee=fee)
             open_row = _open_row(store, symbol)
-            log.debug("store mirror %s → partial sell qty=%s @ %s",
-                      symbol, fill.filled_qty, fill.avg_price)
+            log.debug("store mirror %s → partial sell qty=%s (fill=%s) @ %s",
+                      symbol, slice_qty, fill.filled_qty, fill.avg_price)
 
     if acct.qty <= 0:
         if open_row is None:
@@ -119,6 +127,7 @@ def mirror_symbol_to_store(
             stop, target = plan_fn(entry_px, horizon, meta.get("params"))
         store.promote_armed(int(armed_row["id"]), qty, avg,
                             target_price=target, stop_price=stop)
+        store.disarm_symbol(symbol, exclude_id=int(armed_row["id"]))
         log.debug("store mirror %s → promoted qty=%s avg=%s entry_px=%s",
                   symbol, qty, avg, entry_px)
         return "promoted"
@@ -131,14 +140,10 @@ def mirror_symbol_to_store(
             return "updated"
         return "noop"
 
-    # 진입 논거 미상 — 전략 신호 청산은 보수적으로 끈다(engine.entry_basis).
-    meta = {"source": "fill_mirror", "entry_thesis": RECONCILE_THESIS,
-            "entry_basis": "orphan"}
-    store.open_position(symbol, market, qty, avg,
-                        strategy=None, thesis=RECONCILE_THESIS,
-                        target_price=None, stop_price=None, meta=meta)
-    log.info("store mirror %s → opened orphan qty=%s", symbol, qty)
-    return "opened"
+    # 진입 논거 미상 — armed 계획이 있으면 복원, 없으면 임시 손절 고아.
+    return adopt_live_position(
+        store, symbol, market, qty, avg,
+        source="fill_mirror", thesis=RECONCILE_THESIS)
 
 
 def fill_event_payload(fill: ExecuteResult | None, **extra: Any) -> dict:
