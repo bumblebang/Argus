@@ -248,7 +248,10 @@ def test_reconcile_bumps_buy_working_applied_on_holdings_increase(tmp_path):
 
 
 def test_reconcile_bumps_settled_buy_working_applied(tmp_path):
-    """sweep 이 먼저 settled 찍은 BUY 도 holdings 보정 대상(30분 이중예약 방지)."""
+    """sweep 이 먼저 settled 찍은 BUY 도 holdings 보정 대상(30분 이중예약 방지).
+
+    전량 반영되면 행 삭제 — TTL 허위 귀속실패 경고 방지.
+    """
     store, acct = Store(tmp_path / "t.db"), _acct(tmp_path)
     _seed(store, acct, qty=10)
     store.upsert_working_order(
@@ -258,8 +261,8 @@ def test_reconcile_bumps_settled_buy_working_applied(tmp_path):
     store.update_working_order("B1", settled_at=1.0)
     apply_reconcile_from_live(
         acct, store, _holdings([_item(qty=14)]), markets=("KR",))
-    row = store.get_working_orders("005930", side="BUY", settled=True)[0]
-    assert row["applied_qty"] == 4.0
+    assert store.get_working_orders("005930", side="BUY", settled=True) == []
+    assert store.get_working_orders("005930", side="BUY", settled=False) == []
 
 
 def test_reconcile_buy_applied_notional_uses_incremental(tmp_path):
@@ -267,6 +270,7 @@ def test_reconcile_buy_applied_notional_uses_incremental(tmp_path):
     store, acct = Store(tmp_path / "t.db"), _acct(tmp_path)
     _seed(store, acct, qty=10)
     # 이미 3주 @70k 반영. 누적 7주 @71k → 증분 4주 명목 = 71k*7 − 210k
+    # holdings +4 만 반영 → applied 7, 미체결 잔량 남으므로 행 유지
     store.upsert_working_order(
         order_id="B1", symbol="005930", market="KR", side="BUY",
         qty=10, price=70_000, status="PARTIAL_FILLED", filled_qty=7,
@@ -280,7 +284,7 @@ def test_reconcile_buy_applied_notional_uses_incremental(tmp_path):
 
 
 def test_startup_sync_bumps_buy_working_applied(tmp_path):
-    """기동 동기화 경로에도 BUY applied 보정이 돈다."""
+    """기동 동기화 경로에도 BUY applied 보정 + 전량 반영 시 삭제."""
     from src.broker_sync import apply_sync_from_live
     store, acct = Store(tmp_path / "t.db"), _acct(tmp_path)
     _seed(store, acct, qty=10)
@@ -290,8 +294,80 @@ def test_startup_sync_bumps_buy_working_applied(tmp_path):
         filled_avg=70_000, fee=0.0, applied_qty=0, applied_notional=0)
     apply_sync_from_live(
         acct, store, _holdings([_item(qty=15)]), markets=("KR",))
-    row = store.get_working_orders("005930", side="BUY", settled=False)[0]
-    assert row["applied_qty"] == 5.0
+    assert store.get_working_orders("005930", side="BUY") == []
+
+
+def test_reconcile_buy_avg_missing_uses_order_price(tmp_path):
+    """filled_avg 결측이어도 주문가로 applied 반영 — need 버리면 이중예약."""
+    store, acct = Store(tmp_path / "t.db"), _acct(tmp_path)
+    _seed(store, acct, qty=10)
+    store.upsert_working_order(
+        order_id="B1", symbol="005930", market="KR", side="BUY",
+        qty=5, price=70_000, status="FILLED", filled_qty=5,
+        filled_avg=None, fee=0.0, applied_qty=0, applied_notional=0)
+    store.update_working_order("B1", settled_at=1.0)
+    apply_reconcile_from_live(
+        acct, store, _holdings([_item(qty=15)]), markets=("KR",))
+    assert store.get_working_orders("005930", side="BUY") == []
+
+
+def test_scrub_fully_applied_settled_buy_without_holdings_delta(tmp_path):
+    """need=0 이어도 applied≥filled settled BUY 고아는 스크럽."""
+    store, acct = Store(tmp_path / "t.db"), _acct(tmp_path)
+    _seed(store, acct, qty=10)
+    store.upsert_working_order(
+        order_id="B1", symbol="005930", market="KR", side="BUY",
+        qty=5, price=70_000, status="FILLED", filled_qty=5,
+        filled_avg=70_000, fee=0.0, applied_qty=5, applied_notional=5 * 70_000)
+    store.update_working_order("B1", settled_at=1.0)
+    apply_reconcile_from_live(
+        acct, store, _holdings([_item(qty=10)]), markets=("KR",))
+    assert store.get_working_orders("005930", side="BUY", settled=True) == []
+
+
+def test_expire_fully_applied_settled_buy_no_unattributed_warning(tmp_path):
+    """전량 반영 settled BUY 는 TTL 만료 시 허위 unattributed_fill 없이 삭제."""
+    store = Store(tmp_path / "t.db")
+    store.upsert_working_order(
+        order_id="B1", symbol="005930", market="KR", side="BUY",
+        qty=5, price=70_000, status="FILLED", filled_qty=5,
+        filled_avg=70_000, fee=0.0, applied_qty=5, applied_notional=5 * 70_000)
+    store.update_working_order("B1", settled_at=1.0)
+    broker = _broker(tmp_path, store, _Client(), attribution_ttl_sec=0.0)
+    broker.sweep_working_orders()
+    assert store.get_working_orders(side="BUY", settled=True) == []
+    assert _events(store, "unattributed_fill") == []
+
+
+def test_broker_sync_from_live_sweeps_then_applies_buy(tmp_path):
+    """기동 sync = sweep → holdings 적용. 종료 중 체결분이 영구 미보정되지 않음."""
+    store = Store(tmp_path / "t.db")
+    client = _Client({"status": "FILLED",
+                      "execution": {"filledQuantity": 5,
+                                    "averageFilledPrice": 70_000,
+                                    "commission": 0, "tax": 0}})
+
+    def get_buying_power(seq, market):
+        return {"cashBuyingPower": "500000"}
+
+    def get_holdings(seq, symbol=None):
+        return {"items": [_item(qty=15)]}
+
+    client.get_buying_power = get_buying_power
+    client.get_holdings = get_holdings
+    broker = _broker(tmp_path, store, client)
+    broker.account.positions["005930"] = Position(
+        symbol="005930", qty=10, avg_price=70_000)
+    broker.account.symbol_market["005930"] = "KR"
+    store.upsert_working_order(
+        order_id="B1", symbol="005930", market="KR", side="BUY",
+        qty=5, price=70_000, status="PENDING", filled_qty=0,
+        applied_qty=0, applied_notional=0)
+    out = broker.sync_from_live(client, store, markets=("KR",))
+    assert "sweep" in out
+    assert out["sweep"].get("settled", 0) >= 1
+    assert store.get_working_orders("005930", side="BUY") == []
+    assert broker.account.positions["005930"].qty == 15
 
 
 def test_increase_does_not_attribute(tmp_path):

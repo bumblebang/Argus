@@ -479,20 +479,78 @@ def _emit(store, kind: str, symbol: str, payload: dict) -> None:
         log.warning("이벤트 기록 실패(무시) [%s %s]: %s", kind, symbol, e)
 
 
+def _scrub_fully_applied_buy_working(store) -> None:
+    """applied≥filled 인 settled BUY 고아 행 삭제(TTL 허위 귀속실패 방지).
+
+    need=0 인 재기동에서도 돌아야 한다 — 이전 보정으로 applied 만 맞추고
+    삭제를 빼먹으면 30분 뒤 unattributed_fill 경고가 난다.
+    """
+    try:
+        rows = store.get_working_orders(side="BUY", settled=True) or []
+    except Exception as e:
+        log.warning("재대사: settled BUY 스크럽 조회 실패: %s", e)
+        return
+    for row in rows:
+        filled = float(row.get("filled_qty") or 0.0)
+        applied = float(row.get("applied_qty") or 0.0)
+        if filled - applied > 1e-9:
+            continue
+        try:
+            store.delete_working_order(row["order_id"])
+        except Exception as e:
+            log.warning("재대사: BUY 전량반영 행 삭제 실패 %s: %s",
+                        row.get("order_id"), e)
+
+
+def _bump_buy_working_applied(store, row: dict, take: float, px: float,
+                              fee_take: float) -> bool:
+    """applied_* 올리고, 미반영분이 없고(settled 또는 전량체결)면 삭제. 성공 시 True.
+
+    PARTIAL 미결 행은 filled==applied 여도 qty>filled 잔량이 남으므로 유지한다 —
+    지우면 working room 선차감이 빠진다.
+    """
+    oid = row["order_id"]
+    filled = float(row.get("filled_qty") or 0.0)
+    applied = float(row.get("applied_qty") or 0.0)
+    applied_n = float(row.get("applied_notional") or 0.0)
+    applied_f = float(row.get("applied_fee") or 0.0)
+    qty = float(row.get("qty") or 0.0)
+    new_applied = applied + take
+    try:
+        store.update_working_order(
+            oid,
+            applied_qty=new_applied,
+            applied_notional=applied_n + max(0.0, px) * take,
+            applied_fee=applied_f + fee_take)
+        if filled - new_applied <= 1e-9:
+            settled = row.get("settled_at") is not None
+            fully_filled = filled >= qty - 1e-9 and qty > 1e-9
+            if settled or fully_filled:
+                store.delete_working_order(oid)
+        return True
+    except Exception as e:
+        log.warning("재대사: BUY applied 갱신 실패 %s: %s", oid, e)
+        return False
+
+
 def _sync_buy_working_applied(store, before: dict, live_pos: dict) -> None:
     """재대사/기동이 holdings 로 흡수한 BUY 증가분만큼 working.applied_* 를 올린다.
 
-    finish_live 를 안 거친 체결(폴링 밖)은 원장 qty 만 늘고 applied 가 0 이라
-    room 이 invested+working 으로 이중 예약된다. sweep 이 먼저 settled 로
-    찍은 BUY 도 포함해야 한다 — settled=False 만 보면 attribution_ttl(기본 30분)
-    동안 예약이 남는다.
+    흐름(주기 재대사·기동 sync 공통):
+      1) sweep 이 종결/취소를 반영(기동은 broker.sync_from_live 가 선행)
+      2) holdings 증가분(need)을 BUY working 의 filled−applied 에서 소비
+      3) settled/미결 모두 대상 — sweep 선 settled 누락 시 30분 이중예약
+      4) filled_avg 없으면 주문가(price) 폴백 — 가격도 없으면 수량만이라도 반영
+         (continue 하면 need 를 버려 영구 미보정·이중예약)
+      5) applied≥filled 이면 행 삭제 + settled 고아 스크럽
+         (잔존 시 TTL 허위 귀속실패 경고)
 
-    applied_notional 은 누적 VWAP×take 가 아니라 incremental_fill 증분 명목으로
-    올린다(반복 부분체결에서 틀어짐).
+    applied_notional 은 incremental_fill 증분 명목(가능하면). 폴백은 주문가×take.
     """
     if store is None:
         return
     from .broker import incremental_fill
+    _scrub_fully_applied_buy_working(store)
     syms = set(before) | set(live_pos)
     for sym in syms:
         old_qty = float(before[sym][0]) if sym in before else 0.0
@@ -512,31 +570,36 @@ def _sync_buy_working_applied(store, before: dict, live_pos: dict) -> None:
                 break
             filled = float(row.get("filled_qty") or 0.0)
             applied = float(row.get("applied_qty") or 0.0)
+            avail_qty = filled - applied
+            if avail_qty <= 1e-9:
+                continue
             avg = row.get("filled_avg")
             fee = float(row.get("fee") or 0.0)
             applied_n = float(row.get("applied_notional") or 0.0)
             applied_f = float(row.get("applied_fee") or 0.0)
-            if not avg or float(avg) <= 0:
-                continue
-            inc = incremental_fill(
-                filled, float(avg), fee, applied, applied_n, applied_f)
-            if inc is None:
-                continue
-            avail, px, inc_fee_full = inc
-            take = min(avail, need)
+            limit_px = float(row.get("price") or 0.0)
+            px = 0.0
+            fee_take = 0.0
+            take = min(avail_qty, need)
+            if avg and float(avg) > 0:
+                inc = incremental_fill(
+                    filled, float(avg), fee, applied, applied_n, applied_f)
+                if inc is not None:
+                    avail_qty, px, inc_fee_full = inc
+                    take = min(avail_qty, need)
+                    fee_take = (inc_fee_full * (take / avail_qty)
+                                if avail_qty > 1e-9 else 0.0)
+                else:
+                    px = limit_px
+            else:
+                # avg 결측 — 주문가 폴백. 가격도 없으면 수량만이라도 applied 반영.
+                px = limit_px
             if take <= 1e-9:
                 continue
-            fee_take = inc_fee_full * (take / avail) if avail > 1e-9 else 0.0
-            try:
-                store.update_working_order(
-                    row["order_id"],
-                    applied_qty=applied + take,
-                    applied_notional=applied_n + px * take,
-                    applied_fee=applied_f + fee_take)
-            except Exception as e:
-                log.warning("재대사: BUY applied 갱신 실패 %s: %s", row["order_id"], e)
+            if not _bump_buy_working_applied(store, row, take, px, fee_take):
                 continue
             need -= take
+    _scrub_fully_applied_buy_working(store)
 
 
 def apply_reconcile_from_live(account, store, data: dict,

@@ -244,15 +244,23 @@ def working_buy_reserved_notional(store, market: str, *,
             continue
         filled = float(w.get("filled_qty") or 0.0)
         applied = float(w.get("applied_qty") or 0.0)
-        avg = w.get("filled_avg")
-        if filled - applied <= 1e-9 or not avg or float(avg) <= 0:
+        unapplied = filled - applied
+        if unapplied <= 1e-9:
             continue
-        inc = incremental_fill(
-            filled, float(avg), float(w.get("fee") or 0.0),
-            applied, float(w.get("applied_notional") or 0.0),
-            float(w.get("applied_fee") or 0.0))
-        if inc is not None:
-            total += inc[0] * inc[1]
+        limit_px = float(w.get("price") or 0.0)
+        avg = w.get("filled_avg")
+        if avg and float(avg) > 0:
+            inc = incremental_fill(
+                filled, float(avg), float(w.get("fee") or 0.0),
+                applied, float(w.get("applied_notional") or 0.0),
+                float(w.get("applied_fee") or 0.0))
+            if inc is not None:
+                total += inc[0] * inc[1]
+            elif limit_px > 0:
+                total += unapplied * limit_px
+        elif limit_px > 0:
+            # avg 결측 — open 경로와 같이 주문가 폴백(스킵하면 room 과소예약)
+            total += unapplied * limit_px
     return total
 
 

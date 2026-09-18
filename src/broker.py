@@ -335,12 +335,26 @@ class Broker:
             return fn(self.account)
 
     def sync_from_live(self, gateway, store=None, *, markets=("KR", "US")) -> dict:
-        """기동 동기화 — API fetch(락 밖) + apply( run_locked ). sync_from_live 직접 호출 금지."""
+        """기동 동기화 — sweep → API fetch(락 밖) → apply( run_locked ).
+
+        종료 중·재기동 전 체결분이 working 에 남아 있으면 holdings 만 덮을 때
+        applied 보정이 영구히 어긋난다. 주기 재대사와 같이 **sweep 을 먼저** 돌려
+        종결/취소를 반영한 뒤 동기화한다.
+        """
         from .broker_sync import apply_sync_from_live, fetch_live_account_data
+        sw: dict = {}
+        try:
+            sw = self.sweep_working_orders()
+        except Exception as e:
+            log.warning("기동 sweep 실패(동기화는 계속): %s", e)
+            sw = {"error": str(e)}
         data = fetch_live_account_data(gateway, self.account_seq, markets=markets)
         self.note_sync_result(data)
-        return self.run_locked(
+        out = self.run_locked(
             lambda acct: apply_sync_from_live(acct, store, data, markets=markets))
+        if isinstance(out, dict):
+            out["sweep"] = sw
+        return out
 
     def note_sync_result(self, data: dict) -> dict:
         """실계좌 조회 결과의 실패 비트를 sync_health 에 기록. 갱신된 health 반환.
@@ -836,21 +850,33 @@ class Broker:
     def _expire_settled(self, row: dict, now: float) -> bool:
         """귀속 대기분 만료 회수. 버렸으면 True.
 
-        재대사가 수량 감소를 못 봤다는 뜻이다(직전 재대사가 이미 흡수, 또는 수동
-        개입). 추정으로 채우지 않고 버리되 조용히 지우지는 않는다 — 실체결가를
-        알았는데 원장에 못 넣었다는 기록이 남아야 리포트에서 구멍이 보인다.
+        전량 반영(applied≥filled)된 행은 허위 '귀속 실패' 없이 삭제한다 — BUY
+        holdings 보정 후 삭제가 누락돼도 TTL 에 경고가 나면 안 된다.
+
+        그 외는 재대사가 수량 감소를 못 봤다는 뜻이다. 추정으로 채우지 않고
+        버리되 조용히 지우지는 않는다 — 실체결가를 알았는데 원장에 못 넣었다는
+        기록이 남아야 리포트에서 구멍이 보인다.
         """
         if self.attribution_ttl_sec < 0:
             return False
         age = now - float(row.get("settled_at") or now)
         if age < self.attribution_ttl_sec:
             return False
+        filled = float(row.get("filled_qty") or 0.0)
+        applied = float(row.get("applied_qty") or 0.0)
+        if filled - applied <= 1e-9:
+            # 전량 반영된 고아 — 허위 '귀속 실패' 없이 삭제
+            self._store_call(self.store.delete_working_order, row["order_id"])
+            return True
         self._store_call(self.store.delete_working_order, row["order_id"])
-        log.warning("[귀속 실패] %s %s 체결 %s @ %s — 재대사가 수량 감소를 못 봄(%.0f초)",
-                    row["side"], row["symbol"], row["filled_qty"],
-                    row.get("filled_avg"), age)
+        side = str(row.get("side") or "")
+        why = ("holdings 보정이 미반영분을 못 흡수"
+               if side == "BUY" else "재대사가 수량 감소를 못 봄")
+        log.warning("[귀속 실패] %s %s 체결 %s @ %s — %s(%.0f초)",
+                    side, row["symbol"], row["filled_qty"],
+                    row.get("filled_avg"), why, age)
         self._emit_symbol("unattributed_fill", row["symbol"], {
-            "order_id": row["order_id"], "side": row["side"],
+            "order_id": row["order_id"], "side": side,
             "filled_qty": row["filled_qty"], "applied_qty": row.get("applied_qty"),
             "avg_price": row.get("filled_avg"), "age_sec": round(age, 1)})
         return True
