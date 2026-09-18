@@ -166,8 +166,10 @@ def compute_sleeve(*, sleeve_pct: float, brain_reserve_pct: float,
     빌려주되 예비금 아래로는 절대 내려가지 않게 한다. 뇌가 예비금보다 많이 쓰고 있으면
     그 실사용액이 그대로 차감돼 밸류 예산이 줄어든다.
 
-    working_buy_notional 은 미체결 BUY 잔량×주문가(현금 홀드분). 포지션에 아직 안
-    잡혔어도 room 을 잡아두지 않으면 다음 진입이 같은 예산을 이중 사용한다.
+    working_buy_notional 은 미반영 BUY 잔량(qty−applied_qty)×주문가. 포지션에 아직
+    안 잡혔어도 room 을 잡아두지 않으면 다음 진입이 같은 예산을 이중 사용한다.
+    exposure_base=equity 일 때는 호출측이 0 을 넘겨야 한다 — 실계좌 cash 에
+    이미 홀드가 반영돼 이중 차감된다.
 
     base<=0(예: US capital 0)이면 budget 은 0 이 되어 진입이 차단된다.
     """
@@ -186,6 +188,37 @@ def compute_sleeve(*, sleeve_pct: float, brain_reserve_pct: float,
             "brain_reserve": round(brain_reserve, 2),
             "gross_limit": round(gross_limit, 2),
             "working_buy": round(working, 2)}
+
+
+# 종결·취소된 working 은 잔량 명목에서 제외(CANCELED 과차감 방지).
+_WORKING_BUY_SKIP_STATUS = frozenset({
+    "FILLED", "CANCELED", "REJECTED", "CANCEL_REJECTED", "REPLACE_REJECTED",
+})
+
+
+def working_buy_reserved_notional(store, market: str, *,
+                                  exposure_base: str = "capital") -> float:
+    """시장별 미반영 BUY 예약 명목(qty − applied_qty)×price.
+
+    filled 가 아니라 applied 기준 — 평균가 결측으로 원장 미반영인 체결분도
+    room 에 남긴다. exposure_base=equity 면 0(실계좌 cash 홀드와 이중 차감 금지).
+    """
+    if str(exposure_base or "capital").lower() == "equity":
+        return 0.0
+    if store is None:
+        return 0.0
+    total = 0.0
+    for w in store.get_working_orders(side="BUY", settled=False) or []:
+        if str(w.get("market") or "") != market:
+            continue
+        st = str(w.get("status") or "").upper()
+        if st in _WORKING_BUY_SKIP_STATUS:
+            continue
+        rem = float(w["qty"]) - float(w.get("applied_qty") or 0.0)
+        if rem <= 0:
+            continue
+        total += rem * float(w.get("price") or 0.0)
+    return total
 
 
 # ── (a) 셀렉터 ─────────────────────────────────────────────────────
@@ -651,19 +684,14 @@ class ValueRunner:
         total = sum(float(r["qty"]) * float(r["avg_price"]) for r in rows
                     if r["market"] == market)
         brain_invested = max(0.0, total - invested)
-        working_buy = 0.0
-        if self.store is not None:
-            try:
-                for w in self.store.get_working_orders(side="BUY", settled=False) or []:
-                    if str(w.get("market") or "") != market:
-                        continue
-                    rem = float(w["qty"]) - float(w.get("filled_qty") or 0.0)
-                    if rem <= 0:
-                        continue
-                    working_buy += rem * float(w.get("price") or 0.0)
-            except Exception as e:
-                log.warning("[value_trade][%s] working BUY 명목 산출 실패: %s",
-                            market, e)
+        exp_base = str(self.cfg.risk.get("exposure_base") or "capital")
+        try:
+            working_buy = working_buy_reserved_notional(
+                self.store, market, exposure_base=exp_base)
+        except Exception as e:
+            log.warning("[value_trade][%s] working BUY 명목 산출 실패: %s",
+                        market, e)
+            working_buy = 0.0
         return compute_sleeve(sleeve_pct=cfg_v["sleeve_pct"],
                               brain_reserve_pct=cfg_v["brain_reserve_pct"],
                               max_gross_exposure=self.cfg.risk.get("max_gross_exposure"),

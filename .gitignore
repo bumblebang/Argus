@@ -9,20 +9,20 @@ __pycache__/
 venv/
 .pytest_cache/
 
-# ?댁쁺??濡쒖뺄 ???ㅺ퀎醫?紐⑤뱶쨌寃쎈줈쨌?댁쁺?쇱?. 怨듦컻 ??μ냼?먮뒗 example留??щ┛??
+# 운영자 로컬 — 실계좌 모드·경로·운영일지. 공개 저장소에는 example만 올린다.
 config.yaml
 CONTEXT.md
 CONTEXT.local.md
 _chk_*.py
 
-# ???由ъ꽌移??뚰겕?몃━쨌?곗텧臾??덈?寃쎈줈쨌?댁쁺 硫붾え媛 ?욎엫)
-# README 留?異붿쟻 ??lab ?ㅽ겕由쏀듃/data ??濡쒖뺄 ?꾩슜
+# 퀀트 리서치 워크트리·산출물(절대경로·운영 메모가 섞임)
+# README 만 추적 — lab 스크립트/data 는 로컬 전용
 research/**
 !research/README.md
 data/quant_review/
 
-# runtime data (?앹꽦臾?. ?꾨낫援?base_universe_*.txt)怨?KRX bld 移댄깉濡쒓렇??異붿쟻??
-# ???대뜑???ㅺ퀎醫??붿쟻???ㅼ뼱 ?덈떎 ??bot.db(?ъ??샕룹껜寃걔룰껐???꾨Ц), ?먯옣, ?좏겙 罹먯떆.
+# runtime data (생성물). 후보군(base_universe_*.txt)과 KRX bld 카탈로그는 추적함.
+# 이 폴더엔 실계좌 흔적이 들어 있다 — bot.db(포지션·체결·결정 전문), 원장, 토큰 캐시.
 data/*.json
 !data/krx_bld_catalog.json
 data/*.jsonl*
@@ -42,7 +42,7 @@ data/history/
 data/context_archive/
 data/krx_cache/
 data/llm_inbox/
-# Phase 2 ?덉씠?꾩썐 ??nested ?먯옣/?몃컯??諛깆뾽(git add -A ?ш퀬 諛⑹?)
+# Phase 2 레이아웃 — nested 원장/인박스/백업(git add -A 사고 방지)
 data/state/
 data/inbox/
 data/ledgers/
@@ -50,9 +50,11 @@ data/archive/
 logs/
 *.log
 
-# 怨듦컻 ?섏씠吏 ?앹꽦臾???諛쒗뻾? 蹂꾨룄 ??μ냼濡??섍컙??public/
+# 공개 페이지 생성물 — 발행은 별도 저장소로 나간다
+public/
 
-# 濡쒖뺄 ?ㅼ씠?닿렇????README 誘몄궗??argus_loop_final.png
+# 로컬 다이어그램 — README 미사용
+argus_loop_final.png
 
 # os / editor / build
 .DS_Store

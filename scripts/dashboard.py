@@ -1691,8 +1691,20 @@ def _gather() -> dict:
             "manager_epochs": manager_epochs(_st, since_days=30),
             "recent_pending": [dict(r) for r in _st.get_pending_shadow_positions()[:8]],
         }
+        # 밸류 room 표시용 — Store 는 아래에서 close 되므로 시장별 명목만 스냅.
+        try:
+            from src.agents.value_trade import working_buy_reserved_notional
+            vcfg = data.get("value_cfg") or {}
+            exp = str(vcfg.get("exposure_base") or "capital")
+            data["working_buy_notional"] = {
+                m: working_buy_reserved_notional(_st, m, exposure_base=exp)
+                for m in (vcfg.get("markets") or ["KR", "US"])
+            }
+        except Exception:
+            data["working_buy_notional"] = {}
     except Exception:
         data["instrumentation"] = None
+        data.setdefault("working_buy_notional", {})
     finally:
         if _st is not None:
             try:
@@ -3639,11 +3651,14 @@ def _value_html(d: dict) -> str:
         brain = sum(float(x.get("qty") or 0) * float(x.get("avg_price") or 0)
                     for x in open_rows
                     if x.get("market") == m and not _is_value_pos(x))
+        # capital 기준일 때만 working BUY 차감(로드 시 스냅). equity 면 이중 차감 금지.
+        working = float((d.get("working_buy_notional") or {}).get(m) or 0)
         s = compute_sleeve(sleeve_pct=sleeve_pct,
                            brain_reserve_pct=float(vcfg.get("brain_reserve_pct") or 0),
                            max_gross_exposure=vcfg.get("max_gross_exposure"),
                            base=_sleeve_base(vcfg, snap, m),
-                           value_invested=invested, brain_invested=brain)
+                           value_invested=invested, brain_invested=brain,
+                           working_buy_notional=working)
         budget, room = s["budget"], s["room"]
         used_s = f"{invested / budget * 100:.0f}%" if budget else "–"
         rcls = "neg" if room <= 0 else "pos"

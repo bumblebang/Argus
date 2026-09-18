@@ -26,9 +26,10 @@ class ExecuteResult:
 
     @classmethod
     def rejected(cls, reason: str, *, order_qty: float = 0.0,
-                 limit_price: float | None = None) -> ExecuteResult:
+                 limit_price: float | None = None,
+                 order_id: str | None = None) -> ExecuteResult:
         return cls(ok=False, order_qty=order_qty, limit_price=limit_price,
-                   reject_reason=reason or "")
+                   reject_reason=reason or "", order_id=order_id)
 
     @classmethod
     def from_fill(cls, *, fill_qty: float, fill_price: float, fee: float,
