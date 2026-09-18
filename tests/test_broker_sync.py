@@ -5,11 +5,20 @@
 """
 import json
 
+import pytest
+
+from src import broker_sync as bs
 from src.paper_account import PaperAccount
 from src.engine.store import Store
 from src.strategies.base import Position
 from src.broker_sync import (sync_from_live, reconcile_from_live, should_sync,
                              SYNC_THESIS, RECONCILE_THESIS)
+
+
+@pytest.fixture(autouse=True)
+def _no_retry_sleep(monkeypatch):
+    """재시도 간격만 0 으로 — 재시도 횟수는 그대로 둔다."""
+    monkeypatch.setattr(bs, "_FETCH_RETRY_WAITS", (0.0, 0.0))
 
 
 class _MockClient:
@@ -65,9 +74,12 @@ def test_sync_mirrors_cash_and_positions(tmp_path):
     row = rows[0]
     assert row["symbol"] == "005930" and row["qty"] == 1 and row["avg_price"] == 267500
     assert row["thesis"] == SYNC_THESIS
-    assert row["stop_price"] is None and row["target_price"] is None
+    # 계획 없는 고아 — swing 기본 임시 손절. 뇌가 덮어쓰기 전까지 하방 방어.
+    assert row["stop_price"] == round(267500 * 0.95, 2)
+    assert row["target_price"] == round(267500 * 1.10, 2)
     import json
-    assert json.loads(row["meta"])["source"] == "synced"
+    meta = json.loads(row["meta"])
+    assert meta["source"] == "synced" and meta["provisional_stop"] is True
 
     assert summary["synced"] == 1
     assert summary["cash"]["KR"] == 732463
@@ -131,9 +143,79 @@ def test_sync_bp_failure_keeps_existing_cash(tmp_path):
     client = _MockClient(holdings={"items": []},
                          buying_power={"KR": {"cashBuyingPower": "732463"}},
                          bp_exc={"US": RuntimeError("boom")})
-    sync_from_live(client, 1, acct, None, markets=("KR", "US"))
+    summary = sync_from_live(client, 1, acct, None, markets=("KR", "US"))
     assert acct.cash["KR"] == 732463
     assert acct.cash["US"] == 888            # 실패 시장은 기존값 유지
+    # 낡은 현금으로 계속 돌더라도 '실패했다'는 사실은 반드시 남는다.
+    assert summary["cash_ok"] is False
+    assert summary["failed_markets"] == ["US"]
+    assert "boom" in summary["errors"]["US"]
+
+
+def test_fetch_marks_cash_ok_when_all_markets_ok(tmp_path):
+    client = _MockClient(holdings={"items": []},
+                         buying_power={"KR": {"cashBuyingPower": "1"},
+                                       "US": {"cashBuyingPower": "2"}})
+    data = bs.fetch_live_account_data(client, 1, markets=("KR", "US"))
+    assert data["cash_ok"] is True and data["holdings_ok"] is True
+    assert data["failed_markets"] == [] and data["errors"] == {}
+
+
+def test_fetch_retries_transient_failure_then_succeeds(tmp_path):
+    """한 박자 쉬면 풀리는 실패(토큰 경합 등)는 재시도로 흡수한다."""
+    calls = {"n": 0}
+
+    class _Flaky(_MockClient):
+        def get_buying_power(self, account_seq, market):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise RuntimeError("일시 오류")
+            return {"cashBuyingPower": "500"}
+
+    client = _Flaky(holdings={"items": []})
+    data = bs.fetch_live_account_data(client, 1, markets=("KR",))
+    assert data["cash"]["KR"] == 500
+    assert data["cash_ok"] is True and calls["n"] == 2
+
+
+def test_fetch_unparsable_cash_counts_as_failure(tmp_path):
+    """숫자로 못 읽은 응답도 실패다 — 조용히 건너뛰면 낡은 현금이 진실이 된다."""
+    client = _MockClient(holdings={"items": []},
+                         buying_power={"KR": {"cashBuyingPower": "??"}})
+    data = bs.fetch_live_account_data(client, 1, markets=("KR",))
+    assert data["cash_ok"] is False and data["failed_markets"] == ["KR"]
+
+
+def test_holdings_failure_marks_health_fields(tmp_path):
+    acct = _acct(tmp_path)
+    client = _MockClient(holdings_exc=RuntimeError("holdings down"),
+                         buying_power={"KR": {"cashBuyingPower": "1"}})
+    summary = sync_from_live(client, 1, acct, None, markets=("KR",))
+    assert summary["holdings_ok"] is False
+    assert "holdings down" in summary["errors"]["holdings"]
+
+
+def test_broker_sync_health_tracks_failures_and_recovery(tmp_path):
+    from src.broker import Broker
+    from src.risk_gate import RiskGate
+
+    gate = RiskGate({"capital": {"KR": 1_000_000}, "max_position_pct": 0.5,
+                     "max_positions": 5, "daily_loss_limit_pct": 0.05,
+                     "kill_switch_file": str(tmp_path / "HALT")})
+    broker = Broker(account=_acct(tmp_path), gate=gate, mode="live")
+
+    assert broker.sync_stale_sec() is None          # 아직 성공 이력 없음
+    broker.note_sync_result({"cash_ok": False, "holdings_ok": True,
+                             "failed_markets": ["US"], "errors": {"US": "boom"}})
+    assert broker.sync_health["consecutive_failures"] == 1
+    assert broker.sync_health["last_ok_ts"] is None
+    broker.note_sync_result({"cash_ok": False, "holdings_ok": False})
+    assert broker.sync_health["consecutive_failures"] == 2
+
+    broker.note_sync_result({"cash_ok": True, "holdings_ok": True})
+    assert broker.sync_health["consecutive_failures"] == 0
+    assert broker.sync_health["failed_markets"] == []
+    assert broker.sync_stale_sec() is not None and broker.sync_stale_sec() < 5
 
 
 def test_sync_holdings_failure_keeps_positions(tmp_path):
@@ -259,9 +341,73 @@ def test_reconcile_adopts_orphan_holding(tmp_path):
     row = store.get_open_positions()[0]
     assert row["symbol"] == "005930" and row["qty"] == 1
     assert row["thesis"] == RECONCILE_THESIS
-    assert row["stop_price"] is None and row["target_price"] is None  # 코드청산 비활성
-    assert json.loads(row["meta"])["source"] == "reconcile_adopted"
+    assert row["stop_price"] == round(267500 * 0.95, 2)
+    assert row["target_price"] == round(267500 * 1.10, 2)
+    meta = json.loads(row["meta"])
+    assert meta["source"] == "reconcile_adopted" and meta["provisional_stop"] is True
     assert res["adopted"] == ["005930"]
+    store.close()
+
+
+def test_reconcile_promotes_armed_plan_instead_of_orphan(tmp_path):
+    """봇이 armed 계획을 세운 뒤 지연 체결되면 그 손절/목표를 복원한다."""
+    store = Store(tmp_path / "bot.db")
+    acct = _acct(tmp_path)
+    store.arm_candidate(
+        "005930", "KR", strategy="ma_crossover", thesis="뇌 계획",
+        meta={"horizon": "day", "params": {"stop_loss_pct": 0.03, "target_profit_pct": 0.05}})
+    client = _MockClient(holdings={"items": [_SAMSUNG]},
+                         buying_power={"KR": {"cashBuyingPower": "732463"}})
+    res = reconcile_from_live(client, 1, acct, store, markets=("KR",))
+
+    opens = store.get_open_positions()
+    assert len(opens) == 1
+    row = opens[0]
+    assert row["strategy"] == "ma_crossover"
+    assert row["stop_price"] == round(267500 * 0.97, 2)
+    assert row["target_price"] == round(267500 * 1.05, 2)
+    meta = json.loads(row["meta"])
+    assert meta.get("provisional_stop") is not True
+    assert store.get_armed() == []
+    assert res["adopted"] == ["005930"]
+    store.close()
+
+
+def test_startup_sync_halt_reason_on_holdings_or_all_cash(tmp_path):
+    from src.broker_sync import startup_sync_halt_reason
+    assert startup_sync_halt_reason(
+        {"holdings_ok": False, "cash_ok": True, "errors": {"holdings": "down"}},
+        ["KR"]) == "down"
+    assert startup_sync_halt_reason(
+        {"holdings_ok": True, "cash_ok": False, "failed_markets": ["KR", "US"]},
+        ["KR", "US"]).startswith("cash fetch failed")
+    # 일부 시장만 실패 → HALT 아님(주기 재대사가 이어서 재시도)
+    assert startup_sync_halt_reason(
+        {"holdings_ok": True, "cash_ok": False, "failed_markets": ["US"]},
+        ["KR", "US"]) is None
+
+
+def test_record_sync_visibility_emits_degraded_and_recovered(tmp_path):
+    from src.broker import Broker
+    from src.broker_sync import record_sync_visibility
+    from src.risk_gate import RiskGate
+
+    gate = RiskGate({"capital": {"KR": 1_000_000}, "max_position_pct": 0.5,
+                     "max_positions": 5, "daily_loss_limit_pct": 0.05,
+                     "kill_switch_file": str(tmp_path / "HALT")})
+    broker = Broker(account=_acct(tmp_path), gate=gate, mode="live",
+                    sync_stale_error_sec=3600)
+    store = Store(tmp_path / "bot.db")
+    broker.note_sync_result({"cash_ok": False, "holdings_ok": True,
+                             "failed_markets": ["US"], "errors": {"US": "boom"}})
+    record_sync_visibility(broker, store, prev_failures=0)
+    deg = [e for e in store.recent_events("sync_degraded", 0)]
+    assert deg and json.loads(deg[0]["payload"])["severity"] == "error"  # last_ok 없음
+
+    broker.note_sync_result({"cash_ok": True, "holdings_ok": True})
+    record_sync_visibility(broker, store, prev_failures=1)
+    rec = store.recent_events("sync_recovered", 0)
+    assert rec
     store.close()
 
 

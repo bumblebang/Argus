@@ -804,6 +804,7 @@ class CycleRunner:
                     item = self._universe_item(sym)
                     if item and item.get("source"):
                         meta["source"] = item["source"]
+                    # provisional_stop 은 넣지 않는다 — 뇌가 손절/목표를 덮어쓰면 임시 표식 해제.
                     self.store.update_position(
                         row["id"], qty=pos.qty, avg_price=pos.avg_price,
                         strategy=strat, thesis=(prop.thesis if prop else _row_get(row, "thesis")),

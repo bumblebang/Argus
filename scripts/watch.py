@@ -72,6 +72,7 @@ from src.agents.llm import ClaudeCLIClient
 from src.agents.value_trade import ValueRunner, value_trade_cfg
 from src.broker_sync import (apply_reconcile_from_live,
                              fetch_live_account_data, halt_after_live_sync_failure,
+                             record_sync_visibility, startup_sync_halt_reason,
                              should_sync)
 
 log = get_logger("watch")
@@ -454,17 +455,34 @@ def _start_reconcile_timer(broker, gateway, store, cfg, markets,
             # fetch 직전 gen — 조회 중 주문이 시작·끝나면 apply 시 stale_snapshot 으로 연기
             gen = broker.activity_generation()
             data = fetch_live_account_data(gateway, seq, markets=tuple(markets))
+            prev_failures = int(
+                (getattr(broker, "sync_health", None) or {}).get(
+                    "consecutive_failures", 0) or 0)
+            broker.note_sync_result(data)
+            record_sync_visibility(broker, store, prev_failures=prev_failures)
             res = broker.reconcile(
                 lambda acct: apply_reconcile_from_live(
                     acct, store, data, markets=tuple(markets)),
                 expect_gen=gen)
             if (res.get("adopted") or res.get("closed") or res.get("error")
-                    or res.get("attributed")):
+                    or res.get("attributed")
+                    or not res.get("cash_ok", True)
+                    or not res.get("holdings_ok", True)):
                 store.log_event("reconcile", None, res)
             if not res.get("deferred"):
                 _sync_capital(broker.account)
         except Exception as e:
             log.warning("주기 재대사 오류(무시): %s", e)
+            prev_failures = int(
+                (getattr(broker, "sync_health", None) or {}).get(
+                    "consecutive_failures", 0) or 0)
+            try:
+                broker.note_sync_result({
+                    "cash_ok": False, "holdings_ok": False,
+                    "failed_markets": [], "errors": {"reconcile": str(e)}})
+                record_sync_visibility(broker, store, prev_failures=prev_failures)
+            except Exception as e2:
+                log.warning("재대사 실패 가시화 오류(무시): %s", e2)
 
     _once()
 
@@ -710,8 +728,19 @@ def main() -> int:
     if should_sync(broker):
         try:
             _sync = broker.sync_from_live(gateway, store, markets=tuple(markets))
-            log.info("실계좌 동기화 완료 — 현금=%s, 보유=%d종목", _sync["cash"], _sync["synced"])
-            store.log_event("live_sync", None, _sync)
+            halt_why = startup_sync_halt_reason(_sync, markets)
+            if halt_why:
+                halt_after_live_sync_failure(broker, store, RuntimeError(halt_why))
+            elif not _sync.get("cash_ok", True):
+                log.warning(
+                    "실계좌 동기화 부분실패 — 현금=%s, 보유=%d종목, failed=%s",
+                    _sync.get("cash"), _sync.get("synced"),
+                    _sync.get("failed_markets"))
+                store.log_event("live_sync", None, _sync)
+            else:
+                log.info("실계좌 동기화 완료 — 현금=%s, 보유=%d종목",
+                         _sync["cash"], _sync["synced"])
+                store.log_event("live_sync", None, _sync)
         except Exception as e:
             halt_after_live_sync_failure(broker, store, e)
     # 매수 안전가드 배선: 부적격 종목(관리/거래정지/상폐예정/ETF·ETN 등) 매수를 차단한다.

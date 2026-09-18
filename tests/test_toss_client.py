@@ -233,6 +233,92 @@ def test_request_429_retries_per_attempt(tmp_path, monkeypatch):
     assert acquires[0] == "ACCOUNT"
 
 
+def _retry_client(tmp_path, monkeypatch):
+    monkeypatch.setattr("src.toss_client._TOKEN_CACHE", tmp_path / ".token.json")
+    monkeypatch.setattr("src.toss_client.time.sleep", lambda _s: None)
+    client = TossClient(_creds(), rate_limiter=None)
+    client._token = "cached"
+    client._token_exp = 1e12
+    return client
+
+
+def test_request_retries_transport_error_then_success(tmp_path, monkeypatch):
+    """타임아웃·연결 끊김은 재시도 — 조회 1회 실패로 원장이 낡으면 안 된다."""
+    client = _retry_client(tmp_path, monkeypatch)
+    calls = {"n": 0}
+
+    def fake_request(method, url, **kw):
+        calls["n"] += 1
+        if calls["n"] <= 2:
+            raise tc.requests.exceptions.ConnectTimeout("연결 타임아웃")
+        return _mock_resp(200, json_body={"result": {"ok": True}}, body="{}")
+
+    client.session.request = fake_request
+    assert client._request("holdings") == {"ok": True}
+    assert calls["n"] == 3
+
+
+def test_request_transport_error_exhausted_raises(tmp_path, monkeypatch):
+    """계속 실패하면 마지막 시도에서 그대로 전파 — 상위가 실패를 인지해야 한다."""
+    client = _retry_client(tmp_path, monkeypatch)
+    calls = {"n": 0}
+
+    def fake_request(method, url, **kw):
+        calls["n"] += 1
+        raise tc.requests.exceptions.ConnectionError("연결 실패")
+
+    client.session.request = fake_request
+    with pytest.raises(tc.requests.exceptions.ConnectionError):
+        client._request("holdings")
+    assert calls["n"] == tc._RETRY_ATTEMPTS
+
+
+def test_request_retries_5xx_then_success(tmp_path, monkeypatch):
+    client = _retry_client(tmp_path, monkeypatch)
+    calls = {"n": 0}
+
+    def fake_request(method, url, **kw):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return _mock_resp(503, body="service unavailable")
+        return _mock_resp(200, json_body={"result": {"ok": True}}, body="{}")
+
+    client.session.request = fake_request
+    assert client._request("buying_power") == {"ok": True}
+    assert calls["n"] == 2
+
+
+def test_request_5xx_exhausted_raises(tmp_path, monkeypatch):
+    client = _retry_client(tmp_path, monkeypatch)
+    calls = {"n": 0}
+
+    def fake_request(method, url, **kw):
+        calls["n"] += 1
+        return _mock_resp(500, body="boom")
+
+    client.session.request = fake_request
+    with pytest.raises(TossAPIError) as exc:
+        client._request("buying_power")
+    assert exc.value.status == 500
+    assert calls["n"] == tc._RETRY_ATTEMPTS
+
+
+def test_request_4xx_raises_without_retry(tmp_path, monkeypatch):
+    """요청 오류는 재시도해도 같다 — 즉시 raise(레이트리밋 낭비 방지)."""
+    client = _retry_client(tmp_path, monkeypatch)
+    calls = {"n": 0}
+
+    def fake_request(method, url, **kw):
+        calls["n"] += 1
+        return _mock_resp(400, body="bad request")
+
+    client.session.request = fake_request
+    with pytest.raises(TossAPIError) as exc:
+        client._request("buying_power")
+    assert exc.value.status == 400
+    assert calls["n"] == 1
+
+
 def test_place_order_amount_sends_us_market_amount_only():
     """소수점 BUY용 금액 주문은 quantity/price/timeInForce를 섞지 않는다."""
     client = TossClient(_creds(), rate_limiter=None)

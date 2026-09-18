@@ -2,6 +2,11 @@
 from __future__ import annotations
 
 import json
+import time
+
+from .logging_setup import get_logger
+
+log = get_logger("store_sync")
 
 RECONCILE_THESIS = "라이브 재대사 시 발견된 미추적 보유 — 뇌 재평가 필요"
 SYNC_THESIS = "라이브 전환 시 기존 보유 — 뇌 재평가 필요"
@@ -53,7 +58,61 @@ def is_orphan_store_row(row) -> bool:
     if thesis in (RECONCILE_THESIS, SYNC_THESIS):
         return True
     meta = _parse_meta(_row_get(row, "meta"))
+    if bool(meta.get("provisional_stop")):
+        return True
     return str(meta.get("source") or "") in _ORPHAN_SOURCES
+
+
+def adopt_live_position(store, symbol: str, market: str, qty: float, avg: float,
+                        *, source: str, thesis: str) -> str:
+    """실계좌에서 발견한 보유를 store 에 채택. 'promoted'|'opened' 반환.
+
+    봇 자기 주문이 폴링 창 밖에서 체결되면 store open 행이 없고 armed 계획만
+    남아 있다. 그때 disarm 먼저 하면 손절가가 사라지므로, **armed 가 있으면
+    promote 로 복원**하고, 없을 때만 swing 기본 손절을 임시로 씌운다.
+    """
+    from .agents.wiring import entry_stop_target
+    from .engine.entry_basis import BASIS_ORPHAN
+    from .shadow_ledger import cancel_shadow_on_fill
+
+    armed = None
+    try:
+        for row in store.get_armed():
+            if row["symbol"] == symbol:
+                armed = row
+                break
+    except Exception as e:
+        log.warning("채택: armed 조회 실패 %s: %s", symbol, e)
+
+    if armed is not None:
+        meta = _parse_meta(armed["meta"])
+        horizon = str(meta.get("horizon") or "swing")
+        params = meta.get("params") if isinstance(meta.get("params"), dict) else None
+        stop, target = entry_stop_target(float(avg), horizon, params)
+        aid = int(armed["id"])
+        store.promote_armed(aid, float(qty), float(avg),
+                            target_price=target, stop_price=stop)
+        store.disarm_symbol(symbol, exclude_id=aid)
+        cancel_shadow_on_fill(store, symbol)
+        log.info("채택 %s → armed 계획 승격 stop=%s target=%s source=%s",
+                 symbol, stop, target, source)
+        return "promoted"
+
+    stop, target = entry_stop_target(float(avg), "swing", None)
+    meta = {
+        "source": source,
+        "entry_thesis": thesis,
+        "synced_ts": time.time(),
+        "provisional_stop": True,
+        "entry_basis": BASIS_ORPHAN,
+    }
+    store.open_position(symbol, market, float(qty), float(avg),
+                        strategy=None, thesis=thesis,
+                        target_price=target, stop_price=stop, meta=meta)
+    store.disarm_symbol(symbol)
+    cancel_shadow_on_fill(store, symbol)
+    log.info("채택 %s → 임시손절 고아 개설 stop=%s source=%s", symbol, stop, source)
+    return "opened"
 
 
 def sync_open_qty(

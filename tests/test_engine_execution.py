@@ -186,6 +186,41 @@ def test_exit_partial_keeps_store_open_and_records_pnl(tmp_path):
     assert closed[0]["pnl"] == (71000 - 70000) * 3
 
 
+def test_partial_exit_slice_clamped_to_ledger_drop(tmp_path):
+    """주문 누적 filled_qty > 원장 감소분이면 closed slice 를 원장 감소로 클램프.
+
+    재대사가 원장만 먼저 맞춘 뒤 mirror 가 들어오면 filled_qty 가 이미 반영된
+    감소보다 클 수 있다. 그때 slice 를 그대로 쓰면 pnl 만 부풀고 open 은
+    update_position 이 덮어 정상처럼 보인다.
+    """
+    from src.fill_result import ExecuteResult
+    from src.store_fill import mirror_symbol_to_store
+
+    store = Store(tmp_path / "t.db")
+    broker = _broker(tmp_path, store=store)
+    broker.account.apply_fill("005930", "KR", "BUY", 10, 70000, 0, "seed")
+    # 원장은 이미 7주(재대사 반영). store 는 아직 10주.
+    broker.account.apply_fill("005930", "KR", "SELL", 3, 71000, 30, "recon")
+    store.open_position("005930", "KR", 10, 70000, stop_price=69000)
+    assert broker.position("005930").qty == 7
+
+    fill = ExecuteResult.from_fill(
+        fill_qty=5, fill_price=71000, fee=50,
+        order_qty=5, limit_price=71000, status="FILLED",
+        order_id="X1", side="SELL")
+    assert fill.ok and fill.side == "SELL"
+    mirror_symbol_to_store(store, broker, "005930", fill=fill,
+                           exit_reason="partial_exit")
+
+    opens = store.get_open_positions()
+    assert len(opens) == 1 and opens[0]["qty"] == 7
+    closed = [r for r in store.get_closed_positions() if r["exit_reason"] == "partial_exit"]
+    assert len(closed) == 1
+    assert closed[0]["qty"] == 3                    # 5가 아니라 원장 감소 3
+    assert abs(closed[0]["pnl"] - ((71000 - 70000) * 3 - 30)) < 1e-6  # fee 50*(3/5)
+    store.close()
+
+
 def test_entry_skips_when_already_held(tmp_path):
     """open+armed 공존 시 추가 매수 차단."""
     store = Store(tmp_path / "t.db")

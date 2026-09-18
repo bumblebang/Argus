@@ -2322,14 +2322,22 @@ def _plan_cells(row: dict | None, dp: int) -> str:
     """손절/목표 = '코드가 이 포지션을 어떻게 지키는가'.
 
     손절이 비어 있으면 **가격 기반 자동 청산이 안 걸린 상태**다(계좌 동기화로 채택된 고아
-    보유 등). 조용한 '–' 로 두면 안 보이므로 경고색으로 드러낸다.
+    보유 등). 조용한 '–' 로 두면 안 보이므로 경고색으로 드러낸다. 임시 손절
+    (provisional_stop)은 뇌 재평가 전 하방만 막는 값 — '미설정'과 구분해 표기한다.
     """
     if not row:
         return "<td class=freshwarn>원장 없음</td><td class=muted>–</td>"
-    trail = _trail_badge(_safe_json(row.get("meta")))
+    meta = _safe_json(row.get("meta"))
+    trail = _trail_badge(meta)
     stop = row.get("stop_price")
-    stop_s = (f"<span class=mono>{_fmt(stop, dp)}</span>{trail}" if stop
-              else "<span class=freshwarn title='가격 기반 자동 손절 미설정'>미설정</span>")
+    provisional = bool(meta.get("provisional_stop")) if isinstance(meta, dict) else False
+    if stop and provisional:
+        stop_s = (f"<span class=freshwarn title='뇌 재평가 전 임시 손절(코드 기본)'>"
+                  f"임시 {_fmt(stop, dp)}</span>{trail}")
+    elif stop:
+        stop_s = f"<span class=mono>{_fmt(stop, dp)}</span>{trail}"
+    else:
+        stop_s = "<span class=freshwarn title='가격 기반 자동 손절 미설정'>미설정</span>"
     return f"<td>{stop_s}</td><td class=mono>{_fmt(row.get('target_price'), dp)}</td>"
 
 
