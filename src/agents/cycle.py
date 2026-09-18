@@ -171,6 +171,8 @@ def run_cycle(*, context_json: str, decision_agent, validation_agent, broker, ri
     코드 바닥(하드스톱·트레일링·빠른손 트리거)은 이 가드와 무관하게 계속 작동한다.
 
     tranche_weights: 심볼→회차 비중(밸류 분할). budget_caps: 심볼→명목 상한(슬리브 room).
+    같은 room 이 여러 심볼에 복제된 경우(밸류) 공유 풀로 소진한다 — 앞 주문이 쓴
+    명목을 빼지 않으면 종목마다 잔여 전체를 다시 쓴다.
     LLM target_weight 는 사이징에 쓰지 않는다(저널용으로만 남을 수 있음).
 
     zone_fn(symbol)->dict|None 이 주어지면 **갭 진입 가드**(스윙/장투 BUY 한정): 현재가가
@@ -205,6 +207,18 @@ def run_cycle(*, context_json: str, decision_agent, validation_agent, broker, ri
     validation = validation_agent.review(context_json, decision)
     verdict_by_sym = {v.symbol: v for v in validation.verdicts}
     _fill_proposal_prices(decision, price_lookup, resolve_price_fn)
+
+    # 밸류 슬리브 room 은 종목 dict 에 같은 값으로 복제된다. 공유 잔여로 소진.
+    _sleeve_left: list[float] | None = None
+    if budget_caps:
+        _cap_vals = []
+        for _v in budget_caps.values():
+            try:
+                _cap_vals.append(float(_v))
+            except (TypeError, ValueError):
+                pass
+        if _cap_vals and abs(max(_cap_vals) - min(_cap_vals)) < 1e-6:
+            _sleeve_left = [_cap_vals[0]]
 
     executed: list[dict] = []
     try:
@@ -346,6 +360,13 @@ def run_cycle(*, context_json: str, decision_agent, validation_agent, broker, ri
                     cur_notional = 0.0
                 headroom = max(0.0, equity * hard_cap - cur_notional)
                 extra = (budget_caps or {}).get(p.symbol)
+                if _sleeve_left is not None:
+                    # 공유 잔여 — 앞 주문이 이미 깎은 room 을 쓴다.
+                    try:
+                        extra = (_sleeve_left[0] if extra is None
+                                 else min(float(extra), _sleeve_left[0]))
+                    except (TypeError, ValueError):
+                        extra = _sleeve_left[0]
                 weight, min_qty = min_lot_adjust(
                     weight, price=price, capital=equity, conviction=p.conviction,
                     min_lot_conviction=min_lot_conviction)
@@ -384,6 +405,13 @@ def run_cycle(*, context_json: str, decision_agent, validation_agent, broker, ri
                 st = "gate_rejected"
             if st == "filled" or st == "partial":
                 exec_reason = p.thesis[:80]
+                # 공유 슬리브: 체결 명목만큼 잔여 차감(다음 종목이 재사용하지 못하게).
+                if (p.side == "BUY" and _sleeve_left is not None
+                        and float(res.filled_qty or 0) > 0):
+                    fill_px = float(res.avg_price or price or 0)
+                    spent = float(res.filled_qty) * fill_px
+                    if spent > 0:
+                        _sleeve_left[0] = max(0.0, _sleeve_left[0] - spent)
             else:
                 exec_reason = (res.reject_reason
                                or getattr(broker, "last_reject_reason", None)

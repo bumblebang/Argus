@@ -114,6 +114,42 @@ def test_cycle_budget_cap_clips_sleeve_room(tmp_path):
     assert broker.account.position("005930").qty == 50  # room 5만
 
 
+def test_cycle_shared_sleeve_budget_consumed_across_symbols(tmp_path):
+    """같은 room 이 종목마다 복제돼도 앞 체결 명목을 빼서 다음 종목에 재사용 금지."""
+    decision = DecisionOutput(market_view="x", proposals=[
+        Proposal(symbol="005930", market="KR", side="BUY", conviction=1.0,
+                 horizon="position", target_weight=0.99, thesis="a", key_risks=[]),
+        Proposal(symbol="000660", market="KR", side="BUY", conviction=1.0,
+                 horizon="position", target_weight=0.99, thesis="b", key_risks=[]),
+    ])
+    llm = MockLLM(_responder(decision))
+    acct = PaperAccount(cash={"KR": 10_000_000}, fee_rate={"KR": 0.0},
+                        slippage_bps={"KR": 0.0}, state_path=tmp_path / "a.json")
+    gate = RiskGate({"capital": {"KR": 10_000_000}, "max_position_pct": 0.50,
+                     "max_positions": 10, "daily_loss_limit_pct": 0.05,
+                     "max_order_notional": {},
+                     "kill_switch_file": str(tmp_path / "HALT")})
+    broker = Broker(account=acct, gate=gate, client=None, mode="paper")
+    risk = RiskManager(capital={"KR": 10_000_000}, base_position_pct=0.20,
+                       max_position_pct=0.50)
+    room = 100_000
+    res = run_cycle(
+        context_json="{}", decision_agent=DecisionAgent(llm),
+        validation_agent=ValidationAgent(llm, min_conviction=0.0),
+        broker=broker, risk=risk,
+        price_lookup={"005930": 1000.0, "000660": 1000.0},
+        journal_path=tmp_path / "d.jsonl",
+        conviction_sizing=True,
+        budget_caps={"005930": room, "000660": room})
+    assert res.executed[0]["status"] == "filled"
+    assert res.executed[1]["status"] == "gate_rejected"  # room 소진 → qty=0 거부
+    q1 = broker.account.position("005930").qty
+    q2 = broker.account.position("000660").qty
+    # 버그였으면 각 100주(room 전체×2). 수정 후 합 명목 ≤ room.
+    assert q1 * 1000 + q2 * 1000 <= room + 1e-6
+    assert q1 == 100 and q2 == 0  # 첫 종목이 room 전량 소진
+
+
 def test_cycle_tranche_weight_scales(tmp_path):
     decision = DecisionOutput(market_view="x", proposals=[Proposal(
         symbol="005930", market="KR", side="BUY", conviction=1.0,

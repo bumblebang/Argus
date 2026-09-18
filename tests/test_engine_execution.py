@@ -406,6 +406,18 @@ def test_execute_locked_passes_qty_before_to_finish_live(tmp_path):
     assert len(broker.account.journal) == 0
 
 
+def test_incremental_fill_backs_out_applied_notional():
+    from src.broker import incremental_fill
+    # 누적 10 @ 71000, 반영 3 @ 70000 → 증분 7 @ 71428.57
+    got = incremental_fill(10, 71000, 100.0, 3, 3 * 70000, 30.0)
+    assert got is not None
+    qty, px, fee = got
+    assert qty == 7.0
+    assert abs(px - (71000 * 10 - 210000) / 7) < 1e-9
+    assert abs(fee - 70.0) < 1e-9
+    assert incremental_fill(3, 70000, 30.0, 3, 210000, 30.0) is None
+
+
 def test_finish_live_skip_sell_books_realized_pnl(tmp_path):
     """재대사가 qty 를 맞춘 뒤 SELL finish 가 apply_fill 을 스킵해도 손익은 귀속."""
     from src.strategies.base import Position
@@ -431,6 +443,40 @@ def test_finish_live_skip_sell_books_realized_pnl(tmp_path):
     assert any(f.side == "SELL" and f.qty == 3 for f in broker.account.journal)
 
 
+def test_finish_live_skip_uses_incremental_avg_not_cumulative(tmp_path):
+    """부분체결 이후 스킵 귀속은 누적 VWAP 이 아니라 증분 단가."""
+    from src.strategies.base import Position
+    store = Store(tmp_path / "t.db")
+    broker = _broker(tmp_path, mode="live", store=store, client=_MockClient(
+        resp={"orderId": "S10"}, order_detail=_filled(10, 71000, "FILLED")))
+    # 3주는 이미 apply_fill(70000) — working applied 반영. 재대사가 나머지 7주 흡수.
+    broker.account.positions["005930"] = Position(symbol="005930", qty=0, avg_price=0)
+    broker.account.symbol_market["005930"] = "KR"
+    broker.account.cash["KR"] = 1_000_000
+    store.upsert_working_order(
+        order_id="S10", symbol="005930", market="KR", side="SELL", qty=10,
+        price=70000, status="PARTIAL_FILLED", filled_qty=3, filled_avg=70000,
+        fee=30.0, applied_qty=3, applied_notional=3 * 70000, applied_fee=30.0)
+    # 이미 반영된 3주분 손익(저널) — 스킵 경로가 다시 안 더해야 함.
+    broker.account.record_exit_attribution(
+        "005930", "KR", 3, 70000, 70000, 30.0, reason="prior_partial")
+    before = broker.account.realized_pnl["KR"]
+    order = Order("005930", "KR", "SELL", 10, 70000.0)
+    with broker._lock:
+        broker._finish_live(
+            order, "stop", "S10",
+            {"order_qty": 10.0, "limit_price": 70000.0},
+            10, 71000, 100.0, "FILLED",
+            qty_before=10.0, avg_before=70000.0)
+    # 증분 7주 @ (71000*10 - 210000)/7 = 71428.571...
+    inc_px = (71000 * 10 - 210000) / 7
+    expected_delta = (inc_px - 70000) * 7 - 70.0
+    assert abs(broker.account.realized_pnl["KR"] - (before + expected_delta)) < 1e-3
+    sells = [f for f in broker.account.journal if f.side == "SELL" and "finish_live_skip" in f.reason]
+    assert len(sells) == 1 and abs(sells[0].qty - 7) < 1e-9
+    assert abs(sells[0].price - inc_px) < 1e-6
+
+
 def test_finish_live_skip_sell_pnl_idempotent_with_j3(tmp_path):
     """J3 가 이미 귀속한 매도는 finish_live 스킵 경로에서 다시 안 더한다."""
     from src.strategies.base import Position
@@ -439,7 +485,8 @@ def test_finish_live_skip_sell_pnl_idempotent_with_j3(tmp_path):
     broker.account.positions["005930"] = Position(symbol="005930", qty=7, avg_price=70000)
     broker.account.symbol_market["005930"] = "KR"
     broker.account.record_exit_attribution(
-        "005930", "KR", 3, 72000, 70000, 30.0, reason="reconcile_attribution")
+        "005930", "KR", 3, 72000, 70000, 30.0,
+        reason="reconcile_attribution:S8")
     before = broker.account.realized_pnl["KR"]
     order = Order("005930", "KR", "SELL", 3, 72000.0)
     with broker._lock:

@@ -68,6 +68,30 @@ def _is_fractional_qty(qty: float) -> bool:
     return abs(q - round(q)) > 1e-9
 
 
+def incremental_fill(filled_qty: float, avg_px: float, fee: float,
+                     applied_qty: float = 0.0,
+                     applied_notional: float = 0.0,
+                     applied_fee: float = 0.0,
+                     ) -> tuple[float, float, float] | None:
+    """누적 체결(filled×avg)에서 미반영분의 (증분수량, 증분단가, 증분수수료).
+
+    토스 averageFilledPrice 는 누적 VWAP 이라, 이미 원장에 넣은 분을 빼고
+    남은 구간의 실체결가를 써야 한다. 오차는 부분체결 사이 가격 변동폭에 비례.
+    미반영분이 없으면 None.
+    """
+    delta = float(filled_qty) - float(applied_qty or 0.0)
+    if delta <= 1e-9 or not avg_px or float(avg_px) <= 0:
+        return None
+    inc_notional = float(avg_px) * float(filled_qty) - float(applied_notional or 0.0)
+    if inc_notional <= 0:
+        return None
+    px = inc_notional / delta
+    if px <= 0:
+        return None
+    inc_fee = max(0.0, float(fee or 0.0) - float(applied_fee or 0.0))
+    return delta, px, inc_fee
+
+
 def whole_share_buy_qty(order) -> float | None:
     """소수점 BUY 를 온주로 절사한 수량. 절사할 필요가 없으면 None.
 
@@ -152,7 +176,8 @@ class Broker:
         self.limit_slippage_pct = float(limit_slippage_pct)
         # 시간외(프리/애프터/데이마켓) 스프레드 상한. 최우선호가끼리 이 비율 넘게 벌어져 있으면
         # 주문을 스킵한다 — 마켓터블 리밋은 '최우선호가 대비' 상한이라 최우선호가 자체가
-        # 적정가에서 멀면 그대로 나쁜 가격에 체결된다. 0 이하면 가드 비활성. 정규장은 미적용.
+        # 적정가에서 멀면 그대로 나쁜 가격에 체결된다. 0 이하면 가드 비활성.
+        # 정규장 온주는 미적용. 단 소수점(정규장 한정·시장가)은 정규장에도 적용.
         self.max_spread_pct_extended = float(max_spread_pct_extended)
         # 라이브 체결 대사 폴링(주문 접수 후 실체결 수량·평균가·수수료를 읽어 원장에 반영).
         self.reconcile_poll_attempts = int(reconcile_poll_attempts)
@@ -519,18 +544,30 @@ class Broker:
 
     def _sell_pnl_already_booked(self, order_id: str, symbol: str,
                                  filled_qty: float, avg_px: float) -> bool:
-        """재대사(J3) 또는 이전 finish 가 이미 이 매도 손익을 저널에 넣었는지."""
+        """재대사(J3) 또는 이전 finish 가 이미 이 매도 손익을 저널에 넣었는지.
+
+        세 다리: (1) finish_live_skip/order_id 저널 (2) J3 reason 에 order_id
+        (3) working_orders.applied_qty ≥ filled. 가격 비교는 누적 VWAP 과 증분가가
+        달라 멱등이 깨지므로 쓰지 않는다.
+        """
         tag = f"finish_live_skip:{order_id}"
+        booked = 0.0
         for f in reversed(self.account.journal):
             if f.symbol != symbol or f.side != "SELL":
                 continue
             reason = str(getattr(f, "reason", "") or "")
-            if order_id and (tag in reason or order_id in reason):
-                return True
-            # J3 귀속: 같은 수량·체결가(근사)면 이미 반영된 것으로 본다.
+            if order_id and (tag in reason or f"reconcile_attribution:{order_id}" in reason
+                             or (order_id in reason and (
+                                 "finish_live_skip" in reason
+                                 or "reconcile_attribution" in reason))):
+                booked += float(f.qty)
+                if booked + 1e-9 >= float(filled_qty):
+                    return True
+                continue
+            # 구 J3(order_id 없는 reason) — 같은 수량·근사가만 최신 1건 인정.
             if (abs(float(f.qty) - float(filled_qty)) < 1e-9
                     and abs(float(f.price) - float(avg_px)) < 0.01
-                    and "reconcile_attribution" in reason):
+                    and reason == "reconcile_attribution"):
                 return True
             break
         if self.store is None or not order_id:
@@ -545,6 +582,23 @@ class Broker:
             applied = float(row.get("applied_qty") or 0.0)
             return applied + 1e-9 >= float(filled_qty)
         return False
+
+    def _working_applied(self, order_id: str, symbol: str
+                         ) -> tuple[float, float, float]:
+        """working_orders 의 (applied_qty, applied_notional, applied_fee). 없으면 0."""
+        if self.store is None or not order_id:
+            return 0.0, 0.0, 0.0
+        try:
+            rows = self.store.get_working_orders(symbol)
+        except Exception:
+            return 0.0, 0.0, 0.0
+        for row in rows or []:
+            if str(row.get("order_id") or "") != str(order_id):
+                continue
+            return (float(row.get("applied_qty") or 0.0),
+                    float(row.get("applied_notional") or 0.0),
+                    float(row.get("applied_fee") or 0.0))
+        return 0.0, 0.0, 0.0
 
     # ── 미체결 주문 레지스트리 (J2) ────────────────────────────
     def _register_working_order(self, order: Order, order_id: str, status: str,
@@ -914,27 +968,41 @@ class Broker:
                      avg_before: float | None = None,
                      exit_reason: str | None = None) -> ExecuteResult:
         if filled_qty > 0 and avg_px and avg_px > 0:
+            applied_q, applied_n, applied_f = self._working_applied(
+                order_id, order.symbol)
+            inc = incremental_fill(
+                filled_qty, avg_px, fee, applied_q, applied_n, applied_f)
+            # 증분 없으면(이미 전량 반영) 스킵 경로의 손익 보강도 불필요.
+            book_qty, book_px, book_fee = (
+                (inc[0], inc[1], inc[2]) if inc is not None
+                else (0.0, float(avg_px), 0.0))
             if self._ledger_already_has_fill(order, filled_qty, qty_before):
                 log.info("[LIVE] 체결 id=%s — 원장 이미 반영(재대사), apply_fill 스킵",
                          order_id)
                 # qty/cash 는 재대사가 맞췄고 apply_fill 을 다시 하면 이중 계상.
-                # 매도 실현손익·저널만 비어 있을 수 있으니 여기서 보강한다(J3 와 멱등).
-                if (order.side == "SELL"
+                # 매도 실현손익·저널만 비어 있을 수 있으니 증분만 보강(J3 와 멱등).
+                if (order.side == "SELL" and book_qty > 1e-9
                         and avg_before is not None and float(avg_before) > 0
                         and not self._sell_pnl_already_booked(
                             order_id, order.symbol, filled_qty, avg_px)):
                     self.account.record_exit_attribution(
-                        order.symbol, order.market, float(filled_qty),
-                        float(avg_px), float(avg_before), float(fee or 0.0),
+                        order.symbol, order.market, float(book_qty),
+                        float(book_px), float(avg_before), float(book_fee),
                         reason=f"finish_live_skip:{order_id}")
-                    log.info("[LIVE] 체결 id=%s — apply_fill 스킵분 손익 귀속 qty=%s @ %.2f",
-                             order_id, filled_qty, avg_px)
+                    log.info("[LIVE] 체결 id=%s — apply_fill 스킵분 손익 귀속 "
+                             "증분 qty=%s @ %.4f (누적 filled=%s avg=%.4f)",
+                             order_id, book_qty, book_px, filled_qty, avg_px)
+            elif inc is not None:
+                fill = self.account.apply_fill(
+                    order.symbol, order.market, order.side,
+                    book_qty, book_px, book_fee, reason)
+                log.info("[LIVE] 체결 id=%s status=%s — %s %s x%s @ %.4f "
+                         "(fee %.2f, 누적 filled=%s avg=%.4f) - %s",
+                         order_id, status, fill.side, fill.symbol, fill.qty,
+                         fill.price, fill.fee, filled_qty, avg_px, reason)
             else:
-                fill = self.account.apply_fill(order.symbol, order.market, order.side,
-                                               filled_qty, avg_px, fee, reason)
-                log.info("[LIVE] 체결 id=%s status=%s — %s %s x%s @ %.2f (fee %.2f) - %s",
-                         order_id, status, fill.side, fill.symbol, fill.qty, fill.price,
-                         fill.fee, reason)
+                log.info("[LIVE] 체결 id=%s — 증분 없음(이미 반영), apply_fill 스킵",
+                         order_id)
             payload = {
                 "symbol": order.symbol, "side": order.side, "qty": filled_qty,
                 "price": avg_px, "fee": fee, "order_id": order_id,
@@ -943,6 +1011,9 @@ class Broker:
             }
             if exit_reason:
                 payload["exit_reason"] = exit_reason
+            if book_qty > 1e-9 and abs(book_px - float(avg_px)) > 1e-9:
+                payload["incremental_qty"] = book_qty
+                payload["incremental_price"] = book_px
             self._emit("live_order", order, payload)
             # 부분체결은 잔량이 아직 살아 있다 — 레지스트리에 남겨 재발주를 막고
             # 만료 시 취소한다. 지금까지는 성공 반환 후 잔량을 잊었다.
@@ -1039,7 +1110,7 @@ class Broker:
         - client/account_seq 없거나 live_markets 밖이면 False(집행 스킵).
         - SELL: 실 매도가능 수량(get_sellable)으로 클램프 — 원장 드리프트로 인한 오버셀·
           고아 포지션을 막는다. 매도가능 0 이면 스킵.
-        - 시간외 세션: 호가 스프레드가 상한을 넘으면 스킵(얇은 호가 방어).
+        - 시간외 세션(및 정규장 소수점): 호가 스프레드가 상한을 넘으면 스킵.
         - 주문가/금액 산정 기준: 호가북 마켓터블 리밋가로 갱신
           (없으면 기존 견적가 유지, 폴백).
         """
@@ -1082,7 +1153,7 @@ class Broker:
         # 호가북은 여기서 1번만 조회해 스프레드 가드와 리밋가 산정이 함께 쓴다(MARKET_DATA 절약).
         ob = self._fetch_orderbook(order.symbol)
         if not self._spread_ok(order, ob):
-            self.last_reject_reason = "시간외 스프레드 초과"
+            self.last_reject_reason = "스프레드 초과"
             return False
 
         if ob is not None:                    # 조회 실패면 견적가 유지(기존 폴백 동작)
@@ -1100,9 +1171,12 @@ class Broker:
             return None
 
     def _spread_ok(self, order: Order, ob: dict | None) -> bool:
-        """시간외 세션 스프레드 가드. 주문을 내도 되면 True.
+        """스프레드 가드. 주문을 내도 되면 True.
 
-        정규장(current_session == "regular")에는 절대 발동하지 않는다. 시간외에서만
+        기본은 시간외만. 정규장 온주는 발동하지 않는다. 단 소수점 수량은 정규장
+        한정·시장가라 정규장에도 같은 상한을 적용한다(보호가 필요한 주문과 가드가
+        없는 시간대가 겹치는 구멍 방지).
+
         (ask-bid)/중간가 가 max_spread_pct_extended 를 넘으면 False(주문 스킵) +
         wide_spread_skip 이벤트. 호가북 조회 실패·한쪽 호가 없음 등으로 스프레드를
         계산할 수 없으면 가드를 적용하지 않는다(가드 오작동으로 정상 주문을 막는 게 더 나쁘다).
@@ -1110,7 +1184,8 @@ class Broker:
         if self.max_spread_pct_extended <= 0:
             return True
         session = current_session(order.market)
-        if session == "regular":
+        fractional = _is_fractional_qty(order.qty)
+        if session == "regular" and not fractional:
             return True
         ask = self._best_price(ob, "asks")
         bid = self._best_price(ob, "bids")
@@ -1120,12 +1195,14 @@ class Broker:
         spread = (ask - bid) / mid if mid > 0 else 0.0
         if spread <= self.max_spread_pct_extended:
             return True
-        log.warning("[LIVE] %s 시간외(%s) 스프레드 %.2f%% > 상한 %.2f%% — 주문 스킵 (%s x%s)",
-                    order.symbol, session, spread * 100,
+        why = "소수점" if (session == "regular" and fractional) else f"시간외({session})"
+        log.warning("[LIVE] %s %s 스프레드 %.2f%% > 상한 %.2f%% — 주문 스킵 (%s x%s)",
+                    order.symbol, why, spread * 100,
                     self.max_spread_pct_extended * 100, order.side, order.qty)
         self._emit("wide_spread_skip", order,
                    {"symbol": order.symbol, "side": order.side, "qty": order.qty,
-                    "session": session, "bid": bid, "ask": ask, "spread_pct": spread,
+                    "session": session, "fractional": fractional,
+                    "bid": bid, "ask": ask, "spread_pct": spread,
                     "limit_pct": self.max_spread_pct_extended})
         return False
 
