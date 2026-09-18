@@ -691,6 +691,14 @@ class CycleRunner:
         self.sync_store_positions(res)
         return res
 
+    def _arm_conviction_sizing(self, agents_cfg: dict) -> bool:
+        """즉시체결 경로와 동일: config on + sizing_enabled(calibration flat)."""
+        conv_sz = bool(agents_cfg.get("conviction_sizing", True))
+        if conv_sz and self.store:
+            from ..calibration import sizing_enabled
+            conv_sz = sizing_enabled(self.store, configured=True)
+        return conv_sz
+
     def _arm(self, proposal, price: float, zone: dict | None = None) -> bool:
         """BUY 제안을 진입대기(armed)로 등록 → 진입 타이밍은 감시 루프가 잡는다.
 
@@ -725,7 +733,7 @@ class CycleRunner:
                     getattr(self.risk, "conviction_size_span", 0.25)),
                 "target_weight": float(getattr(self.risk, "base_position_pct", 0.20)),
                 "conviction": getattr(proposal, "conviction", None),
-                "conviction_sizing": bool(agents_cfg.get("conviction_sizing", True)),
+                "conviction_sizing": self._arm_conviction_sizing(agents_cfg),
                 "entry_regime": self._regime_now.get(proposal.market),
                 "dossier_id": (d["id"] if d else None)}
         if mlc is not None:
