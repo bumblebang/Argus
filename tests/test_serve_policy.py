@@ -324,3 +324,57 @@ def test_build_context_focus_compact_and_headline_limit(monkeypatch):
     hl = json.loads(narrow)["headlines"]
     assert len(hl) <= 10
     assert all(h.get("symbol") is None for h in hl)
+
+
+# ── 필수 심볼 시장 필터: 국장 사이클에 닫힌 미장 보유분 재주입 금지 (09-18 11:00) ──
+def _mkt(sym):
+    return {"MDT": "US", "XOM": "US", "000003": "KR"}.get(sym)
+
+
+def test_select_focus_markets_drops_closed_market_held():
+    items = [{"symbol": f"{i:06d}", "market": "KR"} for i in range(1, 11)]
+    wake = {"reason": "wake_triggers", "market": "KR",
+            "triggers": [{"kind": "vol_spike", "symbol": "000007"}]}
+    cfg = serve.serve_cfg({"serve": {"enabled": True, "focus_pad": 0}})
+    out, tier = serve.select_candidates(
+        items, wake, held=["000003", "MDT", "XOM"], cfg=cfg,
+        markets={"KR"}, market_fn=_mkt)
+    assert tier == "focus"
+    assert {c["symbol"] for c in out} == {"000003", "000007"}
+
+
+def test_select_focus_markets_drops_closed_market_wake_symbol():
+    wake = {"reason": "disclosure",
+            "triggers": [{"symbol": "AAPL", "market": "US"},
+                         {"symbol": "005930", "market": "KR"}]}
+    cfg = serve.serve_cfg({"serve": {"enabled": True, "focus_pad": 0}})
+    out, _ = serve.select_candidates([], wake, held=[], cfg=cfg, markets=["KR"])
+    assert {c["symbol"] for c in out} == {"005930"}
+
+
+def test_select_scan_markets_drops_closed_market_held_and_armed():
+    items = [{"symbol": f"{i:06d}", "market": "KR"} for i in range(1, 21)]
+    cfg = serve.serve_cfg({"serve": {
+        "enabled": True, "scan_enabled": True, "scan_cap": 5}})
+    out, tier = serve.select_candidates(
+        items, {"reason": "extra"}, held=["000003", "MDT"], armed=["XOM"],
+        cfg=cfg, markets={"KR"}, market_fn=_mkt)
+    assert tier == "scan"
+    syms = {c["symbol"] for c in out}
+    assert "000003" in syms and not ({"MDT", "XOM"} & syms)
+    assert not any(c.get("serve_stub") for c in out)
+
+
+def test_select_markets_none_keeps_all_must():
+    """markets=None(필터 없음) 이면 기존 동작 — 시장 무관 보유 전원 필수."""
+    cfg = serve.serve_cfg({"serve": {"enabled": True, "focus_pad": 0}})
+    out, _ = serve.select_candidates(
+        [], {"reason": "wake_triggers"}, held=["000003", "MDT"], cfg=cfg,
+        market_fn=_mkt)
+    assert {c["symbol"] for c in out} == {"000003", "MDT"}
+
+
+def test_filter_symbols_by_market_fallback_rule():
+    """market_fn 이 모르면 6자리=KR / 그 외=US 규칙."""
+    assert serve.filter_symbols_by_market(
+        ["005930", "TSLA"], {"US"}, lambda s: None) == ["TSLA"]

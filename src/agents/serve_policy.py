@@ -16,7 +16,7 @@
 """
 from __future__ import annotations
 
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 # 정기 각성 — scan tier(느린 슬롯 전량 vs shortlist 분기).
 SCAN_REASONS = frozenset({
@@ -177,6 +177,28 @@ def _market_hint_from_wake(wake: dict | None, symbol: str) -> str:
     return "US"
 
 
+def filter_symbols_by_market(symbols: Iterable[str] | None,
+                             markets: Iterable[str] | None,
+                             market_fn: Callable[[str], str | None] | None = None,
+                             wake: dict | None = None) -> list[str]:
+    """필수 심볼(보유·armed·wake)을 이번 사이클 시장으로 거른다.
+
+    markets=None 이면 그대로. 국장 사이클에 닫힌 미장 보유분이 stub 으로
+    재주입돼 뇌 판단 슬롯·토큰을 먹던 문제(2026-09-18 11:00) 방지.
+    시장 판정: market_fn(원장·유니버스 권위) → wake 힌트/6자리 규칙.
+    """
+    syms = [s for s in (symbols or []) if s]
+    if markets is None:
+        return syms
+    keep = {str(m).upper() for m in markets}
+    out = []
+    for s in syms:
+        m = (market_fn(s) if market_fn else None) or _market_hint_from_wake(wake, s)
+        if str(m).upper() in keep:
+            out.append(s)
+    return out
+
+
 def select_scan_candidates(
     items: list[dict],
     *,
@@ -253,16 +275,22 @@ def select_candidates(items: list[dict], wake: dict | None, *,
                       bullish: list[str] | None = None,
                       scores: dict[str, dict] | None = None,
                       cfg: dict | None = None,
-                      tier: str | None = None) -> tuple[list[dict], str]:
+                      tier: str | None = None,
+                      markets: Iterable[str] | None = None,
+                      market_fn: Callable[[str], str | None] | None = None,
+                      ) -> tuple[list[dict], str]:
     """티어에 따라 items 를 그대로 또는 focus shortlist 로 반환.
 
     반환: (items_out, tier).
     focus: 필수 = held ∪ wake 심볼 → pad → focus_cap.
     items 에 없는 필수 심볼은 stub(force_include)로 넣어 뇌에 항상 보이게 한다.
     필수만으로 cap 초과 시 필수 전원 유지(캡은 pad 에만 적용).
+    markets 가 주어지면 필수 심볼도 그 시장 것만 남긴다(국장 중 미장 보유 제외).
     """
     c = cfg or serve_cfg(None)
     t = tier or classify_tier(wake, cfg=c)
+    held = filter_symbols_by_market(held, markets, market_fn, wake)
+    armed = filter_symbols_by_market(armed, markets, market_fn, wake)
     if t != "focus":
         if (t == "scan" and c.get("scan_enabled", True)
                 and not scan_shortlist_exempt(wake)):
@@ -273,7 +301,7 @@ def select_candidates(items: list[dict], wake: dict | None, *,
 
     must = []
     seen: set[str] = set()
-    for s in list(held or []) + wake_symbols(wake):
+    for s in held + filter_symbols_by_market(wake_symbols(wake), markets, market_fn, wake):
         if s not in seen:
             seen.add(s)
             must.append(s)
