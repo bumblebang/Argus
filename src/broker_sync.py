@@ -371,13 +371,16 @@ def _consume_settled_sells(store, symbol: str, need: float) -> list[dict]:
             continue                      # 실체결가 없으면 추정하지 않는다
         # 증분 실체결가: 누적 명목 − 이미 원장에 반영된 명목. 부분체결을 먼저
         # apply_fill 로 넣은 주문에서도 남은 분의 실제 단가가 나온다.
-        inc_notional = float(avg) * filled - float(row["applied_notional"] or 0.0)
-        inc_fee = max(0.0, float(row["fee"] or 0.0) - float(row["applied_fee"] or 0.0))
-        px = inc_notional / avail
-        if px <= 0:
+        from .broker import incremental_fill
+        inc = incremental_fill(
+            filled, float(avg), float(row["fee"] or 0.0),
+            applied, float(row["applied_notional"] or 0.0),
+            float(row["applied_fee"] or 0.0))
+        if inc is None:
             continue
+        avail, px, inc_fee_full = inc
         take = min(avail, need)
-        picked.append({"qty": take, "price": px, "fee": inc_fee * (take / avail),
+        picked.append({"qty": take, "price": px, "fee": inc_fee_full * (take / avail),
                        "order_id": row["order_id"]})
         need -= take
         try:
@@ -387,7 +390,7 @@ def _consume_settled_sells(store, symbol: str, need: float) -> list[dict]:
                 store.update_working_order(
                     row["order_id"], applied_qty=applied + take,
                     applied_notional=float(row["applied_notional"] or 0.0) + px * take,
-                    applied_fee=float(row["applied_fee"] or 0.0) + inc_fee * (take / avail))
+                    applied_fee=float(row["applied_fee"] or 0.0) + inc_fee_full * (take / avail))
         except Exception as e:
             log.warning("귀속: 레지스트리 정리 실패 %s: %s", row["order_id"], e)
     return picked
@@ -415,8 +418,13 @@ def _attribute_exits(account, store, before: dict, live_pos: dict) -> dict:
         if got > 1e-9:
             fee = sum(p["fee"] for p in picked)
             px = sum(p["qty"] * p["price"] for p in picked) / got
+            # order_id 를 reason 에 박아 finish_live 멱등 가드가 누적VWAP≠증분가
+            # 여도 같은 주문을 재귀속하지 않게 한다(#65 세 다리 보강).
+            oids = [str(p["order_id"]) for p in picked if p.get("order_id")]
+            why = ("reconcile_attribution:" + ",".join(oids)
+                   if oids else "reconcile_attribution")
             account.record_exit_attribution(sym, market, got, px, old_avg, fee,
-                                            reason="reconcile_attribution")
+                                            reason=why)
             resolved[sym] = {"qty": got, "price": px, "fee": fee}
             log.info("[귀속] %s 매도 %s @ %.2f (수수료 %.2f) — 실체결가로 기입",
                      sym, got, px, fee)

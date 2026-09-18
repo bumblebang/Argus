@@ -96,7 +96,7 @@ def collect(store, cfg: dict, since_days: float) -> dict:
     }
 
 
-def main() -> None:
+def main() -> int:
     ap = argparse.ArgumentParser(description="측정층 기준선 스냅샷")
     ap.add_argument("--out", type=Path, default=DEFAULT_OUT)
     ap.add_argument("--since-days", type=float, default=90.0)
@@ -112,11 +112,11 @@ def main() -> None:
         if not args.out.exists():
             print(json.dumps({"error": "기준선 없음", "path": str(args.out)},
                              ensure_ascii=False))
-            return
+            return 1
         old = json.loads(args.out.read_text(encoding="utf-8"))
         print(json.dumps({"baseline": old, "current": snap},
                          ensure_ascii=False, indent=2))
-        return
+        return 0
 
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(snap, ensure_ascii=False, indent=2),
@@ -125,7 +125,8 @@ def main() -> None:
                       "calibration_n": snap["calibration"]["n"],
                       "shadow_n_scored": (snap["shadow"]["overall"] or {}).get("n_scored")},
                      ensure_ascii=False))
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

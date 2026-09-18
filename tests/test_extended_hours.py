@@ -5,7 +5,8 @@
 - WatchConfig.trading_sessions 설정이 없으면 루프는 기존대로 정규장에서만 거래한다.
 - 주기(정기) 뇌 각성은 brain_sessions 에 있는 세션에서만, 트리거(이벤트) 각성은 시간외에도 발화한다.
 - 데이트레(day) 진입은 프리·애프터에서도 평가. 오버나잇은 오늘 마지막 허용 세션 종료 N분 전이 막는다.
-- 시간외 + 넓은 스프레드면 라이브 주문 스킵. 정규장/호가 결측은 가드 미적용.
+- 시간외 + 넓은 스프레드면 라이브 주문 스킵. 정규장 온주/호가 결측은 가드 미적용.
+- 정규장 소수점(시장가)은 스프레드 가드 발동.
 
 네트워크 0 — 가짜 게이트웨이/클라이언트 주입 + 세션 판정 monkeypatch.
 """
@@ -352,7 +353,7 @@ def test_시간외_좁은_스프레드_통과(tmp_path, monkeypatch):
 
 
 def test_정규장은_넓은_스프레드여도_통과(tmp_path, monkeypatch):
-    """가드는 시간외 전용 — 정규장에서는 절대 발동하지 않는다."""
+    """가드는 시간외 전용(온주) — 정규장 온주에서는 발동하지 않는다."""
     _session(monkeypatch, "regular")
     store = Store(tmp_path / "t.db")
     client = _MockClient(orderbook=_book(69000, 71000))      # 시간외였다면 스킵될 폭
@@ -360,6 +361,27 @@ def test_정규장은_넓은_스프레드여도_통과(tmp_path, monkeypatch):
     ok = b.execute(Order("005930", "KR", "BUY", 1, 70000.0), "test")
     assert ok
     assert store.recent_events("wide_spread_skip", 0) == []
+
+
+def test_정규장_소수점_넓은_스프레드_스킵(tmp_path, monkeypatch):
+    """소수점(정규장 한정·시장가)은 정규장에도 스프레드 가드 발동."""
+    _session(monkeypatch, "regular")
+    store = Store(tmp_path / "t.db")
+    client = _MockClient(orderbook=_book(98.0, 102.0))       # ≈4% > 2%
+    b = _live_broker(tmp_path, client, store=store, max_spread=0.02)
+    # US live + 소수점 수량
+    b.live_markets = ["US"]
+    b.account.cash["US"] = 1_000
+    from src.strategies.base import Position
+    b.account.positions["AAPL"] = Position(symbol="AAPL", qty=0.5, avg_price=90.0)
+    b.account.symbol_market["AAPL"] = "US"
+    ok = b.execute(Order("AAPL", "US", "SELL", 0.5, 100.0), "test")
+    assert not ok
+    assert client.calls == []
+    evs = store.recent_events("wide_spread_skip", 0)
+    assert len(evs) == 1
+    p = json.loads(evs[0]["payload"])
+    assert p["session"] == "regular" and p["fractional"] is True
 
 
 def test_호가북_결측이면_가드_미적용_통과(tmp_path, monkeypatch):

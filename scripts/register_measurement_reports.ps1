@@ -11,8 +11,8 @@ $vbs = Join-Path $PSScriptRoot "run_hidden.vbs"
 if (-not (Test-Path $bat)) { Write-Error "run_measurement_reports.bat 없음: $bat"; exit 1 }
 if (-not (Test-Path $vbs)) { Write-Error "run_hidden.vbs 없음: $vbs"; exit 1 }
 
-$action = New-ScheduledTaskAction -Execute "C:\Windows\System32\wscript.exe" `
-    -Argument "`"$vbs`" `"$bat`""
+$action = New-ScheduledTaskAction -Execute "C:\Windows\System32\cscript.exe" `
+    -Argument "//nologo `"$vbs`" `"$bat`""
 $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -WakeToRun `
     -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Hours 1) `
     -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries
@@ -29,3 +29,4 @@ Write-Host "[OK] ArgusMeasurementReports ($WeekdayAt weekdays)"
 Write-Host "  해제: Unregister-ScheduledTask -TaskName ArgusMeasurementReports"
 Write-Host "  로그: logs\measurement_reports.run.log"
 Write-Host "  산출: data\dossier_quality.json / wiring_mismatch.json / measurement_baseline_latest.json"
+Write-Host "  실패 시 LastTaskResult≠0 (cscript+cmd /c call 로 exit code 전달)"
