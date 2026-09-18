@@ -294,21 +294,29 @@ def _items_to_synced(items: list) -> list[dict]:
 
 def apply_sync_from_live(account, store, data: dict, *, markets=("KR", "US")) -> dict:
     """기동 동기화 apply — broker.run_locked/reconcile 안에서 호출."""
+    before = {sym: (float(p.qty), float(p.avg_price),
+                    account.symbol_market.get(sym, "KR"))
+              for sym, p in account.positions.items() if p.is_open}
+
     for market, cash in (data.get("cash") or {}).items():
         account.cash[market] = cash
 
     holdings_ok = bool(data.get("holdings_ok"))
     items = data.get("items") or []
     synced = _items_to_synced(items)
+    live_pos: dict = {}
 
     if holdings_ok:
         new_positions, new_mkt = _parse_holdings_items(items)
+        live_pos = new_positions
         account.positions = new_positions
         account.symbol_market = new_mkt
     account._save()
 
     if store is not None and holdings_ok:
         _sync_store(store, synced, account)
+        # 주기 재대사와 같이 BUY working applied 보정 — 기동만 빠져 이중예약.
+        _sync_buy_working_applied(store, before, live_pos)
 
     return {"cash": dict(account.cash),
             "positions": [{"symbol": s["symbol"], "qty": s["qty"], "avg": s["avg"]}
@@ -472,14 +480,19 @@ def _emit(store, kind: str, symbol: str, payload: dict) -> None:
 
 
 def _sync_buy_working_applied(store, before: dict, live_pos: dict) -> None:
-    """재대사가 holdings 로 흡수한 BUY 증가분만큼 working.applied_qty 를 올린다.
+    """재대사/기동이 holdings 로 흡수한 BUY 증가분만큼 working.applied_* 를 올린다.
 
     finish_live 를 안 거친 체결(폴링 밖)은 원장 qty 만 늘고 applied 가 0 이라
-    room 이 invested+working 으로 이중 예약된다. 증가분을 filled−applied 에서
-    소비해 겹침을 줄인다(방향은 보수적 — 못 맞추면 예약이 남을 수 있음).
+    room 이 invested+working 으로 이중 예약된다. sweep 이 먼저 settled 로
+    찍은 BUY 도 포함해야 한다 — settled=False 만 보면 attribution_ttl(기본 30분)
+    동안 예약이 남는다.
+
+    applied_notional 은 누적 VWAP×take 가 아니라 incremental_fill 증분 명목으로
+    올린다(반복 부분체결에서 틀어짐).
     """
     if store is None:
         return
+    from .broker import incremental_fill
     syms = set(before) | set(live_pos)
     for sym in syms:
         old_qty = float(before[sym][0]) if sym in before else 0.0
@@ -487,8 +500,10 @@ def _sync_buy_working_applied(store, before: dict, live_pos: dict) -> None:
         need = new_qty - old_qty
         if need <= 1e-9:
             continue
+        rows: list = []
         try:
-            rows = store.get_working_orders(sym, side="BUY", settled=False) or []
+            rows.extend(store.get_working_orders(sym, side="BUY", settled=False) or [])
+            rows.extend(store.get_working_orders(sym, side="BUY", settled=True) or [])
         except Exception as e:
             log.warning("재대사: BUY working 조회 실패 %s: %s", sym, e)
             continue
@@ -497,19 +512,27 @@ def _sync_buy_working_applied(store, before: dict, live_pos: dict) -> None:
                 break
             filled = float(row.get("filled_qty") or 0.0)
             applied = float(row.get("applied_qty") or 0.0)
-            avail = filled - applied
-            if avail <= 1e-9:
-                continue
-            take = min(avail, need)
-            avg = float(row.get("filled_avg") or row.get("price") or 0.0)
+            avg = row.get("filled_avg")
             fee = float(row.get("fee") or 0.0)
-            fee_take = fee * (take / filled) if filled > 1e-9 else 0.0
+            applied_n = float(row.get("applied_notional") or 0.0)
+            applied_f = float(row.get("applied_fee") or 0.0)
+            if not avg or float(avg) <= 0:
+                continue
+            inc = incremental_fill(
+                filled, float(avg), fee, applied, applied_n, applied_f)
+            if inc is None:
+                continue
+            avail, px, inc_fee_full = inc
+            take = min(avail, need)
+            if take <= 1e-9:
+                continue
+            fee_take = inc_fee_full * (take / avail) if avail > 1e-9 else 0.0
             try:
                 store.update_working_order(
                     row["order_id"],
                     applied_qty=applied + take,
-                    applied_notional=float(row.get("applied_notional") or 0.0) + avg * take,
-                    applied_fee=float(row.get("applied_fee") or 0.0) + fee_take)
+                    applied_notional=applied_n + px * take,
+                    applied_fee=applied_f + fee_take)
             except Exception as e:
                 log.warning("재대사: BUY applied 갱신 실패 %s: %s", row["order_id"], e)
                 continue

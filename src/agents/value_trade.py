@@ -192,18 +192,20 @@ def compute_sleeve(*, sleeve_pct: float, brain_reserve_pct: float,
 
 def working_buy_reserved_notional(store, market: str, *,
                                   exposure_base: str = "capital") -> float:
-    """시장별 미반영 BUY 예약 명목(qty − applied_qty)×price.
+    """시장별 미반영 BUY 예약 명목.
 
-    filled 가 아니라 applied 기준 — 평균가 결측으로 원장 미반영인 체결분도
-    room 에 남긴다. 진행 중(settled=False)은 _TRACK_WORKING status 만
-    (CANCELED 0주 과차감 방지). 귀속 대기(settled=True)는 filled−applied 만
-    — 부분체결 후 취소된 잔량은 빼고 미반영 체결분만 남긴다.
+    진행 중(settled=False, _TRACK_WORKING):
+      미체결 잔량×주문가 + 미반영 체결 증분명목(filled×avg − applied_notional).
+    귀속 대기(settled=True):
+      미반영 체결 증분명목만 — 부분체결 후 취소 잔량은 제외.
+      (filled−applied)×누적avg 가 아니라 증분 명목을 쓴다.
+
     exposure_base 인자는 호환용으로 무시(capital/equity 모두 전액 차감).
     """
     _ = exposure_base
     if store is None:
         return 0.0
-    from ..broker import _TRACK_WORKING
+    from ..broker import _TRACK_WORKING, incremental_fill
     total = 0.0
     try:
         open_rows = store.get_working_orders(side="BUY", settled=False) or []
@@ -216,19 +218,41 @@ def working_buy_reserved_notional(store, market: str, *,
         st = str(w.get("status") or "").upper()
         if st not in _TRACK_WORKING:
             continue
-        rem = float(w["qty"]) - float(w.get("applied_qty") or 0.0)
-        if rem <= 0:
-            continue
-        total += rem * float(w.get("price") or 0.0)
+        qty = float(w["qty"])
+        filled = float(w.get("filled_qty") or 0.0)
+        applied = float(w.get("applied_qty") or 0.0)
+        limit_px = float(w.get("price") or 0.0)
+        unfilled = max(0.0, qty - filled)
+        if unfilled > 0 and limit_px > 0:
+            total += unfilled * limit_px
+        unapplied = filled - applied
+        if unapplied > 1e-9:
+            avg = w.get("filled_avg")
+            if avg and float(avg) > 0:
+                inc = incremental_fill(
+                    filled, float(avg), float(w.get("fee") or 0.0),
+                    applied, float(w.get("applied_notional") or 0.0),
+                    float(w.get("applied_fee") or 0.0))
+                if inc is not None:
+                    total += inc[0] * inc[1]
+                elif limit_px > 0:
+                    total += unapplied * limit_px
+            elif limit_px > 0:
+                total += unapplied * limit_px
     for w in settled_rows:
         if str(w.get("market") or "") != market:
             continue
-        rem = (float(w.get("filled_qty") or 0.0)
-               - float(w.get("applied_qty") or 0.0))
-        if rem <= 0:
+        filled = float(w.get("filled_qty") or 0.0)
+        applied = float(w.get("applied_qty") or 0.0)
+        avg = w.get("filled_avg")
+        if filled - applied <= 1e-9 or not avg or float(avg) <= 0:
             continue
-        px = float(w.get("filled_avg") or w.get("price") or 0.0)
-        total += rem * px
+        inc = incremental_fill(
+            filled, float(avg), float(w.get("fee") or 0.0),
+            applied, float(w.get("applied_notional") or 0.0),
+            float(w.get("applied_fee") or 0.0))
+        if inc is not None:
+            total += inc[0] * inc[1]
     return total
 
 
