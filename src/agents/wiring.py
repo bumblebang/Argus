@@ -45,6 +45,20 @@ def resolve_execution_mode(*, broker_mode: str, dry_run: bool,
         return "live"
     return "paper"
 
+def sector_map_from_items(universe: dict | None) -> dict:
+    """{market: [item,...]} → symbol→sector. 정규화 불가·미지정은 제외.
+
+    RiskGate 가 유니버스 핫리로드마다 같은 규칙으로 맵을 다시 만들 때 쓴다.
+    """
+    out: dict[str, str] = {}
+    for _market, lst in (universe or {}).items():
+        for it in (lst or []):
+            sym, sec = it.get("symbol"), normalize_sector(it.get("sector"))
+            if sym and sec:
+                out[sym] = sec
+    return out
+
+
 def sector_map_from_universe(cfg: AppConfig) -> dict:
     """config.universe 의 symbol→sector 매핑(포트폴리오 감독관의 섹터 집중도용).
 
@@ -53,22 +67,19 @@ def sector_map_from_universe(cfg: AppConfig) -> dict:
     검사에서 빠짐 — 비활성, 안전). 유니버스 sector 는 universe_roll 이 KRX 업종
     분류현황·Finnhub profile2 실데이터로 채운다.
     """
-    out: dict[str, str] = {}
-    for _market, lst in (cfg.universe or {}).items():
-        for it in (lst or []):
-            sym, sec = it.get("symbol"), normalize_sector(it.get("sector"))
-            if sym and sec:
-                out[sym] = sec
-    return out
+    return sector_map_from_items(cfg.universe)
 
 
 def build_paper_core(cfg: AppConfig, *, live_client=None, account_seq=None,
-                     store=None) -> tuple[Broker, RiskManager]:
+                     store=None, sector_map_fn=None) -> tuple[Broker, RiskManager]:
     """공유 코어(계좌+하드게이트+브로커, 리스크매니저) 구성.
 
     진입(뇌 CycleRunner)과 청산(감시 루프 ExitExecutor)이 **같은 계좌**를 봐야 하므로
     한 번 만들어 둘 다에 주입한다. PaperAccount 는 data/paper_account.json 으로 영속.
     하드 게이트엔 포트폴리오 수준 감독관(총 익스포저·섹터 집중도)도 함께 싣는다.
+
+    sector_map_fn: 호출 시 최신 symbol→sector dict. 유니버스 핫리로드 후 게이트 맵이
+    기동 스냅샷에 고정되지 않게 한다(미지정 시 기동 시 sector_map 만 사용).
 
     라이브 배선(심층 방어): live_client 를 **명시 주입한 프로세스(watch 데몬)만** 실주문이
     가능하다. 배치/스크립트는 live_client 를 넘기지 않으므로 config 가 live 여도 자동 페이퍼.
@@ -84,10 +95,11 @@ def build_paper_core(cfg: AppConfig, *, live_client=None, account_seq=None,
         if len(sector_map) < n_syms:      # 조용한 비활성 방지 — 커버리지를 크게 알린다
             pct = 100.0 * len(sector_map) / n_syms if n_syms else 0.0
             log.warning("섹터 집중도 감독: universe %d종목 중 %d종목만 sector 지정"
-                        "(커버리지 %.0f%%) — 미지정 종목은 검사에서 제외됩니다. "
+                        "(커버리지 %.0f%%) — 미지정은 '%s' 버킷"
+                        "(한도=max_sector_pct×unclassified_sector_mult)으로 검사합니다. "
                         "커버리지가 낮으면 scripts/refresh_sectors.py 로 "
                         "data/sector_cache.json 을 채우세요.",
-                        n_syms, len(sector_map), pct)
+                        n_syms, len(sector_map), pct, "미분류")
     account = PaperAccount(
         cash=paper_cfg.get("cash", {"KR": 10_000_000, "US": 10_000}),
         fee_rate=paper_cfg.get("fee_rate", {}),
@@ -112,7 +124,10 @@ def build_paper_core(cfg: AppConfig, *, live_client=None, account_seq=None,
                      "allow_min_lot": risk_cfg.get("allow_min_lot", False),
                      "min_lot_qty": risk_cfg.get("min_lot_qty", 1.0),
                      "min_lot_max_notional": risk_cfg.get("min_lot_max_notional"),
-                     "sector_map": sector_map})
+                     "sector_map": sector_map,
+                     "sector_map_fn": sector_map_fn,
+                     "unclassified_sector_mult": risk_cfg.get(
+                         "unclassified_sector_mult", 0.5)})
     broker_cfg = cfg.raw.get("broker", {}) or {}
     mode = broker_cfg.get("mode", "paper")
     live_markets = broker_cfg.get("live_markets", ["KR"])

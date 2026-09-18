@@ -229,10 +229,15 @@ def test_sleeve_skips_when_budget_exhausted(tmp_path):
     # base = 게이트 기준(exposure_base=capital) 1,000,000. 뇌 유휴라 예산은 절대 상한
     # 1,000,000×0.60 = 600,000(동적: 900,000 − 예비금 300,000 = 600,000). value 로 소진.
     store.open_position("000001", "KR", 600, 1000.0, strategy="value",
-                        meta={"source": "value"})
+                        meta={"source": "value", "horizon": "position",
+                              "fair_high": 2000.0})
+    # 페이퍼에도 같은 보유가 있어야 SELL 사이징이 동작(출구 전용 사이클).
+    runner.broker.account.apply_fill("000001", "KR", "BUY", 600, 1000.0, 0, "seed")
     summary = runner.run()
-    assert summary["markets"]["KR"].get("skip") == "sleeve_full"
-    assert runner.broker.account.position("900001").qty == 0    # 진입 안 함
+    m = summary["markets"]["KR"]
+    assert m.get("funnel", {}).get("skip_entries") == "sleeve_full"
+    assert m.get("funnel", {}).get("exit_only") is True
+    assert runner.broker.account.position("900001").qty == 0    # 신규 진입 안 함
 
 
 def test_sleeve_skips_when_max_positions_reached(tmp_path):
@@ -242,9 +247,12 @@ def test_sleeve_skips_when_max_positions_reached(tmp_path):
     runner.cfg.raw["value_trade"]["max_positions"] = 1          # 상한 1(기본 3)
     # 잔여 예산은 있게(소액) + value 포지션 1개 → count 상한 도달.
     store.open_position("000001", "KR", 1, 1000.0, strategy="value",
-                        meta={"source": "value"})
+                        meta={"source": "value", "horizon": "position"})
+    runner.broker.account.apply_fill("000001", "KR", "BUY", 1, 1000.0, 0, "seed")
     summary = runner.run()
-    assert summary["markets"]["KR"].get("skip") == "max_positions"
+    m = summary["markets"]["KR"]
+    assert m.get("funnel", {}).get("skip_entries") == "max_positions"
+    assert m.get("funnel", {}).get("exit_only") is True
 
 
 def test_capital_not_slots_limits_new_entries(tmp_path):
@@ -385,20 +393,26 @@ def test_compute_sleeve_matches_live_numbers():
 
 
 def test_runner_sleeve_uses_brain_usage_and_skips(tmp_path):
-    """러너 통합: 뇌가 base×0.85 를 쓰면 밸류 예산이 base×0.05 로 줄어 LLM 무접촉 스킵."""
+    """러너 통합: 뇌가 base×0.85 를 쓰면 밸류 예산이 base×0.05 로 줄어 신규 진입 스킵.
+
+    보유 밸류가 있으면 출구 전용 사이클은 돈다(skip_entries=sleeve_full).
+    """
     wl = {"900001": _entry(name="밸류1", conviction=0.7, fair_low_pct=30.0,
                            metrics={"price": 1000.0})}
     runner, store = _build_runner(tmp_path, wl)
     # 뇌(비밸류) 850,000 + 밸류 60,000 → 예산 50,000 < 투자 60,000 → 잔여 음수.
     store.open_position("005930", "KR", 850, 1000.0, strategy="swing", meta={})
     store.open_position("000001", "KR", 60, 1000.0, strategy="value",
-                        meta={"source": "value"})
+                        meta={"source": "value", "horizon": "position"})
+    runner.broker.account.apply_fill("000001", "KR", "BUY", 60, 1000.0, 0, "seed")
     sleeve = runner._sleeve("KR", value_trade_cfg(runner.cfg),
                             runner._value_positions())
     assert sleeve["base"] == 1_000_000.0 and sleeve["brain_invested"] == 850_000.0
     assert sleeve["budget"] == 50_000.0 and sleeve["room"] == -10_000.0
     summary = runner.run()
-    assert summary["markets"]["KR"].get("skip") == "sleeve_full"
+    m = summary["markets"]["KR"]
+    assert m.get("funnel", {}).get("skip_entries") == "sleeve_full"
+    assert m.get("funnel", {}).get("exit_only") is True
     assert runner.broker.account.position("900001").qty == 0
 
 
@@ -515,7 +529,7 @@ def test_cap_bump_는_퇴짜보다_훨씬_느슨하다():
     cfg = load_config()
     cfg.raw["value_trade"] = {"enabled": True}
     v = value_trade_cfg(cfg)
-    assert v["cooldown_hold_n"] == 3
+    assert v["cooldown_hold_n"] == 8
     assert v["cooldown_cap_bump_n"] >= 6
     assert v["cooldown_streak_ttl_days"] > 0
 
@@ -671,3 +685,58 @@ def test_gated_candidate_carries_fair_low(tmp_path):
 def test_code_conviction_floor_default():
     cfg = load_config()
     assert value_trade_cfg(cfg)["code_conviction_floor"] == 0.35
+
+
+def test_build_value_holdings_time_stop_flag():
+    from src.agents.value_trade import build_value_holdings
+    opened = _OPEN_NOW - 130 * 86400
+    rows = [{"symbol": "V1", "market": "KR", "qty": 10, "avg_price": 1000.0,
+             "opened_at": opened, "thesis": "싼 이유",
+             "meta": json.dumps({"source": "value", "fair_low": 1200,
+                                 "fair_high": 1500})}]
+    out = build_value_holdings(rows, {"V1": 1100.0},
+                               {"time_stop_days": 120}, _OPEN_NOW, "KR")
+    assert len(out) == 1
+    assert out[0]["time_stop"]["exceeded"] is True
+    assert out[0]["fair_high"] == 1500
+    assert out[0]["unrealized_pnl_pct"] == 10.0
+
+
+def test_value_runner_sells_holding_on_llm_sell(tmp_path):
+    """밸류 트랙이 holdings SELL 을 내리면 페이퍼·원장이 닫힌다(출구 소유권)."""
+    def sell_llm(cands):
+        def responder(schema, system, user):
+            if schema is DecisionOutput:
+                ctx = json.loads(user)
+                holds = ctx.get("holdings") or []
+                assert holds and holds[0]["symbol"] == "000001"
+                assert holds[0]["time_stop"]["exceeded"] is True
+                props = [Proposal(symbol="000001", market="KR", side="SELL",
+                                  conviction=0.8, horizon="position",
+                                  target_weight=0.0, thesis="120일 논지 반증",
+                                  key_risks=["time"])]
+                return DecisionOutput(market_view="exit", proposals=props)
+            return ValidationOutput(verdicts=[ValidationVerdict(
+                symbol="000001", approved=True, reason="ok")])
+        return MockLLM(responder)
+
+    runner, store = _build_runner(tmp_path, {}, llm_factory=sell_llm)
+    opened = _OPEN_NOW - 130 * 86400
+    store.open_position(
+        "000001", "KR", 10, 1000.0, strategy="value",
+        thesis="옛 논지",
+        meta={"source": "value", "horizon": "position",
+              "fair_low": 1200, "fair_high": 1600})
+    # opened_at 을 과거로 덮어 time_stop 초과
+    store.conn.execute("UPDATE positions SET opened_at=? WHERE symbol=?",
+                       (opened, "000001"))
+    store.conn.commit()
+    runner.broker.account.apply_fill("000001", "KR", "BUY", 10, 1000.0, 0, "seed")
+    # 시세 주입
+    runner.price_fn = lambda syms, m: {s: 1100.0 for s in syms}
+    summary = runner.run()
+    m = summary["markets"]["KR"]
+    assert m.get("sold") == 1
+    assert runner.broker.account.position("000001").qty == 0
+    open_rows = store.get_open_positions()
+    assert not any(r["symbol"] == "000001" for r in open_rows)

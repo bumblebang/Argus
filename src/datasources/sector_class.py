@@ -19,18 +19,22 @@ import time
 from datetime import date, timedelta
 from pathlib import Path
 
+from ..config import ROOT
 from ..logging_setup import get_logger
 from ..sector_taxonomy import normalize_sector
 
 log = get_logger("src.sector_class")
 
-CACHE_PATH = Path("data/sector_cache.json")
+# cwd 상대경로 금지 — doctor/watch/스크립트 cwd 가 갈라지면 캐시가 비어
+# 섹터캡이 조용히 꺼진다. 토큰 캐시와 같이 리포 ROOT 아래 고정.
+CACHE_PATH = ROOT / "data" / "sector_cache.json"
 TTL_SEC = 30 * 86400.0                    # 업종은 정적 — 30일
 MISS_TTL_SEC = 86400.0                    # 분류 실패분은 하루 뒤 재시도
 KR_BLD = "dbms/MDC/STAT/standard/MDCSTAT03901"   # 업종분류현황
 FINNHUB_PROFILE = "https://finnhub.io/api/v1/stock/profile2"
 US_SPACING_SEC = 1.1                      # 무료 티어 60req/min
 US_MAX_PER_RUN = 60                       # 1회 롤에서 새로 조회할 US 심볼 상한
+_UNKNOWN_RAW_SEEN: set[str] = set()       # 신설 업종 경고 중복 억제
 
 
 # ── 캐시 입출력 ──────────────────────────────────────────────
@@ -79,6 +83,12 @@ def _fresh(entry: dict | None, now: float) -> bool:
 def _put(cache: dict, market: str, symbol: str, raw: str | None, now: float) -> bool:
     """raw 업종 문자열을 정규화해 캐시에 기록. 정규화 실패면 raw 만 남긴다."""
     sec = normalize_sector(raw)
+    if raw and sec is None:
+        key = f"{market}:{raw}"
+        if key not in _UNKNOWN_RAW_SEEN:
+            _UNKNOWN_RAW_SEEN.add(key)
+            log.warning("섹터 정규화 실패(미분류) — %s raw=%r. "
+                        "sector_taxonomy 맵에 업종을 추가하세요.", market, raw)
     _market_block(cache, market)[str(symbol)] = {
         "sector": sec, "raw": raw, "fetched": now}
     return sec is not None
@@ -123,14 +133,16 @@ def fetch_kr_industries(client=None, *, days: int = 7) -> dict[str, str]:
     return {}
 
 
-def refresh_kr(cache: dict, symbols, now: float, *, client=None) -> int:
+def refresh_kr(cache: dict, symbols, now: float, *, client=None,
+               force: bool = False) -> int:
     """요청 심볼 중 캐시가 만료된 게 있으면 KRX 전종목을 한 번 받아 채운다.
 
     벌크 1회 호출이라 심볼 수와 무관. 반환값 = 새로 정규화에 성공한 심볼 수.
+    force=True 면 TTL 을 무시하고 재조회한다(디스크 캐시는 호출부가 보존).
     """
     want = [str(s) for s in symbols if s]
     blk = _market_block(cache, "KR")
-    if all(_fresh(blk.get(s), now) for s in want):
+    if not force and all(_fresh(blk.get(s), now) for s in want):
         return 0
     table = fetch_kr_industries(client)
     if not table:
@@ -170,11 +182,15 @@ def fetch_us_industry(symbol: str, api_key: str, *, timeout: float = 15.0) -> st
 
 def refresh_us(cache: dict, symbols, now: float, *, api_key: str | None = None,
                max_fetch: int = US_MAX_PER_RUN, spacing_sec: float = US_SPACING_SEC,
-               sleep=time.sleep) -> int:
-    """캐시 만료된 US 심볼만 Finnhub 로 조회. 1회 실행 상한 max_fetch."""
+               sleep=time.sleep, force: bool = False) -> int:
+    """캐시 만료된 US 심볼만 Finnhub 로 조회. 1회 실행 상한 max_fetch.
+
+    force=True 면 TTL 무시 — 요청 심볼을 전부 stale 로 본다(디스크는 덮어쓰기 전 유지).
+    """
     key = api_key or os.getenv("FINNHUB_API_KEY") or ""
     blk = _market_block(cache, "US")
-    stale = [str(s) for s in symbols if s and not _fresh(blk.get(str(s)), now)]
+    stale = [str(s) for s in symbols
+             if s and (force or not _fresh(blk.get(str(s)), now))]
     if not stale:
         return 0
     if not key:
@@ -197,10 +213,13 @@ def refresh_us(cache: dict, symbols, now: float, *, api_key: str | None = None,
 def ensure_sectors(symbols_by_market: dict, *, cache_path: Path | None = None,
                    now: float | None = None, krx_client=None,
                    api_key: str | None = None,
-                   max_us_fetch: int = US_MAX_PER_RUN) -> dict:
+                   max_us_fetch: int = US_MAX_PER_RUN,
+                   force: bool = False) -> dict:
     """요청 심볼들의 섹터를 캐시에 채우고 캐시 dict 를 반환(디스크에도 저장).
 
     네트워크 실패는 삼킨다 — 섹터를 못 채워도 매매는 계속되어야 한다.
+    force=True 면 TTL 을 무시해 재조회한다. 디스크 파일을 먼저 지우지 않는다 —
+    조회 실패 시 기존 캐시 항목이 그대로 남는다.
     """
     now = time.time() if now is None else now
     cache = load_cache(cache_path)
@@ -209,10 +228,11 @@ def ensure_sectors(symbols_by_market: dict, *, cache_path: Path | None = None,
         m = str(market).upper()
         try:
             if m == "KR":
-                changed += refresh_kr(cache, syms, now, client=krx_client)
+                changed += refresh_kr(cache, syms, now, client=krx_client,
+                                      force=force)
             elif m == "US":
                 changed += refresh_us(cache, syms, now, api_key=api_key,
-                                      max_fetch=max_us_fetch)
+                                      max_fetch=max_us_fetch, force=force)
         except Exception as e:
             log.warning("[%s] 섹터 수집 실패(무시하고 진행): %s", m, e)
     if changed:

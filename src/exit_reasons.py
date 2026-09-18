@@ -24,6 +24,7 @@ EXIT_REASON_KO = {
     "session_end": "종가 청산",
     "time_stop": "시간손절",
     "brain": "뇌 판단",
+    "value_fair_high": "적정가 상단",
     "partial_exit": "부분 청산",
     "exit": "청산",
 }
