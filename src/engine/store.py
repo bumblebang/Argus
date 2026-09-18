@@ -262,10 +262,11 @@ class Store:
                              placed_at: float | None = None,
                              reason: str | None = None,
                              meta: dict | None = None) -> None:
-        """미체결 주문 기록(멱등). 같은 order_id 재접수 시 상태만 갱신.
+        """미체결 주문 기록(멱등). 같은 order_id 재접수 시 체결 스냅샷을 갱신.
 
-        applied_* 는 '이미 원장에 반영된' 체결분이다. 접수 시점에 한 번만 쓰고
-        이후 갱신하지 않는다 — 재대사 귀속이 미반영분을 정확히 계산하는 기준선.
+        applied_* 는 '이미 원장에 반영된' 체결분이다. ON CONFLICT 때는 **증가만**
+        허용한다 — PENDING(applied=0) 위에 부분체결을 재등록해도 기준선이 0으로
+        덮이지 않아 J3 귀속이 누적 VWAP 을 그대로 쓰지 않는다.
         """
         now = time.time()
         with self._lock:
@@ -275,7 +276,14 @@ class Store:
                 " applied_fee, status, placed_at, last_checked, reason, meta)"
                 " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)"
                 " ON CONFLICT(order_id) DO UPDATE SET"
-                " filled_qty=excluded.filled_qty, status=excluded.status,"
+                " filled_qty=excluded.filled_qty,"
+                " filled_avg=COALESCE(excluded.filled_avg, working_orders.filled_avg),"
+                " fee=COALESCE(excluded.fee, working_orders.fee),"
+                " applied_qty=MAX(working_orders.applied_qty, excluded.applied_qty),"
+                " applied_notional=MAX(working_orders.applied_notional,"
+                "                      excluded.applied_notional),"
+                " applied_fee=MAX(working_orders.applied_fee, excluded.applied_fee),"
+                " status=excluded.status,"
                 " last_checked=excluded.last_checked",
                 (order_id, symbol, market, side, float(qty), float(price),
                  float(filled_qty), filled_avg, fee, float(applied_qty),

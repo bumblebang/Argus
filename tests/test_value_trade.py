@@ -329,6 +329,15 @@ def test_compute_sleeve_brain_idle_uses_absolute_cap():
     assert s["brain_reserve"] == 300_000.0 and s["gross_limit"] == 900_000.0
 
 
+def test_compute_sleeve_working_buy_reduces_room():
+    """미체결 BUY 명목은 invested 에 없어도 room 에서 차감."""
+    s = compute_sleeve(**_SLEEVE_KW, base=1_000_000, value_invested=100_000,
+                       brain_invested=0, working_buy_notional=50_000)
+    assert s["invested"] == 100_000.0
+    assert s["working_buy"] == 50_000.0
+    assert s["room"] == 450_000.0  # 600k - 100k - 50k
+
+
 def test_compute_sleeve_shrinks_when_brain_exceeds_reserve():
     """뇌가 예비금 초과 사용 → 실사용액이 그대로 차감된다(base×0.90 − base×0.50)."""
     s = compute_sleeve(**_SLEEVE_KW, base=1_000_000, value_invested=0,

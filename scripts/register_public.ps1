@@ -14,8 +14,8 @@ $vbs = Join-Path $PSScriptRoot "run_hidden.vbs"
 if (-not (Test-Path $bat)) { Write-Error "run_public.bat 없음: $bat"; exit 1 }
 if (-not (Test-Path $vbs)) { Write-Error "run_hidden.vbs 없음: $vbs"; exit 1 }
 
-$action = New-ScheduledTaskAction -Execute "C:\Windows\System32\cscript.exe" `
-    -Argument "//nologo `"$vbs`" `"$bat`""
+$action = New-ScheduledTaskAction -Execute "C:\Windows\System32\wscript.exe" `
+    -Argument "`"$vbs`" `"$bat`""
 $triggers = $Times | ForEach-Object { New-ScheduledTaskTrigger -Daily -At $_ }
 $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable -WakeToRun `
     -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Minutes 15)

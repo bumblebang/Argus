@@ -206,8 +206,10 @@ class EntryExecutor:
         if qty <= 0:
             return {"action": "buy", "executed": False, "reason": "사이징 0"}
 
+        buy_cap = (None if skip_position_headroom(min_qty)
+                   else self._headroom(sym, market, exec_px, equity))
         res = self.broker.execute_with_mirror(
-            Order(sym, market, "BUY", qty, exec_px),
+            Order(sym, market, "BUY", qty, exec_px, notional_cap=buy_cap),
             reason=f"[entry:{name}] {sig.reason}",
             store=self.store, armed_id=armed["id"], plan_fn=self.plan_fn)
         if not res:
@@ -260,8 +262,10 @@ class EntryExecutor:
                               else self._headroom(sym, market, price, equity)))
             if qty <= 0:
                 return {"action": "buy", "executed": False, "reason": "사이징 0"}
+            buy_cap = (None if skip_position_headroom(min_qty)
+                       else self._headroom(sym, market, price, equity))
             res = self.broker.execute_with_mirror(
-                Order(sym, market, "BUY", qty, price),
+                Order(sym, market, "BUY", qty, price, notional_cap=buy_cap),
                 reason="[entry:zone] 존 진입",
                 store=self.store, armed_id=armed["id"],
                 plan_fn=lambda p, h, params: combine_stop_target(

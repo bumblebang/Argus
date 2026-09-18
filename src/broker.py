@@ -257,13 +257,18 @@ class Broker:
                 return self.last_result
 
         if self.mode == "live":
-            if not self._prepare_live_order(order):
+            if not self._prepare_live_order(order, exit_reason=exit_reason):
                 with self._lock:
                     if not self.last_reject_reason:
                         self.last_reject_reason = "라이브 주문 준비 실패"
+                    # prepare 가 qty/price 를 바꿨을 수 있음 — 거부 스냅샷도 최신값.
+                    base_kw = {"order_qty": float(order.qty),
+                               "limit_price": float(order.price)}
                     self.last_result = ExecuteResult.rejected(
                         self.last_reject_reason, **base_kw)
                 return self.last_result
+            base_kw = {"order_qty": float(order.qty),
+                       "limit_price": float(order.price)}
 
         with self._lock:
             prep = self._begin_execute_locked(order, reason, base_kw)
@@ -1104,15 +1109,18 @@ class Broker:
                     "ordered": order.market, "ledger": held})
         order.market = held
 
-    def _prepare_live_order(self, order: Order) -> bool:
+    def _prepare_live_order(self, order: Order, *,
+                            exit_reason: str | None = None) -> bool:
         """라이브 주문을 게이트 이전에 실조건으로 보정. 진행 가능하면 True.
 
         - client/account_seq 없거나 live_markets 밖이면 False(집행 스킵).
         - SELL: 실 매도가능 수량(get_sellable)으로 클램프 — 원장 드리프트로 인한 오버셀·
           고아 포지션을 막는다. 매도가능 0 이면 스킵.
-        - 시간외 세션(및 정규장 소수점): 호가 스프레드가 상한을 넘으면 스킵.
+        - 시간외 세션(및 정규장 소수점 BUY): 호가 스프레드가 상한을 넘으면 스킵.
+          exit_reason 있는 SELL(스탑 등)은 정규장 소수점에서도 면제.
         - 주문가/금액 산정 기준: 호가북 마켓터블 리밋가로 갱신
-          (없으면 기존 견적가 유지, 폴백).
+          (없으면 기존 견적가 유지, 폴백). BUY 는 notional_cap 이 있으면 상향가
+          기준으로 qty 를 재절사한다.
         """
         if self.client is None or self.account_seq is None:
             log.error("live 모드인데 client/account_seq 가 없습니다. 집행 중단.")
@@ -1152,7 +1160,7 @@ class Broker:
 
         # 호가북은 여기서 1번만 조회해 스프레드 가드와 리밋가 산정이 함께 쓴다(MARKET_DATA 절약).
         ob = self._fetch_orderbook(order.symbol)
-        if not self._spread_ok(order, ob):
+        if not self._spread_ok(order, ob, exit_reason=exit_reason):
             self.last_reject_reason = "스프레드 초과"
             return False
 
@@ -1160,6 +1168,44 @@ class Broker:
             px = self._marketable_limit(order, ob)
             if px and px > 0:
                 order.price = px
+        if not self._retarget_buy_qty_to_cap(order):
+            return False
+        return True
+
+    def _retarget_buy_qty_to_cap(self, order: Order) -> bool:
+        """BUY notional_cap 이 있으면 현재가 기준 qty 재절사. 진행 가능하면 True.
+
+        마켓터블 리밋가 상향 뒤 qty×price 가 사이징 캡을 넘지 않게 한다. 재절사 결과가
+        0 이면 주문 스킵.
+        """
+        if order.side != "BUY":
+            return True
+        cap_raw = getattr(order, "notional_cap", None)
+        if cap_raw is None:
+            return True
+        try:
+            cap = float(cap_raw)
+        except (TypeError, ValueError):
+            return True
+        if cap < 0 or order.price <= 0:
+            return True
+        if float(order.qty) * float(order.price) <= cap + 1e-9:
+            return True
+        raw = cap / float(order.price)
+        if _is_fractional_qty(order.qty) and raw < 1:
+            new_qty = float(Decimal(str(raw)).quantize(
+                Decimal("0.0001"), rounding=ROUND_DOWN))
+        else:
+            new_qty = float(math.floor(raw + 1e-12))
+        if new_qty < float(order.qty):
+            log.warning("[LIVE] %s 리밋가 상향 후 qty 재절사 %s→%s (cap=%s @%s)",
+                        order.symbol, order.qty, new_qty, cap, order.price)
+            order.qty = new_qty
+        if float(order.qty) <= 0:
+            log.warning("[LIVE] %s notional_cap 재절사 결과 0 — 매수 스킵 (cap=%s @%s)",
+                        order.symbol, cap, order.price)
+            self.last_reject_reason = "notional_cap 재절사 0"
+            return False
         return True
 
     def _fetch_orderbook(self, symbol: str) -> dict | None:
@@ -1170,12 +1216,14 @@ class Broker:
             log.warning("[LIVE] 호가 조회 실패 → 리밋가 폴백(견적가 사용) %s: %s", symbol, e)
             return None
 
-    def _spread_ok(self, order: Order, ob: dict | None) -> bool:
+    def _spread_ok(self, order: Order, ob: dict | None, *,
+                   exit_reason: str | None = None) -> bool:
         """스프레드 가드. 주문을 내도 되면 True.
 
         기본은 시간외만. 정규장 온주는 발동하지 않는다. 단 소수점 수량은 정규장
         한정·시장가라 정규장에도 같은 상한을 적용한다(보호가 필요한 주문과 가드가
-        없는 시간대가 겹치는 구멍 방지).
+        없는 시간대가 겹치는 구멍 방지). exit_reason 있는 SELL(스탑·트레일 등)은
+        정규장 소수점에서도 면제 — 청산을 스프레드로 막지 않는다. BUY·시간외는 유지.
 
         (ask-bid)/중간가 가 max_spread_pct_extended 를 넘으면 False(주문 스킵) +
         wide_spread_skip 이벤트. 호가북 조회 실패·한쪽 호가 없음 등으로 스프레드를
@@ -1186,6 +1234,10 @@ class Broker:
         session = current_session(order.market)
         fractional = _is_fractional_qty(order.qty)
         if session == "regular" and not fractional:
+            return True
+        # 정규장 소수점 스탑/트레일 청산은 스프레드로 막지 않는다.
+        if (session == "regular" and fractional
+                and order.side == "SELL" and exit_reason):
             return True
         ask = self._best_price(ob, "asks")
         bid = self._best_price(ob, "bids")

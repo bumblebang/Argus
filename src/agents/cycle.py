@@ -393,8 +393,10 @@ def run_cycle(*, context_json: str, decision_agent, validation_agent, broker, ri
             else:  # SELL: 보유 수량 전량
                 qty = broker.position(p.symbol).qty
             exit_reason = "brain" if p.side == "SELL" else None
+            buy_cap = notional_cap if p.side == "BUY" else None
             res = broker.execute(
-                Order(p.symbol, p.market, p.side, qty, price),
+                Order(p.symbol, p.market, p.side, qty, price,
+                      notional_cap=buy_cap),
                 reason=f"[agent] {p.thesis[:60]}",
                 store=store, exit_reason=exit_reason)
             if res.partial:
@@ -405,11 +407,19 @@ def run_cycle(*, context_json: str, decision_agent, validation_agent, broker, ri
                 st = "gate_rejected"
             if st == "filled" or st == "partial":
                 exec_reason = p.thesis[:80]
-                # 공유 슬리브: 체결 명목만큼 잔여 차감(다음 종목이 재사용하지 못하게).
-                if (p.side == "BUY" and _sleeve_left is not None
-                        and float(res.filled_qty or 0) > 0):
-                    fill_px = float(res.avg_price or price or 0)
-                    spent = float(res.filled_qty) * fill_px
+                # 공유 슬리브: 체결 명목 + (라이브) working 잔량×주문가 선차감.
+                # 잔량을 안 빼면 다음 종목이 room 을 다시 쓴다.
+                if p.side == "BUY" and _sleeve_left is not None:
+                    spent = 0.0
+                    fq = float(res.filled_qty or 0)
+                    if fq > 0:
+                        fill_px = float(res.avg_price or price or 0)
+                        spent += fq * fill_px
+                    if getattr(broker, "mode", None) == "live":
+                        rem = max(0.0, float(res.order_qty or 0) - fq)
+                        if rem > 0:
+                            lim = float(res.limit_price or price or 0)
+                            spent += rem * lim
                     if spent > 0:
                         _sleeve_left[0] = max(0.0, _sleeve_left[0] - spent)
             else:

@@ -589,6 +589,32 @@ def test_upsert_is_idempotent(tmp_path):
     assert rows[0]["status"] == "PARTIAL_FILLED" and rows[0]["filled_qty"] == 5.0
 
 
+def test_upsert_conflict_raises_applied_never_shrinks(tmp_path):
+    """PENDING(applied=0) 위 부분체결 재등록 시 applied_* 증가·filled_avg 갱신."""
+    store = Store(tmp_path / "t.db")
+    store.upsert_working_order(
+        order_id="X1", symbol="005930", market="KR", side="BUY",
+        qty=10, price=1_000, status="PENDING", filled_qty=0)
+    store.upsert_working_order(
+        order_id="X1", symbol="005930", market="KR", side="BUY",
+        qty=10, price=1_000, status="PARTIAL_FILLED", filled_qty=3,
+        filled_avg=1_010.0, fee=3.0,
+        applied_qty=3, applied_notional=3_030.0, applied_fee=3.0)
+    row = store.get_working_orders()[0]
+    assert row["status"] == "PARTIAL_FILLED" and row["filled_qty"] == 3.0
+    assert row["filled_avg"] == 1_010.0 and row["fee"] == 3.0
+    assert row["applied_qty"] == 3.0
+    assert row["applied_notional"] == 3_030.0 and row["applied_fee"] == 3.0
+    # 더 낮은 applied 로 덮어써도 감소하지 않는다.
+    store.upsert_working_order(
+        order_id="X1", symbol="005930", market="KR", side="BUY",
+        qty=10, price=1_000, status="PARTIAL_FILLED", filled_qty=3,
+        filled_avg=1_010.0, fee=3.0,
+        applied_qty=0, applied_notional=0.0, applied_fee=0.0)
+    row = store.get_working_orders()[0]
+    assert row["applied_qty"] == 3.0 and row["applied_notional"] == 3_030.0
+
+
 def test_filled_without_avg_keeps_working_no_ledger(tmp_path):
     """부재(P0 L1): filled>0 · avg 없음 → 원장 무변 + working 유지(고스트 방지)."""
     store = Store(tmp_path / "t.db")

@@ -22,6 +22,8 @@ class Order:
     side: str          # "BUY" | "SELL"
     qty: float
     price: float
+    # 라이브 마켓터블 리밋가 상향 후 qty 재절사 한도(없으면 재절사 생략).
+    notional_cap: float | None = None
 
     @property
     def notional(self) -> float:

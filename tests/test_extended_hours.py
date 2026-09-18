@@ -384,6 +384,24 @@ def test_정규장_소수점_넓은_스프레드_스킵(tmp_path, monkeypatch):
     assert p["session"] == "regular" and p["fractional"] is True
 
 
+def test_정규장_소수점_exit_reason_SELL은_스프레드_면제(tmp_path, monkeypatch):
+    """스탑 등 exit_reason SELL 은 정규장 소수점이어도 청산을 막지 않는다."""
+    _session(monkeypatch, "regular")
+    store = Store(tmp_path / "t.db")
+    client = _MockClient(orderbook=_book(98.0, 102.0))
+    b = _live_broker(tmp_path, client, store=store, max_spread=0.02)
+    b.live_markets = ["US"]
+    b.account.cash["US"] = 1_000
+    from src.strategies.base import Position
+    b.account.positions["AAPL"] = Position(symbol="AAPL", qty=0.5, avg_price=90.0)
+    b.account.symbol_market["AAPL"] = "US"
+    # 면제 판정은 place 직전까지 — 체결 폴링 스텁은 이 테스트 범위 밖.
+    b.execute(Order("AAPL", "US", "SELL", 0.5, 100.0), "stop",
+              exit_reason="stop_hit")
+    assert client.calls, "스프레드 면제 후 실주문이 나가야 한다"
+    assert store.recent_events("wide_spread_skip", 0) == []
+
+
 def test_호가북_결측이면_가드_미적용_통과(tmp_path, monkeypatch):
     """스프레드를 계산할 수 없으면 통과(가드 오작동으로 정상 주문을 막는 게 더 나쁘다)."""
     _session(monkeypatch, "aftermarket")
