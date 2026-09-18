@@ -346,6 +346,34 @@ def test_compute_sleeve_working_buy_reduces_room():
     assert s["room"] == 450_000.0  # 600k - 100k - 50k
 
 
+def test_working_buy_reserved_uses_applied_not_filled(tmp_path):
+    """평균가 결측(filled>applied) 분은 qty−applied 로 room 예약."""
+    from src.agents.value_trade import working_buy_reserved_notional
+    from src.engine.store import Store
+    store = Store(tmp_path / "t.db")
+    store.upsert_working_order(
+        order_id="W1", symbol="005930", market="KR", side="BUY",
+        qty=10, price=70_000, status="UNKNOWN", filled_qty=3,
+        applied_qty=0, applied_notional=0, applied_fee=0)
+    # filled 기준이면 7×70k, applied 기준이면 10×70k
+    n = working_buy_reserved_notional(store, "KR", exposure_base="capital")
+    assert n == 10 * 70_000
+
+
+def test_working_buy_reserved_skips_canceled_and_equity(tmp_path):
+    from src.agents.value_trade import working_buy_reserved_notional
+    from src.engine.store import Store
+    store = Store(tmp_path / "t.db")
+    store.upsert_working_order(
+        order_id="W1", symbol="005930", market="KR", side="BUY",
+        qty=10, price=70_000, status="CANCELED", filled_qty=0)
+    store.upsert_working_order(
+        order_id="W2", symbol="000660", market="KR", side="BUY",
+        qty=5, price=100_000, status="PENDING", filled_qty=0)
+    assert working_buy_reserved_notional(store, "KR", exposure_base="capital") == 500_000
+    assert working_buy_reserved_notional(store, "KR", exposure_base="equity") == 0.0
+
+
 def test_compute_sleeve_shrinks_when_brain_exceeds_reserve():
     """뇌가 예비금 초과 사용 → 실사용액이 그대로 차감된다(base×0.90 − base×0.50)."""
     s = compute_sleeve(**_SLEEVE_KW, base=1_000_000, value_invested=0,
