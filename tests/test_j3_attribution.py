@@ -232,6 +232,21 @@ def test_buy_side_working_order_does_not_attribute(tmp_path):
     assert res["attributed"] == {}
 
 
+def test_reconcile_bumps_buy_working_applied_on_holdings_increase(tmp_path):
+    """holdings 증가분이 working BUY applied_qty 를 올려 room 이중예약을 줄인다."""
+    store, acct = Store(tmp_path / "t.db"), _acct(tmp_path)
+    _seed(store, acct, qty=10)
+    store.upsert_working_order(
+        order_id="B1", symbol="005930", market="KR", side="BUY",
+        qty=10, price=70_000, status="PARTIAL_FILLED", filled_qty=4,
+        filled_avg=70_000, fee=0.0, applied_qty=0, applied_notional=0)
+    apply_reconcile_from_live(
+        acct, store, _holdings([_item(qty=14)]), markets=("KR",))
+    row = store.get_working_orders("005930", side="BUY", settled=False)[0]
+    assert row["applied_qty"] == 4.0
+    assert abs(row["applied_notional"] - 4 * 70_000) < 1e-6
+
+
 def test_increase_does_not_attribute(tmp_path):
     store, acct = Store(tmp_path / "t.db"), _acct(tmp_path)
     _seed(store, acct, qty=5)

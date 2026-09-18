@@ -168,8 +168,8 @@ def compute_sleeve(*, sleeve_pct: float, brain_reserve_pct: float,
 
     working_buy_notional 은 미반영 BUY 잔량(qty−applied_qty)×주문가. 포지션에 아직
     안 잡혔어도 room 을 잡아두지 않으면 다음 진입이 같은 예산을 이중 사용한다.
-    exposure_base=equity 일 때는 호출측이 0 을 넘겨야 한다 — 실계좌 cash 에
-    이미 홀드가 반영돼 이중 차감된다.
+    exposure_base(capital/equity) 와 무관하게 전액 차감한다 — equity 에서 0 으로
+    끄면 다음 사이클 예약이 풀린다.
 
     base<=0(예: US capital 0)이면 budget 은 0 이 되어 진입이 차단된다.
     """
@@ -190,34 +190,45 @@ def compute_sleeve(*, sleeve_pct: float, brain_reserve_pct: float,
             "working_buy": round(working, 2)}
 
 
-# 종결·취소된 working 은 잔량 명목에서 제외(CANCELED 과차감 방지).
-_WORKING_BUY_SKIP_STATUS = frozenset({
-    "FILLED", "CANCELED", "REJECTED", "CANCEL_REJECTED", "REPLACE_REJECTED",
-})
-
-
 def working_buy_reserved_notional(store, market: str, *,
                                   exposure_base: str = "capital") -> float:
     """시장별 미반영 BUY 예약 명목(qty − applied_qty)×price.
 
     filled 가 아니라 applied 기준 — 평균가 결측으로 원장 미반영인 체결분도
-    room 에 남긴다. exposure_base=equity 면 0(실계좌 cash 홀드와 이중 차감 금지).
+    room 에 남긴다. 진행 중(settled=False)은 _TRACK_WORKING status 만
+    (CANCELED 0주 과차감 방지). 귀속 대기(settled=True)는 filled−applied 만
+    — 부분체결 후 취소된 잔량은 빼고 미반영 체결분만 남긴다.
+    exposure_base 인자는 호환용으로 무시(capital/equity 모두 전액 차감).
     """
-    if str(exposure_base or "capital").lower() == "equity":
-        return 0.0
+    _ = exposure_base
     if store is None:
         return 0.0
+    from ..broker import _TRACK_WORKING
     total = 0.0
-    for w in store.get_working_orders(side="BUY", settled=False) or []:
+    try:
+        open_rows = store.get_working_orders(side="BUY", settled=False) or []
+        settled_rows = store.get_working_orders(side="BUY", settled=True) or []
+    except Exception:
+        return 0.0
+    for w in open_rows:
         if str(w.get("market") or "") != market:
             continue
         st = str(w.get("status") or "").upper()
-        if st in _WORKING_BUY_SKIP_STATUS:
+        if st not in _TRACK_WORKING:
             continue
         rem = float(w["qty"]) - float(w.get("applied_qty") or 0.0)
         if rem <= 0:
             continue
         total += rem * float(w.get("price") or 0.0)
+    for w in settled_rows:
+        if str(w.get("market") or "") != market:
+            continue
+        rem = (float(w.get("filled_qty") or 0.0)
+               - float(w.get("applied_qty") or 0.0))
+        if rem <= 0:
+            continue
+        px = float(w.get("filled_avg") or w.get("price") or 0.0)
+        total += rem * px
     return total
 
 
@@ -684,10 +695,8 @@ class ValueRunner:
         total = sum(float(r["qty"]) * float(r["avg_price"]) for r in rows
                     if r["market"] == market)
         brain_invested = max(0.0, total - invested)
-        exp_base = str(self.cfg.risk.get("exposure_base") or "capital")
         try:
-            working_buy = working_buy_reserved_notional(
-                self.store, market, exposure_base=exp_base)
+            working_buy = working_buy_reserved_notional(self.store, market)
         except Exception as e:
             log.warning("[value_trade][%s] working BUY 명목 산출 실패: %s",
                         market, e)

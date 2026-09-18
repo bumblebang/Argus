@@ -370,8 +370,22 @@ def test_working_buy_reserved_skips_canceled_and_equity(tmp_path):
     store.upsert_working_order(
         order_id="W2", symbol="000660", market="KR", side="BUY",
         qty=5, price=100_000, status="PENDING", filled_qty=0)
-    assert working_buy_reserved_notional(store, "KR", exposure_base="capital") == 500_000
-    assert working_buy_reserved_notional(store, "KR", exposure_base="equity") == 0.0
+    assert working_buy_reserved_notional(store, "KR") == 500_000
+    # equity 도 capital 과 같이 전액 차감(예약 끄지 않음)
+    assert working_buy_reserved_notional(store, "KR", exposure_base="equity") == 500_000
+
+
+def test_working_buy_reserved_settled_partial_excludes_cancel_remainder(tmp_path):
+    """부분체결 후 취소 — 귀속 대기행은 filled−applied 만(취소 잔량 제외)."""
+    from src.agents.value_trade import working_buy_reserved_notional
+    from src.engine.store import Store
+    store = Store(tmp_path / "t.db")
+    store.upsert_working_order(
+        order_id="W1", symbol="005930", market="KR", side="BUY",
+        qty=10, price=70_000, status="CANCELED", filled_qty=3,
+        filled_avg=70_000, applied_qty=0, applied_notional=0)
+    store.update_working_order("W1", settled_at=1.0)
+    assert working_buy_reserved_notional(store, "KR") == 3 * 70_000
 
 
 def test_compute_sleeve_shrinks_when_brain_exceeds_reserve():
