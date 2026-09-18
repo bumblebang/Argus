@@ -150,6 +150,24 @@ def test_live_marketable_limit_walks_book_within_cap(tmp_path):
     assert client.calls[0]["price"] == 70500.0
 
 
+def test_live_buy_retargets_qty_after_limit_raise(tmp_path):
+    """리밋가 상향 뒤 notional_cap/price 로 qty 재절사."""
+    client = _MockClient(
+        resp={"orderId": "C1"},
+        orderbook={"asks": [{"price": "70000", "volume": "3"},
+                            {"price": "70500", "volume": "10"}],
+                   "bids": [{"price": "69900", "volume": "10"}]},
+        order_detail=_filled(6, 70500),
+    )
+    b = _live_broker(tmp_path, client)
+    # 견적 7만×7=49만 → 리밋 70500 이면 49만/70500 ≈ 6.95 → 6주
+    ok = b.execute(Order("005930", "KR", "BUY", 7, 70000.0,
+                         notional_cap=490_000), "test")
+    assert ok
+    assert client.calls[0]["price"] == 70500.0
+    assert client.calls[0]["qty"] == 6
+
+
 def test_live_us_fractional_buy_uses_market_order_amount(tmp_path):
     """US 소수점 BUY는 quantity 지정가가 아니라 금액 시장가로 전송."""
     client = _MockClient(

@@ -152,18 +152,22 @@ def value_trade_cfg(cfg: AppConfig) -> dict:
 # ── 슬리브 예산(순수 함수 — 러너·대시보드 공유) ─────────────────────
 def compute_sleeve(*, sleeve_pct: float, brain_reserve_pct: float,
                    max_gross_exposure: float | None, base: float,
-                   value_invested: float, brain_invested: float) -> dict:
+                   value_invested: float, brain_invested: float,
+                   working_buy_notional: float = 0.0) -> dict:
     """밸류 슬리브의 동적 예산/투자/잔여(전부 원가 기준 qty×avg_price).
 
         gross   = max_gross_exposure (None 이면 1.0)
         dynamic = base*gross - max(brain_invested, base*brain_reserve_pct)
         budget  = max(0, min(base*sleeve_pct, dynamic))
-        room    = budget - value_invested
+        room    = budget - value_invested - working_buy_notional
 
     sleeve_pct 는 **절대 상한**(고정 배분이 아니다), brain_reserve_pct 는 뇌(단타/스윙)
     트랙에 항상 남겨둘 활주로다 — 밸류는 자본을 수개월 잠그므로, 뇌가 아직 안 쓴 여유는
     빌려주되 예비금 아래로는 절대 내려가지 않게 한다. 뇌가 예비금보다 많이 쓰고 있으면
     그 실사용액이 그대로 차감돼 밸류 예산이 줄어든다.
+
+    working_buy_notional 은 미체결 BUY 잔량×주문가(현금 홀드분). 포지션에 아직 안
+    잡혔어도 room 을 잡아두지 않으면 다음 진입이 같은 예산을 이중 사용한다.
 
     base<=0(예: US capital 0)이면 budget 은 0 이 되어 진입이 차단된다.
     """
@@ -173,13 +177,15 @@ def compute_sleeve(*, sleeve_pct: float, brain_reserve_pct: float,
     gross_limit = base * gross
     dynamic = gross_limit - max(float(brain_invested), brain_reserve)
     budget = max(0.0, min(base * float(sleeve_pct), dynamic))
+    working = float(working_buy_notional or 0.0)
     return {"budget": round(budget, 2),
             "invested": round(float(value_invested), 2),
-            "room": round(budget - float(value_invested), 2),
+            "room": round(budget - float(value_invested) - working, 2),
             "base": round(base, 2),
             "brain_invested": round(float(brain_invested), 2),
             "brain_reserve": round(brain_reserve, 2),
-            "gross_limit": round(gross_limit, 2)}
+            "gross_limit": round(gross_limit, 2),
+            "working_buy": round(working, 2)}
 
 
 # ── (a) 셀렉터 ─────────────────────────────────────────────────────
@@ -645,12 +651,26 @@ class ValueRunner:
         total = sum(float(r["qty"]) * float(r["avg_price"]) for r in rows
                     if r["market"] == market)
         brain_invested = max(0.0, total - invested)
+        working_buy = 0.0
+        if self.store is not None:
+            try:
+                for w in self.store.get_working_orders(side="BUY", settled=False) or []:
+                    if str(w.get("market") or "") != market:
+                        continue
+                    rem = float(w["qty"]) - float(w.get("filled_qty") or 0.0)
+                    if rem <= 0:
+                        continue
+                    working_buy += rem * float(w.get("price") or 0.0)
+            except Exception as e:
+                log.warning("[value_trade][%s] working BUY 명목 산출 실패: %s",
+                            market, e)
         return compute_sleeve(sleeve_pct=cfg_v["sleeve_pct"],
                               brain_reserve_pct=cfg_v["brain_reserve_pct"],
                               max_gross_exposure=self.cfg.risk.get("max_gross_exposure"),
                               base=self._exposure_base_amount(market),
                               value_invested=invested,
-                              brain_invested=brain_invested)
+                              brain_invested=brain_invested,
+                              working_buy_notional=working_buy)
 
     # ── due 시장 판정 ────────────────────────────────────────────
     def _due_markets(self, cfg_v: dict, state: dict, now: float) -> list[str]:
