@@ -338,8 +338,11 @@ class Broker:
         """기동 동기화 — sweep → API fetch(락 밖) → apply( run_locked ).
 
         종료 중·재기동 전 체결분이 working 에 남아 있으면 holdings 만 덮을 때
-        applied 보정이 영구히 어긋난다. 주기 재대사와 같이 **sweep 을 먼저** 돌려
-        종결/취소를 반영한 뒤 동기화한다.
+        BUY applied·SELL 귀속이 영구히 어긋난다. 주기 재대사와 같이 **sweep 을
+        먼저** 돌린 뒤 동기화한다.
+
+        sweep 이 ``block_reconcile`` 이면 매도 귀속 대기 심볼의 holdings 덮기를
+        보류한다(다음 주기 재대사). 그 심볼만 덮으면 실현손익 구멍이 난다.
         """
         from .broker_sync import apply_sync_from_live, fetch_live_account_data
         sw: dict = {}
@@ -347,11 +350,18 @@ class Broker:
             sw = self.sweep_working_orders()
         except Exception as e:
             log.warning("기동 sweep 실패(동기화는 계속): %s", e)
-            sw = {"error": str(e)}
+            sw = {"error": str(e), "block_reconcile": True}
+        defer = bool(sw.get("block_reconcile"))
+        if defer:
+            log.warning("기동 sync: sweep 미완(block_reconcile) — sell 귀속 대기 "
+                        "심볼 holdings 덮기 보류(fetch_failed=%s)",
+                        sw.get("fetch_failed"))
         data = fetch_live_account_data(gateway, self.account_seq, markets=markets)
         self.note_sync_result(data)
         out = self.run_locked(
-            lambda acct: apply_sync_from_live(acct, store, data, markets=markets))
+            lambda acct: apply_sync_from_live(
+                acct, store, data, markets=markets,
+                defer_sell_holdings=defer))
         if isinstance(out, dict):
             out["sweep"] = sw
         return out

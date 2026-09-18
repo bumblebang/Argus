@@ -292,8 +292,44 @@ def _items_to_synced(items: list) -> list[dict]:
     return synced
 
 
-def apply_sync_from_live(account, store, data: dict, *, markets=("KR", "US")) -> dict:
-    """기동 동기화 apply — broker.run_locked/reconcile 안에서 호출."""
+def _sell_attribution_pending_symbols(store) -> set[str]:
+    """매도 귀속/조회 대기 심볼 — block_reconcile 시 holdings 덮기 보류 대상.
+
+    미결 SELL(조회 실패로 block)과 settled 미반영 SELL 모두 포함. 이 심볼의
+    수량을 먼저 덮으면 감소분이 before 에서 사라져 다음 주기에도 귀속 불가.
+    """
+    out: set[str] = set()
+    if store is None:
+        return out
+    try:
+        rows = store.get_working_orders(side="SELL") or []
+    except Exception as e:
+        log.warning("기동 sync: sell 대기 심볼 조회 실패: %s", e)
+        return out
+    for row in rows:
+        sym = row.get("symbol")
+        if not sym:
+            continue
+        if row.get("settled_at") is not None:
+            filled = float(row.get("filled_qty") or 0.0)
+            applied = float(row.get("applied_qty") or 0.0)
+            if filled - applied <= 1e-9:
+                continue
+        out.add(str(sym))
+    return out
+
+
+def apply_sync_from_live(account, store, data: dict, *, markets=("KR", "US"),
+                         defer_sell_holdings: bool = False) -> dict:
+    """기동 동기화 apply — broker.run_locked 안에서 호출.
+
+    순서(재대사와 동일 의도): 귀속 → holdings 덮기 → BUY applied 보정 → store 미러.
+    종료 중 체결된 SELL 을 holdings 로만 덮으면 실현손익이 저널에 안 들어가고
+    settled 행이 TTL 뒤 귀속실패로 버려진다.
+
+    ``defer_sell_holdings``(sweep ``block_reconcile``): 매도 귀속 대기 심볼은
+    수량을 덮지 않고 경고만 — 다음 주기 재대사에 맡긴다.
+    """
     before = {sym: (float(p.qty), float(p.avg_price),
                     account.symbol_market.get(sym, "KR"))
               for sym, p in account.positions.items() if p.is_open}
@@ -303,44 +339,89 @@ def apply_sync_from_live(account, store, data: dict, *, markets=("KR", "US")) ->
 
     holdings_ok = bool(data.get("holdings_ok"))
     items = data.get("items") or []
-    synced = _items_to_synced(items)
+    attributed: dict = {}
+    deferred: list[str] = []
     live_pos: dict = {}
+    live_mkt: dict = {}
 
-    if holdings_ok:
-        new_positions, new_mkt = _parse_holdings_items(items)
-        live_pos = new_positions
-        account.positions = new_positions
-        account.symbol_market = new_mkt
+    if not holdings_ok:
+        account._save()
+        return {"cash": dict(account.cash), "positions": [], "synced": 0,
+                "attributed": {}, "deferred_sell_symbols": [],
+                "error": data.get("error", "holdings fetch failed"),
+                **_health_fields(data)}
+
+    live_pos, live_mkt = _parse_holdings_items(items)
+    hold_syms: set[str] = set()
+    if defer_sell_holdings and store is not None:
+        hold_syms = _sell_attribution_pending_symbols(store)
+        if hold_syms:
+            deferred = sorted(hold_syms)
+            log.warning("기동 sync: sell 귀속 대기 심볼 holdings 덮기 연기 — %s",
+                        deferred)
+
+    # 귀속 먼저(덮기 전). 연기 심볼은 before 에서 제외 — 실체결가 없이
+    # unattributed_delta 만 남기고 감소분을 영구 소진하지 않게.
+    before_attr = {s: v for s, v in before.items() if s not in hold_syms}
+    attributed = _attribute_exits(account, store, before_attr, live_pos)
+
+    # holdings 덮기 — 연기 심볼은 기동 전 수량 유지
+    merged_pos = dict(live_pos)
+    merged_mkt = dict(live_mkt)
+    for sym in hold_syms:
+        if sym in before:
+            q, avg, mkt = before[sym]
+            merged_pos[sym] = Position(symbol=sym, qty=q, avg_price=avg)
+            merged_mkt[sym] = mkt
+    account.positions = merged_pos
+    account.symbol_market = merged_mkt
     account._save()
 
-    if store is not None and holdings_ok:
-        _sync_store(store, synced, account)
-        # 주기 재대사와 같이 BUY working applied 보정 — 기동만 빠져 이중예약.
-        _sync_buy_working_applied(store, before, live_pos)
+    # BUY applied 는 실제 흡수된 증가분(merged) 기준
+    synced = [
+        {"symbol": s, "qty": float(p.qty), "avg": float(p.avg_price),
+         "market": merged_mkt.get(s, "KR")}
+        for s, p in merged_pos.items()
+    ]
+    if store is not None:
+        _sync_buy_working_applied(store, before, merged_pos)
+        _sync_store(store, synced, account,
+                    attributed=attributed, skip_symbols=hold_syms)
 
     return {"cash": dict(account.cash),
             "positions": [{"symbol": s["symbol"], "qty": s["qty"], "avg": s["avg"]}
                           for s in synced],
-            "synced": len(synced), **_health_fields(data)}
+            "synced": len(synced), "attributed": attributed,
+            "deferred_sell_symbols": deferred, **_health_fields(data)}
 
 
 def sync_from_live(client, account_seq, account, store=None,
-                   *, markets=("KR", "US")) -> dict:
+                   *, markets=("KR", "US"),
+                   defer_sell_holdings: bool = False) -> dict:
     """레거시/테스트용. 라이브 데몬은 broker.sync_from_live(gateway) 로 락 안 apply."""
     data = fetch_live_account_data(client, account_seq, markets=markets)
-    return apply_sync_from_live(account, store, data, markets=markets)
+    return apply_sync_from_live(account, store, data, markets=markets,
+                                defer_sell_holdings=defer_sell_holdings)
 
 
-def _sync_store(store, synced: list[dict], account) -> None:
+def _sync_store(store, synced: list[dict], account, *,
+                attributed: dict | None = None,
+                skip_symbols: set[str] | None = None) -> None:
+    attributed = attributed or {}
+    skip = set(skip_symbols or ())
     open_rows = {r["symbol"]: r for r in store.get_open_positions()}
     live_syms = set()
     for s in synced:
         sym = s["symbol"]
+        if sym in skip:
+            continue
         live_syms.add(sym)
         try:
             row = open_rows.get(sym)
             if row is not None:
                 sync_open_qty(store, row, sym, s["qty"], s["avg"], account,
+                              exit_price=_exit_price(account, sym, attributed),
+                              allow_journal_fallback=False,
                               reason="live_sync")
                 continue
             adopt_live_position(
@@ -349,14 +430,16 @@ def _sync_store(store, synced: list[dict], account) -> None:
         except Exception as e:
             log.warning("동기화: store 미러 실패(생략) %s: %s", sym, e)
     for sym, row in open_rows.items():
+        if sym in skip:
+            continue
         if sym not in live_syms:
             try:
-                exit_px = _last_sell_price(account, sym)
-                store.close_position(row["id"], exit_price=exit_px, reason="live_sync",
-                                     fee=_last_sell_fee(account, sym))
+                exit_px = _exit_price(account, sym, attributed)
+                store.close_position(
+                    row["id"], exit_price=exit_px, reason="live_sync",
+                    fee=_last_sell_fee(account, sym) if exit_px else 0.0)
             except Exception as e:
                 log.warning("동기화: store 청산 실패(생략) %s: %s", sym, e)
-
 
 def _consume_settled_sells(store, symbol: str, need: float) -> list[dict]:
     """귀속 대기 중인 매도 체결분을 need 만큼 소비. 실체결가 불명 행은 건너뛴다."""
