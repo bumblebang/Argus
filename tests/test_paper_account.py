@@ -55,6 +55,25 @@ def test_state_persists(tmp_path):
     assert reloaded.position("AAPL").qty == 2
 
 
+def test_start_cash_원장_복원(tmp_path):
+    """config 시드와 달라도 저장된 start_cash 가 우선(입출금 반영 유지)."""
+    path = tmp_path / "acct.json"
+    acct = PaperAccount(cash={"KR": 1_000_000, "US": 100}, state_path=path)
+    acct.start_cash["KR"] = 1_500_000
+    acct._save()
+    reloaded = PaperAccount(cash={"KR": 1_000_000, "US": 100}, state_path=path)
+    assert reloaded.start_cash["KR"] == 1_500_000
+    assert reloaded.start_cash["US"] == 100
+
+
+def test_입출금_시_start_cash_이동(tmp_path):
+    acct = _acct(tmp_path)
+    acct.ensure_sod_equity("KR")
+    before = acct.start_cash["KR"]
+    acct.adjust_sod_for_external_cash("KR", 200_000)
+    assert acct.start_cash["KR"] == before + 200_000
+
+
 # ── 일 손실 한도용 '오늘' 실현손익 (날짜 경계 리셋) ─────────────────
 def test_daily_realized_pnl_accumulates_today(tmp_path):
     acct = _acct(tmp_path)

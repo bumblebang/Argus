@@ -24,8 +24,22 @@ log = get_logger("src.dart")
 
 CORP_URL = "https://opendart.fss.or.kr/api/corpCode.xml"
 FNLTT_URL = "https://opendart.fss.or.kr/api/fnlttSinglAcnt.json"
+# 전체 재무제표(BS/IS/CF…) — fs_div 필수. CF 는 SinglAcnt 에 없어 All 만 가능.
+FNLTT_ALL_URL = "https://opendart.fss.or.kr/api/fnlttSinglAcntAll.json"
 LIST_URL = "https://opendart.fss.or.kr/api/list.json"
 DOCUMENT_URL = "https://opendart.fss.or.kr/api/document.xml"
+
+# CF 합계 — 한글 account_nm 보다 IFRS account_id 가 안정(실측 삼성·노바렉스·글로비스).
+_CF_TOTAL_IDS = {
+    "ifrs-full_CashFlowsFromUsedInOperatingActivities": "operating_cf",
+    "ifrs-full_CashFlowsFromUsedInInvestingActivities": "investing_cf",
+    "ifrs-full_CashFlowsFromUsedInFinancingActivities": "financing_cf",
+}
+# 취득액(보통 양수=유출). FCF 근사 = operating_cf − capex.
+_CF_CAPEX_IDS = frozenset({
+    "ifrs-full_PurchaseOfPropertyPlantAndEquipmentClassifiedAsInvestingActivities",
+    "ifrs-full_PurchaseOfIntangibleAssetsClassifiedAsInvestingActivities",
+})
 
 
 def fetch_recent_disclosures(api_key: str, *, date_yyyymmdd: str | None = None,
@@ -118,6 +132,56 @@ def fetch_financials(api_key: str, corp_code: str, year: int, timeout: int = 20)
     if all(v is None for v in vals.values()):
         return None
     return {"fiscal_year": year, **vals}
+
+
+def fetch_cashflows(api_key: str, corp_code: str, year: int, timeout: int = 30
+                    ) -> dict | None:
+    """DART 전체재무(fnlttSinglAcntAll)에서 CF 합계·capex·FCF 근사.
+
+    CFS → OFS 순. 반환 {fiscal_year, operating_cf, investing_cf, financing_cf,
+    capex, fcf}. 관심 합계가 하나도 없으면 None.
+    fcf = operating_cf − capex(유형+무형 취득 합, 둘 다 있을 때만). 성장/유지 capex
+    구분은 안 함 — 음수 영업CF·만성 capex>OCF 레드플래그용.
+    """
+    headers_ok = False
+    rows: list = []
+    for fs_div in ("CFS", "OFS"):
+        r = requests.get(FNLTT_ALL_URL, params={
+            "crtfc_key": api_key, "corp_code": corp_code,
+            "bsns_year": str(year), "reprt_code": "11011", "fs_div": fs_div,
+        }, timeout=timeout)
+        if r.status_code != 200:
+            continue
+        body = r.json()
+        if body.get("status") != "000":
+            continue
+        headers_ok = True
+        rows = [x for x in (body.get("list") or []) if x.get("sj_div") == "CF"]
+        if rows:
+            break
+    if not headers_ok or not rows:
+        return None
+
+    totals: dict[str, float | None] = {k: None for k in (
+        "operating_cf", "investing_cf", "financing_cf")}
+    capex_sum = 0.0
+    capex_hit = False
+    for row in rows:
+        aid = (row.get("account_id") or "").strip()
+        amt = _to_num(row.get("thstrm_amount"))
+        key = _CF_TOTAL_IDS.get(aid)
+        if key and totals[key] is None and amt is not None:
+            totals[key] = amt
+        if aid in _CF_CAPEX_IDS and amt is not None:
+            capex_sum += abs(amt)   # 부호 혼재 대비 절대값(유출)
+            capex_hit = True
+    if all(v is None for v in totals.values()) and not capex_hit:
+        return None
+    capex = round(capex_sum, 0) if capex_hit else None
+    ocf = totals["operating_cf"]
+    fcf = (round(ocf - capex, 0)
+           if (ocf is not None and capex is not None) else None)
+    return {"fiscal_year": year, **totals, "capex": capex, "fcf": fcf}
 
 
 def load_corp_map(api_key: str, cache: str | Path = "data/dart_corpcode.json") -> dict[str, str]:

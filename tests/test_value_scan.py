@@ -535,6 +535,19 @@ class TestKrFundamentals:
         assert f["revenue_growth"] == round((3.3e14 - 3.0e14) / 3.0e14, 4)
         assert f["net_income_growth"] == round((3.4e13 - 2.0e13) / 2.0e13, 4)
         assert f["op_income_growth"] == round((4.0e13 - 3.0e13) / 3.0e13, 4)
+        assert "operating_cf" not in f  # 캐시에 CF 키 없으면 미포함
+
+    def test_캐시_CF_전달(self):
+        cache = {"CORP": {
+            "2025": _fin(2025, operating_cf=1e12, investing_cf=-5e11,
+                         financing_cf=-2e11, capex=4e11, fcf=6e11),
+            "2024": _fin(2024),
+        }}
+        f = _kr_fundamentals("K", {"005930": "CORP"}, "005930", 1.666e15, cache,
+                             fetch_fn=lambda *a: None)
+        assert f["operating_cf"] == 1e12
+        assert f["fcf"] == 6e11
+        assert f["capex"] == 4e11
 
     def test_파생지표_계산(self):
         # debt_ratio/current_ratio/roe/roa/op_margin — 당해 재무로 계산.

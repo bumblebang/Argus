@@ -19,7 +19,10 @@ from typing import Callable
 
 from .config import ROOT
 from .logging_setup import get_logger
-from .value_scan import _FIN_CACHE_KEYS, _load_fin_cache, _save_fin_cache, _year_complete
+from .value_scan import (
+    _CF_CACHE_KEYS, _FIN_CACHE_KEYS, _cf_filled, _load_fin_cache, _save_fin_cache,
+    _year_complete,
+)
 from .value_score import DEFAULT_QUINTILE_N_MIN, quintile_coverage_report
 
 log = get_logger("value_fin_backfill")
@@ -65,6 +68,7 @@ def backfill_financials(
     sleep_s: float = 0.05,
     n_min: int = DEFAULT_QUINTILE_N_MIN,
     fetch_fn: Callable | None = None,
+    fetch_cf_fn: Callable | None = None,
     load_corp_map_fn: Callable | None = None,
     now_fn: Callable[[], float] = time.time,
 ) -> dict:
@@ -72,11 +76,14 @@ def backfill_financials(
 
     기본·weekly: 윈도우 연도 중 불완전/결측만 조회.
     force: 윈도우 연도 전부 재조회(덮어쓰기).
+    CF(SinglAcntAll)는 BS 완전 연도에 대해 miss-only(또는 force)로 병합.
     """
     if load_corp_map_fn is None:
         from .datasources.dart import load_corp_map as load_corp_map_fn
     if fetch_fn is None:
         from .datasources.dart import fetch_financials as fetch_fn
+    if fetch_cf_fn is None:
+        from .datasources.dart import fetch_cashflows as fetch_cf_fn
     if corp_map is None:
         corp_map = load_corp_map_fn(api_key)
     if cache is None:
@@ -90,6 +97,10 @@ def backfill_financials(
     errors = 0
     calls = 0
     hard_miss = 0
+    cf_fetched = 0
+    cf_calls = 0
+    cf_skipped = 0
+    cf_empty = 0
 
     for row in pool_rows:
         sym = row.get("symbol")
@@ -111,27 +122,71 @@ def backfill_financials(
             need_years = [y for y in years if not _year_complete(ce.get(str(y)))]
         if not need_years:
             skipped += 1
-            continue
+        else:
+            got_any = False
+            for y in need_years:
+                try:
+                    calls += 1
+                    got = fetch_fn(api_key, corp, y)
+                    if sleep_s > 0:
+                        time.sleep(sleep_s)
+                except Exception as e:
+                    errors += 1
+                    log.debug("[backfill][%s] %s 실패: %s", sym, y, e)
+                    continue
+                if got:
+                    if corp not in cache:
+                        cache[corp] = {}
+                    entry = {k: got.get(k) for k in _FIN_CACHE_KEYS}
+                    for ck in _CF_CACHE_KEYS:
+                        if ck not in got:
+                            entry.pop(ck, None)
+                    # 기존 CF 유지(BS 재조회 시 CF 지우지 않음 — force CF 는 아래)
+                    prev_ent = ce.get(str(y)) or {}
+                    if not force:
+                        for ck in _CF_CACHE_KEYS:
+                            if ck in prev_ent and ck not in entry:
+                                entry[ck] = prev_ent[ck]
+                    cache[corp][str(y)] = entry
+                    fetched += 1
+                    got_any = True
+            if not got_any:
+                hard_miss += 1
+            ce = cache.get(corp) or {}
 
-        got_any = False
-        for y in need_years:
+        # CF miss-only — BS 가 있는 윈도우 연도만
+        for y in years:
+            ent = ce.get(str(y))
+            if not _year_complete(ent):
+                continue
+            if not force and _cf_filled(ent):
+                cf_skipped += 1
+                continue
             try:
-                calls += 1
-                got = fetch_fn(api_key, corp, y)
+                cf_calls += 1
+                cf = fetch_cf_fn(api_key, corp, y)
                 if sleep_s > 0:
                     time.sleep(sleep_s)
             except Exception as e:
                 errors += 1
-                log.debug("[backfill][%s] %s 실패: %s", sym, y, e)
+                log.debug("[backfill][%s] CF %s 실패: %s", sym, y, e)
+                # 실패해도 키를 박아 재시도 폭주 방지(다음 force 전까지)
+                ent = dict(ent)
+                for ck in _CF_CACHE_KEYS:
+                    ent.setdefault(ck, None)
+                cache.setdefault(corp, {})[str(y)] = ent
                 continue
-            if got:
-                if corp not in cache:
-                    cache[corp] = {}
-                cache[corp][str(y)] = {k: got.get(k) for k in _FIN_CACHE_KEYS}
-                fetched += 1
-                got_any = True
-        if not got_any:
-            hard_miss += 1
+            ent = dict(ent)
+            if cf:
+                for ck in _CF_CACHE_KEYS:
+                    ent[ck] = cf.get(ck)
+                cf_fetched += 1
+            else:
+                for ck in _CF_CACHE_KEYS:
+                    ent[ck] = None
+                cf_empty += 1
+            cache.setdefault(corp, {})[str(y)] = ent
+        ce = cache.get(corp) or {}
 
     _save_fin_cache(cache)
 
@@ -153,6 +208,9 @@ def backfill_financials(
                     fund["debt_ratio"] = round(fin["total_liabilities"] / eq, 4)
                 fund["roe"] = (round(ni / eq, 4)
                                if (eq and eq > 0 and ni is not None) else None)
+                if "operating_cf" in fin:
+                    fund["operating_cf"] = fin.get("operating_cf")
+                    fund["fcf"] = fin.get("fcf")
         cov_rows.append({
             "symbol": sym,
             "market_cap": mcap,
@@ -173,6 +231,10 @@ def backfill_financials(
         "skipped_complete": skipped,
         "hard_miss_symbols": hard_miss,
         "dart_calls": calls,
+        "cf_calls": cf_calls,
+        "cf_fetched": cf_fetched,
+        "cf_skipped": cf_skipped,
+        "cf_empty": cf_empty,
         "errors": errors,
         "cache_corps": len(cache),
         "n_min": n_min,
@@ -181,7 +243,7 @@ def backfill_financials(
     }
     log.info("[backfill] %s", {k: summary[k] for k in (
         "pool", "corp_map_miss", "fetched_year_entries", "skipped_complete",
-        "dart_calls", "errors", "hard_miss_symbols")})
+        "dart_calls", "cf_calls", "cf_fetched", "errors", "hard_miss_symbols")})
     return summary
 
 

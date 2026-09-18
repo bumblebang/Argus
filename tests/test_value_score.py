@@ -155,6 +155,10 @@ class TestBackfill:
                     "total_liabilities": 5e11, "current_assets": 3e11,
                     "current_liabilities": 2e11}
 
+        def fetch_cf(api, corp, year):
+            return {"fiscal_year": year, "operating_cf": 1e9, "investing_cf": -5e8,
+                    "financing_cf": -2e8, "capex": 4e8, "fcf": 6e8}
+
         summary = backfill_financials(
             "K", pool,
             corp_map={"AAA": "CORP_A"},
@@ -162,14 +166,50 @@ class TestBackfill:
             years=(2024, 2023),
             sleep_s=0,
             fetch_fn=fetch,
+            fetch_cf_fn=fetch_cf,
             load_corp_map_fn=lambda *a, **k: {"AAA": "CORP_A"},
         )
         assert summary["corp_map_miss"] == 1
         assert summary["fetched_year_entries"] == 2
+        assert summary["cf_fetched"] == 2
         assert "CORP_A" in cache
-        assert "2024" in cache["CORP_A"]
+        assert cache["CORP_A"]["2024"]["operating_cf"] == 1e9
 
     def test_캐시_hit_스킵(self, monkeypatch):
+        monkeypatch.setattr("src.value_fin_backfill._save_fin_cache", lambda *a, **k: None)
+        pool = [{"symbol": "AAA", "market_cap": 1e12}]
+        cache = {"CORP_A": {
+            "2024": {"fiscal_year": 2024, "equity": 1, "net_income": 1,
+                     "revenue": 1, "operating_income": 1, "total_assets": 1,
+                     "total_liabilities": 1, "current_assets": 1,
+                     "current_liabilities": 1, "operating_cf": 10},
+            "2023": {"fiscal_year": 2023, "equity": 1, "net_income": 1,
+                     "revenue": 1, "operating_income": 1, "total_assets": 1,
+                     "total_liabilities": 1, "current_assets": 1,
+                     "current_liabilities": 1, "operating_cf": 9},
+        }}
+        calls = []
+        cf_calls = []
+
+        def fetch(*a, **k):
+            calls.append(1)
+            return None
+
+        def fetch_cf(*a, **k):
+            cf_calls.append(1)
+            return None
+
+        summary = backfill_financials(
+            "K", pool, corp_map={"AAA": "CORP_A"}, cache=cache,
+            years=(2024, 2023), sleep_s=0, fetch_fn=fetch, fetch_cf_fn=fetch_cf,
+            load_corp_map_fn=lambda *a, **k: {"AAA": "CORP_A"},
+        )
+        assert summary["skipped_complete"] == 1
+        assert calls == []
+        assert cf_calls == []
+        assert summary["cf_skipped"] == 2
+
+    def test_CF_miss만_조회(self, monkeypatch):
         monkeypatch.setattr("src.value_fin_backfill._save_fin_cache", lambda *a, **k: None)
         pool = [{"symbol": "AAA", "market_cap": 1e12}]
         cache = {"CORP_A": {
@@ -180,21 +220,25 @@ class TestBackfill:
             "2023": {"fiscal_year": 2023, "equity": 1, "net_income": 1,
                      "revenue": 1, "operating_income": 1, "total_assets": 1,
                      "total_liabilities": 1, "current_assets": 1,
-                     "current_liabilities": 1},
+                     "current_liabilities": 1, "operating_cf": 1},
         }}
-        calls = []
+        cf_years = []
 
-        def fetch(*a, **k):
-            calls.append(1)
-            return None
+        def fetch_cf(api, corp, year):
+            cf_years.append(year)
+            return {"operating_cf": 100, "investing_cf": -40, "financing_cf": -10,
+                    "capex": 30, "fcf": 70, "fiscal_year": year}
 
         summary = backfill_financials(
             "K", pool, corp_map={"AAA": "CORP_A"}, cache=cache,
-            years=(2024, 2023), sleep_s=0, fetch_fn=fetch,
+            years=(2024, 2023), sleep_s=0,
+            fetch_fn=lambda *a, **k: None,
+            fetch_cf_fn=fetch_cf,
             load_corp_map_fn=lambda *a, **k: {"AAA": "CORP_A"},
         )
-        assert summary["skipped_complete"] == 1
-        assert calls == []
+        assert cf_years == [2024]
+        assert summary["cf_fetched"] == 1
+        assert cache["CORP_A"]["2024"]["fcf"] == 70
 
     def test_불완전연도_재조회(self, monkeypatch):
         monkeypatch.setattr("src.value_fin_backfill._save_fin_cache", lambda *a, **k: None)
@@ -212,6 +256,7 @@ class TestBackfill:
         backfill_financials(
             "K", pool, corp_map={"AAA": "CORP_A"}, cache=cache,
             years=(2024, 2023), sleep_s=0, fetch_fn=fetch,
+            fetch_cf_fn=lambda *a, **k: {"operating_cf": 1, "fiscal_year": 2024},
             load_corp_map_fn=lambda *a, **k: {"AAA": "CORP_A"},
         )
         assert 2024 in calls and 2023 in calls
@@ -232,7 +277,9 @@ class TestBackfill:
         summary = backfill_financials(
             "K", pool, corp_map={"AAA": "CORP_A"}, cache=cache,
             years=(2024, 2023), sleep_s=0, fetch_fn=fetch,
+            fetch_cf_fn=lambda *a, **k: None,
             load_corp_map_fn=lambda *a, **k: {"AAA": "CORP_A"},
             n_min=1,
         )
         assert summary["coverage"]["ok"] is False
+        assert summary["cf_fetched"] == 0

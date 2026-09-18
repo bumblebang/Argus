@@ -27,6 +27,7 @@ _COMMANDS: dict[str, str] = {
     "athena": "athena.py",
     "value-scan": "value_scan.py",
     "value-fin-backfill": "value_fin_backfill.py",
+    "value-us-quality-backfill": "value_us_quality_backfill.py",
     "value-trade": "value_trade.py",
     "screen": "screen.py",
     "market-state": "build_market_state.py",
@@ -47,7 +48,8 @@ _COMMANDS: dict[str, str] = {
 def _help_text() -> str:
     # 그룹별 안내용 (실행은 전부 _COMMANDS)
     core = "watch doctor bootstrap bridge agent-cycle"
-    batch = "athena value-scan value-fin-backfill value-trade market-state baserate earnings-cal macro-cal"
+    batch = ("athena value-scan value-fin-backfill value-us-quality-backfill "
+             "value-trade market-state baserate earnings-cal macro-cal")
     ops = "screen watchdog alert-check live-smoke which-claude public shadow-score"
     checks = "check-auth check-cli  (또는: doctor --check-auth|--check-cli)"
     return (

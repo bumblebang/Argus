@@ -1,7 +1,8 @@
 """capital_sync — 실자산 → risk.capital 폴백 동기화."""
 from __future__ import annotations
 
-from src.capital_sync import (apply_capital_sync, equity_by_market, should_update)
+from src.capital_sync import (apply_capital_sync, capital_cash_seed_gaps,
+                              equity_by_market, should_update)
 from src.paper_account import PaperAccount
 from src.risk import RiskManager
 from src.risk_gate import RiskGate
@@ -49,3 +50,14 @@ def test_equity_by_market_skips_nonpositive(tmp_path):
     acct = PaperAccount(cash={"KR": 100, "US": 0}, state_path=tmp_path / "a.json")
     eq = equity_by_market(acct, ("KR", "US"))
     assert eq == {"KR": 100.0}
+
+
+def test_capital_cash_seed_gaps():
+    assert capital_cash_seed_gaps(
+        {"KR": 2_000_000, "US": 725},
+        {"KR": 2_000_000, "US": 725}) == []
+    gaps = capital_cash_seed_gaps(
+        {"KR": 2_000_000, "US": 725},
+        {"KR": 1_000_000, "US": 725},
+        markets=("KR", "US"))
+    assert len(gaps) == 1 and gaps[0]["market"] == "KR"

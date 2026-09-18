@@ -53,6 +53,34 @@ def should_update(old: float, new: float, *, min_pct: float, min_abs: float) -> 
     return delta / old >= float(min_pct or 0)
 
 
+def capital_cash_seed_gaps(
+    capital: dict | None,
+    paper_cash: dict | None,
+    *,
+    markets: tuple[str, ...] | list[str] | None = None,
+    tol_pct: float = 0.01,
+) -> list[dict[str, float | str]]:
+    """config 시드 불일치 — risk.capital 과 paper.cash 가 같은 시장에서 어긋난 항목.
+
+    런타임 여유현금(account.cash) ≠ capital 은 정상(보유에 묶인 돈). 여기는 **설정 시드**만.
+    """
+    from .risk_gate import _normalize_capital
+
+    cap = _normalize_capital(capital or {})
+    cash = _normalize_capital(paper_cash or {})
+    mkts = [str(m).upper() for m in (markets or sorted(set(cap) | set(cash)))]
+    out: list[dict[str, float | str]] = []
+    for m in mkts:
+        c = float(cap.get(m, 0) or 0)
+        s = float(cash.get(m, 0) or 0)
+        if c <= 0 and s <= 0:
+            continue
+        base = max(c, s, 1.0)
+        if abs(c - s) / base > float(tol_pct or 0):
+            out.append({"market": m, "capital": c, "paper_cash": s})
+    return out
+
+
 def apply_capital_sync(
     *,
     gate=None,

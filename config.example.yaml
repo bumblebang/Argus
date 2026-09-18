@@ -118,6 +118,7 @@ alerts:
 
 risk:
   # 배정 자본 — 손실예산(SoD) 폴백. 라이브는 capital_sync 가 재대사마다 equity 로 맞춤.
+  # paper.cash 와 같은 시장·같은 금액(시드 정합). 런타임 여유현금 ≠ capital 은 정상.
   capital:
     KR: 2000000
     US: 725
@@ -155,8 +156,8 @@ risk:
 
 paper:
   cash:
-    KR: 1000000              # 페이퍼 시작 현금. 라이브에선 실계좌 미러로 덮임
-    US: 0
+    KR: 2000000              # 시드 — risk.capital 과 맞출 것. 라이브에선 실계좌 미러로 덮임
+    US: 725
   fee_rate:
     KR: 0.00015
     US: 0.001
@@ -434,6 +435,10 @@ value_scan:
   # S0 주간 재무 백필 — 마지막 리포트가 N일보다 오래되면 스캔 주기에 얹어 실행.
   # 0 이면 비활성(수동 `argus value-fin-backfill` 만).
   fin_backfill_days: 7
+  # US QualityTilt — Finnhub miss-only. 주기에 얹되 회당 max(무료 티어 pacing).
+  us_quality_backfill_days: 7
+  us_quality_backfill_max: 80
+  us_quality_backfill_sleep_s: 1.05
   # S0/S1 종합 Score(정렬 전환은 S2). 병기·백필 커버리지용.
   value_score:
     quintile_n_min: 20

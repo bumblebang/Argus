@@ -168,6 +168,14 @@ class PaperAccount:
             log.warning("[SoD] 출금 후 기준≤0 (%s %.0f%+.0f) — 0 고정", market, base, amt)
             new_base = 0.0
         self._sod_equity[market] = new_base
+        # 원금(start_cash)도 같이 이동 — 대시보드 원금대비 수익률이 입금으로 부풀지 않게.
+        try:
+            seed = float(self.start_cash.get(market, 0.0) or 0.0) + amt
+        except (TypeError, ValueError):
+            seed = amt
+        if seed < 0:
+            seed = 0.0
+        self.start_cash[market] = seed
         log.info("[SoD] 입출금 보정 %s %.0f → %.0f (%+.0f)", market, base, new_base, amt)
         self._save()
 
@@ -347,6 +355,16 @@ class PaperAccount:
         for sym, p in data.get("positions", {}).items():
             self.positions[sym] = Position(symbol=sym, qty=p["qty"], avg_price=p["avg_price"])
         self.journal = [Fill(**j) for j in data.get("journal", [])]
+        raw_start = data.get("start_cash")
+        if isinstance(raw_start, dict) and raw_start:
+            # 파일 원장이 있으면 config paper.cash 시드보다 원장 우선(입출금 반영분 유지).
+            merged = dict(self.start_cash)
+            for k, v in raw_start.items():
+                try:
+                    merged[str(k).upper()] = float(v)
+                except (TypeError, ValueError):
+                    continue
+            self.start_cash = merged
 
     def _save(self) -> None:
         self.state_path.parent.mkdir(parents=True, exist_ok=True)
