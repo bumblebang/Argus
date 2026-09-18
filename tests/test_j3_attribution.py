@@ -247,6 +247,53 @@ def test_reconcile_bumps_buy_working_applied_on_holdings_increase(tmp_path):
     assert abs(row["applied_notional"] - 4 * 70_000) < 1e-6
 
 
+def test_reconcile_bumps_settled_buy_working_applied(tmp_path):
+    """sweep 이 먼저 settled 찍은 BUY 도 holdings 보정 대상(30분 이중예약 방지)."""
+    store, acct = Store(tmp_path / "t.db"), _acct(tmp_path)
+    _seed(store, acct, qty=10)
+    store.upsert_working_order(
+        order_id="B1", symbol="005930", market="KR", side="BUY",
+        qty=10, price=70_000, status="FILLED", filled_qty=4,
+        filled_avg=70_000, fee=0.0, applied_qty=0, applied_notional=0)
+    store.update_working_order("B1", settled_at=1.0)
+    apply_reconcile_from_live(
+        acct, store, _holdings([_item(qty=14)]), markets=("KR",))
+    row = store.get_working_orders("005930", side="BUY", settled=True)[0]
+    assert row["applied_qty"] == 4.0
+
+
+def test_reconcile_buy_applied_notional_uses_incremental(tmp_path):
+    """반복 부분체결 — applied_notional 은 누적avg×take 가 아니라 증분 명목."""
+    store, acct = Store(tmp_path / "t.db"), _acct(tmp_path)
+    _seed(store, acct, qty=10)
+    # 이미 3주 @70k 반영. 누적 7주 @71k → 증분 4주 명목 = 71k*7 − 210k
+    store.upsert_working_order(
+        order_id="B1", symbol="005930", market="KR", side="BUY",
+        qty=10, price=70_000, status="PARTIAL_FILLED", filled_qty=7,
+        filled_avg=71_000, fee=70.0, applied_qty=3,
+        applied_notional=3 * 70_000, applied_fee=30.0)
+    apply_reconcile_from_live(
+        acct, store, _holdings([_item(qty=14)]), markets=("KR",))
+    row = store.get_working_orders("005930", side="BUY", settled=False)[0]
+    assert row["applied_qty"] == 7.0
+    assert abs(row["applied_notional"] - 7 * 71_000) < 1e-6
+
+
+def test_startup_sync_bumps_buy_working_applied(tmp_path):
+    """기동 동기화 경로에도 BUY applied 보정이 돈다."""
+    from src.broker_sync import apply_sync_from_live
+    store, acct = Store(tmp_path / "t.db"), _acct(tmp_path)
+    _seed(store, acct, qty=10)
+    store.upsert_working_order(
+        order_id="B1", symbol="005930", market="KR", side="BUY",
+        qty=5, price=70_000, status="FILLED", filled_qty=5,
+        filled_avg=70_000, fee=0.0, applied_qty=0, applied_notional=0)
+    apply_sync_from_live(
+        acct, store, _holdings([_item(qty=15)]), markets=("KR",))
+    row = store.get_working_orders("005930", side="BUY", settled=False)[0]
+    assert row["applied_qty"] == 5.0
+
+
 def test_increase_does_not_attribute(tmp_path):
     store, acct = Store(tmp_path / "t.db"), _acct(tmp_path)
     _seed(store, acct, qty=5)

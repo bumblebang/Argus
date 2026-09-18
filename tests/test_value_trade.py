@@ -376,16 +376,18 @@ def test_working_buy_reserved_skips_canceled_and_equity(tmp_path):
 
 
 def test_working_buy_reserved_settled_partial_excludes_cancel_remainder(tmp_path):
-    """부분체결 후 취소 — 귀속 대기행은 filled−applied 만(취소 잔량 제외)."""
+    """부분체결 후 취소 — 귀속 대기행은 증분 명목만(취소 잔량·누적avg×rem 금지)."""
     from src.agents.value_trade import working_buy_reserved_notional
     from src.engine.store import Store
     store = Store(tmp_path / "t.db")
+    # 누적 5주 @72k, 이미 2주 @70k 반영 → 증분 3주 명목 = 72k*5 − 140k
     store.upsert_working_order(
         order_id="W1", symbol="005930", market="KR", side="BUY",
-        qty=10, price=70_000, status="CANCELED", filled_qty=3,
-        filled_avg=70_000, applied_qty=0, applied_notional=0)
+        qty=10, price=70_000, status="CANCELED", filled_qty=5,
+        filled_avg=72_000, applied_qty=2, applied_notional=2 * 70_000)
     store.update_working_order("W1", settled_at=1.0)
-    assert working_buy_reserved_notional(store, "KR") == 3 * 70_000
+    assert abs(working_buy_reserved_notional(store, "KR")
+               - (72_000 * 5 - 2 * 70_000)) < 1e-6
 
 
 def test_compute_sleeve_shrinks_when_brain_exceeds_reserve():
