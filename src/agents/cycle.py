@@ -407,25 +407,27 @@ def run_cycle(*, context_json: str, decision_agent, validation_agent, broker, ri
                 st = "gate_rejected"
             if st == "filled" or st == "partial":
                 exec_reason = p.thesis[:80]
-                # 공유 슬리브: 체결 명목 + (라이브) working 잔량×주문가 선차감.
-                # 잔량을 안 빼면 다음 종목이 room 을 다시 쓴다.
-                if p.side == "BUY" and _sleeve_left is not None:
-                    spent = 0.0
-                    fq = float(res.filled_qty or 0)
-                    if fq > 0:
-                        fill_px = float(res.avg_price or price or 0)
-                        spent += fq * fill_px
-                    if getattr(broker, "mode", None) == "live":
-                        rem = max(0.0, float(res.order_qty or 0) - fq)
-                        if rem > 0:
-                            lim = float(res.limit_price or price or 0)
-                            spent += rem * lim
-                    if spent > 0:
-                        _sleeve_left[0] = max(0.0, _sleeve_left[0] - spent)
             else:
                 exec_reason = (res.reject_reason
                                or getattr(broker, "last_reject_reason", None)
                                or "리스크게이트 거부")
+            # 공유 슬리브: 체결 명목 + (라이브) working 잔량×주문가 선차감.
+            # FILLED/PARTIAL 안에만 두면 미체결(0주) BUY 가 같은 사이클 room 을
+            # 안 깎아 다음 종목이 재사용한다.
+            if p.side == "BUY" and _sleeve_left is not None:
+                spent = 0.0
+                fq = float(res.filled_qty or 0)
+                if fq > 0 and st in ("filled", "partial"):
+                    fill_px = float(res.avg_price or price or 0)
+                    spent += fq * fill_px
+                if getattr(broker, "mode", None) == "live":
+                    # 접수된 주문만(order_id). 게이트 거부는 잔량 없음.
+                    rem = max(0.0, float(res.order_qty or 0) - fq)
+                    if rem > 0 and res.order_id:
+                        lim = float(res.limit_price or price or 0)
+                        spent += rem * lim
+                if spent > 0:
+                    _sleeve_left[0] = max(0.0, _sleeve_left[0] - spent)
             executed.append({"symbol": p.symbol, "action": p.side,
                              "status": st, "reason": exec_reason,
                              "avg_price": res.avg_price,
