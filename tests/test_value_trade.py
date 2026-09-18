@@ -390,6 +390,19 @@ def test_working_buy_reserved_settled_partial_excludes_cancel_remainder(tmp_path
                - (72_000 * 5 - 2 * 70_000)) < 1e-6
 
 
+def test_working_buy_reserved_settled_avg_missing_uses_order_price(tmp_path):
+    """settled BUY avg 결측 시 주문가 폴백 — 스킵하면 room 과소예약."""
+    from src.agents.value_trade import working_buy_reserved_notional
+    from src.engine.store import Store
+    store = Store(tmp_path / "t.db")
+    store.upsert_working_order(
+        order_id="W1", symbol="005930", market="KR", side="BUY",
+        qty=10, price=70_000, status="CANCELED", filled_qty=5,
+        filled_avg=None, applied_qty=2, applied_notional=0)
+    store.update_working_order("W1", settled_at=1.0)
+    assert working_buy_reserved_notional(store, "KR") == 3 * 70_000
+
+
 def test_compute_sleeve_shrinks_when_brain_exceeds_reserve():
     """뇌가 예비금 초과 사용 → 실사용액이 그대로 차감된다(base×0.90 − base×0.50)."""
     s = compute_sleeve(**_SLEEVE_KW, base=1_000_000, value_invested=0,
