@@ -262,7 +262,8 @@ def test_run_wires_zone_fn_when_guard_on(tmp_path):
     assert r.account.position("005930").qty == 0             # 시장가 미체결
     meta = json.loads(store.get_armed()[0]["meta"])
     assert meta["entry_zone"]["invalidation"] == 90          # 존 정보가 armed 에 실림
-    assert meta.get("conviction_sizing") is True
+    # 미캘리브 스토어 → sizing_enabled=False (즉시체결 경로와 동일 flat 스탬프)
+    assert meta.get("conviction_sizing") is False
     assert meta.get("conviction") is not None
     assert meta.get("min_lot_conviction") == 0.6
 
