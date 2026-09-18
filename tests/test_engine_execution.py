@@ -367,6 +367,90 @@ def test_finish_live_skips_double_apply_after_reconcile(tmp_path):
     assert len(broker.account.journal) == 0
 
 
+def test_execute_locked_passes_qty_before_to_finish_live(tmp_path):
+    """레거시 _execute_locked 도 qty_before 를 넘겨 이중 apply_fill 을 막는다."""
+    from src.strategies.base import Position
+    broker = _broker(tmp_path, mode="live", client=_MockClient(
+        resp={"orderId": "L1"}, order_detail=_filled(10, 70000, "FILLED")))
+    # 재대사가 이미 체결분을 원장에 반영한 상태.
+    broker.account.positions["005930"] = Position(symbol="005930", qty=10, avg_price=70000)
+    broker.account.symbol_market["005930"] = "KR"
+    order = Order("005930", "KR", "BUY", 10, 70000.0)
+
+    seen: dict = {}
+    real_finish = broker._finish_live
+
+    def _wrap_finish(*a, **kw):
+        seen["qty_before"] = kw.get("qty_before")
+        seen["avg_before"] = kw.get("avg_before")
+        return real_finish(*a, **kw)
+
+    broker._finish_live = _wrap_finish
+    # begin 시점에 qty_before=0 으로 스냅되도록 포지션을 잠시 비운 뒤, poll 전에 재대사 반영.
+    broker.account.positions["005930"] = Position(symbol="005930", qty=0, avg_price=0)
+    with broker._lock:
+        prep = broker._begin_execute_locked(
+            order, "legacy", {"order_qty": 10.0, "limit_price": 70000.0})
+    assert prep and prep["qty_before"] == 0.0
+    # poll 창 동안 재대사가 qty 를 맞춤.
+    broker.account.positions["005930"] = Position(symbol="005930", qty=10, avg_price=70000)
+    filled_qty, avg_px, fee, status = broker._reconcile_order(prep["order_id"])
+    with broker._lock:
+        res = broker._finish_live(
+            order, "legacy", prep["order_id"], prep["base_kw"],
+            filled_qty, avg_px, fee, status,
+            qty_before=prep.get("qty_before"),
+            avg_before=prep.get("avg_before"))
+    assert res.ok
+    assert broker.position("005930").qty == 10          # 20으로 안 부풀음
+    assert len(broker.account.journal) == 0
+
+
+def test_finish_live_skip_sell_books_realized_pnl(tmp_path):
+    """재대사가 qty 를 맞춘 뒤 SELL finish 가 apply_fill 을 스킵해도 손익은 귀속."""
+    from src.strategies.base import Position
+    store = Store(tmp_path / "t.db")
+    broker = _broker(tmp_path, mode="live", store=store, client=_MockClient(
+        resp={"orderId": "S9"}, order_detail=_filled(3, 72000, "FILLED")))
+    # 매도 전: 10주 @ 70000. 재대사 후: 7주(3주 체결 반영), avg 유지.
+    broker.account.positions["005930"] = Position(symbol="005930", qty=7, avg_price=70000)
+    broker.account.symbol_market["005930"] = "KR"
+    broker.account.cash["KR"] = 1_000_000
+    order = Order("005930", "KR", "SELL", 3, 72000.0)
+    cash_before = broker.account.cash["KR"]
+    with broker._lock:
+        res = broker._finish_live(
+            order, "stop", "S9",
+            {"order_qty": 3.0, "limit_price": 72000.0},
+            3, 72000, 30.0, "FILLED",
+            qty_before=10.0, avg_before=70000.0)
+    assert res.ok
+    assert broker.position("005930").qty == 7           # qty 이중 차감 없음
+    assert broker.account.cash["KR"] == cash_before     # 현금 이중 가산 없음
+    assert abs(broker.account.realized_pnl["KR"] - ((72000 - 70000) * 3 - 30)) < 1e-6
+    assert any(f.side == "SELL" and f.qty == 3 for f in broker.account.journal)
+
+
+def test_finish_live_skip_sell_pnl_idempotent_with_j3(tmp_path):
+    """J3 가 이미 귀속한 매도는 finish_live 스킵 경로에서 다시 안 더한다."""
+    from src.strategies.base import Position
+    broker = _broker(tmp_path, mode="live", client=_MockClient(
+        resp={"orderId": "S8"}, order_detail=_filled(3, 72000, "FILLED")))
+    broker.account.positions["005930"] = Position(symbol="005930", qty=7, avg_price=70000)
+    broker.account.symbol_market["005930"] = "KR"
+    broker.account.record_exit_attribution(
+        "005930", "KR", 3, 72000, 70000, 30.0, reason="reconcile_attribution")
+    before = broker.account.realized_pnl["KR"]
+    order = Order("005930", "KR", "SELL", 3, 72000.0)
+    with broker._lock:
+        broker._finish_live(
+            order, "stop", "S8",
+            {"order_qty": 3.0, "limit_price": 72000.0},
+            3, 72000, 30.0, "FILLED",
+            qty_before=10.0, avg_before=70000.0)
+    assert broker.account.realized_pnl["KR"] == before
+
+
 def test_paper_inflight_rejects_duplicate(tmp_path):
     """페이퍼: in-flight 중이면 두 번째 주문 거부."""
     broker = _broker(tmp_path, mode="paper")

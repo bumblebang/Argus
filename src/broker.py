@@ -263,6 +263,7 @@ class Broker:
                     order, reason, prep["order_id"], prep["base_kw"],
                     filled_qty, avg_px, fee, status,
                     qty_before=prep.get("qty_before"),
+                    avg_before=prep.get("avg_before"),
                     exit_reason=exit_reason)
                 self._mirror_after_fill(mirror_st, order, res, armed_id, plan_fn, exit_reason)
                 return res
@@ -515,6 +516,35 @@ class Broker:
         sell_qty = min(filled_qty, qty_before)
         expected = max(0.0, qty_before - sell_qty)
         return abs(pos.qty - expected) < eps and sell_qty > eps
+
+    def _sell_pnl_already_booked(self, order_id: str, symbol: str,
+                                 filled_qty: float, avg_px: float) -> bool:
+        """재대사(J3) 또는 이전 finish 가 이미 이 매도 손익을 저널에 넣었는지."""
+        tag = f"finish_live_skip:{order_id}"
+        for f in reversed(self.account.journal):
+            if f.symbol != symbol or f.side != "SELL":
+                continue
+            reason = str(getattr(f, "reason", "") or "")
+            if order_id and (tag in reason or order_id in reason):
+                return True
+            # J3 귀속: 같은 수량·체결가(근사)면 이미 반영된 것으로 본다.
+            if (abs(float(f.qty) - float(filled_qty)) < 1e-9
+                    and abs(float(f.price) - float(avg_px)) < 0.01
+                    and "reconcile_attribution" in reason):
+                return True
+            break
+        if self.store is None or not order_id:
+            return False
+        try:
+            rows = self.store.get_working_orders(symbol)
+        except Exception:
+            return False
+        for row in rows or []:
+            if str(row.get("order_id") or "") != str(order_id):
+                continue
+            applied = float(row.get("applied_qty") or 0.0)
+            return applied + 1e-9 >= float(filled_qty)
+        return False
 
     # ── 미체결 주문 레지스트리 (J2) ────────────────────────────
     def _register_working_order(self, order: Order, order_id: str, status: str,
@@ -853,9 +883,11 @@ class Broker:
                 return None
 
         qty_before = float(self.account.position(order.symbol).qty)
+        avg_before = float(self.account.position(order.symbol).avg_price or 0.0)
         if self.mode != "live":
             self._mark_inflight(order)
-            return {"kind": "paper", "base_kw": base_kw, "qty_before": qty_before}
+            return {"kind": "paper", "base_kw": base_kw,
+                    "qty_before": qty_before, "avg_before": avg_before}
 
         order_id = self._place_live_order(order, reason)
         if order_id is None:
@@ -864,7 +896,7 @@ class Broker:
         # place→poll 창에 working 이 비면 반대 SELL 이 취소를 못 함 → 즉시 등록.
         self._register_working_order(order, order_id, "PENDING", 0.0, reason)
         return {"kind": "live", "order_id": order_id, "base_kw": base_kw,
-                "qty_before": qty_before}
+                "qty_before": qty_before, "avg_before": avg_before}
 
     def _finish_paper(self, order: Order, reason: str, base_kw: dict) -> ExecuteResult:
         fill = self.account.fill(order.symbol, order.market, order.side,
@@ -879,11 +911,24 @@ class Broker:
     def _finish_live(self, order: Order, reason: str, order_id: str, base_kw: dict,
                      filled_qty: float, avg_px: float | None, fee: float,
                      status: str, *, qty_before: float | None = None,
+                     avg_before: float | None = None,
                      exit_reason: str | None = None) -> ExecuteResult:
         if filled_qty > 0 and avg_px and avg_px > 0:
             if self._ledger_already_has_fill(order, filled_qty, qty_before):
                 log.info("[LIVE] 체결 id=%s — 원장 이미 반영(재대사), apply_fill 스킵",
                          order_id)
+                # qty/cash 는 재대사가 맞췄고 apply_fill 을 다시 하면 이중 계상.
+                # 매도 실현손익·저널만 비어 있을 수 있으니 여기서 보강한다(J3 와 멱등).
+                if (order.side == "SELL"
+                        and avg_before is not None and float(avg_before) > 0
+                        and not self._sell_pnl_already_booked(
+                            order_id, order.symbol, filled_qty, avg_px)):
+                    self.account.record_exit_attribution(
+                        order.symbol, order.market, float(filled_qty),
+                        float(avg_px), float(avg_before), float(fee or 0.0),
+                        reason=f"finish_live_skip:{order_id}")
+                    log.info("[LIVE] 체결 id=%s — apply_fill 스킵분 손익 귀속 qty=%s @ %.2f",
+                             order_id, filled_qty, avg_px)
             else:
                 fill = self.account.apply_fill(order.symbol, order.market, order.side,
                                                filled_qty, avg_px, fee, reason)
@@ -965,7 +1010,9 @@ class Broker:
             return self._finish_paper(order, reason, prep["base_kw"])
         filled_qty, avg_px, fee, status = self._reconcile_order(prep["order_id"])
         return self._finish_live(order, reason, prep["order_id"], prep["base_kw"],
-                                 filled_qty, avg_px, fee, status)
+                                 filled_qty, avg_px, fee, status,
+                                 qty_before=prep.get("qty_before"),
+                                 avg_before=prep.get("avg_before"))
 
     def _adopt_ledger_market(self, order: Order) -> None:
         """보유 종목이면 원장 symbol_market 을 market 권위로 삼는다.
