@@ -38,6 +38,21 @@ def test_position_triggers_no_price():
     assert T.position_triggers(_pos(stop_price=69000), price=None) == []
 
 
+def test_value_fair_high_triggers_act():
+    pos = _pos(strategy="value",
+               meta={"source": "value", "fair_high": 1500.0})
+    t = T.value_fair_high_trigger(pos, 1500.0)
+    assert t is not None and t.kind == "value_fair_high" and t.urgency == "act"
+
+
+def test_value_fair_high_ignores_non_value_and_below():
+    assert T.value_fair_high_trigger(
+        _pos(strategy="swing", meta={"fair_high": 1500}), 1600) is None
+    assert T.value_fair_high_trigger(
+        _pos(strategy="value", meta={"source": "value", "fair_high": 1500}),
+        1499) is None
+
+
 def test_volatility_spike_up():
     t = T.volatility_trigger("AAPL", [100, 101, 104.0], spike_pct=0.03)
     assert t and t.kind == "vol_spike" and t.payload["change"] > 0

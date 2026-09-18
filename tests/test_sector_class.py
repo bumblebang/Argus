@@ -195,3 +195,50 @@ def test_ensure_sectors_swallows_source_failure(monkeypatch, tmp_path):
                               cache_path=tmp_path / "c.json", api_key="k")
     assert SC.sector_for(cache, "US", "NVDA") == "정보기술"
     assert SC.sector_for(cache, "KR", "005930") is None
+
+
+def test_cache_path_is_repo_rooted():
+    """cwd 가 달라도 같은 파일을 본다 — 섹터캡 조용한 실효화 방지."""
+    from src.config import ROOT
+    assert SC.CACHE_PATH.is_absolute()
+    assert SC.CACHE_PATH == ROOT / "data" / "sector_cache.json"
+
+
+def test_force_refresh_ignores_ttl_without_wiping_disk(monkeypatch, tmp_path):
+    """--force 는 TTL 만 무시. 디스크를 먼저 지우면 조회 실패 시 캡이 죽는다."""
+    p = tmp_path / "sector_cache.json"
+    old = {"KR": {"005930": {"sector": "정보기술", "raw": "전기·전자",
+                             "fetched": 1.0}}}
+    SC.save_cache(old, p)
+
+    client = _krx()  # 0건 — 네트워크 실패 시뮬
+    cache = SC.ensure_sectors({"KR": ["005930"]}, cache_path=p, now=1e12,
+                              krx_client=client, force=True)
+    # 조회 실패 → 기존 항목 유지, 디스크도 그대로
+    assert SC.sector_for(cache, "KR", "005930") == "정보기술"
+    assert SC.sector_for(SC.load_cache(p), "KR", "005930") == "정보기술"
+
+
+def test_force_refresh_kr_refetches_when_fresh(monkeypatch):
+    client = _krx([{"ISU_SRT_CD": "005930", "IDX_IND_NM": "전기·전자"}])
+    cache: dict = {}
+    SC.refresh_kr(cache, ["005930"], now=1000.0, client=client)
+    before = client.calls
+    # TTL 안인데 force → 재조회
+    client.rows = {"STK": [{"ISU_SRT_CD": "005930", "IDX_IND_NM": "제약"}],
+                   "KSQ": []}
+    hit = SC.refresh_kr(cache, ["005930"], now=1000.0 + 3600, client=client,
+                        force=True)
+    assert hit >= 1
+    assert client.calls > before
+    assert SC.sector_for(cache, "KR", "005930") == "헬스케어"
+
+
+def test_unknown_krx_industry_logs_once(caplog):
+    SC._UNKNOWN_RAW_SEEN.clear()
+    cache: dict = {}
+    SC._put(cache, "KR", "999999", "신설업종XYZ", 1.0)
+    SC._put(cache, "KR", "999998", "신설업종XYZ", 2.0)  # 같은 raw — 경고 1회
+    msgs = [r.getMessage() for r in caplog.records if "정규화 실패" in r.getMessage()]
+    assert len(msgs) == 1
+    assert SC.sector_for(cache, "KR", "999999") is None

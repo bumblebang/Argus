@@ -74,7 +74,8 @@ from src.engine.entry_basis import parse_signal_exit
 from src.agents.pipeline import (CycleRunner, select_backend, build_live_llm,
                                  build_brain_llm_factories,
                                  synth_candles, history_candles_1y, dry_llm_factory,
-                                 build_paper_core, entry_stop_target)
+                                 build_paper_core, entry_stop_target,
+                                 sector_map_from_items)
 from src.agents.llm import ClaudeCLIClient
 from src.agents.value_trade import ValueRunner, value_trade_cfg
 from src.broker_sync import (apply_reconcile_from_live,
@@ -717,8 +718,10 @@ def run_from_args(args) -> int:
     # (브로커가 TossClient 를 새로 만들면 데몬 토큰 무효화 → 반드시 게이트웨이 재사용).
     broker_cfg = cfg.raw.get("broker", {}) or {}
     live_client = None if args.dry else gateway
-    broker, risk = build_paper_core(cfg, live_client=live_client,
-                                    account_seq=broker_cfg.get("account_seq"), store=store)
+    broker, risk = build_paper_core(
+        cfg, live_client=live_client,
+        account_seq=broker_cfg.get("account_seq"), store=store,
+        sector_map_fn=lambda: sector_map_from_items(provider.markets()))
     # 라이브 전환 시 실계좌 → 봇 원장/store 미러링(감시 루프가 broker 를 쓰기 전에 1회).
     # 페이퍼면 스킵(config 초기값 유지). 라이브 동기화 실패는 심각 → ERROR + 전역 HALT
     # (어긋난 원장으로 주문 금지). 운영자가 HALT 파일 삭제 후 재기동/재동기화.
@@ -824,11 +827,13 @@ def run_from_args(args) -> int:
         value_timer_stop = _start_value_timer(value_worker, cfg, markets)
         log.info("밸류 트랙 활성 — 감시 루프와 분리된 하루 1회 진입 판단(cooldown 3600s).")
     # 대시보드를 같은 프로세스 안 데몬 스레드로 병합(별도 pythonw 불필요, 읽기전용).
+    dashboard_on = False
     if wcfg.get("dashboard", True):
         port = int(wcfg.get("dashboard_port", 8787))
         try:
             import dashboard as _dashboard
             _dashboard.start_background(port)
+            dashboard_on = True
             log.info("대시보드 인프로세스 기동 — http://127.0.0.1:%d", port)
         except OSError as e:
             log.warning("대시보드 포트 사용 중(%d)일 수 있음 — 대시보드 생략: %s", port, e)
@@ -931,6 +936,22 @@ def run_from_args(args) -> int:
         _rec_sec = float(broker_cfg.get("reconcile_sec", 300))
         log.info("원장 재대사=on(%.0f분) — 실계좌 병합으로 드리프트 차단 · capital 동기화",
                  _rec_sec / 60)
+    _on = lambda x: "on" if x else "off"
+    log.info(
+        "기동 요약 — brain=%s value=%s account_snap=%s session=%s reconcile=%s "
+        "disclosure=%s earnings=%s edgar=%s slice=%s universe=%s dashboard=%s",
+        _on(brain),
+        _on(value_worker),
+        "on" if account_stop else "off(client missing)",
+        _on(session_stop),
+        _on(reconcile_stop),
+        _on(watcher_stop),
+        _on(earn_watcher_stop),
+        _on(edgar_watcher_stop),
+        _on(slice_stop),
+        _on(uni_stop),
+        _on(dashboard_on),
+    )
     _keep_awake(True)
     try:
         loop.run_forever(max_ticks=args.ticks)

@@ -3,10 +3,10 @@
 S0/S1: ValueFactor(시총분위 상대) + 낙폭 + QualityTilt, age_decay(first_seen_at).
 정렬 SSOT 전환(S2) 전까지는 병기·테스트용.
 
-**결측 ValueFactor = NEUTRAL_VALUE_FACTOR(0.5)** — 이 축의 스케일은 [0,1] 이고
-0 은 "중립"이 아니라 **가장 비쌈**이다. 재무 결측을 0 으로 두면 최대 감점이 되어
-사실상 탈락 사유가 되므로(설계 금지 사항), 중앙값 0.5 를 준다. quality_tilt 가
-[-1,1]→0.5 로 정규화되는 것과 같은 규약.
+**결측 ValueFactor AND drawdown = NEUTRAL_VALUE_FACTOR(0.5)** — 이 축의 스케일은
+[0,1] 이고 0 은 "중립"이 아니라 **가장 비쌈**(val) 또는 **밴드 밖**(dd)이다.
+재무·낙폭 결측을 0 으로 두면 최대 감점이 되어 사실상 탈락 사유가 되므로(설계 금지
+사항), 중앙값 0.5 를 준다. quality_tilt 가 [-1,1]→0.5 로 정규화되는 것과 같은 규약.
 분위별 유효 표본 < n_min 이면 시장 pooled 폴백, pooled도 미달이면 중립.
 """
 from __future__ import annotations
@@ -99,7 +99,7 @@ def drawdown_component(drawdown_1y_pct: float | None, *,
                        dd_floor: float = -70.0, dd_ceil: float = -25.0,
                        peak: tuple[float, float] = DEFAULT_DD_PEAK,
                        deep_floor: float = DEFAULT_DD_DEEP_FLOOR) -> float:
-    """낙폭 %를 [0,1]로 — **역U자**. 밴드 밖·결측 → 0.
+    """낙폭 %를 [0,1]로 — **역U자**. 밴드 밖 → 0, 결측 → NEUTRAL_VALUE_FACTOR.
 
     peak 구간(기본 -50~-35%)이 1.0. 그보다 얕으면 기회가 작아 0 쪽으로,
     그보다 깊으면 '떨어지는 칼' 쪽이라 deep_floor 까지 감점한다. 예전처럼
@@ -107,7 +107,7 @@ def drawdown_component(drawdown_1y_pct: float | None, *,
     """
     dd = _finite(drawdown_1y_pct)
     if dd is None:
-        return 0.0
+        return NEUTRAL_VALUE_FACTOR
     if not (dd_floor <= dd <= dd_ceil):
         return 0.0
     lo, hi = float(min(peak)), float(max(peak))       # 예: -50, -35
@@ -126,7 +126,11 @@ def drawdown_component(drawdown_1y_pct: float | None, *,
 
 
 def _cheapness_ranks(values: list[float | None]) -> list[float | None]:
-    """낮을수록 싼 배수 → [0,1] 상대 점수(가장 쌈=1, 가장 비쌈=0). 결측은 None."""
+    """낮을수록 싼 배수 → [0,1] 상대 점수(가장 쌈=1, 가장 비쌈=0). 결측은 None.
+
+    동일 값은 average rank — 입력 순서로 1.0/0.0 이 갈라지지 않는다.
+    전부 동점이면 모두 0.5(중립).
+    """
     indexed = [(i, v) for i, v in enumerate(values) if v is not None and v > 0]
     out: list[float | None] = [None] * len(values)
     if len(indexed) < 2:
@@ -135,9 +139,17 @@ def _cheapness_ranks(values: list[float | None]) -> list[float | None]:
         return out
     indexed.sort(key=lambda t: t[1])  # 낮은(싼) 값 먼저
     n = len(indexed)
-    for rank, (i, _) in enumerate(indexed):
-        # rank 0(가장 쌈) → 1.0, rank n-1 → 0.0
-        out[i] = 1.0 - (rank / (n - 1))
+    i = 0
+    while i < n:
+        j = i + 1
+        while j < n and indexed[j][1] == indexed[i][1]:
+            j += 1
+        # 동점 구간의 ordinal rank 평균 (0-based): (i + j-1) / 2
+        avg_rank = (i + j - 1) / 2.0
+        score = 1.0 - (avg_rank / (n - 1))
+        for k in range(i, j):
+            out[indexed[k][0]] = score
+        i = j
     return out
 
 

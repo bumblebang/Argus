@@ -141,11 +141,54 @@ def test_sector_concentration_other_sector_ok(tmp_path):
 
 
 def test_sector_check_skips_unmapped_symbol(tmp_path):
-    gate = _gate(tmp_path, max_sector_pct=0.4, max_position_pct=0.5, sector_map={})
+    """하위호환 이름 — 이제는 미분류 버킷으로 검사한다(조용한 스킵 금지)."""
+    gate = _gate(tmp_path, max_sector_pct=0.4, max_position_pct=0.5, sector_map={},
+                 unclassified_sector_mult=0.5)
+    acct = _acct(tmp_path, cash={"KR": 1_000_000})
+    # 미분류 한도 = 40%×0.5=20만. 25만 보유 후 +20만 → 초과
+    acct.fill("005930", "KR", "BUY", 2500, 100)
+    d = gate.check(Order("000660", "KR", "BUY", 2000, 100), acct)
+    assert not d.approved and "미분류" in d.reason
+
+
+def test_unclassified_within_half_cap_ok(tmp_path):
+    gate = _gate(tmp_path, max_sector_pct=0.4, max_position_pct=0.5, sector_map={},
+                 unclassified_sector_mult=0.5, max_order_notional={"KR": 500_000})
+    acct = _acct(tmp_path, cash={"KR": 1_000_000})
+    acct.fill("005930", "KR", "BUY", 1000, 100)               # 10만 미분류
+    d = gate.check(Order("000660", "KR", "BUY", 500, 100), acct)  # +5만 → 15만 < 20만
+    assert d.approved
+
+
+def test_sector_map_fn_picks_up_symbols_after_start(tmp_path):
+    """기동 시 맵이 비어도 sector_map_fn 이 최신을 주면 섹터캡이 산다(핫리로드)."""
+    live = {"005930": "반도체", "000660": "반도체"}
+    gate = _gate(tmp_path, max_sector_pct=0.4, max_position_pct=0.5,
+                 sector_map={}, sector_map_fn=lambda: dict(live))
+    acct = _acct(tmp_path, cash={"KR": 1_000_000})
+    acct.fill("005930", "KR", "BUY", 2500, 100)               # 250k 반도체
+    d = gate.check(Order("000660", "KR", "BUY", 2000, 100), acct)  # +200k > 400k
+    assert not d.approved and "섹터 집중" in d.reason
+    assert gate.sector_map.get("000660") == "반도체"
+
+
+def test_sector_map_fn_failure_keeps_previous_map(tmp_path):
+    calls = {"n": 0}
+
+    def flaky():
+        calls["n"] += 1
+        if calls["n"] == 1:
+            return {"005930": "반도체", "000660": "반도체"}
+        raise RuntimeError("provider down")
+
+    gate = _gate(tmp_path, max_sector_pct=0.4, max_position_pct=0.5,
+                 sector_map={}, sector_map_fn=flaky)
     acct = _acct(tmp_path, cash={"KR": 1_000_000})
     acct.fill("005930", "KR", "BUY", 2500, 100)
-    d = gate.check(Order("000660", "KR", "BUY", 2000, 100), acct)  # 섹터 미상 -> 섹터검사 스킵
-    assert d.approved
+    assert not gate.check(Order("000660", "KR", "BUY", 2000, 100), acct).approved
+    # 두 번째 검사는 fn 실패 → 직전 맵으로 계속 차단
+    d = gate.check(Order("000660", "KR", "BUY", 2000, 100), acct)
+    assert not d.approved and "섹터 집중" in d.reason
 
 
 def test_portfolio_checks_off_by_default(tmp_path):

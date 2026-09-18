@@ -10,6 +10,9 @@
     python scripts/refresh_sectors.py --force    # TTL 무시하고 전량 재조회
 
 US 는 Finnhub 무료 티어(60req/min)라 심볼당 ~1.1초 걸린다. --max-us 로 조절.
+
+--force 는 디스크 캐시를 먼저 지우지 않는다. TTL 만 무시해 재조회하고, 조회가
+전부 실패하면 기존 캐시·universe 섹터를 보존한 채 non-zero 로 끝난다.
 """
 from __future__ import annotations
 
@@ -27,7 +30,7 @@ from dotenv import load_dotenv                                    # noqa: E402
 load_dotenv(ROOT / ".env")
 
 from src.datasources.sector_class import (                        # noqa: E402
-    CACHE_PATH, ensure_sectors, load_cache, save_cache, sector_for)
+    CACHE_PATH, ensure_sectors, save_cache, sector_for)
 from src.sector_taxonomy import normalize_sector                  # noqa: E402
 from src.universe_roll import OUT, _atomic_write, _load_yaml      # noqa: E402
 
@@ -37,7 +40,7 @@ def main() -> int:
     ap.add_argument("--dry-run", action="store_true",
                     help="조회·커버리지 보고만, universe.yaml 미변경")
     ap.add_argument("--force", action="store_true",
-                    help="캐시 TTL 무시하고 전량 재조회")
+                    help="캐시 TTL 무시하고 전량 재조회(디스크는 성공 후에만 갱신)")
     ap.add_argument("--max-us", type=int, default=250,
                     help="이번 실행에서 새로 조회할 US 심볼 상한(기본 250)")
     args = ap.parse_args()
@@ -53,13 +56,13 @@ def main() -> int:
           ", ".join(f"{m} {len(v)}" for m, v in symbols.items()))
 
     if args.force and CACHE_PATH.exists():
+        # 수동 복구용 백업만 — 라이브 파일은 조회 성공 전 unlink 금지.
         backup = CACHE_PATH.with_suffix(".json.bak")
         backup.write_text(CACHE_PATH.read_text(encoding="utf-8"), encoding="utf-8")
-        CACHE_PATH.unlink()
-        print(f"--force: 기존 캐시를 {backup.name} 로 옮기고 전량 재조회")
+        print(f"--force: 기존 캐시를 {backup.name} 로 백업(라이브 파일 유지) 후 재조회")
 
     t0 = time.time()
-    cache = ensure_sectors(symbols, max_us_fetch=args.max_us)
+    cache = ensure_sectors(symbols, max_us_fetch=args.max_us, force=args.force)
     print(f"섹터 조회 {time.time() - t0:.0f}초")
 
     filled, missing, dist = 0, [], collections.Counter()
@@ -84,6 +87,11 @@ def main() -> int:
     if missing:
         print(f"\n미분류 {len(missing)}종목: {', '.join(missing[:20])}"
               + (" ..." if len(missing) > 20 else ""))
+
+    if total > 0 and filled == 0:
+        print("\n섹터 조회 결과가 비었습니다 — universe/캐시를 덮어쓰지 않습니다.",
+              file=sys.stderr)
+        return 1
 
     if args.dry_run:
         print("\n--dry-run: universe.yaml 미변경")
