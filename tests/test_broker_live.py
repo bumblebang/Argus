@@ -79,6 +79,8 @@ def _live_broker(tmp_path, client, store=None, live_markets=None, cash=None,
     for sym, (qty, avg, market) in (positions or {}).items():   # 보유 세팅(SELL 테스트용)
         acct.apply_fill(sym, market, "BUY", qty, avg, 0.0, "seed")
     gate = _gate(tmp_path, capital=capital, notional=notional)
+    if store is None:
+        store = Store(tmp_path / "live_broker.db")
     # 테스트는 폴링 대기 없이(sleep 0) 빠르게.
     return Broker(account=acct, gate=gate, client=client, mode="live",
                   account_seq=1, live_markets=(live_markets or ["KR"]), store=store,

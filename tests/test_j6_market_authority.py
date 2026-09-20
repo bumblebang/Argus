@@ -14,6 +14,7 @@ from src.broker import Broker
 from src.paper_account import PaperAccount
 from src.risk import RiskManager
 from src.risk_gate import Order, RiskGate
+from src.engine.store import Store
 
 
 def _broker(tmp_path, mode="paper", **kw):
@@ -22,6 +23,8 @@ def _broker(tmp_path, mode="paper", **kw):
     gate = RiskGate({"capital": {"KR": 1_000_000, "US": 0}, "max_position_pct": 0.5,
                      "max_positions": 5, "daily_loss_limit_pct": 0.05,
                      "kill_switch_file": str(tmp_path / "HALT")})
+    if mode == "live":
+        kw.setdefault("store", Store(tmp_path / "j6.db"))
     return Broker(account=acct, gate=gate, mode=mode, **kw)
 
 

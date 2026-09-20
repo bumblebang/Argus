@@ -21,6 +21,20 @@ from src.eval_protocol import (
 def test_touches_for_paths():
     t = touches_for_paths(["src/risk_gate.py", "README.md"])
     assert t == {"risk_gate"}
+    t2 = touches_for_paths(["src/strategies/foo.py", "src/agents/decision_agent.py"])
+    assert t2 == {"strategies", "decision_agent"}
+
+
+def test_git_diff_failure_is_not_ok(monkeypatch):
+    from src.eval.protected_guard import GitDiffError
+
+    def boom(base, head="HEAD"):
+        raise GitDiffError("shallow")
+
+    monkeypatch.setattr("src.eval.protected_guard.git_changed_files", boom)
+    ok, msgs = check_protected_changes(base_ref="abc", pr_body=None)
+    assert ok is False
+    assert any("git diff 실패" in m for m in msgs)
 
 
 def test_config_touches_risk_block():

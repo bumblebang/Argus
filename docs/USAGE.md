@@ -126,3 +126,20 @@ API 키(`ANTHROPIC_API_KEY`)는 종량제 토큰 과금. 둘 다 쓰면 백엔�
 - [ ] 구독 쓸 때: 장중 같은 계정으로 무거운 에이전트 개발 자제
 
 라이브는 체크리스트를 페이퍼로 통과한 뒤에만.
+
+## 미확인 주문(`local:<uuid>`) 수동 연결
+
+접수 응답이 유실되면 `working_orders.order_id` 가 `local:<uuid>` / `status=UNKNOWN` 으로
+남고, 해당 심볼은 양방향 신규 주문이 막힌다. API 로 자동 발견은 불가하다.
+
+1. 토스 앱/콘솔에서 해당 시각·종목의 **실제 orderId** 를 확인한다.
+2. 운영 DB에서 한 번의 UPDATE 로 키를 연결한다 (DELETE+INSERT 금지):
+
+```sql
+UPDATE working_orders
+SET order_id = '<실orderId>', status = 'PENDING', last_checked = strftime('%s','now')
+WHERE order_id = 'local:<uuid>';
+```
+
+3. `alert_check` / heartbeat `trading_health.unknown_symbols` 에서 심볼이 사라졌는지 확인.
+4. 주문이 이미 체결·취소됐으면 status 를 맞춰 두고 sweep 이 정산하게 한다.

@@ -110,7 +110,8 @@ def evaluate(now: float, hb_age: float | None, market_open: bool = True,
              hb_polled: int | None = None,
              hb_markets_open: list | None = None,
              hb_should_be_open: list | None = None,
-             expects_polling: bool = False) -> list[str]:
+             expects_polling: bool = False,
+             trading_health: dict | None = None) -> list[str]:
     """순수 판정 — 경보 사유 리스트(빈 리스트=정상).
 
     brain_errors_recent / last_brain_done_age 는 하위호환으로 받지만 **무시**한다
@@ -120,6 +121,8 @@ def evaluate(now: float, hb_age: float | None, market_open: bool = True,
     hb_ok/hb_polled/hb_should_be_open: 하트비트 JSON. should_be_open 비어있지 않은데
     polled=0·markets_open 비어있음·ok=False 면 가짜 초록을 경보로 올린다.
     expects_polling 은 구 하트비트(should_be_open 없음) 폴백용.
+
+    trading_health: 장 개폐와 무관 — HALT/pause/sync/미확인·격리 주문.
     """
     del brain_errors_recent, last_brain_done_age, market_open  # 명시적 미사용
     reasons: list[str] = []
@@ -152,7 +155,37 @@ def evaluate(now: float, hb_age: float | None, market_open: bool = True,
     if mode == "bridge" and bridge_armed is False:
         reasons.append(
             "브릿지 모드인데 미무장 — bridge.heartbeat 만료/없음 → circuit 위험")
+
+    reasons.extend(_trading_health_reasons(trading_health))
     return reasons
+
+
+def _trading_health_reasons(th: dict | None) -> list[str]:
+    """장 개폐와 무관한 거래 건강도 경보."""
+    if not th:
+        return []
+    out: list[str] = []
+    if th.get("halted"):
+        out.append("전역 HALT 활성 — BUY/SELL 전부 차단")
+    paused = th.get("paused") or []
+    if paused:
+        out.append(f"시장 pause 활성({'+'.join(paused)}) — 해당 시장 BUY 차단")
+    sh = th.get("sync_health") or {}
+    if sh.get("cash_ok") is False or sh.get("holdings_ok") is False:
+        failed = ",".join(sh.get("failed_markets") or []) or "?"
+        out.append(f"실계좌 sync 불량(failed={failed})")
+    unk = th.get("unknown_symbols") or []
+    if unk:
+        out.append(f"미확인 주문 심볼: {','.join(unk)}")
+    q = th.get("quarantined_symbols") or []
+    if q:
+        out.append(f"격리(QUARANTINED) 주문 심볼: {','.join(q)}")
+    rf = th.get("register_failed_symbols") or []
+    if rf:
+        out.append(f"등록실패 심볼(메모리 격리): {','.join(rf)}")
+    if th.get("store_error"):
+        out.append(f"Store 오류: {th['store_error']}")
+    return out
 
 
 def _bridge_inbox_and_max_age() -> tuple[Path, float]:
@@ -449,6 +482,7 @@ def main() -> int:
         hb_markets_open=list(hb.get("markets_open") or []) if hb else None,
         hb_should_be_open=list(hb.get("should_be_open") or []) if hb else None,
         expects_polling=expects_polling if not hb.get("should_be_open") else False,
+        trading_health=hb.get("trading_health") if isinstance(hb.get("trading_health"), dict) else None,
     )
     reasons.extend(crosscheck_reasons(now))
     next_actions = actions_for(reasons, brain_mode=mode)
@@ -459,11 +493,19 @@ def main() -> int:
     prev_mode = prev.get("brain_mode") or "ok"
     prev_reasons = list(prev.get("reasons") or [])
     prev_push_ok = prev.get("push_ok", True)
+    last_unresolved_push = float(prev.get("last_unresolved_push") or 0)
+    unresolved = any(
+        ("미확인" in r) or ("격리" in r) or ("등록실패" in r) or ("pause" in r)
+        or ("HALT" in r) or ("sync 불량" in r)
+        for r in reasons)
+    # 미해소 주문·pause/HALT 는 300초마다 재통지.
+    unresolved_due = unresolved and (now - last_unresolved_push >= 300)
 
     if reasons:
         since = prev.get("since") if was_active else now
         should_fire = ((not was_active) or (prev_mode != mode)
-                       or (prev_reasons != reasons) or (not prev_push_ok))
+                       or (prev_reasons != reasons) or (not prev_push_ok)
+                       or unresolved_due)
         push_ok = True
         if should_fire:
             _log("FIRED", reasons, brain_mode=mode, actions=next_actions,
@@ -474,6 +516,8 @@ def main() -> int:
                     format_push_body(reasons, next_actions, budget_line=budget_line))
             else:
                 push_ok = False
+            if unresolved and push_ok:
+                last_unresolved_push = now
         else:
             push_ok = bool(prev_push_ok)
         payload = {
@@ -484,6 +528,7 @@ def main() -> int:
             "actions": next_actions,
             "budget": gauge,
             "push_ok": push_ok,
+            "last_unresolved_push": last_unresolved_push,
         }
         ALERT.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
         print("[alert] ACTIVE:", " | ".join(reasons))

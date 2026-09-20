@@ -200,9 +200,11 @@ class TossClient:
         if path_params:
             path = path.format(**path_params)
         url = self.creds.base_url + path
+        # order_create 재시도 금지: 접수 후 응답 유실 시 이중 주문. 첫 실패 즉시 전파.
+        max_attempts = 1 if key == "order_create" else _RETRY_ATTEMPTS
         token_retried = False
-        for attempt in range(_RETRY_ATTEMPTS):
-            last_try = attempt == _RETRY_ATTEMPTS - 1
+        for attempt in range(max_attempts):
+            last_try = attempt == max_attempts - 1
             self._acquire(key)                  # 재시도마다 토큰 소비(429 폭주 방지)
             try:
                 resp = self.session.request(method, url, params=params, json=json,
@@ -211,6 +213,7 @@ class TossClient:
             except requests.exceptions.RequestException as e:
                 # 타임아웃·연결 끊김·DNS 는 곧 회복되는 일과성 장애다. 여기서 그냥
                 # 튀면 계좌 동기화가 조회 1회 실패로 원장을 낡은 채 둔다.
+                # order_create 는 재시도 자체가 이중주문 — 즉시 전파.
                 if last_try:
                     raise
                 wait = _backoff_wait(attempt)
@@ -223,16 +226,20 @@ class TossClient:
                 # 방금 발급한 토큰이 401 이면 쓰로틀/경합이므로 '재발급하지 말고' 백오프 후 같은
                 # 토큰으로 재시도한다(잦은 재발급 자체가 쓰로틀 대상 → thrash 원인). 오래된 토큰만 1회 재발급.
                 age = time.time() - self._token_issued_at
-                if age > 60 and not token_retried:
+                if age > 60 and not token_retried and not last_try:
                     log.warning("401 invalid-token (토큰 %.0fs 경과, stale 추정) -> 재발급 1회 후 재시도", age)
                     self._invalidate_token()
                     token_retried = True
                     continue
+                if last_try:
+                    raise TossAPIError(resp.status_code, resp.text)
                 wait = _backoff_wait(attempt)
                 log.warning("401 invalid-token (쓰로틀 추정, 토큰 %.0fs 전 발급) -> 재발급 없이 %.1fs 백오프", age, wait)
                 time.sleep(wait)
                 continue
             if resp.status_code == 429:
+                if last_try:
+                    raise TossAPIError(resp.status_code, resp.text)
                 # 문서 권장: Retry-After 존중 + 지수 백오프 + 지터
                 retry_after = resp.headers.get("Retry-After")
                 base = float(retry_after) if retry_after else 2 ** attempt
@@ -242,7 +249,7 @@ class TossClient:
                 time.sleep(wait)
                 continue
             if resp.status_code >= 500:
-                # 서버측 일과성 오류 — 재시도 대상. 4xx(요청 오류)는 재시도해도 같다.
+                # 서버측 일과성 오류 — 재시도 대상. order_create·4xx 는 재시도 안 함.
                 if last_try:
                     raise TossAPIError(resp.status_code, resp.text)
                 wait = _backoff_wait(attempt)

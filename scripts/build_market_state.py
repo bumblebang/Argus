@@ -47,10 +47,11 @@ def _synth(symbol: str, market: str) -> pd.DataFrame:
 def _priority_us_symbols(cfg) -> list[str]:
     """보유·armed US 티커 — 배치 뉴스에서 유니버스 앞자리보다 우선."""
     out: list[str] = []
+    store = None
     try:
         from src.engine.store import Store
         db = (cfg.raw.get("run") or {}).get("db_path", "data/bot.db")
-        store = Store(db)
+        store = Store(db, readonly=True)
         for rows in (store.get_open_positions(), store.get_armed()):
             for r in rows:
                 sym = str(r["symbol"] or "").strip()
@@ -62,6 +63,12 @@ def _priority_us_symbols(cfg) -> list[str]:
     except Exception as e:
         log = get_logger("build_state")
         log.warning("US 뉴스 priority(보유/armed) 조회 실패(유니버스만): %s", e)
+    finally:
+        if store is not None:
+            try:
+                store.conn.close()
+            except Exception:
+                pass
     return list(dict.fromkeys(out))
 
 

@@ -617,13 +617,26 @@ class WatchLoop:
             polled = int(res.polled or 0)
             should_poll = bool(should_be_open)
             ok = (not tick_error) and (not should_poll or polled > 0)
-            self.heartbeat_path.write_text(json.dumps({
+            payload = {
                 "ts": now_ts, "ticks": self._ticks,
                 "should_be_open": should_be_open,
                 "markets_open": markets, "polled": polled,
                 "ok": ok, "tick_error": bool(tick_error),
                 "code_rev": self._code_rev,
-            }), encoding="utf-8")
+            }
+            # trading_health: 시세 ok 와 별개(HALT/pause/sync/미확인 주문).
+            try:
+                br = getattr(self, "broker", None) or getattr(self, "_broker", None)
+                if br is None and self.executor is not None:
+                    br = getattr(self.executor, "broker", None)
+                if br is not None and hasattr(br, "trading_health"):
+                    payload["trading_health"] = br.trading_health()
+            except Exception as e:
+                payload["trading_health"] = {"store_error": str(e)}
+            tmp = self.heartbeat_path.with_suffix(
+                self.heartbeat_path.suffix + ".tmp")
+            tmp.write_text(json.dumps(payload), encoding="utf-8")
+            tmp.replace(self.heartbeat_path)
         except OSError as e:
             log.warning("하트비트 기록 실패: %s", e)
 

@@ -17,6 +17,9 @@ FILE_TOUCHES: dict[str, str] = {
     "src/engine/exit_policy.py": "exit_policy",
     "src/agents/validation_agent.py": "validation_rules",
     "src/calibration.py": "conviction_weights",
+    "src/agents/decision_agent.py": "decision_agent",
+    "src/agents/athena.py": "athena",
+    "src/agents/conviction.py": "conviction",
 }
 
 # config 최상위 블록 → touch (값 변경만; 키 존재 여부는 deep diff)
@@ -61,6 +64,8 @@ def touches_for_paths(changed: list[str]) -> set[str]:
         p = raw.replace("\\", "/").lstrip("./")
         if touch := FILE_TOUCHES.get(p):
             out.add(touch)
+        elif p.startswith("src/strategies/") or p == "src/strategies":
+            out.add("strategies")
     return out
 
 
@@ -78,6 +83,10 @@ def is_defect_fix(text: str | None) -> bool:
     return any(m.lower() in low for m in DEFECT_FIX_MARKERS)
 
 
+class GitDiffError(RuntimeError):
+    """git diff 실패 — 빈 목록으로 통과시키면 안 됨."""
+
+
 def git_changed_files(base: str, head: str = "HEAD") -> list[str]:
     def _run(args: list[str]) -> subprocess.CompletedProcess:
         return subprocess.run(
@@ -91,7 +100,12 @@ def git_changed_files(base: str, head: str = "HEAD") -> list[str]:
 
     out = _run(["git", "diff", "--name-only", f"{base}...{head}"])
     if out.returncode != 0:
+        err1 = (out.stderr or out.stdout or "").strip()
         out = _run(["git", "diff", "--name-only", base, head])
+        if out.returncode != 0:
+            err2 = (out.stderr or out.stdout or "").strip()
+            raise GitDiffError(
+                f"git diff 실패 base={base!r} head={head!r}: {err1 or err2 or 'unknown'}")
     stdout = out.stdout or ""
     return [ln.strip() for ln in stdout.splitlines() if ln.strip()]
 
@@ -141,7 +155,11 @@ def check_protected_changes(
     evidence_n: int | None = None,
 ) -> tuple[bool, list[str]]:
     """PROTECTED touch 가 있으면 defect-fix 또는 can_promote 통과 필요."""
-    changed = git_changed_files(base_ref, head_ref)
+    try:
+        changed = git_changed_files(base_ref, head_ref)
+    except GitDiffError as e:
+        return False, [f"git diff 실패 — PROTECTED 가드 통과 불가: {e}"]
+
     if not changed:
         return True, ["변경 파일 없음"]
 

@@ -51,6 +51,20 @@ def test_wake_kwargs_fallback_for_noarg_cycle_fn(tmp_path):
     assert bw.run_pending() is True and calls == ["ran"]
 
 
+def test_cycle_body_typeerror_not_retried(tmp_path):
+    """wake= 지원 cycle 본문의 TypeError 는 무인자 재호출하지 않는다."""
+    calls = []
+
+    def cycle(wake=None):
+        calls.append(wake)
+        raise TypeError("본문 버그")
+
+    bw = BrainWorker(cycle, store=Store(tmp_path / "t.db"))
+    bw.wake("periodic", [])
+    assert bw.run_pending() is False  # 예외는 워커가 삼킴(실패 반환)
+    assert len(calls) == 1
+
+
 def test_cooldown_skips(tmp_path):
     store = Store(tmp_path / "t.db")
     now = [1000.0]

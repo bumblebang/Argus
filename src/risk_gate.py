@@ -148,6 +148,7 @@ class RiskGate:
             limits.get("daily_loss_use_sod_delta", True))
         self.max_order_notional = limits.get("max_order_notional", {})
         self.kill_switch_file = limits.get("kill_switch_file", "data/HALT")
+        self._memory_paused: set[str] = set()
         # 포트폴리오 수준 감독관 한도(선택). None 이면 비활성 — 종목단위 한도만 적용.
         gross = limits.get("max_gross_exposure")
         self.max_gross_exposure = float(gross) if gross is not None else None
@@ -217,7 +218,7 @@ class RiskGate:
     def engage_halt(self, reason: str = "") -> Path:
         """전역 HALT 파일 생성(BUY/SELL 전부 차단). 운영자가 파일을 지울 때까지 유지.
 
-        라이브 동기화 실패 등 '원장이 실계좌와 어긋날 수 있는' 상황에서 호출한다.
+        수동 킬스위치. 기동 sync 실패는 pause_market(시장별 BUY만)을 쓴다.
         """
         p = self._halt_path()
         p.parent.mkdir(parents=True, exist_ok=True)
@@ -225,7 +226,28 @@ class RiskGate:
         p.write_text(text, encoding="utf-8")
         return p
 
+    def pause_market(self, market: str, reason: str = "") -> Path:
+        """시장 pause 파일(HALT.{KR|US}) 생성 — 해당 시장 BUY만 차단(SELL 허용).
+
+        한도·캡·노출 수치/판정식은 변경하지 않는다. 자동 해제 없음.
+        """
+        p = self._market_pause_path(market)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        text = (reason or "pause").strip() + "\n"
+        p.write_text(text, encoding="utf-8")
+        # 파일 기록 직후에도 메모리 플래그(기록 실패 폴백·프로세스 내 즉시 반영).
+        m = str(market or "").upper()
+        self._memory_paused.add(m)
+        return p
+
+    def pause_market_memory(self, market: str) -> None:
+        """파일 기록 실패 시 프로세스 내 시장 pause만."""
+        self._memory_paused.add(str(market or "").upper())
+
     def is_market_paused(self, market: str) -> bool:
+        m = str(market or "").upper()
+        if m in self._memory_paused:
+            return True
         return _paths.halt_pause_exists(market, configured=self.kill_switch_file)
 
     def pause_status(self) -> str:

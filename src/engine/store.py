@@ -315,6 +315,23 @@ class Store:
                 f"UPDATE working_orders SET {', '.join(sets)} WHERE order_id=?", vals)
             self.conn.commit()
 
+    def rekey_working_order(self, old_order_id: str, new_order_id: str, *,
+                            status: str | None = None) -> None:
+        """local:<uuid> → 실 orderId 전환. DELETE+INSERT 금지(한 번의 UPDATE)."""
+        if old_order_id == new_order_id and status is None:
+            return
+        sets, vals = ["order_id=?", "last_checked=?"], [new_order_id, time.time()]
+        if status is not None:
+            sets.append("status=?")
+            vals.append(status)
+        vals.append(old_order_id)
+        with self._lock:
+            cur = self.conn.execute(
+                f"UPDATE working_orders SET {', '.join(sets)} WHERE order_id=?", vals)
+            if cur.rowcount < 1:
+                raise KeyError(f"working_order 없음: {old_order_id}")
+            self.conn.commit()
+
     def delete_working_order(self, order_id: str) -> None:
         with self._lock:
             self.conn.execute("DELETE FROM working_orders WHERE order_id=?", (order_id,))

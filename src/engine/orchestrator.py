@@ -679,6 +679,36 @@ def run_from_args(args) -> int:
     setup_logging("INFO", log_file="watch.log")
 
     cfg = load_config()
+    from src.runtime_isolation import (
+        assert_dry_brain_not_live, begin_isolation, isolation_needed,
+        ops_token_contention, resolve_brain_dry, ConfigError, is_run_bot_env)
+    api_key = os.getenv("ANTHROPIC_API_KEY")
+    wcfg0 = cfg.raw.get("watch", {})
+    brain_dry = resolve_brain_dry(
+        args_dry=getattr(args, "dry", False),
+        args_cli=getattr(args, "cli", False),
+        args_live=getattr(args, "live", False),
+        brain_backend=wcfg0.get("brain_backend"), api_key=api_key)
+    broker_cfg0 = cfg.raw.get("broker", {}) or {}
+    try:
+        assert_dry_brain_not_live(
+            brain_dry=brain_dry,
+            broker_mode=str(broker_cfg0.get("mode") or "paper"),
+            dry_run=bool(cfg.dry_run))
+    except ConfigError as e:
+        log.error("%s", e)
+        return 1
+
+    isolated = isolation_needed(
+        cli_dry=bool(getattr(args, "dry", False)), brain_dry=brain_dry,
+        run_bot=is_run_bot_env())
+    if isolated:
+        begin_isolation(force_paper_cfg=cfg)
+        why = ops_token_contention()
+        if why:
+            log.error("%s", why)
+            return 1
+
     # 감시 루프(M1)는 시세·캔들만 폴링 -> 인증(client_id/secret)만 있으면 된다.
     # account_no 는 잔고/주문(M2+)에서만 필요하므로 여기선 요구하지 않는다.
     need = [k for k, v in {"TOSS_CLIENT_ID": cfg.creds.client_id,
@@ -688,9 +718,11 @@ def run_from_args(args) -> int:
         return 1
 
     # 단일 인스턴스 락 — 오펀/중복 기동 시 토스 토큰 경합(→401)·claude 동시 스폰 경합 방지.
+    also = ([] if isolated
+            else [_paths.ROOT / "data" / "watch.pid.lock"])
     lock = SingleInstance(_paths.resolve("watch_pid"),
                           lockfile=_paths.resolve("watch_lock"),
-                          also_lockfiles=[_paths.ROOT / "data" / "watch.pid.lock"])
+                          also_lockfiles=also)
     try:
         lock.acquire()
     except AlreadyRunning as e:

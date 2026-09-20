@@ -36,6 +36,12 @@ def main() -> int:
     setup_logging("INFO")
     cfg = load_config()
 
+    from src.runtime_isolation import begin_isolation
+    from src.engine.store import Store
+    from src import paths as _paths
+    begin_isolation(force_paper_cfg=cfg)
+    store = Store(_paths.resolve("db"))
+
     api_key = os.getenv("ANTHROPIC_API_KEY")
     # 백엔드 결정: --dry(mock) | --cli(구독) | --live/키(API) | 기본(키 있으면 API, 없으면 dry)
     dry, use_cli, subscription = select_backend(dry=args.dry, cli=args.cli,
@@ -57,7 +63,8 @@ def main() -> int:
         llm_factory = lambda cands: live_llm
         fetch_raw = history_candles_1y
 
-    runner = CycleRunner(cfg, llm_factory=llm_factory, fetch_candles=fetch_raw)
+    runner = CycleRunner(cfg, llm_factory=llm_factory, fetch_candles=fetch_raw,
+                         store=store)
 
     cycle = 0
     while True:

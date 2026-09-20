@@ -13,7 +13,27 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from .config import ROOT
+from .config import ROOT as ROOT  # noqa: F401 — watch/orchestrator 가 paths.ROOT 사용
+
+# 프로세스 단위 data root 오버라이드(격리 실행). None 이면 repo ROOT.
+_DATA_ROOT: Path | None = None
+
+
+def data_root() -> Path:
+    """resolve 기본 base — 격리 시 tempfile, 아니면 repo ROOT."""
+    return _DATA_ROOT if _DATA_ROOT is not None else ROOT
+
+
+def set_data_root(root: Path | None) -> Path | None:
+    """프로세스 data root 설정. 이전 값을 반환(테스트 복원용)."""
+    global _DATA_ROOT
+    prev = _DATA_ROOT
+    _DATA_ROOT = None if root is None else Path(root)
+    return prev
+
+
+def is_isolated() -> bool:
+    return _DATA_ROOT is not None
 
 # tests/golden/ops_path_manifest.json 의 paths 와 동일해야 한다 (레거시 계약).
 CANONICAL: dict[str, str] = {
@@ -150,7 +170,7 @@ def resolve(key: str, *, root: Path | None = None,
     """
     if key not in CANONICAL:
         raise KeyError(f"unknown path key {key!r}")
-    base = ROOT if root is None else Path(root)
+    base = data_root() if root is None else Path(root)
     legacy_rel = rel(key)
     new_rel = layout_rel(key)
 
@@ -213,7 +233,7 @@ def halt_pause_candidates(market: str, *, root: Path | None = None,
     m = str(market).upper()
     suffix = f".{m}"
     base = resolve("halt", root=root, configured=configured)
-    b = ROOT if root is None else Path(root)
+    b = data_root() if root is None else Path(root)
     legacy = b / CANONICAL["halt"]
     layout = b / LAYOUT["halt"]
     raw: list[Path] = [

@@ -303,6 +303,37 @@ def test_request_5xx_exhausted_raises(tmp_path, monkeypatch):
     assert calls["n"] == tc._RETRY_ATTEMPTS
 
 
+def test_order_create_no_retry_on_5xx(tmp_path, monkeypatch):
+    """order_create 는 이중주문 방지를 위해 첫 실패에서 즉시 전파."""
+    client = _retry_client(tmp_path, monkeypatch)
+    calls = {"n": 0}
+
+    def fake_request(method, url, **kw):
+        calls["n"] += 1
+        return _mock_resp(500, body="boom")
+
+    client.session.request = fake_request
+    with pytest.raises(TossAPIError) as exc:
+        client._request("order_create", json={"symbol": "005930"})
+    assert exc.value.status == 500
+    assert calls["n"] == 1
+
+
+def test_order_create_no_retry_on_transport(tmp_path, monkeypatch):
+    import requests
+    client = _retry_client(tmp_path, monkeypatch)
+    calls = {"n": 0}
+
+    def fake_request(method, url, **kw):
+        calls["n"] += 1
+        raise requests.exceptions.Timeout("slow")
+
+    client.session.request = fake_request
+    with pytest.raises(requests.exceptions.Timeout):
+        client._request("order_create", json={"symbol": "005930"})
+    assert calls["n"] == 1
+
+
 def test_request_4xx_raises_without_retry(tmp_path, monkeypatch):
     """요청 오류는 재시도해도 같다 — 즉시 raise(레이트리밋 낭비 방지)."""
     client = _retry_client(tmp_path, monkeypatch)

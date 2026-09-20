@@ -85,23 +85,37 @@ def should_sync(broker) -> bool:
 
 
 def halt_after_live_sync_failure(broker, store, error: BaseException) -> str:
-    """라이브 기동 동기화 실패 → 전역 HALT + 이벤트. HALT 경로 문자열 반환.
+    """라이브 기동 동기화 실패 → live_markets 마다 시장 pause(BUY만) + 이벤트.
 
-    원장이 실계좌와 어긋난 채 주문이 나가면 안 된다. 데몬은 떠 있어도 게이트가
-    BUY/SELL 을 전부 막는다. 운영자가 HALT 파일을 지우고 재동기화해야 한다.
+    전역 HALT 는 SELL(청산)까지 막아 위험하다. 시장 pause 는 해당 시장 BUY만
+    차단하고 청산 SELL 은 허용. 자동 해제 없음. 파일 기록 실패 시 메모리 pause.
+    수동 전역 HALT(engage_halt) 의미는 유지.
     """
     gate = getattr(broker, "gate", None)
-    if gate is None or not hasattr(gate, "engage_halt"):
-        raise RuntimeError("broker.gate.engage_halt 없음 — HALT 불가") from error
-    halt_path = gate.engage_halt(f"live_sync_failed: {error}")
-    log.error("실계좌 동기화 실패 — 전역 HALT 활성(%s): %s", halt_path, error)
+    if gate is None or not hasattr(gate, "pause_market"):
+        raise RuntimeError("broker.gate.pause_market 없음 — 시장 pause 불가") from error
+    markets = list(getattr(broker, "live_markets", None) or ["KR"])
+    paths: list[str] = []
+    for m in markets:
+        m = str(m).upper()
+        try:
+            p = gate.pause_market(m, f"live_sync_failed: {error}")
+            paths.append(str(p))
+        except OSError as e:
+            log.error("시장 pause 파일 기록 실패(%s) — 메모리 pause: %s", m, e)
+            if hasattr(gate, "pause_market_memory"):
+                gate.pause_market_memory(m)
+            paths.append(f"memory:{m}")
+    joined = ",".join(paths) if paths else "none"
+    log.error("실계좌 동기화 실패 — 시장 pause 활성(%s): %s", joined, error)
     if store is not None:
         try:
             store.log_event("error", None, {
-                "where": "live_sync", "error": str(error), "halt": str(halt_path)})
+                "where": "live_sync", "error": str(error),
+                "market_pause": paths})
         except Exception as e:
-            log.warning("live_sync HALT 이벤트 기록 실패: %s", e)
-    return str(halt_path)
+            log.warning("live_sync pause 이벤트 기록 실패: %s", e)
+    return joined
 
 
 def startup_sync_halt_reason(sync: dict, markets=()) -> str | None:
