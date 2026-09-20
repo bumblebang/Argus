@@ -17,6 +17,7 @@
 """
 from __future__ import annotations
 
+import inspect
 import threading
 import time
 from pathlib import Path
@@ -278,11 +279,20 @@ class BrainWorker:
         })
 
     def _invoke_cycle(self, wake_ctx: dict) -> object:
-        """cycle_fn(wake=...) 지원 시 각성 사유를 넘기고, 아니면 무인자 호출(밸류 워커 등)."""
-        try:
+        """cycle_fn(wake=...) 지원 여부를 호출 전에 정하고 한 번만 호출.
+
+        본문 TypeError 는 재호출하지 않는다(주문 일부 실행 후 사이클 재실행 방지).
+        """
+        if self._cycle_accepts_wake():
             return self.cycle_fn(wake=wake_ctx)
+        return self.cycle_fn()
+
+    def _cycle_accepts_wake(self) -> bool:
+        try:
+            inspect.signature(self.cycle_fn).bind(wake=None)
+            return True
         except TypeError:
-            return self.cycle_fn()
+            return False
 
     def _log(self, kind: str, payload: dict) -> None:
         if self.store:

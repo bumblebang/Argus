@@ -143,7 +143,10 @@ def test_unknown_blocks_reorder_and_holds_buying_power(tmp_path):
     assert len(client.placed) == 1
 
     again = broker.execute(Order("005930", "KR", "BUY", 1, 600_000), "tick2")
-    assert not again.ok and "미체결" in (again.reject_reason or "")
+    assert not again.ok and (
+        "미체결" in (again.reject_reason or "")
+        or "미확인" in (again.reject_reason or "")
+        or "UNKNOWN" in (again.reject_reason or ""))
     assert len(client.placed) == 1
 
     other = broker.execute(Order("000660", "KR", "BUY", 1, 600_000), "other")
@@ -407,7 +410,7 @@ def test_cancel_failure_keeps_order_working(tmp_path):
 
 
 def test_cancel_failure_abandons_after_ttl(tmp_path):
-    """취소가 계속 실패해도 abandon TTL 이면 강제 회수(+경보) — 전 종목 매수 동결 방지."""
+    """취소가 계속 실패해도 abandon TTL 이면 QUARANTINED(+경보) — 삭제 금지."""
     class _BadCancel(_Client):
         def cancel_order(self, account_seq, order_id):
             raise RuntimeError("취소 거부")
@@ -420,17 +423,21 @@ def test_cancel_failure_abandons_after_ttl(tmp_path):
                                side="BUY", qty=1, price=600_000, status="PENDING",
                                placed_at=time.time() - 120)
     out = broker.sweep_working_orders()
-    assert out["abandoned"] == 1 and store.get_working_orders() == []
+    assert out["abandoned"] == 1
+    rows = store.get_working_orders()
+    assert len(rows) == 1 and rows[0]["status"] == "QUARANTINED"
     kinds = [r["kind"] for r in store.conn.execute(
-        "SELECT kind FROM events WHERE kind='working_order_abandoned'").fetchall()]
-    assert kinds == ["working_order_abandoned"]
-    # 예약이 풀려 다른 종목 매수가 다시 통과한다.
+        "SELECT kind FROM events WHERE kind='working_order_quarantined'").fetchall()]
+    assert kinds == ["working_order_quarantined"]
+    # 격리 심볼은 막히지만 다른 종목 매수는 통과.
     ok_client = _Client({"status": "FILLED",
                          "execution": {"filledQuantity": 1,
                                        "averageFilledPrice": 600_000,
                                        "commission": 0, "tax": 0}})
     broker.client = ok_client
     assert broker.execute(Order("000660", "KR", "BUY", 1, 600_000), "thaw").ok
+    # 같은 심볼은 QUARANTINED 로 양방향 차단.
+    assert not broker.execute(Order("005930", "KR", "BUY", 1, 600_000), "blocked").ok
 
 
 def test_fetch_failure_abandons_after_ttl(tmp_path):
@@ -445,7 +452,9 @@ def test_fetch_failure_abandons_after_ttl(tmp_path):
                                side="BUY", qty=1, price=1_000, status="PENDING",
                                placed_at=time.time() - 10)
     out = broker.sweep_working_orders()
-    assert out["abandoned"] == 1 and store.get_working_orders() == []
+    assert out["abandoned"] == 1
+    rows = store.get_working_orders()
+    assert len(rows) == 1 and rows[0]["status"] == "QUARANTINED"
 
 
 def test_negative_abandon_ttl_never_drops(tmp_path):
@@ -466,7 +475,7 @@ def test_negative_abandon_ttl_never_drops(tmp_path):
 
 
 def test_execute_prunes_abandoned_before_gate(tmp_path):
-    """sweep 전이라도 execute 가 abandon 행을 비워 매수여력을 푼다."""
+    """sweep 전이라도 execute 가 abandon 행을 QUARANTINED 로 격리해 예약을 푼다."""
     store = Store(tmp_path / "t.db")
     client = _Client({"status": "FILLED",
                       "execution": {"filledQuantity": 1,
@@ -477,7 +486,8 @@ def test_execute_prunes_abandoned_before_gate(tmp_path):
                                side="BUY", qty=1, price=600_000, status="PENDING",
                                placed_at=time.time() - 120)
     assert broker.execute(Order("000660", "KR", "BUY", 1, 600_000), "thaw").ok
-    assert store.get_working_orders() == []
+    rows = store.get_working_orders()
+    assert len(rows) == 1 and rows[0]["status"] == "QUARANTINED"
 
 
 def test_unconfirmed_cancel_keeps_order_working(tmp_path):

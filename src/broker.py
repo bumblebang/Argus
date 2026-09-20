@@ -16,6 +16,7 @@ from decimal import Decimal, ROUND_DOWN
 import math
 import threading
 import time
+import uuid
 from typing import Any, Callable
 
 from .fill_result import ExecuteResult
@@ -38,8 +39,18 @@ _TERMINAL = {"FILLED", "CANCELED", "REJECTED", "CANCEL_REJECTED", "REPLACE_REJEC
 _PENDING = {"PENDING", "PENDING_CANCEL", "PENDING_REPLACE", "PARTIAL_FILLED", "REPLACED"}
 # place 성공 뒤 get_order 폴링이 전부 실패하면 status=UNKNOWN. _PENDING 에 없어
 # 레지스트리·예약을 건너뛰면 J1(이중지출)·J2(재발주)가 동시에 풀린다.
-# REJECTED 등 확정 종결은 여기 넣지 않는다.
-_TRACK_WORKING = _PENDING | {"UNKNOWN"}
+# REJECTED 등 확정 종결은 여기 넣지 않는다. QUARANTINED=취소 미확인 격리.
+_TRACK_WORKING = _PENDING | {"UNKNOWN", "QUARANTINED"}
+_LOCAL_ORDER_PREFIX = "local:"
+
+
+def _is_local_order_id(order_id: str | None) -> bool:
+    return bool(order_id) and str(order_id).startswith(_LOCAL_ORDER_PREFIX)
+
+
+def _is_blocking_working_status(status: str | None) -> bool:
+    s = str(status or "").upper()
+    return s in ("UNKNOWN", "QUARANTINED") or s.startswith("LOCAL")
 
 
 def _more_aggressive(side: str, new_px: float, old_px: float) -> bool:
@@ -185,10 +196,11 @@ class Broker:
         # 뇌 워커(진입)와 감시 루프(코드 청산)가 동시에 execute 할 수 있어 직렬화.
         # 주기 재대사(reconcile)도 이 락을 잡아 gate.check/체결과 원자적으로 계좌를 병합한다.
         self._lock = threading.Lock()
-        # 접수됐지만 원장 미반영인 주문 {symbol: Reservation}. 동일 종목 중복 주문을
-        # 막을 뿐 아니라, 게이트가 다른 종목 주문을 볼 때 이 예약분을 현금·노출에서
-        # 미리 뺀다(J1). 심볼 집합만으로는 계좌 단위 한도를 지킬 수 없다.
+        # 접수됐지만 원장 미반영인 주문 {reservation_id: Reservation}.
+        # 키는 uuid(심볼이 아님) — 반대 방향 주문이 서로 예약을 덮지 않게.
         self._inflight: dict[str, Reservation] = {}
+        # upsert_working_order 실패 시 메모리에 남겨 심볼 양방향 차단 + heartbeat 노출.
+        self._register_failed_symbols: set[str] = set()
         # 예약이 새면 매수가 영구히 막히므로 TTL 로 강제 회수(+경보). 0 이하면 비활성.
         self.reservation_ttl_sec = float(reservation_ttl_sec)
         # 미체결 주문 방치 시간. 넘으면 취소한다. 0 이면 즉시 취소, 음수면 취소 안 함.
@@ -275,7 +287,7 @@ class Broker:
         if prep is None:
             return self.last_result
 
-        sym = order.symbol
+        rid = prep.get("reservation_id")
         if prep["kind"] == "paper":
             try:
                 with self._lock:
@@ -284,7 +296,7 @@ class Broker:
                     return res
             finally:
                 with self._lock:
-                    self._clear_inflight(sym)
+                    self._clear_inflight(rid)
 
         try:
             filled_qty, avg_px, fee, status = self._reconcile_order(prep["order_id"])
@@ -299,7 +311,7 @@ class Broker:
                 return res
         finally:
             with self._lock:
-                self._clear_inflight(sym)
+                self._clear_inflight(rid)
 
     def execute_with_mirror(
         self, order: Order, reason: str, *,
@@ -394,24 +406,82 @@ class Broker:
             return None
         return max(0.0, (now if now is not None else time.time()) - float(ts))
 
+    def trading_health(self) -> dict:
+        """heartbeat/alert_check 용 거래 건강도(시세 ok 와 별개)."""
+        unknown: list[str] = []
+        quarantined: list[str] = []
+        store_error = None
+        if self.store is not None:
+            try:
+                for row in self.store.get_working_orders(settled=False) or []:
+                    sym = str(row.get("symbol") or "")
+                    st = str(row.get("status") or "").upper()
+                    oid = str(row.get("order_id") or "")
+                    if st == "QUARANTINED":
+                        if sym and sym not in quarantined:
+                            quarantined.append(sym)
+                    elif st == "UNKNOWN" or _is_local_order_id(oid):
+                        if sym and sym not in unknown:
+                            unknown.append(sym)
+            except Exception as e:
+                store_error = str(e)
+        gate = self.gate
+        halted = bool(gate and hasattr(gate, "is_globally_halted")
+                      and gate.is_globally_halted())
+        paused = []
+        if gate and hasattr(gate, "pause_status"):
+            ps = gate.pause_status()
+            if ps and ps not in ("none", "ALL"):
+                paused = ps.split("+")
+            elif ps == "ALL":
+                paused = ["KR", "US"]
+        elif gate:
+            for m in ("KR", "US"):
+                if hasattr(gate, "is_market_paused") and gate.is_market_paused(m):
+                    paused.append(m)
+        return {
+            "mode": self.mode,
+            "halted": halted,
+            "paused": paused,
+            "sync_health": dict(self.sync_health),
+            "unknown_symbols": sorted(unknown),
+            "quarantined_symbols": sorted(quarantined),
+            "register_failed_symbols": sorted(self._register_failed_symbols),
+            "store_error": store_error,
+        }
+
     def activity_generation(self) -> int:
         """주문 활동 세대(락 안 스냅샷). 재대사 fetch 직전 캡처용."""
         with self._lock:
             return self._activity_gen
 
-    def _mark_inflight(self, order: Order, order_id: str | None = None) -> None:
-        """락 안: 예약 등록 + activity_gen 증가."""
-        self._inflight[order.symbol] = Reservation(
+    def _mark_inflight(self, order: Order, order_id: str | None = None) -> str:
+        """락 안: 예약 등록 + activity_gen 증가. reservation_id(uuid) 반환."""
+        rid = str(uuid.uuid4())
+        self._inflight[rid] = Reservation(
             symbol=order.symbol, market=order.market, side=order.side,
             qty=float(order.qty), price=float(order.price),
             order_id=order_id, placed_at=time.time())
         self._activity_gen += 1
+        return rid
 
-    def _clear_inflight(self, symbol: str) -> None:
-        """락 안: 예약 해제. 실제로 빠져 나갔을 때만 gen 증가."""
-        if self._inflight.pop(symbol, None) is None:
+    def _clear_inflight(self, reservation_id: str | None) -> None:
+        """락 안: 자기 reservation_id 만 해제."""
+        if not reservation_id:
+            return
+        if self._inflight.pop(reservation_id, None) is None:
             return
         self._activity_gen += 1
+
+    def _inflight_for(self, symbol: str, side: str | None = None) -> list[tuple[str, Reservation]]:
+        out: list[tuple[str, Reservation]] = []
+        for rid, r in self._inflight.items():
+            if r.symbol != symbol:
+                continue
+            if side is not None and str(r.side).upper() != str(side).upper():
+                continue
+            out.append((rid, r))
+        return out
 
     def _prune_expired_reservations(self) -> None:
         """락 안: 만료된 in-flight 예약 회수.
@@ -422,16 +492,17 @@ class Broker:
         """
         if self._inflight and self.reservation_ttl_sec > 0:
             now = time.time()
-            for sym, r in list(self._inflight.items()):
+            for rid, r in list(self._inflight.items()):
                 if now - r.placed_at <= self.reservation_ttl_sec:
                     continue
-                self._inflight.pop(sym, None)
+                self._inflight.pop(rid, None)
                 self._activity_gen += 1
                 log.error("[예약 만료] %s %s x%s (id=%s, %.0f초 경과) — 강제 회수",
-                          r.side, sym, r.qty, r.order_id, now - r.placed_at)
-                self._emit_symbol("reservation_expired", sym, {
-                    "symbol": sym, "side": r.side, "qty": r.qty,
+                          r.side, r.symbol, r.qty, r.order_id, now - r.placed_at)
+                self._emit_symbol("reservation_expired", r.symbol, {
+                    "symbol": r.symbol, "side": r.side, "qty": r.qty,
                     "price": r.price, "order_id": r.order_id,
+                    "reservation_id": rid,
                     "age_sec": round(now - r.placed_at, 1)})
 
     def _active_reservations(self) -> list[Reservation]:
@@ -453,28 +524,38 @@ class Broker:
         return self._working_age(row, now) >= self.working_order_abandon_ttl_sec
 
     def _abandon_working_order(self, row: dict, now: float, *, why: str) -> None:
-        """취소·조회가 안 되는 미체결 행을 레지스트리에서 버리고 경보.
+        """취소·조회가 안 되는 미체결 행을 QUARANTINED 로 격리(삭제 금지).
 
-        증권사 쪽 주문이 아직 살아 있을 수 있다(고아 위험). 그래도 한 행이
-        매수여력을 영구 홀드해 전 종목 매수를 죽이는 쪽이 더 비싸다 — inflight
-        reservation_ttl 과 같은 취지. 이벤트·에러 로그로 조용히 넘어가지 않는다.
+        증권사 쪽 주문이 아직 살아 있을 수 있다. 삭제하면 재발주·이중주문이 열린다.
+        QUARANTINED 는 _TRACK_WORKING 에 포함 → 예약·양방향 차단 유지. 다음 sweep 이
+        조회로 해소하고, 미해소면 경보를 반복한다.
         """
         oid = row["order_id"]
+        status = str(row.get("status") or "").upper()
+        if status == "QUARANTINED":
+            # 이미 격리 — prune 재호출 시 이벤트 노이즈 방지. 경보만 주기적으로.
+            age = self._working_age(row, now)
+            log.error("[미체결 격리 유지] %s %s (id=%s, %.0f초, %s)",
+                      row.get("side"), row.get("symbol"), oid, age, why)
+            self._emit_symbol("working_order_quarantine_alert", row.get("symbol"), {
+                "order_id": oid, "side": row.get("side"), "qty": row.get("qty"),
+                "price": row.get("price"), "filled_qty": row.get("filled_qty"),
+                "status": "QUARANTINED", "age_sec": round(age, 1), "why": why})
+            return
         age = self._working_age(row, now)
-        log.error("[미체결 강제회수] %s %s x%s @ %s (id=%s, %.0f초, %s) — 예약 해제",
+        log.error("[미체결 격리] %s %s x%s @ %s (id=%s, %.0f초, %s) — QUARANTINED",
                   row.get("side"), row.get("symbol"), row.get("qty"),
                   row.get("price"), oid, age, why)
-        self._store_call(self.store.delete_working_order, oid)
-        self._emit_symbol("working_order_abandoned", row.get("symbol"), {
+        self._store_call(self.store.update_working_order, oid, status="QUARANTINED")
+        self._emit_symbol("working_order_quarantined", row.get("symbol"), {
             "order_id": oid, "side": row.get("side"), "qty": row.get("qty"),
             "price": row.get("price"), "filled_qty": row.get("filled_qty"),
-            "status": row.get("status"), "age_sec": round(age, 1), "why": why})
+            "status": "QUARANTINED", "age_sec": round(age, 1), "why": why})
 
     def _prune_abandoned_working_orders(self) -> None:
-        """락 안: abandon TTL 지난 미체결 행 회수(게이트 직전 방어).
+        """락 안: abandon TTL 지난 미체결 행 격리(게이트 직전 방어).
 
-        sweep 이 취소 실패만 반복하면 예약이 남는다. execute 경로에서도
-        같은 TTL 로 비워 전 종목 매수 동결을 끊는다.
+        이미 QUARANTINED 인 행은 건너뛴다(매 execute 재격리 이벤트 노이즈 방지).
         """
         if self.store is None or self.working_order_abandon_ttl_sec < 0:
             return
@@ -484,6 +565,8 @@ class Broker:
             return
         now = time.time()
         for row in rows:
+            if str(row.get("status") or "").upper() == "QUARANTINED":
+                continue
             if self._should_abandon_working(row, now):
                 self._abandon_working_order(row, now, why="ttl_prune")
 
@@ -510,7 +593,7 @@ class Broker:
             # abandon 대상은 예약에서 제외(직전 prune 이 지웠어도 경합 대비).
             if self._should_abandon_working(row, now):
                 continue
-            if row["symbol"] in self._inflight:
+            if any(r.symbol == row["symbol"] for r in self._inflight.values()):
                 continue
             placed = float(row["placed_at"] or 0.0)
             if since is not None and placed <= since:
@@ -543,7 +626,7 @@ class Broker:
             # buying_power 갱신이 막혀 오히려 원장이 더 오래 틀린다.
             self._prune_expired_reservations()
             if self._inflight:
-                syms = sorted(self._inflight)
+                syms = sorted({r.symbol for r in self._inflight.values()})
                 log.debug("재대사 연기 — in-flight %s", syms)
                 return {"deferred": True, "reason": "inflight", "inflight": syms}
             if expect_gen is not None and expect_gen != self._activity_gen:
@@ -663,29 +746,45 @@ class Broker:
                 fee=float(fee), applied_qty=applied_qty,
                 applied_notional=applied_notional, applied_fee=applied_fee,
                 reason=reason)
+            self._register_failed_symbols.discard(order.symbol)
         except Exception as e:
-            log.error("미체결 주문 기록 실패 — 고아 주문 위험 id=%s: %s", order_id, e)
+            log.error("미체결 주문 기록 실패 — 메모리 격리·심볼 차단 id=%s: %s",
+                      order_id, e)
+            self._register_failed_symbols.add(order.symbol)
+            raise
 
     def _reject_working_order(self, order: Order, base_kw: dict) -> bool:
         """같은 종목·같은 방향 미체결이 있으면 재발주 거부.
 
-        side 구분 없이 막으면 미체결 BUY 가 ExitExecutor 손절 SELL 을
-        게이트보다 먼저 차단한다(실재현). 반대 방향은 통과.
-
-        같은 방향이어도 (a) TTL 경과 (b) 더 공격적 재지정가 이면
-        재대사 타이머를 기다리지 않고 여기서 취소 시도한다.
-        working_order_ttl_sec=60 인데 sweep 만 reconcile_sec(기본 300)에
-        묶이면 손절 재시도가 60~360초 밀리고, 가격이 더 빠져도 새 주문이
-        안 나간다. 취소 실패 시에는 여전히 거부(이중 주문 방지).
+        UNKNOWN/QUARANTINED/local: 행과 등록실패 심볼은 block_on_working_order=False
+        로도 우회 불가(양방향 차단).
         """
-        if not self.block_on_working_order or self.store is None:
+        if order.symbol in self._register_failed_symbols:
+            self.last_reject_reason = "미체결 등록 실패 심볼(격리)"
+            log.info("[거부] %s %s — 등록 실패 격리", order.side, order.symbol)
+            self.last_result = ExecuteResult.rejected(self.last_reject_reason, **base_kw)
+            return True
+        if self.store is None:
             return False
         try:
-            rows = self.store.get_working_orders(
-                order.symbol, side=order.side, settled=False)
+            all_rows = self.store.get_working_orders(order.symbol, settled=False)
         except Exception as e:
             log.warning("미체결 조회 실패(통과) %s: %s", order.symbol, e)
             return False
+        for row in all_rows or []:
+            st = str(row.get("status") or "").upper()
+            oid = str(row.get("order_id") or "")
+            if st in ("UNKNOWN", "QUARANTINED") or _is_local_order_id(oid):
+                self.last_reject_reason = f"미확인/격리 주문 존재({st or 'local'})"
+                log.info("[거부] %s %s — UNKNOWN/QUARANTINED 양방향 차단 id=%s",
+                         order.side, order.symbol, oid)
+                self.last_result = ExecuteResult.rejected(
+                    self.last_reject_reason, **base_kw)
+                return True
+        if not self.block_on_working_order:
+            return False
+        rows = [r for r in (all_rows or [])
+                if str(r.get("side") or "").upper() == str(order.side).upper()]
         if not rows:
             return False
         if self._try_release_same_side_working(order, rows):
@@ -707,6 +806,10 @@ class Broker:
         now = time.time()
         released = False
         for row in rows:
+            if _is_local_order_id(row.get("order_id")):
+                continue
+            if str(row.get("status") or "").upper() in ("UNKNOWN", "QUARANTINED"):
+                continue
             age = now - float(row.get("placed_at") or now)
             ttl_due = (self.working_order_ttl_sec >= 0
                        and age >= self.working_order_ttl_sec)
@@ -741,15 +844,19 @@ class Broker:
             except Exception as e:
                 log.warning("반대편 미체결 조회 실패 %s: %s", order.symbol, e)
         # place-poll 창: store 반영 전 inflight BUY
-        cur = self._inflight.get(order.symbol)
-        if (cur is not None and str(cur.side).upper() == "BUY" and cur.order_id
-                and not any(r.get("order_id") == cur.order_id for r in rows)):
-            rows.append({
-                "order_id": cur.order_id, "symbol": order.symbol,
-                "market": order.market or cur.market, "side": "BUY",
-                "qty": float(cur.qty), "price": float(cur.price),
-            })
+        for _rid, cur in self._inflight_for(order.symbol, side="BUY"):
+            if cur.order_id and not _is_local_order_id(cur.order_id) and not any(
+                    r.get("order_id") == cur.order_id for r in rows):
+                rows.append({
+                    "order_id": cur.order_id, "symbol": order.symbol,
+                    "market": order.market or cur.market, "side": "BUY",
+                    "qty": float(cur.qty), "price": float(cur.price),
+                })
         for row in rows:
+            if _is_local_order_id(row.get("order_id")):
+                log.warning("[LIVE] local 키 반대편 BUY — API 취소 불가 id=%s",
+                            row.get("order_id"))
+                continue
             log.info("[LIVE] 청산 전 반대편 BUY 취소 id=%s %s x%s @ %s",
                      row["order_id"], row["symbol"], row["qty"], row.get("price"))
             if not self._cancel_and_confirm(row["order_id"], row):
@@ -759,11 +866,8 @@ class Broker:
     def _reject_inflight(self, order: Order, base_kw: dict) -> bool:
         """in-flight 거부(같은 방향만). True 이면 last_result 설정됨."""
         self._prune_expired_reservations()    # 만료 회수 후 판정
-        cur = self._inflight.get(order.symbol)
-        if cur is None:
-            return False
-        if str(cur.side).upper() != str(order.side).upper():
-            # 미체결 폴링 중 BUY 가 손절 SELL 을 막지 않게.
+        same = self._inflight_for(order.symbol, side=order.side)
+        if not same:
             return False
         self.last_reject_reason = "동일 종목 주문 처리 중(in-flight)"
         log.info("[거부] %s %s — in-flight", order.side, order.symbol)
@@ -774,16 +878,9 @@ class Broker:
         """레지스트리 정산 — 기동 시 1회 + 주기 재대사마다.
 
         상태를 재조회해 종결분을 정산하고, TTL 초과 미체결은 취소한다. **원장 수량은
-        건드리지 않는다** — 체결 반영은 재대사(live holdings)가 단일 소유자이고,
-        여기서 apply_fill 하면 이중 계상이 된다. 이 표는 (a) 재발주 차단,
-        (b) 고아 주문 회수, (c) J3 귀속용 실체결가 출처의 세 역할을 한다.
+        건드리지 않는다**. local: 키는 API 에 보내지 않고 격리·경보만 유지.
 
-        (c) 때문에 원장 미반영 체결분이 남은 종결 주문은 삭제하지 않고 settled_at
-        만 찍는다. 재대사가 실체결가로 소비한 뒤 지운다. 소비되지 않은 채 오래
-        남으면 attribution_ttl 로 버리고 unattributed_fill 을 남긴다.
-
-        매도 주문 조회가 한 건이라도 실패하면 ``block_reconcile=True`` — 재대사가
-        보유 감소를 먼저 흡수하면 settled 출처가 없어 손익이 영구 구멍 난다.
+        조회는 락 밖, 적용은 락 안 + 행 재읽기(stale 응답 미적용).
         """
         if self.store is None or self.client is None or self.account_seq is None:
             return {"skipped": True, "block_reconcile": False}
@@ -794,7 +891,8 @@ class Broker:
             return {"error": str(e), "block_reconcile": True}
         out = {"checked": 0, "settled": 0, "canceled": 0, "cancel_failed": 0,
                "working": 0, "awaiting_attribution": 0, "dropped": 0,
-               "abandoned": 0, "fetch_failed": 0, "block_reconcile": False}
+               "abandoned": 0, "quarantined": 0, "fetch_failed": 0,
+               "block_reconcile": False, "local_orphan": 0}
         now = time.time()
         for row in rows:
             oid = row["order_id"]
@@ -805,47 +903,95 @@ class Broker:
                     out["awaiting_attribution"] += 1
                 continue
             out["checked"] += 1
+            if _is_local_order_id(oid):
+                out["local_orphan"] += 1
+                out["working"] += 1
+                log.error("[미확인 local 주문] id=%s %s %s — API 조회 불가, 격리 유지",
+                          oid, row.get("side"), row.get("symbol"))
+                self._emit_symbol("working_order_local_orphan", row.get("symbol"), {
+                    "order_id": oid, "side": row.get("side"), "status": row.get("status"),
+                    "age_sec": round(self._working_age(row, now), 1)})
+                if self._should_abandon_working(row, now):
+                    with self._lock:
+                        fresh = self._working_row_snapshot(oid)
+                        if fresh is None or fresh.get("settled_at"):
+                            continue
+                        self._abandon_working_order(fresh, now, why="local_orphan")
+                        out["quarantined"] += 1
+                continue
             info = self._fetch_order(oid)
-            if info is None:
-                if self._should_abandon_working(row, now):
-                    self._abandon_working_order(row, now, why="fetch_failed")
-                    out["abandoned"] += 1
-                else:
+            with self._lock:
+                fresh = self._working_row_snapshot(oid)
+                if fresh is None:
+                    continue
+                if (fresh.get("status") != row.get("status")
+                        or float(fresh.get("filled_qty") or 0)
+                        != float(row.get("filled_qty") or 0)
+                        or fresh.get("settled_at")):
+                    # 행이 바뀌었으면 옛 응답 적용 안 함
                     out["working"] += 1
-                    out["fetch_failed"] += 1
-                    # SELL 체결가를 못 찍은 채 holdings 를 덮으면 귀속 대상(감소)이 사라진다.
-                    if str(row.get("side") or "").upper() == "SELL":
-                        out["block_reconcile"] = True
-                continue
-            status, filled, avg, fee = _parse_execution(info)
-            self._store_call(self.store.update_working_order, oid, status=status,
-                             filled_qty=filled, filled_avg=avg, fee=fee)
-            if status in _TERMINAL:
-                out["settled"] += 1
-                if self._settle_or_drop(oid, row, filled, now):
-                    out["awaiting_attribution"] += 1
-                self._emit_symbol("working_order_settled", row["symbol"], {
-                    "order_id": oid, "status": status, "filled_qty": filled,
-                    "avg_price": avg, "qty": row["qty"], "side": row["side"]})
-                continue
-            age = now - float(row["placed_at"] or now)
-            if self.working_order_ttl_sec < 0 or age < self.working_order_ttl_sec:
-                # 취소 유예 중이라도 abandon TTL 이면 강제 회수(영구 동결 방지).
-                if self._should_abandon_working(row, now):
-                    self._abandon_working_order(row, now, why="ttl_no_cancel")
-                    out["abandoned"] += 1
-                else:
-                    out["working"] += 1
-                continue
+                    continue
+                if info is None:
+                    if self._should_abandon_working(fresh, now):
+                        self._abandon_working_order(fresh, now, why="fetch_failed")
+                        out["quarantined"] += 1
+                        out["abandoned"] += 1
+                    else:
+                        out["working"] += 1
+                        out["fetch_failed"] += 1
+                        if str(fresh.get("side") or "").upper() == "SELL":
+                            out["block_reconcile"] = True
+                    continue
+                status, filled, avg, fee = _parse_execution(info)
+                self._store_call(self.store.update_working_order, oid, status=status,
+                                 filled_qty=filled, filled_avg=avg, fee=fee)
+                if status in _TERMINAL:
+                    out["settled"] += 1
+                    if self._settle_or_drop(oid, fresh, filled, now):
+                        out["awaiting_attribution"] += 1
+                    self._emit_symbol("working_order_settled", fresh["symbol"], {
+                        "order_id": oid, "status": status, "filled_qty": filled,
+                        "avg_price": avg, "qty": fresh["qty"], "side": fresh["side"]})
+                    continue
+                age = now - float(fresh["placed_at"] or now)
+                if self.working_order_ttl_sec < 0 or age < self.working_order_ttl_sec:
+                    if (str(fresh.get("status") or "").upper() != "QUARANTINED"
+                            and self._should_abandon_working(fresh, now)):
+                        self._abandon_working_order(fresh, now, why="ttl_no_cancel")
+                        out["quarantined"] += 1
+                        out["abandoned"] += 1
+                    else:
+                        out["working"] += 1
+                    continue
+            # 취소는 락 밖 I/O
             if self._cancel_and_confirm(oid, row):
                 out["canceled"] += 1
-            elif self._should_abandon_working(row, now):
-                self._abandon_working_order(row, now, why="cancel_failed")
-                out["abandoned"] += 1
             else:
-                out["cancel_failed"] += 1
-                out["working"] += 1
+                with self._lock:
+                    fresh = self._working_row_snapshot(oid)
+                    if fresh is None or fresh.get("settled_at"):
+                        continue
+                    if self._should_abandon_working(fresh, now):
+                        self._abandon_working_order(fresh, now, why="cancel_failed")
+                        out["quarantined"] += 1
+                        out["abandoned"] += 1
+                    else:
+                        out["cancel_failed"] += 1
+                        out["working"] += 1
         return out
+
+    def _working_row_snapshot(self, order_id: str) -> dict | None:
+        """락 안: order_id 현재 행. 없으면 None."""
+        if self.store is None:
+            return None
+        try:
+            rows = self.store.get_working_orders()
+        except Exception:
+            return None
+        for r in rows or []:
+            if r.get("order_id") == order_id:
+                return r
+        return None
 
     def _settle_or_drop(self, order_id: str, row: dict,
                         filled: float, now: float) -> bool:
@@ -892,6 +1038,8 @@ class Broker:
         return True
 
     def _fetch_order(self, order_id: str) -> dict | None:
+        if _is_local_order_id(order_id):
+            return None
         try:
             return self.client.get_order(self.account_seq, order_id) or {}
         except Exception as e:
@@ -900,6 +1048,9 @@ class Broker:
 
     def _cancel_and_confirm(self, order_id: str, row: dict) -> bool:
         """취소 요청 후 재조회로 확인. 확인 못 하면 레지스트리에 남긴다(재발주 계속 차단)."""
+        if _is_local_order_id(order_id):
+            log.warning("[LIVE] local 키 취소 불가 id=%s", order_id)
+            return False
         try:
             self.client.cancel_order(self.account_seq, order_id)
         except Exception as e:
@@ -980,17 +1131,17 @@ class Broker:
         qty_before = float(self.account.position(order.symbol).qty)
         avg_before = float(self.account.position(order.symbol).avg_price or 0.0)
         if self.mode != "live":
-            self._mark_inflight(order)
-            return {"kind": "paper", "base_kw": base_kw,
+            rid = self._mark_inflight(order)
+            return {"kind": "paper", "base_kw": base_kw, "reservation_id": rid,
                     "qty_before": qty_before, "avg_before": avg_before}
 
-        order_id = self._place_live_order(order, reason)
-        if order_id is None:
+        placed = self._place_live_order(order, reason)
+        if placed is None:
             return None
-        self._mark_inflight(order, order_id)  # place 직후(락 안) — 중복 주문 race 차단
-        # place→poll 창에 working 이 비면 반대 SELL 이 취소를 못 함 → 즉시 등록.
-        self._register_working_order(order, order_id, "PENDING", 0.0, reason)
+        order_id = placed["order_id"]
+        rid = self._mark_inflight(order, order_id)
         return {"kind": "live", "order_id": order_id, "base_kw": base_kw,
+                "reservation_id": rid,
                 "qty_before": qty_before, "avg_before": avg_before}
 
     def _finish_paper(self, order: Order, reason: str, base_kw: dict) -> ExecuteResult:
@@ -1352,8 +1503,13 @@ class Broker:
                 break
         return picked
 
-    def _place_live_order(self, order: Order, reason: str) -> str | None:
-        """라이브 주문 접수만(락 안). orderId 또는 None(실패 시 last_result 설정)."""
+    def _place_live_order(self, order: Order, reason: str) -> dict | None:
+        """라이브 주문 접수(락 안).
+
+        POST 전 local:<uuid> UNKNOWN 을 commit 한 뒤에만 전송. orderId 받으면
+        rekey UPDATE. 전송 예외·orderId 없음·등록 실패는 ExecuteResult.unknown.
+        반환: {"order_id": str} 또는 None(last_result 설정됨).
+        """
         base_kw = {"order_qty": float(order.qty), "limit_price": float(order.price)}
         fractional_us = (
             str(order.market).upper() == "US"
@@ -1365,44 +1521,76 @@ class Broker:
             if fractional_us and order.side == "BUY"
             else None
         )
+        client_order_id = str(uuid.uuid4())
+        local_id = f"{_LOCAL_ORDER_PREFIX}{client_order_id}"
         request_meta = {
             "side": order.side,
             "qty": order.qty,
             "order_type": order_type,
+            "client_order_id": client_order_id,
             **({"order_amount": order_amount} if order_amount is not None else {}),
         }
+        if self.store is None:
+            self.last_result = ExecuteResult.unknown(
+                "working_orders Store 없음 — 실주문 거부", **base_kw, side=order.side)
+            return None
+        try:
+            self.store.upsert_working_order(
+                order_id=local_id, symbol=order.symbol, market=order.market,
+                side=order.side, qty=float(order.qty), price=float(order.price),
+                status="UNKNOWN", filled_qty=0.0, reason=reason)
+        except Exception as e:
+            log.error("[LIVE] local UNKNOWN commit 실패 — POST 안 함: %s", e)
+            self.last_result = ExecuteResult.unknown(
+                "local working commit 실패", **base_kw, side=order.side)
+            return None
+
         try:
             if order_amount is not None:
-                # 토스 US 소수점 BUY는 MARKET+orderAmount만 허용한다.
                 resp = self.client.place_order(
                     account_seq=self.account_seq, symbol=order.symbol, side=order.side,
-                    order_amount=order_amount, order_type=order_type)
+                    order_amount=order_amount, order_type=order_type,
+                    client_order_id=client_order_id)
             else:
-                # 정수 주문은 기존 지정가 수량 주문. US 소수점 SELL만 시장가 수량 주문.
                 resp = self.client.place_order(
                     account_seq=self.account_seq, symbol=order.symbol, side=order.side,
                     qty=order.qty, order_type=order_type,
-                    price=(order.price if order_type == "LIMIT" else None))
+                    price=(order.price if order_type == "LIMIT" else None),
+                    client_order_id=client_order_id)
         except Exception as e:
             log.error("[LIVE] 주문 전송 실패 — %s %s x%s @ %.2f (%s%s): %s",
                       order.side, order.symbol, order.qty, order.price, order_type,
                       f", amount={order_amount}" if order_amount is not None else "", e)
             self._emit("live_order_error", order, {
-                **request_meta, "error": str(e), "reason": reason})
-            self.last_result = ExecuteResult.rejected(
-                "주문 전송 실패", **base_kw)
+                **request_meta, "error": str(e), "reason": reason,
+                "local_order_id": local_id})
+            self.last_result = ExecuteResult.unknown(
+                "주문 전송 실패(미확인)", order_id=local_id, status="UNKNOWN",
+                side=order.side, **base_kw)
             return None
 
         order_id = self._order_id(resp)
         if order_id is None:
-            log.error("[LIVE] 주문 응답에 주문식별자(orderId) 없음 — 실패 처리: %s", resp)
+            log.error("[LIVE] 주문 응답에 주문식별자(orderId) 없음 — UNKNOWN: %s", resp)
             self._emit("live_order_error", order,
                        {**request_meta, "error": "응답에 orderId 없음",
-                        "resp": str(resp)[:300],
-                        "reason": reason})
-            self.last_result = ExecuteResult.rejected("orderId 없음", **base_kw)
+                        "resp": str(resp)[:300], "reason": reason,
+                        "local_order_id": local_id})
+            self.last_result = ExecuteResult.unknown(
+                "orderId 없음(미확인)", order_id=local_id, status="UNKNOWN",
+                side=order.side, **base_kw)
             return None
-        return order_id
+
+        try:
+            self.store.rekey_working_order(local_id, order_id, status="PENDING")
+        except Exception as e:
+            log.error("[LIVE] orderId rekey 실패 local=%s → %s: %s", local_id, order_id, e)
+            self._register_failed_symbols.add(order.symbol)
+            self.last_result = ExecuteResult.unknown(
+                "접수 후 등록 실패", order_id=order_id, status="UNKNOWN",
+                side=order.side, **base_kw)
+            return None
+        return {"order_id": order_id}
 
     def _reconcile_order(self, order_id: str) -> tuple[float, float | None, float, str]:
         """주문을 폴링해 (체결수량, 평균체결가, 수수료+세금, status).

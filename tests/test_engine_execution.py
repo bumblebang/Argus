@@ -302,7 +302,7 @@ def test_inflight_blocks_concurrent_live_order(tmp_path):
     release.set()
     t.join(timeout=5)
     assert first_res["r"].ok
-    assert "005930" not in broker._inflight
+    assert not any(r.symbol == "005930" for r in broker._inflight.values())
 
 
 def test_reconcile_deferred_while_inflight(tmp_path):
@@ -327,8 +327,8 @@ def test_reconcile_deferred_on_stale_snapshot_gen(tmp_path):
     broker = _broker(tmp_path, mode="live")
     gen = broker.activity_generation()
     with broker._lock:
-        broker._mark_inflight(Order("005930", "KR", "BUY", 1, 70000.0))
-        broker._clear_inflight("005930")
+        rid = broker._mark_inflight(Order("005930", "KR", "BUY", 1, 70000.0))
+        broker._clear_inflight(rid)
     assert broker.activity_generation() == gen + 2
     assert not broker._inflight
 
@@ -370,7 +370,8 @@ def test_finish_live_skips_double_apply_after_reconcile(tmp_path):
 def test_execute_locked_passes_qty_before_to_finish_live(tmp_path):
     """레거시 _execute_locked 도 qty_before 를 넘겨 이중 apply_fill 을 막는다."""
     from src.strategies.base import Position
-    broker = _broker(tmp_path, mode="live", client=_MockClient(
+    store = Store(tmp_path / "t.db")
+    broker = _broker(tmp_path, mode="live", store=store, client=_MockClient(
         resp={"orderId": "L1"}, order_detail=_filled(10, 70000, "FILLED")))
     # 재대사가 이미 체결분을 원장에 반영한 상태.
     broker.account.positions["005930"] = Position(symbol="005930", qty=10, avg_price=70000)
@@ -516,7 +517,8 @@ def test_paper_begin_registers_inflight_before_finish(tmp_path):
     def _snap_begin(order, reason, base_kw):
         prep = Broker._begin_execute_locked(broker, order, reason, base_kw)
         if prep and prep.get("kind") == "paper":
-            seen["inflight"] = "005930" in broker._inflight
+            seen["inflight"] = any(
+                r.symbol == "005930" for r in broker._inflight.values())
         return prep
 
     broker._begin_execute_locked = _snap_begin

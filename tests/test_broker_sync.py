@@ -272,7 +272,7 @@ def test_should_sync_gates_on_broker_mode(tmp_path):
 
 
 def test_halt_after_live_sync_failure_blocks_orders(tmp_path):
-    """부재(P0 L3): sync 실패 핸들러 → HALT 파일 + 게이트 BUY/SELL 거부."""
+    """기동 sync 실패 → 시장 pause(BUY만). 전역 HALT 아님 — SELL 허용."""
     from src.broker import Broker
     from src.broker_sync import halt_after_live_sync_failure
     from src.risk_gate import RiskGate, Order
@@ -287,18 +287,22 @@ def test_halt_after_live_sync_failure_blocks_orders(tmp_path):
     broker = Broker(account=acct, gate=gate, mode="live", store=store,
                     live_markets=["KR"])
     path = halt_after_live_sync_failure(broker, store, RuntimeError("holdings down"))
-    assert halt.exists()
-    assert path == str(halt)
-    assert "live_sync_failed" in halt.read_text(encoding="utf-8")
-    assert gate.is_globally_halted()
+    pause = halt.with_name(halt.name + ".KR")
+    assert pause.exists()
+    assert "HALT.KR" in path or str(pause) in path or path.endswith(".KR")
+    assert "live_sync_failed" in pause.read_text(encoding="utf-8")
+    assert not gate.is_globally_halted()
+    assert gate.is_market_paused("KR")
     buy = gate.check(Order("005930", "KR", "BUY", 1, 70000), acct)
+    assert not buy.approved and "pause" in buy.reason
+    # 청산 SELL 은 pause 를 통과(보유만 맞으면).
+    acct.apply_fill("005930", "KR", "BUY", 1, 70000, 0.0, "seed")
     sell = gate.check(Order("005930", "KR", "SELL", 1, 70000), acct)
-    assert not buy.approved and "킬스위치" in buy.reason
-    assert not sell.approved and "킬스위치" in sell.reason
+    assert sell.approved
     evs = store.recent_events("error", 0)
     assert len(evs) >= 1
     payload = json.loads(evs[0]["payload"])
-    assert payload["where"] == "live_sync" and "halt" in payload
+    assert payload["where"] == "live_sync" and "market_pause" in payload
     store.close()
 
 

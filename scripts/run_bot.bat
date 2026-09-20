@@ -17,6 +17,7 @@ if not exist "%ARGUS%" if not exist "%PY%" (
 echo.>> logs\bot.run.log
 echo ===== run %date% %time% =====>> logs\bot.run.log
 
+set "ARGUS_RUN_BOT=1"
 if exist "%ARGUS%" (
   "%ARGUS%" market-state >> logs\bot.run.log 2>&1
   "%ARGUS%" agent-cycle --cli >> logs\bot.run.log 2>&1

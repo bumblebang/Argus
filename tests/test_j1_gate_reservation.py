@@ -12,6 +12,7 @@ import pytest
 from src.broker import Broker
 from src.paper_account import PaperAccount
 from src.risk_gate import Order, Reservation, RiskGate
+from src.engine.store import Store
 
 
 def _gate(tmp_path, **over):
@@ -129,6 +130,7 @@ class _HoldClient:
 
 
 def _live_broker(tmp_path, cash=100_000, **kw):
+    kw.setdefault("store", Store(tmp_path / "j1.db"))
     return Broker(account=_acct(tmp_path, cash), gate=_gate(tmp_path),
                   mode="live", account_seq="A1", live_markets=["KR"], **kw)
 
@@ -180,8 +182,8 @@ def test_expired_reservation_is_reclaimed(tmp_path):
     broker = _live_broker(tmp_path)
     broker.reservation_ttl_sec = 1.0
     with broker._lock:
-        broker._mark_inflight(Order("005930", "KR", "BUY", 1, 60_000))
-        broker._inflight["005930"].placed_at -= 5.0
+        rid = broker._mark_inflight(Order("005930", "KR", "BUY", 1, 60_000))
+        broker._inflight[rid].placed_at -= 5.0
         assert broker._active_reservations() == []
     assert broker._inflight == {}
 
@@ -190,8 +192,8 @@ def test_ttl_zero_disables_reclaim(tmp_path):
     broker = _live_broker(tmp_path)
     broker.reservation_ttl_sec = 0.0
     with broker._lock:
-        broker._mark_inflight(Order("005930", "KR", "BUY", 1, 60_000))
-        broker._inflight["005930"].placed_at -= 10_000
+        rid = broker._mark_inflight(Order("005930", "KR", "BUY", 1, 60_000))
+        broker._inflight[rid].placed_at -= 10_000
         assert len(broker._active_reservations()) == 1
 
 
@@ -200,8 +202,8 @@ def test_expired_reservation_unblocks_reconcile(tmp_path):
     broker = _live_broker(tmp_path)
     broker.reservation_ttl_sec = 1.0
     with broker._lock:
-        broker._mark_inflight(Order("005930", "KR", "BUY", 1, 60_000))
-        broker._inflight["005930"].placed_at -= 5.0
+        rid = broker._mark_inflight(Order("005930", "KR", "BUY", 1, 60_000))
+        broker._inflight[rid].placed_at -= 5.0
     assert broker.reconcile(lambda acct: {"applied": True}) == {"applied": True}
 
 
@@ -209,8 +211,8 @@ def test_expired_reservation_bumps_activity_gen(tmp_path):
     broker = _live_broker(tmp_path)
     broker.reservation_ttl_sec = 1.0
     with broker._lock:
-        broker._mark_inflight(Order("005930", "KR", "BUY", 1, 60_000))
-        broker._inflight["005930"].placed_at -= 5.0
+        rid = broker._mark_inflight(Order("005930", "KR", "BUY", 1, 60_000))
+        broker._inflight[rid].placed_at -= 5.0
         gen = broker._activity_gen
         broker._active_reservations()
         assert broker._activity_gen == gen + 1
@@ -220,7 +222,7 @@ def test_expired_reservation_bumps_activity_gen(tmp_path):
 def test_mark_inflight_records_order_fields(tmp_path, side):
     broker = _live_broker(tmp_path)
     with broker._lock:
-        broker._mark_inflight(Order("005930", "KR", side, 3, 1_000), order_id="X9")
-    r = broker._inflight["005930"]
+        rid = broker._mark_inflight(Order("005930", "KR", side, 3, 1_000), order_id="X9")
+    r = broker._inflight[rid]
     assert (r.side, r.qty, r.price, r.order_id) == (side, 3.0, 1_000.0, "X9")
     assert r.notional == 3_000.0

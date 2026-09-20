@@ -28,6 +28,7 @@ from .wiring import (
     DATA, LLMFactory, FetchCandles,
     build_paper_core, sector_map_from_universe, earnings_near,
     resolve_strategy, combine_stop_target,
+    dry_llm_factory, synth_candles,
 )
 from .. import paths as _paths
 
@@ -74,6 +75,11 @@ class CycleRunner:
                 risk = default_risk
         elif risk is None:
             risk = risk_manager_from_cfg(cfg.risk)
+        # live broker + dry 뇌 factory/합성캔들 동일성 → 거부(기동 시 1회).
+        if getattr(broker, "mode", "") == "live" and (
+                llm_factory is dry_llm_factory or fetch_candles is synth_candles):
+            raise RuntimeError(
+                "CycleRunner: live broker 와 dry_llm_factory/synth_candles 동시 사용 금지")
         self.broker = broker
         self.account = broker.account
         self.risk = risk

@@ -38,8 +38,22 @@ $wdSettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfG
 Register-ScheduledTask -TaskName "ArgusWatchdog" -Action $wdAction -Trigger $wdTrigger `
     -Settings $wdSettings -Description "Argus-Watch heartbeat watchdog (restart on hang)" -Force | Out-Null
 
-Write-Host "[OK] ArgusWatch + ArgusWatchdog 등록 완료."
+# ── ArgusAlertCheck (trading_health / 미해소 주문 ntfy, 5분) ──
+$alertAction = New-ScheduledTaskAction -Execute $py -Argument "scripts\alert_check.py" -WorkingDirectory $root
+$alertTrigger = New-ScheduledTaskTrigger -Once -At (Get-Date) `
+    -RepetitionInterval (New-TimeSpan -Minutes 5) `
+    -RepetitionDuration (New-TimeSpan -Days 3650)
+$alertSettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+    -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Minutes 5)
+Register-ScheduledTask -TaskName "ArgusAlertCheck" -Action $alertAction -Trigger $alertTrigger `
+    -Settings $alertSettings -Description "Argus trading_health / HALT-pause / unresolved order alerts (ntfy)" -Force | Out-Null
+
+Write-Host "[OK] ArgusWatch + ArgusWatchdog + ArgusAlertCheck 등록 완료."
 Write-Host "  git hook(머지 후 재기동):  powershell -ExecutionPolicy Bypass -File scripts\install_git_hooks.ps1"
 Write-Host "  시작:  schtasks /Run /TN ArgusWatch"
-Write-Host "  상태:  schtasks /Query /TN ArgusWatch ; schtasks /Query /TN ArgusWatchdog"
+Write-Host "  상태:  schtasks /Query /TN ArgusWatch ; schtasks /Query /TN ArgusWatchdog ; schtasks /Query /TN ArgusAlertCheck"
 Write-Host "  로그:  logs\watch.run.log (프로세스), data\state\watch.heartbeat (생존)"
+# Linux/mac 예시:
+#   crontab: */5 * * * * cd /path/to/argus && .venv/bin/python scripts/alert_check.py
+#   systemd timer: OnUnitActiveSec=5min + ArgusAlertCheck.service
+#   launchd plist: StartInterval=300

@@ -337,6 +337,24 @@ def main(argv: list[str] | None = None) -> int:
         _ok("python", pyv)
     _ok("config", f"mode={mode} dry_run={dry}")
 
+    # dry 뇌 + live + not dry_run → FAIL
+    try:
+        from src.runtime_isolation import assert_dry_brain_not_live, resolve_brain_dry
+        import os as _os
+        brain_dry = resolve_brain_dry(
+            brain_backend=(raw.get("watch") or {}).get("brain_backend"),
+            api_key=_os.getenv("ANTHROPIC_API_KEY"))
+        assert_dry_brain_not_live(
+            brain_dry=brain_dry, broker_mode=mode, dry_run=dry)
+        _ok("dry×live", "dry 뇌와 live 설정 충돌 없음")
+    except Exception as e:
+        from src.runtime_isolation import ConfigError
+        if isinstance(e, ConfigError):
+            _bad("dry×live", str(e))
+            blocked = True
+        else:
+            _warn("dry×live", f"점검 실패: {e}")
+
     if not check_tz():
         blocked = True
 
