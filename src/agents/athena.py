@@ -22,6 +22,7 @@ import pandas as pd
 from ..baserate import analyze
 from ..focus import build_focus, attach_krx_fields
 from ..logging_setup import get_logger
+from .dossier_reach import apply_reach, atr_pct_from_df, level_reach, reach_cfg
 from .features import technical_summary
 from .schemas import DossierLevelOutput, DossierOutput
 from .athena_phase2 import (
@@ -515,6 +516,7 @@ def run_batch(cfg, store, llm, market: str, *,
     agent = AthenaAgent(llm)
     ms = market_state or {}
     p2 = phase2_cfg(cfg)
+    rc = reach_cfg(cfg)
     from ..config import ROOT
     uni_syms = [it["symbol"] for it in (cfg.universe or {}).get(market, [])
                 if it.get("symbol")]
@@ -579,10 +581,20 @@ def run_batch(cfg, store, llm, market: str, *,
                 mode = "full"
                 level_note = None
             out, notes = sanitize(out, price=px)
+            reach = None
+            if rc["mode"] != "off" and out.stance == "bullish":
+                reach = level_reach(
+                    entry_low=out.entry_low, entry_high=out.entry_high,
+                    invalidation=out.invalidation, target=out.target,
+                    atr_pct=atr_pct_from_df(df, rc["atr_period"]))
+                out, reach_notes = apply_reach(out, reach, rc)
+                notes = notes + reach_notes
             rr = compute_rr(out.entry_low, out.entry_high, out.invalidation, out.target)
             ev_payload = {"stance": out.stance, "horizon": out.horizon,
                           "evidence": out.evidence, "key_risks": out.key_risks,
                           "sanitize_notes": notes, "refresh_mode": mode}
+            if reach:
+                ev_payload["reach"] = {**reach, "mode": rc["mode"]}
             if level_note:
                 ev_payload["level_note"] = level_note
             if mode == "full" and px and float(px) > 0:

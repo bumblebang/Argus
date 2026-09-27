@@ -143,6 +143,8 @@ def summarize_dossiers(
 
     outcomes = _label_outcomes(store, data_dir=data_path, cfg=cfg,
                                since=now - label_days * 86400, now=now)
+    reach_out = reach_outcomes(store, data_dir=data_path, cfg=cfg,
+                               since=now - label_days * 86400, now=now)
 
     n = len(rows)
     bullish_n = stance_ct["bullish"]
@@ -162,6 +164,7 @@ def summarize_dossiers(
         "price_coverage": price_meta_out,
         "coverage": coverage,
         "outcomes": outcomes,
+        "reach_outcomes": reach_out,
         "note": ("Tier 0 도시어 품질. stance 라벨 평가는 outcomes 참고. "
                  "프롬프트 승격 근거로 단독 쓰지 말 것(min_n). "
                  "zone_unknown_rate 높으면 가격 센서 실패(승격 아님)."),
@@ -255,3 +258,70 @@ def _label_outcomes(
         "by_stance": by_stance,
         "skipped": skipped,
     }
+
+
+def reach_outcomes(
+    store,
+    *,
+    data_dir: Path | str | None,
+    cfg: dict | None,
+    since: float,
+    now: float,
+) -> dict[str, Any]:
+    """강세 도시에 결과를 목표 거리(ATR 배수) 구간별로. athena.reach 관찰용.
+
+    evidence.reach 가 없는 과거 도시에도 일봉 파일로 생성 시점 ATR 을 재계산해 소급한다.
+    같은 종목 갱신이 섞여 있으니 n_symbols 도 같이 본다.
+    """
+    from .labels import _load_ohlc, asof_local_date, symbol_market
+    from ..agents.dossier_reach import atr_pct_from_bars, level_reach, reach_bucket
+
+    if not data_dir:
+        return {"status": "no_data_dir", "by_bucket": {}}
+    data_dir = Path(data_dir)
+    with store._lock:
+        hist = store.conn.execute(
+            "SELECT symbol, created_at, entry_low, entry_high, target, invalidation, "
+            "evidence FROM dossiers WHERE created_at >= ? AND created_at <= ?",
+            (since, now)).fetchall()
+    bars_cache: dict[str, list] = {}
+    by_bucket: dict[str, dict[str, Any]] = {}
+    for row in hist:
+        r = dict(row)
+        if dossier_stance(r) != "bullish":
+            continue
+        ev = r.get("evidence")
+        try:
+            ev = json.loads(ev) if isinstance(ev, str) and ev else (ev or {})
+        except (TypeError, ValueError):
+            ev = {}
+        sym = str(r["symbol"])
+        asof = datetime.fromtimestamp(float(r["created_at"]), tz=timezone.utc)
+        reach = ev.get("reach") if isinstance(ev, dict) else None
+        if not reach:
+            if sym not in bars_cache:
+                bars_cache[sym] = _load_ohlc(data_dir, sym)
+            # 생성일 이전 봉만(당일 봉은 미래 정보 포함)
+            start = asof_local_date(asof, symbol_market(sym))
+            prior = [b for b in bars_cache[sym] if b[0].date() < start]
+            reach = level_reach(entry_low=r.get("entry_low"), entry_high=r.get("entry_high"),
+                                invalidation=r.get("invalidation"), target=r.get("target"),
+                                atr_pct=atr_pct_from_bars(prior[-60:]))
+        hz = str(ev.get("horizon") or "swing") if isinstance(ev, dict) else "swing"
+        hit = target_hit_before_stop(data_dir, sym, asof, target=r.get("target"),
+                                     invalidation=r.get("invalidation"), horizon=hz, cfg=cfg)
+        reason = hit.get("reason")
+        if reason not in ("target_first", "stop_first", "neither_by_horizon"):
+            continue
+        b = by_bucket.setdefault(reach_bucket((reach or {}).get("tgt_atr")),
+                                 {"n": 0, "target_first": 0, "stop_first": 0,
+                                  "neither_by_horizon": 0, "_syms": set()})
+        b["n"] += 1
+        b[reason] += 1
+        b["_syms"].add(sym)
+    for b in by_bucket.values():
+        b["n_symbols"] = len(b.pop("_syms"))
+        b["target_rate"] = round(b["target_first"] / b["n"], 3) if b["n"] else None
+    return {"status": "scored" if by_bucket else "empty",
+            "by_bucket": dict(sorted(by_bucket.items())),
+            "note": "목표 거리(ATR 배수)별 기간 내 도달. 4 ATR 이상은 09-27 기준 도달 4%."}

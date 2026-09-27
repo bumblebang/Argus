@@ -47,6 +47,15 @@ def macd(series: pd.Series, fast: int = 12, slow: int = 26,
     return macd_line, signal_line, macd_line - signal_line
 
 
+def atr(high: pd.Series, low: pd.Series, close: pd.Series,
+        period: int = 14) -> pd.Series:
+    """Wilder ATR — 하루 평균 변동폭(갭 포함 True Range)."""
+    prev = close.shift(1)
+    tr = pd.concat([high - low, (high - prev).abs(), (low - prev).abs()],
+                   axis=1).max(axis=1)
+    return tr.ewm(alpha=1 / period, min_periods=period, adjust=False).mean()
+
+
 def donchian_high(high: pd.Series, period: int) -> pd.Series:
     """돈치안 상단 채널: 최근 period 최고가(당봉 제외는 호출측에서 shift)."""
     return high.rolling(window=period, min_periods=period).max()

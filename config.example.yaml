@@ -331,6 +331,13 @@ athena:
   # 우회하므로(새 재료 즉시 반응) 상한이 없으면 미커버 발굴이 굶는다.
   # 0=무제한(권장 안 함 — 큐가 max_per_run 을 다 먹을 수 있다)
   queue_max_per_run: 10
+  # 목표가 도달 가능성 — 목표 거리를 ATR 배수로 기록(evidence.reach).
+  # 09-27 실측: 목표 ≥4 ATR 인 강세 도시에는 20일 내 목표 도달 4%(<4 ATR 은 23%).
+  # observe=기록만 / enforce=초과 시 neutral 강등 / off. 관찰 표본 본 뒤 enforce 전환.
+  reach:
+    mode: observe
+    max_target_atr: 4.0
+    atr_period: 14
   timeout: 240
   windows:
     KR:
