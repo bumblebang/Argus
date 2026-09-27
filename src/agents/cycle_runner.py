@@ -592,6 +592,10 @@ class CycleRunner:
                        "max_position_pct": self.cfg.risk.get("max_position_pct", 0.2),
                        "max_positions": self.cfg.risk.get("max_positions"),   # None = 무제한
                        "open_positions": self.account.open_count}
+        day_on = bool((self.cfg.raw.get("day_track") or {}).get("enabled", True))
+        if not day_on:
+            constraints["day_track"] = ("off — horizon=day BUY 는 집행되지 않는다. "
+                                        "swing/position/close_scan 만 제안할 것")
         # 트랙레코드(라이브 성과 귀속) + 최근 중대 공시(워처가 잡은 것)를 함께 실어
         # 뇌가 자기 과거 성과와 방금 뜬 재료를 보고 판단하게 한다.
         # wake: BrainWorker 가 넘긴 각성 사유(없으면 배치/수동 호출).
@@ -691,7 +695,8 @@ class CycleRunner:
                         sell_block_fn=self._sell_block_reason,
                         resolve_price_fn=self._resolve_price,
                         store=self.store,
-                        wake_reason=wake_reason)
+                        wake_reason=wake_reason,
+                        day_enabled=day_on)
         self._record(res)
         if self.store:
             from ..shadow_ledger import book_blocked, book_soft_pending

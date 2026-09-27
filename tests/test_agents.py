@@ -200,6 +200,35 @@ def test_cycle_day_buy_routes_to_arm(tmp_path):
     assert broker.position("005930").qty == 0          # 즉시 체결 안 함
 
 
+def test_cycle_day_buy_blocked_when_day_track_off(tmp_path):
+    """day_enabled=False: 진입대기도 즉시매수도 없이 day_disabled."""
+    llm = MockLLM(_responder(_decision_buy_day(0.8), approve=True))
+    broker = _broker(tmp_path)
+    armed = []
+    res = run_cycle(context_json="{}", decision_agent=DecisionAgent(llm),
+                    validation_agent=ValidationAgent(llm, min_conviction=0.6), broker=broker,
+                    risk=RiskManager(capital={"KR": 1_000_000}, max_position_pct=0.2),
+                    price_lookup={"005930": 1000}, journal_path=tmp_path / "d.jsonl",
+                    arm_fn=lambda p, price: armed.append(p.symbol) or True,
+                    day_enabled=False)
+    assert res.executed[0]["status"] == "day_disabled"
+    assert armed == []
+    assert broker.position("005930").qty == 0
+
+
+def test_cycle_day_off_without_arm_fn_does_not_buy_immediately(tmp_path):
+    """arm_fn 없이도 day BUY 가 도시에 면제 경로로 흘러 즉시 체결되지 않는다."""
+    llm = MockLLM(_responder(_decision_buy_day(0.8), approve=True))
+    broker = _broker(tmp_path)
+    res = run_cycle(context_json="{}", decision_agent=DecisionAgent(llm),
+                    validation_agent=ValidationAgent(llm, min_conviction=0.6), broker=broker,
+                    risk=RiskManager(capital={"KR": 1_000_000}, max_position_pct=0.2),
+                    price_lookup={"005930": 1000}, journal_path=tmp_path / "d.jsonl",
+                    day_enabled=False)
+    assert res.executed[0]["status"] == "day_disabled"
+    assert broker.position("005930").qty == 0
+
+
 def test_cycle_already_held_when_broker_has_position(tmp_path):
     """brain cycle: broker 보유 중이면 BUY → already_held."""
     from src.engine.store import Store

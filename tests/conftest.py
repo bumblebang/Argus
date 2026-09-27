@@ -40,6 +40,8 @@ def agents_test_cfg(cfg):
     agents = cfg.raw.setdefault("agents", {})
     agents["require_dossier"] = False
     agents.setdefault("serve", {})["scan_enabled"] = False
+    # 데이 트랙은 운영 기본이 꺼짐(09-27) — 진입대기(arm) 배선 회귀는 켠 상태로 검증.
+    cfg.raw["day_track"] = {"enabled": True}
     return cfg
 
 

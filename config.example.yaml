@@ -361,7 +361,7 @@ screener:
     discover_pool: 250
     default_strategy: ma_crossover
     rank_by: discovery_tv
-    day_tag_top: 20
+    day_tag_top: 0          # 데이 트랙 꺼짐 — pool=day 태그 안 붙임
     day_strategy: volatility_breakout
   min_price: { KR: 2000, US: 5 }
   max_price: { KR: 1000000, US: 2000 }
@@ -389,8 +389,15 @@ screener:
     core_preopen_min: { KR: 90, US: 330 }
     picks_scale: { KR: 1.0, US: 1.5 }
 
+# 데이 트랙(horizon=day, 변동성 돌파 당일 청산) — 꺼짐.
+# 09-27 일봉 백테스트(KR 253·US 359종, 2년, 거래대금 상위100 풀): 당일 종가 청산은
+# k·필터 전 변형에서 비용 후 음수(KR −0.09~−0.22%/회). 돌파 장중 엣지(+0.06~0.19%)
+# < KR 왕복비용 0.33%. 라이브도 armed 15 → 체결 1. 끄면 day BUY 는 day_disabled.
+day_track:
+  enabled: false
+
 day_pool:
-  enabled: true
+  enabled: false   # 데이 트랙 꺼짐과 짝(풀 갱신 불필요)
   markets: ["KR"]
   count: 50
   type: "MARKET_TRADING_AMOUNT"
