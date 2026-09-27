@@ -26,6 +26,15 @@ SHADOW_BOOK_STATUSES = SHADOW_BLOCK_STATUSES | SHADOW_SOFT_STATUSES
 
 _DEFAULT_HORIZON_DAYS = {"day": 1, "swing": 20, "position": 120}
 MIN_SAMPLE = 5
+# 히스토리 종가를 쓸 때 목표일과 실제 봉 날짜의 최대 간격(주말·연휴 여유). 이보다
+# 멀면 CSV 가 갱신 안 된 것 — 낡은 종가로 채점하지 않는다(09-27 실측 154행 중 44행이
+# 몇 주 전 종가로 채점됨).
+HIST_MAX_GAP_DAYS = 5
+# 채점 가격을 못 구해도 이 기간(목표일 이후)까지는 다시 시도한다(CSV 갱신 대기).
+SCORE_RETRY_DAYS = 7
+# 기록 시점 진입가가 같은 시각 시세 스냅샷과 이보다 벌어지면 진입가 오류로 보고
+# 스냅샷 가격으로 바꾼다(09-27: 005930 진입가 64,369 — 실제 ~25만).
+ENTRY_SNAPSHOT_MAX_DEV = 0.15
 
 
 def reason_bucket(st: str, reason: str, concerns: list | None) -> str:
@@ -83,12 +92,13 @@ def _entry_price_at(data_dir: Path, store, symbol: str, ts: float,
     if series:
         t0 = datetime.fromtimestamp(ts, tz=KST).date()
         entry = None
+        entry_d = None
         for d, c in series:
             if d.date() <= t0:
-                entry = c
+                entry, entry_d = c, d.date()
             else:
                 break
-        if entry is not None:
+        if entry is not None and (t0 - entry_d).days <= HIST_MAX_GAP_DAYS:
             return float(entry), "history"
     if store is not None:
         px = store.nearest_snapshot_price(symbol, ts, window_sec=3600)
@@ -122,6 +132,7 @@ def book_row(store, *, cycle_ts: float, cycle_ts_iso: str, sleeve: str,
     meta = {"horizon_days": hdays, "price_source": "price_lookup"}
     if meta_extra:
         meta.update(meta_extra)
+    entry_price = _checked_entry_price(store, symbol, cycle_ts, float(entry_price), meta)
     bucket = reason_bucket(block_status, block_reason or verifier_reason or "",
                            concerns)
     return store.insert_shadow_position(
@@ -146,6 +157,30 @@ def book_row(store, *, cycle_ts: float, cycle_ts_iso: str, sleeve: str,
         state=state,
         meta=meta,
     )
+
+
+def _checked_entry_price(store, symbol: str, ts: float, entry_price: float,
+                         meta: dict) -> float:
+    """진입가를 같은 시각 시세 스냅샷과 대조. 크게 어긋나면 스냅샷 가격을 쓴다.
+
+    price_lookup 은 라이브 시세가 없을 때 캐시 일봉 종가로 채워진다 — 캐시가 낡으면
+    진입가가 수십 % 틀려 그 표본의 수익률이 통째로 가짜가 된다.
+    """
+    snap_fn = getattr(store, "nearest_snapshot_price", None)
+    if snap_fn is None or not ts:
+        return entry_price
+    try:
+        snap = snap_fn(symbol, float(ts), window_sec=1800)
+    except Exception:
+        return entry_price
+    if not snap or snap <= 0:
+        return entry_price
+    if abs(entry_price / snap - 1) <= ENTRY_SNAPSHOT_MAX_DEV:
+        return entry_price
+    log.warning("그림자 진입가 교정 %s: %.4f → 스냅샷 %.4f", symbol, entry_price, snap)
+    meta["entry_price_rejected"] = entry_price
+    meta["price_source"] = "snapshot"
+    return float(snap)
 
 
 def book_soft_pending(store, cycle_result, price_lookup: dict[str, float],
@@ -341,8 +376,26 @@ def backfill_from_jsonl(store, path: Path | str, *, sleeve: str = "brain",
     return out
 
 
+def _csv_last_date(path: Path) -> str:
+    """CSV 마지막 데이터 줄의 날짜(YYYY-MM-DD). 못 읽으면 ""."""
+    try:
+        with path.open("rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            f.seek(max(0, size - 512))
+            tail = f.read().decode("utf-8", errors="ignore")
+    except OSError:
+        return ""
+    for line in reversed(tail.splitlines()):
+        head = line.strip()[:10]
+        if len(head) == 10 and head[4] == "-" and head[7] == "-":
+            return head
+    return ""
+
+
 def pick_history_csv(data_dir: Path, symbol: str) -> Path | None:
-    """1d history CSV — .KS/.KQ/무접미사 모두. 가장 긴 range 우선."""
+    """1d history CSV — .KS/.KQ/무접미사 모두. **가장 최근까지 있는** 파일 우선,
+    같으면 긴 range. range 만 보면 몇 달 전에 받은 5y 가 어제까지 있는 6mo 를 이긴다."""
     root = Path(data_dir)
     found: list[Path] = []
     for pat in (
@@ -355,12 +408,12 @@ def pick_history_csv(data_dir: Path, symbol: str) -> Path | None:
         return None
     rank = {"6mo": 1, "1y": 2, "2y": 3, "5y": 4}
 
-    def _key(p: Path) -> tuple[int, str]:
+    def _key(p: Path) -> tuple[str, int, str]:
         name = p.name
         rng = 0
         if "_1d_" in name:
             rng = rank.get(name.split("_1d_")[-1].replace(".csv", ""), 0)
-        return (rng, name)
+        return (_csv_last_date(p), rng, name)
 
     return max(found, key=_key)
 
@@ -400,11 +453,17 @@ def exit_close_on_calendar(series: list[tuple[datetime, float]],
     entry_dt = datetime.fromtimestamp(entry_ts, tz=ZoneInfo(tzname))
     target_date = entry_dt.date() + timedelta(days=horizon_days)
     best = None
+    best_d = None
     for d, c in series:
         if d.date() <= target_date:
-            best = c
+            best, best_d = c, d.date()
         else:
             break
+    # 낡은 CSV(목표일보다 한참 전에 끝남)·진입일 이전 봉은 청산가가 아니다.
+    if best_d is None or best_d <= entry_dt.date():
+        return None
+    if (target_date - best_d).days > HIST_MAX_GAP_DAYS:
+        return None
     return best
 
 
@@ -478,6 +537,10 @@ def score_open_shadows(store, *, now: float | None = None,
             exit_px = snap_forward(store, sym, entry_ts, float(hdays))
             price_source = "snapshot"
         if exit_px is None:
+            # CSV 가 아직 목표일까지 안 왔을 수 있다 — 유예 기간엔 다음 채점에서 재시도.
+            if now < entry_ts + (hdays + SCORE_RETRY_DAYS) * 86400:
+                stats["pending"] += 1
+                continue
             store.skip_shadow_position(row["id"], "no_price_data")
             stats["skipped"] += 1
             continue
@@ -495,6 +558,57 @@ def score_open_shadows(store, *, now: float | None = None,
                   sym, row["block_bucket"], ret, price_source)
 
     return stats
+
+
+def rescore_shadow_exits(store, *, data_dir: Path | str = "data",
+                         cfg: dict | None = None, apply: bool = True) -> dict[str, Any]:
+    """이미 scored 된 horizon 채점 행의 청산가를 지금 히스토리로 다시 구한다.
+
+    09-27 이전 채점은 가장 긴 range CSV 를 골라, 갱신 안 된 CSV 의 마지막 종가(목표일
+    몇 주 전)를 청산가로 썼다. 고친 규칙으로 다시 구해 다르면 교정하고, 지금도 목표일
+    근처 종가가 없으면 검증 불가로 표본에서 뺀다(skipped). apply=False 면 집계만.
+    """
+    from .eval.trade_defs import roundtrip_cost_pct
+
+    data_dir = Path(data_dir)
+    out: dict[str, Any] = {"checked": 0, "fixed": 0, "voided": 0, "same": 0, "rows": []}
+    cache: dict[str, list] = {}
+    for row in store.get_scored_shadow_positions():
+        r = dict(row)
+        if r.get("exit_reason") not in ("horizon_expired", "pending_timeout"):
+            continue
+        try:
+            entry_px = float(r["entry_price"])
+            old_exit = float(r["exit_price"])
+        except (TypeError, ValueError, KeyError):
+            continue
+        out["checked"] += 1
+        sym = r["symbol"]
+        market = r.get("market") or "KR"
+        if sym not in cache:
+            cache[sym] = load_daily_series(data_dir, sym)
+        hdays = int(_row_horizon_days(r, cfg))
+        new_exit = exit_close_on_calendar(cache[sym], float(r["entry_ts"]), hdays,
+                                          market=market)
+        if new_exit is None:
+            out["voided"] += 1
+            out["rows"].append({"id": r["id"], "symbol": sym, "action": "void",
+                                "old_exit": old_exit})
+            if apply:
+                store.void_shadow_score(int(r["id"]), "stale_history")
+            continue
+        if abs(new_exit - old_exit) <= 1e-9 * max(1.0, abs(old_exit)):
+            out["same"] += 1
+            continue
+        cost_pct = roundtrip_cost_pct(market, cfg) * 100.0
+        new_ret = round((new_exit / entry_px - 1) * 100 - cost_pct, 3)
+        out["fixed"] += 1
+        out["rows"].append({"id": r["id"], "symbol": sym, "action": "fix",
+                            "old_exit": old_exit, "new_exit": new_exit,
+                            "old_ret": r.get("ret_pct"), "new_ret": new_ret})
+        if apply:
+            store.rescore_shadow_exit(int(r["id"]), exit_price=new_exit, ret_pct=new_ret)
+    return out
 
 
 def rescore_shadow_costs(store, *, cfg: dict | None = None) -> dict[str, int]:

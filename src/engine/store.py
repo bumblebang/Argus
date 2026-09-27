@@ -1043,6 +1043,23 @@ class Store:
                 (float(ret_pct), shadow_id))
             self.conn.commit()
 
+    def rescore_shadow_exit(self, shadow_id: int, *, exit_price: float,
+                            ret_pct: float) -> None:
+        """이미 scored 된 행의 청산가·수익률 교정(낡은 히스토리 재채점). scored_at 유지."""
+        with self._lock:
+            self.conn.execute(
+                "UPDATE shadow_positions SET exit_price=?, ret_pct=? WHERE id=?"
+                " AND state='scored'", (float(exit_price), float(ret_pct), shadow_id))
+            self.conn.commit()
+
+    def void_shadow_score(self, shadow_id: int, reason: str) -> None:
+        """scored 행을 skipped 로 — 채점가를 검증할 수 없어 표본에서 뺀다."""
+        with self._lock:
+            self.conn.execute(
+                "UPDATE shadow_positions SET state='skipped', exit_reason=? WHERE id=?"
+                " AND state='scored'", (reason, shadow_id))
+            self.conn.commit()
+
     def skip_shadow_position(self, shadow_id: int, reason: str) -> None:
         now = time.time()
         with self._lock:
