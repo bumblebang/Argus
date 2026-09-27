@@ -12,7 +12,9 @@ account→store 를 즉시 맞춘다(부분체결 포함).
 """
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal, ROUND_DOWN
+import json
 import math
 import threading
 import time
@@ -42,6 +44,18 @@ _PENDING = {"PENDING", "PENDING_CANCEL", "PENDING_REPLACE", "PARTIAL_FILLED", "R
 # REJECTED 등 확정 종결은 여기 넣지 않는다. QUARANTINED=취소 미확인 격리.
 _TRACK_WORKING = _PENDING | {"UNKNOWN", "QUARANTINED"}
 _LOCAL_ORDER_PREFIX = "local:"
+_KST = timezone(timedelta(hours=9))
+# local: 행 해소 — 서버 주문 목록에서 짝을 찾을 때 허용하는 시각 창(초).
+# 전송 재시도(멱등키)가 수십 초 안에 끝나므로 넉넉히 잡는다. 시계 오차 여유 포함.
+_LOCAL_MATCH_BEFORE_SEC = 30.0
+_LOCAL_MATCH_AFTER_SEC = 300.0
+# '없음' 확정용 느슨한 창 — 이 창에 같은 종목·방향 주문이 하나라도 있으면(가격 절삭·
+# 시계 오차로 엄격 대조가 빗나갔을 수 있음) 지우지 않고 미확인으로 둔다.
+_LOCAL_LOOSE_BEFORE_SEC = 300.0
+_LOCAL_LOOSE_AFTER_SEC = 900.0
+# 서버 목록 반영 지연 대비 — 이보다 어린 local 행은 '없음' 확정을 미룬다.
+_LOCAL_ABSENT_GRACE_SEC = 60.0
+_LOCAL_LIST_MAX_PAGES = 5
 
 
 def _is_local_order_id(order_id: str | None) -> bool:
@@ -71,6 +85,36 @@ def _num(v: Any) -> float | None:
         return float(s) if s else None
     except (TypeError, ValueError):
         return None
+
+
+def _row_meta(row: dict) -> dict:
+    meta = row.get("meta")
+    if isinstance(meta, str):
+        try:
+            meta = json.loads(meta)
+        except (TypeError, ValueError):
+            meta = None
+    return meta if isinstance(meta, dict) else {}
+
+
+def _parse_ts(v: Any) -> float | None:
+    """ISO8601(오프셋 포함) → epoch. 실패하면 None."""
+    if not v:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(v).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=_KST)
+    return dt.timestamp()
+
+
+def _same_num(a: Any, b: Any, tol: float = 1e-6) -> bool:
+    x, y = _num(a), _num(b)
+    if x is None or y is None:
+        return False
+    return abs(x - y) <= tol * max(1.0, abs(x), abs(y))
 
 
 def _is_fractional_qty(qty: float) -> bool:
@@ -579,6 +623,11 @@ class Broker:
 
         재대사 **이후** 접수분(placed_at > _cash_reconciled_at)만 예약한다 — 그 이전
         미체결은 이미 실계좌 BP 에 홀드돼 cash 덮기에 반영됐으므로 또 빼면 과차단.
+
+        QUARANTINED(abandon) 행도 예약한다 — 증권사 쪽 주문이 살아 있을 수 있다.
+        영구 홀드는 위 재대사 기준이 막는다(다음 BP 덮기 이후 접수분이 아니게 됨).
+        in-flight 중복 제외는 **같은 주문(order_id)** 만 — 같은 종목이라도 다른
+        주문(예: SELL 처리 중 살아 있는 BUY 미체결)의 홀드를 지우면 안 된다.
         """
         if self.store is None:
             return []
@@ -587,13 +636,10 @@ class Broker:
         except Exception:
             return []
         out: list[Reservation] = []
-        now = time.time()
         since = self._cash_reconciled_at
+        inflight_ids = {str(r.order_id) for r in self._inflight.values() if r.order_id}
         for row in rows:
-            # abandon 대상은 예약에서 제외(직전 prune 이 지웠어도 경합 대비).
-            if self._should_abandon_working(row, now):
-                continue
-            if any(r.symbol == row["symbol"] for r in self._inflight.values()):
+            if str(row.get("order_id") or "") in inflight_ids:
                 continue
             placed = float(row["placed_at"] or 0.0)
             if since is not None and placed <= since:
@@ -903,23 +949,65 @@ class Broker:
                     out["awaiting_attribution"] += 1
                 continue
             out["checked"] += 1
+            prefetched: dict | None = None
             if _is_local_order_id(oid):
-                out["local_orphan"] += 1
-                out["working"] += 1
-                log.error("[미확인 local 주문] id=%s %s %s — API 조회 불가, 격리 유지",
-                          oid, row.get("side"), row.get("symbol"))
-                self._emit_symbol("working_order_local_orphan", row.get("symbol"), {
-                    "order_id": oid, "side": row.get("side"), "status": row.get("status"),
-                    "age_sec": round(self._working_age(row, now), 1)})
-                if self._should_abandon_working(row, now):
+                verdict, match = self._resolve_local_order(row, now)
+                if verdict == "absent":
                     with self._lock:
                         fresh = self._working_row_snapshot(oid)
                         if fresh is None or fresh.get("settled_at"):
                             continue
-                        self._abandon_working_order(fresh, now, why="local_orphan")
-                        out["quarantined"] += 1
-                continue
-            info = self._fetch_order(oid)
+                        self._store_call(self.store.delete_working_order, oid)
+                    out["local_absent"] = out.get("local_absent", 0) + 1
+                    log.warning("[local 해소] id=%s %s %s — 서버 주문 목록에 없음(미접수 확정), 삭제",
+                                oid, row.get("side"), row.get("symbol"))
+                    self._emit_symbol("working_order_local_absent", row.get("symbol"), {
+                        "order_id": oid, "side": row.get("side"),
+                        "age_sec": round(self._working_age(row, now), 1)})
+                    continue
+                if verdict == "found":
+                    real_id = str(match.get("orderId"))
+                    with self._lock:
+                        fresh = self._working_row_snapshot(oid)
+                        if fresh is None or fresh.get("settled_at"):
+                            continue
+                        try:
+                            self.store.rekey_working_order(oid, real_id, status="PENDING")
+                        except Exception as e:
+                            log.error("[local 해소] rekey 실패 %s → %s: %s", oid, real_id, e)
+                            out["working"] += 1
+                            continue
+                    out["local_resolved"] = out.get("local_resolved", 0) + 1
+                    log.warning("[local 해소] id=%s → %s (%s %s status=%s)", oid, real_id,
+                                row.get("side"), row.get("symbol"), match.get("status"))
+                    self._emit_symbol("working_order_local_resolved", row.get("symbol"), {
+                        "order_id": real_id, "local_order_id": oid,
+                        "side": row.get("side"), "status": match.get("status")})
+                    # 실 id 로 바뀌었다 — 아래 일반 경로가 방금 받은 주문 정보로 정산한다.
+                    oid = real_id
+                    row = {**row, "order_id": real_id, "status": "PENDING"}
+                    prefetched = match
+                else:
+                    out["local_orphan"] += 1
+                    out["working"] += 1
+                    log.error("[미확인 local 주문] id=%s %s %s — 서버 조회로 해소 못함, 격리 유지",
+                              oid, row.get("side"), row.get("symbol"))
+                    self._emit_symbol("working_order_local_orphan", row.get("symbol"), {
+                        "order_id": oid, "side": row.get("side"), "status": row.get("status"),
+                        "age_sec": round(self._working_age(row, now), 1)})
+                    if self._should_abandon_working(row, now):
+                        with self._lock:
+                            fresh = self._working_row_snapshot(oid)
+                            if fresh is None or fresh.get("settled_at"):
+                                continue
+                            self._abandon_working_order(fresh, now, why="local_orphan")
+                            out["quarantined"] += 1
+                    elif str(row.get("side") or "").upper() == "SELL":
+                        # 체결됐을 수 있는 매도 — 재대사가 감소를 먼저 흡수하면 손익이
+                        # 영구 소실된다. 격리(abandon TTL) 전까지는 재대사를 미룬다.
+                        out["block_reconcile"] = True
+                    continue
+            info = prefetched if prefetched is not None else self._fetch_order(oid)
             with self._lock:
                 fresh = self._working_row_snapshot(oid)
                 if fresh is None:
@@ -979,6 +1067,92 @@ class Broker:
                         out["cancel_failed"] += 1
                         out["working"] += 1
         return out
+
+    def _resolve_local_order(self, row: dict, now: float
+                             ) -> tuple[str, dict | None]:
+        """local:<uuid> 행을 서버 주문 목록(GET /orders)과 대조한다(락 밖 I/O).
+
+        전송 예외 뒤 접수 여부가 불명인 행은 단건 조회(orderId 모름)로는 영영 못 푼다.
+        그대로 두면 그 종목은 매도 포함 양방향 영구 차단이다. 같은 종목·방향·수량·가격
+        (금액 주문은 금액)이고 접수 시각이 local 기록 직후 창 안인 주문을 찾는다.
+
+        반환: ("found", order) 정확히 1건 / ("absent", None) OPEN·CLOSED 목록을
+        끝까지 봤는데 없음(유예 경과 후만) / ("unknown", None) 조회 실패·후보 복수.
+        """
+        lister = getattr(self.client, "list_orders", None)
+        if lister is None:
+            return "unknown", None
+        placed = float(row.get("placed_at") or now)
+        meta = _row_meta(row)
+        side = str(row.get("side") or "").upper()
+        day_from = datetime.fromtimestamp(
+            placed - _LOCAL_LOOSE_BEFORE_SEC, tz=_KST).strftime("%Y-%m-%d")
+        day_to = datetime.fromtimestamp(now, tz=_KST).strftime("%Y-%m-%d")
+        orders: list[dict] = []
+        complete = True
+        try:
+            res = lister(self.account_seq, status="OPEN", symbol=row["symbol"]) or {}
+            orders.extend(res.get("orders") or [])
+            cursor = None
+            for _ in range(_LOCAL_LIST_MAX_PAGES):
+                res = lister(self.account_seq, status="CLOSED", symbol=row["symbol"],
+                             date_from=day_from, date_to=day_to,
+                             cursor=cursor, limit=100) or {}
+                orders.extend(res.get("orders") or [])
+                cursor = res.get("nextCursor")
+                if not res.get("hasNext") or not cursor:
+                    break
+            else:
+                complete = False
+        except Exception as e:
+            log.warning("local 주문 해소 — 목록 조회 실패 id=%s: %s", row.get("order_id"), e)
+            return "unknown", None
+        known: set[str] = set()
+        try:
+            known = {str(r.get("order_id")) for r in self.store.get_working_orders()}
+        except Exception:
+            pass
+        amount = meta.get("order_amount")
+        cands = []
+        loose = 0
+        for o in orders:
+            if not isinstance(o, dict) or not o.get("orderId"):
+                continue
+            if str(o.get("orderId")) in known:
+                continue
+            if str(o.get("symbol") or row["symbol"]) != str(row["symbol"]):
+                continue
+            if str(o.get("side") or "").upper() != side:
+                continue
+            ts = _parse_ts(o.get("orderedAt"))
+            if ts is None or (placed - _LOCAL_LOOSE_BEFORE_SEC <= ts
+                              <= placed + _LOCAL_LOOSE_AFTER_SEC):
+                loose += 1
+            if ts is None or not (placed - _LOCAL_MATCH_BEFORE_SEC <= ts
+                                  <= placed + _LOCAL_MATCH_AFTER_SEC):
+                continue
+            if amount is not None:
+                if not _same_num(o.get("orderAmount"), amount):
+                    continue
+            else:
+                if not _same_num(o.get("quantity"), row.get("qty")):
+                    continue
+                if (str(meta.get("order_type") or "LIMIT").upper() == "LIMIT"
+                        and not _same_num(o.get("price"), row.get("price"))):
+                    continue
+            cands.append(o)
+        if len(cands) == 1:
+            return "found", cands[0]
+        if cands:
+            log.error("local 주문 해소 — 후보 %d건(모호) id=%s", len(cands), row.get("order_id"))
+            return "unknown", None
+        if loose:
+            log.error("local 주문 해소 — 엄격 대조 0건·근접 주문 %d건(가격 절삭 등) id=%s",
+                      loose, row.get("order_id"))
+            return "unknown", None
+        if complete and now - placed >= _LOCAL_ABSENT_GRACE_SEC:
+            return "absent", None
+        return "unknown", None
 
     def _working_row_snapshot(self, order_id: str) -> dict | None:
         """락 안: order_id 현재 행. 없으면 None."""
@@ -1538,13 +1712,19 @@ class Broker:
             self.store.upsert_working_order(
                 order_id=local_id, symbol=order.symbol, market=order.market,
                 side=order.side, qty=float(order.qty), price=float(order.price),
-                status="UNKNOWN", filled_qty=0.0, reason=reason)
+                status="UNKNOWN", filled_qty=0.0, reason=reason,
+                meta={"client_order_id": client_order_id, "order_type": order_type,
+                      **({"order_amount": order_amount}
+                         if order_amount is not None else {})})
         except Exception as e:
             log.error("[LIVE] local UNKNOWN commit 실패 — POST 안 함: %s", e)
             self.last_result = ExecuteResult.unknown(
                 "local working commit 실패", **base_kw, side=order.side)
             return None
 
+        # 전송 시작 = 주문 활동. 결과 불명으로 끝나 _mark_inflight 를 안 거쳐도,
+        # 조회 중이던 재대사 스냅샷(주문 전 BP)이 이 주문의 홀드를 지우지 않게 한다.
+        self._activity_gen += 1
         try:
             if order_amount is not None:
                 resp = self.client.place_order(
@@ -1558,6 +1738,9 @@ class Broker:
                     price=(order.price if order_type == "LIMIT" else None),
                     client_order_id=client_order_id)
         except Exception as e:
+            if getattr(e, "definitive", False):
+                return self._reject_definitive(order, e, local_id, request_meta,
+                                               reason, base_kw)
             log.error("[LIVE] 주문 전송 실패 — %s %s x%s @ %.2f (%s%s): %s",
                       order.side, order.symbol, order.qty, order.price, order_type,
                       f", amount={order_amount}" if order_amount is not None else "", e)
@@ -1591,6 +1774,29 @@ class Broker:
                 side=order.side, **base_kw)
             return None
         return {"order_id": order_id}
+
+    def _reject_definitive(self, order: Order, err: Exception, local_id: str,
+                           request_meta: dict, reason: str, base_kw: dict) -> None:
+        """서버가 주문을 받지 않았음이 확정(4xx 등) — local 행 삭제 후 거부로 끝낸다.
+
+        UNKNOWN 으로 남기면 그 종목이 매도 포함 양방향 영구 차단된다(손절 불가).
+        """
+        status = getattr(err, "status", None)
+        code = getattr(err, "code", "") or ""
+        try:
+            self.store.delete_working_order(local_id)
+        except Exception as de:
+            # 못 지우면 UNKNOWN 이 남아 차단된다 — 보수적으로 그대로 둔다.
+            log.error("[LIVE] 확정 거부 local 행 삭제 실패 %s: %s", local_id, de)
+        log.warning("[LIVE] 주문 거부(미접수 확정) — %s %s x%s @ %.2f: %s %s",
+                    order.side, order.symbol, order.qty, order.price, status, code or err)
+        self._emit("live_order_rejected", order, {
+            **request_meta, "status": status, "code": code,
+            "error": str(err)[:500], "reason": reason})
+        self.last_reject_reason = f"주문 거부({status}{' ' + code if code else ''})"
+        self.last_result = ExecuteResult.rejected(
+            self.last_reject_reason, status="REJECTED", **base_kw)
+        return None
 
     def _reconcile_order(self, order_id: str) -> tuple[float, float | None, float, str]:
         """주문을 폴링해 (체결수량, 평균체결가, 수수료+세금, status).

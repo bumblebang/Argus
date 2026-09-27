@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import threading
 import time
+from datetime import datetime, timedelta, timezone
 from typing import Any, Iterable
 
 from ..config import AppConfig
@@ -23,6 +24,9 @@ from .store import Store
 log = get_logger("engine.gateway")
 
 _PRICES_BATCH = 200  # /api/v1/prices 1콜 최대 종목수
+_KST = timezone(timedelta(hours=9))
+# 가격 가드 시드 — 재기동 직후 이보다 오래된 스냅샷은 기준가로 쓰지 않는다.
+_GUARD_SEED_MAX_AGE_SEC = 86400.0
 
 
 def _to_float(v: Any) -> float | None:
@@ -30,6 +34,18 @@ def _to_float(v: Any) -> float | None:
         return float(v)
     except (TypeError, ValueError):
         return None
+
+
+def _parse_ts(v: Any) -> float | None:
+    if not v:
+        return None
+    try:
+        dt = datetime.fromisoformat(str(v).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=_KST)
+    return dt.timestamp()
 
 
 def _best_level(levels: Any) -> float | None:
@@ -47,13 +63,17 @@ class TossGateway:
     def __init__(self, client: TossClient, store: Store | None = None,
                  limiter: GroupRateLimiter | None = None,
                  candle_ttl_sec: float = 0.0,
-                 price_guard: PriceGuard | None = None) -> None:
+                 price_guard: PriceGuard | None = None,
+                 quote_timeout_sec: float = 2.0) -> None:
         self.client = client
         self.store = store
         self.limiter = limiter
         # lastPrice 이상 틱 필터(None=끔). 감시 루프·뇌·밸류가 모두 poll_prices 를 거치므로
         # 여기 한 곳에서 걸러야 손절·사이징·vol_spike 가 같은 가격을 본다.
         self.price_guard = price_guard
+        # 가드 교차확인 호가는 1회·짧은 타임아웃 — 늦은 호가보다 '호가 없음' 판정이 낫다
+        # (조회 중엔 게이트웨이 락을 쥐어 전 종목 시세·주문이 멈춘다).
+        self.quote_timeout_sec = float(quote_timeout_sec)
         # 캔들 TTL 캐시: 1초틱에서 같은 캔들을 매초 재호출하면 CHART 예산(5TPS) 초과 →
         # ttl 동안은 캐시 반환(라이브 반응성은 호출측이 마지막봉 종가를 실시간가로 패치).
         self.candle_ttl_sec = float(candle_ttl_sec)
@@ -69,11 +89,13 @@ class TossGateway:
         client = TossClient(cfg.creds, timeout=timeout, rate_limiter=limiter)
         watch = cfg.raw.get("watch", {}) or {}
         ttl = float(watch.get("candle_ttl_sec", 0.0))
-        gw = cls(client, store=store, limiter=limiter, candle_ttl_sec=ttl)
+        pg_raw = watch.get("price_guard") or {}
+        gw = cls(client, store=store, limiter=limiter, candle_ttl_sec=ttl,
+                 quote_timeout_sec=float(pg_raw.get("quote_timeout_sec", 2.0)))
         on_event = ((lambda kind, p: store.log_event(kind, p.get("symbol"), p))
                     if store is not None else None)
         gw.price_guard = PriceGuard.from_config(
-            watch.get("price_guard"), gw.best_quote, on_event=on_event)
+            pg_raw, gw.best_quote, on_event=on_event)
         return gw
 
     # ── 감시층: 전종목 현재가 배치 폴링 (싸다) ─────────────
@@ -96,6 +118,7 @@ class TossGateway:
         # 가드는 락 밖에서 — 의심 틱이면 호가를 부르는데 orderbook() 도 같은 락을 잡는다.
         # 원시 lastPrice 는 payload 에 그대로 남고 price 만 걸러진 값으로 바뀐다.
         if self.price_guard is not None:
+            self._seed_guard([row["symbol"] for row in out])
             for row in out:
                 px, verdict = self.price_guard.filter(row["symbol"], row["price"])
                 if verdict is not None:
@@ -105,6 +128,24 @@ class TossGateway:
         if record and self.store and out:
             self.store.record_snapshots(out)
         return out
+
+    def _seed_guard(self, symbols: list[str]) -> None:
+        """재기동 직후 첫 틱 — 직전 스냅샷(가드 통과가)을 기준가로 심는다.
+
+        기준가가 없으면 첫 틱을 무조건 채택하므로, 오류가가 떠 있는 동안 재기동하면
+        가짜 손절이 그대로 재현된다.
+        """
+        todo = self.price_guard.unseeded(symbols)
+        if not todo:
+            return
+        refs: dict[str, tuple[float, float]] = {}
+        if self.store is not None and hasattr(self.store, "latest_snapshot_refs"):
+            try:
+                refs = self.store.latest_snapshot_refs(
+                    todo, max_age_sec=_GUARD_SEED_MAX_AGE_SEC)
+            except Exception as e:
+                log.warning("가격 가드 시드 조회 실패(첫 틱 채택): %s", e)
+        self.price_guard.seed_refs(refs, tried=todo)
 
     # ── 정밀층: 종목별 캔들/호가 (비싸다, 선별 호출 + TTL 캐시) ───────
     def candles(self, symbol: str, interval: str = "1m", count: int = 200) -> list[dict]:
@@ -125,20 +166,32 @@ class TossGateway:
             return self.client.get_rankings(**kw)
 
     def orderbook(self, symbol: str) -> Any:
+        """주문 직전 리밋가·스프레드 산정용(브로커). 실패하면 브로커가 견적가로 폴백하므로
+        재시도를 짧게 묶는다 — 기본(4회·최대 8초 백오프)이면 호가 장애 한 번에 손절 주문이
+        게이트웨이 락을 쥔 채 수십 초 멈춘다."""
         with self._lock:
-            return self.client._request("orderbook", params={"symbol": symbol})
+            return self.client._request("orderbook", params={"symbol": symbol},
+                                        max_attempts=2,
+                                        timeout=max(self.quote_timeout_sec, 3.0))
 
-    def best_quote(self, symbol: str) -> tuple[float | None, float | None] | None:
-        """최우선 (bid, ask). 조회 실패·빈 호가면 None — PriceGuard 교차확인용."""
+    def best_quote(self, symbol: str) -> tuple[float | None, float | None, float | None] | None:
+        """최우선 (bid, ask, 호가시각). 조회 실패·빈 호가면 None — PriceGuard 교차확인용.
+
+        재시도 없이 1회·짧은 타임아웃. 클라이언트 기본(4회·백오프)이면 한 종목 호가
+        장애가 게이트웨이 락을 수십 초 쥐어 전 종목 손절 평가가 밀린다.
+        """
         try:
-            ob = self.orderbook(symbol) or {}
+            with self._lock:
+                ob = self.client._request("orderbook", params={"symbol": symbol},
+                                          max_attempts=1,
+                                          timeout=self.quote_timeout_sec) or {}
         except Exception as e:
             log.warning("호가 조회 실패(가격 가드) %s: %s", symbol, e)
             return None
         if not isinstance(ob, dict):
             return None
         bid, ask = _best_level(ob.get("bids")), _best_level(ob.get("asks"))
-        return (bid, ask) if (bid or ask) else None
+        return (bid, ask, _parse_ts(ob.get("timestamp"))) if (bid or ask) else None
 
     # ── 계좌/주문 위임 ────────────────────────────────────
     def holdings(self, account_seq: int | str, symbol: str | None = None) -> dict:
@@ -154,6 +207,10 @@ class TossGateway:
     def get_order(self, account_seq: int | str, order_id: str) -> dict:
         with self._lock:
             return self.client.get_order(account_seq, order_id)
+
+    def list_orders(self, account_seq: int | str, **kw: Any) -> dict:
+        with self._lock:
+            return self.client.list_orders(account_seq, **kw)
 
     def cancel_order(self, account_seq: int | str, order_id: str) -> dict:
         with self._lock:

@@ -97,6 +97,8 @@ watch:
     recheck_sec: 30
     ref_max_age_sec: 1800
     max_quotes_per_sec: 3      # 호가 교차확인 상한(MARKET_DATA 10TPS 를 /prices 와 공유)
+    quote_timeout_sec: 2       # 교차확인 호가는 1회·이 타임아웃(재시도 없음)
+    quote_fail_cooldown_sec: 30  # 호가 실패 종목 재조회 대기 · 연속 3회 실패면 전 종목 대기
   brain_backend: "cli"       # cli | live | dry
   brain_interval_sec: 0        # 정각 스케줄은 extra_wakes 전용(상대 주기 끔)
   brain_cooldown_sec: 300

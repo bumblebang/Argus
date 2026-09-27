@@ -41,13 +41,23 @@ def _params_of(pos: dict) -> dict:
 
 
 class StrategyRunner:
+    """거부된 신호 청산은 종목별 지수 백오프(ExitExecutor 와 같은 정책).
+
+    확정봉 신호는 봉이 바뀔 때까지 계속 뜬다 — 시간외 스프레드 초과 같은 거부가
+    라운드로빈마다 주문 시도·호가 조회·error 이벤트를 만든다.
+    """
+
     def __init__(self, gateway, broker, store,
-                 cfg: SignalExitConfig | None = None, now_fn=time.time) -> None:
+                 cfg: SignalExitConfig | None = None, now_fn=time.time, *,
+                 retry_base_sec: float = 10.0, retry_max_sec: float = 120.0) -> None:
         self.gw = gateway
         self.broker = broker
         self.store = store
         self.cfg = cfg or SignalExitConfig()
         self._now = now_fn
+        self.retry_base_sec = float(retry_base_sec)
+        self.retry_max_sec = float(retry_max_sec)
+        self._retry: dict[str, tuple[float, int, float]] = {}   # sym -> (next_ts, streak, last_ts)
 
     def _held_sec(self, pos: dict) -> float | None:
         opened = pos.get("opened_at")
@@ -101,6 +111,13 @@ class StrategyRunner:
             return {"action": "sell", "executed": False, "held_sec": held,
                     "reason": f"최소 보유 미달({held:.0f}s < {self.cfg.min_hold_sec:.0f}s)"}
 
+        now = float(self._now())
+        next_ts, streak, last_ts = self._retry.get(sym, (0.0, 0, 0.0))
+        if now < next_ts:
+            return {"action": "sell", "executed": False, "reason": "청산 재시도 대기",
+                    "retry_in_sec": round(next_ts - now, 1)}
+        if now - last_ts > self.retry_max_sec * 2:
+            streak = 0
         exec_px = order_price(price, df)
         exit_reason = f"strategy:{name}"
         res = self.broker.execute_with_mirror(
@@ -109,9 +126,14 @@ class StrategyRunner:
             store=self.store, exit_reason=exit_reason)
         if not res:
             why = res.reject_reason or getattr(self.broker, "last_reject_reason", None) or "gate_rejected"
+            streak += 1
+            delay = min(self.retry_base_sec * 2 ** (streak - 1), self.retry_max_sec)
+            self._retry[sym] = (now + delay, streak, now)
             self.store.log_event("error", sym, {"where": "strategy_exit",
-                                                "reason": why})
+                                                "reason": why, "retry_in_sec": delay,
+                                                "attempt": streak})
             return {"action": "sell", "executed": False, "reason": why}
+        self._retry.pop(sym, None)
         self.store.log_event("strategy_exit", sym, fill_event_payload(
             res, strategy=name, price=res.avg_price or exec_px, reason=sig.reason))
         log.info("전략청산 %s filled=%s @ %.2f (%s: %s)",

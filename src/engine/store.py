@@ -523,6 +523,31 @@ class Store:
                     out[str(sym)] = px
         return out
 
+    def latest_snapshot_refs(self, symbols: list[str], *,
+                             max_age_sec: float | None = 86400.0,
+                             now: float | None = None) -> dict[str, tuple[float, float]]:
+        """심볼별 최신 스냅샷 (가격, ts). 가격 가드 재기동 시드용."""
+        out: dict[str, tuple[float, float]] = {}
+        import time as _time
+        now_ts = float(now if now is not None else _time.time())
+        with self._lock:
+            for sym in symbols or []:
+                row = self.conn.execute(
+                    "SELECT price, ts FROM snapshots WHERE symbol=? AND price IS NOT NULL "
+                    "ORDER BY ts DESC LIMIT 1", (str(sym),)).fetchone()
+                if not row or row[0] is None:
+                    continue
+                ts = float(row[1])
+                if max_age_sec is not None and now_ts - ts > float(max_age_sec):
+                    continue
+                try:
+                    px = float(row[0])
+                except (TypeError, ValueError):
+                    continue
+                if px > 0:
+                    out[str(sym)] = (px, ts)
+        return out
+
     def closed_position_fidelity(self, since: float | None = None) -> dict:
         """closed+pnl NULL 행을 armed 해제 vs 실체결 손익누락으로 나눈다.
 

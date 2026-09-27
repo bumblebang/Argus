@@ -90,6 +90,54 @@ def test_stop_hit_routes_to_code_exit_not_wake(tmp_path, monkeypatch):
     assert "trigger" in logged                    # wake/precision 은 없음
 
 
+def test_backing_off_exit_kind_does_not_shadow_stop_hit(tmp_path, monkeypatch):
+    """앞 청산 kind(time_stop)가 백오프·거부로 False 여도 같은 틱 stop_hit 을 시도한다."""
+    import time as _time
+    from src.engine.exit_policy import ExitPolicyConfig
+
+    _only_kr_open(monkeypatch)
+    store = Store(tmp_path / "t.db")
+    now = _time.time()
+    gw = FakeGateway({"005930": 59000})           # 손절가 60000 아래 + 보유 25일
+    pos = {"symbol": "005930", "market": "KR", "qty": 10, "avg_price": 70000,
+           "stop_price": 60000, "target_price": None,
+           "opened_at": now - 25 * 86400, "meta": '{"horizon": "swing"}',
+           "strategy": "rsi_reversion"}
+    tried = []
+
+    def execu(sym, m, p, t):
+        tried.append(t.kind)
+        return t.kind == "stop_hit"                # time_stop 은 백오프 중(False)
+
+    ep = ExitPolicyConfig(enabled=True, max_days={"swing": 20, "position": 120},
+                          exclude_strategies=frozenset({"value"}))
+    loop = WatchLoop(gw, store, lambda: {"KR": {"positions": [pos], "candidates": []}},
+                     executor=execu, config=WatchConfig(exit_policy=ep))
+    res = loop.run_once()
+    assert tried == ["time_stop", "stop_hit"] and res.exits == ["005930"]
+
+
+def test_repeated_trigger_events_are_throttled(tmp_path, monkeypatch):
+    """청산이 계속 거부되는 동안 같은 트리거 이벤트를 매 틱 쌓지 않는다(09-23 ROIV)."""
+    _only_kr_open(monkeypatch)
+    store = Store(tmp_path / "t.db")
+    clock = {"t": 1_000_000.0}
+    gw = FakeGateway({"005930": 68000})
+    pos = {"symbol": "005930", "market": "KR", "qty": 10,
+           "avg_price": 70000, "stop_price": 69000, "target_price": None}
+    loop = WatchLoop(gw, store, lambda: {"KR": {"positions": [pos], "candidates": []}},
+                     executor=lambda *a: False, now_fn=lambda: clock["t"])
+    for _ in range(120):
+        res = loop.run_once()
+        assert "stop_hit" in {t.kind for t in res.triggers}
+        clock["t"] += 1
+    rows = store.conn.execute(
+        "SELECT json_extract(payload,'$.kind') AS k FROM events WHERE kind='trigger'"
+    ).fetchall()
+    stop_rows = [r["k"] for r in rows if r["k"] == "stop_hit"]
+    assert len(stop_rows) == 2, [r["k"] for r in rows]
+
+
 def test_time_stop_routes_to_code_exit(tmp_path, monkeypatch):
     import time as _time
     from src.engine.exit_policy import ExitPolicyConfig

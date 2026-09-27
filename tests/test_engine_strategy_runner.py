@@ -72,3 +72,31 @@ def test_skip_when_no_strategy(tmp_path):
     sr = StrategyRunner(FakeGW(_ohlcv([1, 2, 3])), broker, store)
     r = sr.evaluate({"symbol": "005930", "qty": 3, "avg_price": 40}, "KR")
     assert r["action"] == "skip" and r["executed"] is False
+
+
+def test_rejected_signal_exit_backs_off(tmp_path):
+    """거부된 신호 청산은 백오프 — 라운드로빈마다 재주문·error 이벤트 스팸 방지."""
+    from src.fill_result import ExecuteResult
+
+    class _Rejecting:
+        def __init__(self):
+            self.calls = 0
+
+        def execute_with_mirror(self, order, **kw):
+            self.calls += 1
+            return ExecuteResult.rejected("스프레드 초과")
+
+    store = Store(tmp_path / "t.db")
+    store.open_position("005930", "KR", 3, 40, strategy="rsi_reversion",
+                        meta={"entry_basis": "signal",
+                              "params": {"period": 14, "oversold": 30, "overbought": 70}})
+    clock = {"t": 1_000.0}
+    broker = _Rejecting()
+    sr = StrategyRunner(FakeGW(_ohlcv([float(x) for x in range(20, 60)])), broker, store,
+                        cfg=SignalExitConfig(min_hold_sec=0), now_fn=lambda: clock["t"],
+                        retry_base_sec=10, retry_max_sec=40)
+    pos = dict(store.get_open_positions()[0])
+    for _ in range(31):
+        sr.evaluate(pos, "KR")
+        clock["t"] += 1
+    assert broker.calls == 3                              # t=0, 10, 30

@@ -107,6 +107,9 @@ class ExitExecutor:
 
     감시 루프는 1초 틱이라 백오프가 없으면 시간외 스프레드 초과 같은 거부가 매초
     주문 시도·호가 조회·error 이벤트를 만든다(09-23 ROIV 한 종목 30분간 ~1,400건).
+
+    백오프 키는 (종목, 트리거 kind) — 익절 거부가 뒤이은 손절·종가청산을 최대
+    retry_max_sec 동안 막으면 안 된다. 체결되면 그 종목의 백오프를 전부 푼다.
     """
 
     def __init__(self, broker, store, *, retry_base_sec: float = 10.0,
@@ -116,7 +119,8 @@ class ExitExecutor:
         self.retry_base_sec = float(retry_base_sec)
         self.retry_max_sec = float(retry_max_sec)
         self._clock = clock
-        self._retry: dict[str, tuple[float, int, float]] = {}   # sym -> (next_ts, streak, last_ts)
+        # (sym, kind) -> (next_ts, streak, last_ts)
+        self._retry: dict[tuple[str, str], tuple[float, int, float]] = {}
 
     def __call__(self, symbol: str, market: str, price: float | None, trigger) -> bool:
         """보유 전량 시장 청산. 체결되면 True. (감시 루프가 트리거 시 호출)"""
@@ -124,12 +128,13 @@ class ExitExecutor:
         if pos.qty <= 0 or not price or price <= 0:
             return False
         now = self._clock()
-        next_ts, streak, last_ts = self._retry.get(symbol, (0.0, 0, 0.0))
+        kind = getattr(trigger, "kind", "exit")
+        key = (symbol, str(kind))
+        next_ts, streak, last_ts = self._retry.get(key, (0.0, 0, 0.0))
         if now < next_ts:
             return False
         if now - last_ts > self.retry_max_sec * 2:
             streak = 0                         # 오래 조용했으면 새 사건으로 본다
-        kind = getattr(trigger, "kind", "exit")
         sell_qty = pos.qty
         res = self.broker.execute_with_mirror(
             Order(symbol, market, "SELL", sell_qty, price),
@@ -138,12 +143,13 @@ class ExitExecutor:
             why = res.reject_reason or getattr(self.broker, "last_reject_reason", None) or "gate_rejected"
             streak += 1
             delay = min(self.retry_base_sec * 2 ** (streak - 1), self.retry_max_sec)
-            self._retry[symbol] = (now + delay, streak, now)
+            self._retry[key] = (now + delay, streak, now)
             self.store.log_event("error", symbol,
                                  {"where": "exit", "kind": kind, "reason": why,
                                   "retry_in_sec": delay, "attempt": streak})
             return False
-        self._retry.pop(symbol, None)
+        for k in [k for k in self._retry if k[0] == symbol]:
+            self._retry.pop(k, None)
         acct = self.broker.position(symbol)
         self.store.log_event("exit", symbol, fill_event_payload(
             res, kind=kind, price=res.avg_price or price, qty=sell_qty,

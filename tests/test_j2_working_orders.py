@@ -429,12 +429,16 @@ def test_cancel_failure_abandons_after_ttl(tmp_path):
     kinds = [r["kind"] for r in store.conn.execute(
         "SELECT kind FROM events WHERE kind='working_order_quarantined'").fetchall()]
     assert kinds == ["working_order_quarantined"]
-    # 격리 심볼은 막히지만 다른 종목 매수는 통과.
     ok_client = _Client({"status": "FILLED",
                          "execution": {"filledQuantity": 1,
                                        "averageFilledPrice": 600_000,
                                        "commission": 0, "tax": 0}})
     broker.client = ok_client
+    # 격리 주문은 증권사에 살아 있을 수 있다 — BP 재대사 전엔 홀드 유지.
+    held = broker.execute(Order("000660", "KR", "BUY", 1, 600_000), "held")
+    assert not held.ok and "매수여력" in held.reject_reason
+    # 재대사가 cash 를 실계좌 BP 로 덮은 뒤엔(홀드가 BP 에 반영) 다른 종목 매수 통과.
+    broker.reconcile(lambda acct: {})
     assert broker.execute(Order("000660", "KR", "BUY", 1, 600_000), "thaw").ok
     # 같은 심볼은 QUARANTINED 로 양방향 차단.
     assert not broker.execute(Order("005930", "KR", "BUY", 1, 600_000), "blocked").ok
@@ -475,7 +479,9 @@ def test_negative_abandon_ttl_never_drops(tmp_path):
 
 
 def test_execute_prunes_abandoned_before_gate(tmp_path):
-    """sweep 전이라도 execute 가 abandon 행을 QUARANTINED 로 격리해 예약을 푼다."""
+    """sweep 전이라도 execute 가 abandon 행을 QUARANTINED 로 격리한다.
+
+    격리 행의 홀드는 BP 재대사 이후에만 풀린다(살아 있는 주문의 현금 재사용 방지)."""
     store = Store(tmp_path / "t.db")
     client = _Client({"status": "FILLED",
                       "execution": {"filledQuantity": 1,
@@ -485,9 +491,12 @@ def test_execute_prunes_abandoned_before_gate(tmp_path):
     store.upsert_working_order(order_id="X1", symbol="005930", market="KR",
                                side="BUY", qty=1, price=600_000, status="PENDING",
                                placed_at=time.time() - 120)
-    assert broker.execute(Order("000660", "KR", "BUY", 1, 600_000), "thaw").ok
+    held = broker.execute(Order("000660", "KR", "BUY", 1, 600_000), "held")
+    assert not held.ok and "매수여력" in held.reject_reason
     rows = store.get_working_orders()
     assert len(rows) == 1 and rows[0]["status"] == "QUARANTINED"
+    broker.reconcile(lambda acct: {})
+    assert broker.execute(Order("000660", "KR", "BUY", 1, 600_000), "thaw").ok
 
 
 def test_unconfirmed_cancel_keeps_order_working(tmp_path):

@@ -435,6 +435,9 @@ class TickResult:
 # 코드(빠른손)가 즉시 처리하는 청산 트리거 — 뇌를 거치지 않는다.
 _EXIT_KINDS = {"stop_hit", "trail_stop", "target_hit", "time_stop",
                "close_scan_exit", "value_fair_high"}
+# 같은 (종목, kind) 트리거 이벤트 기록 간격. 조건이 유지되는 동안 트리거는 매 틱
+# 다시 뜬다(청산 백오프 중 stop_hit, 무효화 등) — 판단은 매 틱 하되 기록만 줄인다.
+_TRIGGER_LOG_COOLDOWN_SEC = 60.0
 
 
 class WatchLoop:
@@ -473,6 +476,8 @@ class WatchLoop:
         self._regime_acked: dict[str, str] = {}
         # 강등된 전략 반대신호의 마지막 각성 시각 {(symbol, strategy): ts} — 쿨다운.
         self._signal_woke: dict[tuple[str, str], float] = {}
+        # 트리거 이벤트 마지막 기록 시각 {(symbol, kind): ts} — 매 틱 동일 기록 스팸 방지.
+        self._trigger_logged: dict[tuple[str, str], float] = {}
         self._last_brain_wake = 0.0    # 주기 각성 타이머(개장 첫 틱에 바로 1회 발화)
         self._rr = 0                   # per_tick 상한 라운드로빈 오프셋(기아 방지)
         self._last_session: dict[str, str] = {}     # 세션 경계 리셋용: 시장→직전 틱 세션명
@@ -979,24 +984,37 @@ class WatchLoop:
                     trigs.append(vt)
 
                 for t in trigs:
-                    self.store.log_event("trigger", sym, t.as_event())
+                    key = (sym, t.kind)
+                    last = self._trigger_logged.get(key)
+                    if last is None or now_ts - last >= _TRIGGER_LOG_COOLDOWN_SEC:
+                        self._trigger_logged[key] = now_ts
+                        self.store.log_event("trigger", sym, t.as_event())
                     res.triggers.append(t)
+                if len(self._trigger_logged) > 5000:
+                    self._trigger_logged = {
+                        k: v for k, v in self._trigger_logged.items()
+                        if now_ts - v < _TRIGGER_LOG_COOLDOWN_SEC}
 
                 # 빠른손: 손절/익절은 코드가 즉시 청산(뇌 안 거침). 청산하면 이 심볼은
                 # 정밀/각성 대상에서 제외(포지션 사라짐).
                 exited = False
                 if self.executor and sym in positions:
                     pos_market = positions[sym].get("market", market)
+                    # 청산 트리거를 우선순위대로 시도하고 체결되면 멈춘다. 앞 kind 가
+                    # 백오프·거부로 False 면 다음 kind(손절 등)를 이어서 본다 — 첫 kind 만
+                    # 보면 백오프 중인 time_stop 이 같은 틱의 stop_hit 을 가린다.
                     for t in trigs:
-                        if t.kind in _EXIT_KINDS:
-                            try:
-                                if self.executor(sym, pos_market, price, t):
-                                    res.exits.append(sym)
-                                    exited = True
-                            except Exception as e:
-                                log.error("코드 청산 실패 %s: %s", sym, e)
-                                self.store.log_event("error", sym,
-                                                     {"where": "exit", "err": str(e)})
+                        if t.kind not in _EXIT_KINDS:
+                            continue
+                        try:
+                            if self.executor(sym, pos_market, price, t):
+                                res.exits.append(sym)
+                                exited = True
+                                break
+                        except Exception as e:
+                            log.error("코드 청산 실패 %s: %s", sym, e)
+                            self.store.log_event("error", sym,
+                                                 {"where": "exit", "err": str(e)})
                             break
                 if exited:
                     continue

@@ -95,13 +95,29 @@ def test_no_quote_holds_then_accepts_after_confirm_sec():
     assert g.filter("A", 69.0) == (69.0, None)
 
 
-def test_stale_reference_accepts_without_quote():
+def test_stale_reference_accepts_gap_when_no_quote():
+    """밤새 안 본 종목의 개장 갭 — 호가를 못 구하면 낡은 기준으로 붙잡지 않는다."""
     clock = _Clock()
-    g, q = _guard((1.0, 1.0), clock=clock, ref_max_age_sec=1800)
+    g, q = _guard(None, clock=clock, ref_max_age_sec=1800)
     g.filter("A", 100.0)
-    clock.t += 3600                                     # 밤새 안 본 종목의 개장 갭
-    assert g.filter("A", 80.0) == (80.0, None)
-    assert q.calls == 0
+    clock.t += 3600
+    assert g.filter("A", 80.0) == (80.0, "timeout")
+    assert q.calls == 1
+    assert g.filter("A", 79.0) == (79.0, None)
+
+
+def test_stale_reference_still_checks_quote_after_poll_gap():
+    """30분 폴링 공백 뒤 첫 틱도 오류가면 기각 — 예전엔 기준 없이 그대로 채택(가짜 손절)."""
+    clock = _Clock()
+    g, q = _guard((37.98, 38.97), clock=clock, ref_max_age_sec=1800)
+    g.filter("ROIV", 38.25)
+    clock.t += 3600
+    px, verdict = g.filter("ROIV", 29.12)
+    assert verdict == "rejected" and px > 38
+    real, _ = _guard((79.9, 80.1), clock=clock, ref_max_age_sec=1800)
+    real.filter("A", 100.0)
+    clock.t += 3600
+    assert real.filter("A", 80.0) == (80.0, "confirmed")
 
 
 def test_quote_error_treated_as_unavailable():
@@ -146,8 +162,9 @@ class _SeqClient:
         p = self.prices.pop(0)
         return [{"symbol": s, "lastPrice": str(p)} for s in symbols]
 
-    def _request(self, name, params=None):
+    def _request(self, name, params=None, **kw):
         assert name == "orderbook"
+        self.request_kw = kw
         return self.book
 
 
@@ -238,4 +255,155 @@ def test_exit_backoff_clears_on_success(tmp_path):
     broker.ok = True
     broker.position = lambda s: _Pos()
     assert ex("A", "US", 38.0, _Trig()) is True
-    assert "A" not in ex._retry
+    assert not [k for k in ex._retry if k[0] == "A"]
+
+
+# ── 09-27 점검: 멈춘 호가·재기동·캐시·호가 장애 ─────────────────
+
+def test_stale_book_does_not_block_real_crash_forever():
+    """호가가 멈춰(시각이 의심 전) 진짜 급락을 계속 부정해도, 체결가가 움직이면
+    confirm_sec 뒤 채택 — 예전엔 기각이 의심 시계를 매번 리셋해 손절이 영영 안 났다."""
+    clock = _Clock()
+    frozen_at = clock.t - 600
+    g, q = _guard((99.0, 101.0, frozen_at), clock=clock, confirm_sec=180,
+                  recheck_sec=30)
+    g.filter("A", 100.0)
+    verdicts = []
+    for i in range(10):
+        clock.t += 30
+        verdicts.append(g.filter("A", 80.0 - i * 0.5))
+    assert verdicts[0][1] == "rejected"
+    assert ("stale_quote" in [v for _, v in verdicts])
+    px, v = next((p, v) for p, v in verdicts if v == "stale_quote")
+    assert px < 80.0
+    # 채택 이후엔 새 기준가 — 평상 통과
+    assert g.filter("A", 75.0)[1] is None
+
+
+def test_constant_bad_print_rejected_even_with_frozen_book():
+    """한 값에 고정된 오류가(ROIV 29.12 30분)는 호가가 멈춰 보여도 끝까지 기각."""
+    clock = _Clock()
+    g, q = _guard((37.98, 38.97, clock.t - 3600), clock=clock, recheck_sec=30)
+    g.filter("ROIV", 38.25)
+    for _ in range(40):
+        clock.t += 60
+        px, verdict = g.filter("ROIV", 29.12)
+        assert verdict == "rejected" and px > 37
+
+
+def test_live_book_keeps_rejecting_moving_prints():
+    """호가 시각이 의심 뒤로 갱신되면 살아 있는 호가 — 체결가가 움직여도 기각."""
+    clock = _Clock()
+
+    def quote(sym):
+        return (37.98, 38.97, clock.t - 1)
+
+    g = PriceGuard(quote, clock=clock, recheck_sec=30)
+    g.filter("ROIV", 38.25)
+    for i in range(20):
+        clock.t += 30
+        assert g.filter("ROIV", 29.0 + i * 0.01)[1] == "rejected"
+
+
+def test_restart_seeds_reference_from_snapshot():
+    """재기동 직후 첫 틱이 오류가여도 직전 스냅샷 기준으로 호가 확인 → 기각."""
+    clock = _Clock()
+    g, q = _guard((37.98, 38.97), clock=clock)
+    assert g.unseeded(["ROIV", "HPE"]) == ["ROIV", "HPE"]
+    g.seed_refs({"ROIV": (38.25, clock.t - 120)}, tried=["ROIV", "HPE"])
+    assert g.unseeded(["ROIV", "HPE"]) == []
+    px, verdict = g.filter("ROIV", 29.12)
+    assert verdict == "rejected" and px > 38
+    assert g.filter("HPE", 21.58) == (21.58, None)       # 시드 없음 → 기존대로 채택
+
+
+def test_gateway_seeds_guard_from_store_snapshots(tmp_path):
+    store = Store(tmp_path / "t.db")
+    store.record_snapshots([{"symbol": "ROIV", "price": 38.25}])
+    client = _SeqClient(["29.12"],
+                        {"bids": [{"price": "37.98", "volume": "10"}],
+                         "asks": [{"price": "38.97", "volume": "10"}]})
+    gw = TossGateway(client, store=store)
+    gw.price_guard = PriceGuard(gw.best_quote)
+    row = gw.poll_prices(["ROIV"])[0]                    # 재기동 후 첫 폴링
+    assert row["price_guard"] == "rejected" and row["price"] > 38
+
+
+def test_verdict_cache_invalidated_when_reference_moves():
+    """(종목, 오류가) 판정 캐시가 기준가 이동 뒤에도 옛 중간값을 돌려주던 문제."""
+    clock = _Clock()
+    q = _Quotes((61.05, 61.15))
+    g = PriceGuard(q, clock=clock, recheck_sec=30)
+    g.filter("HPE", 61.1)
+    assert g.filter("HPE", 21.58)[1] == "rejected"      # 캐시: 21.58 → 61.1
+    clock.t += 1
+    q.quote = (49.9, 50.1)
+    assert g.filter("HPE", 50.0) == (50.0, "confirmed")  # 진짜 급락 확인 → 새 기준
+    clock.t += 1
+    px, verdict = g.filter("HPE", 21.58)                 # 같은 오류가 재등장
+    assert verdict == "rejected" and abs(px - 50.0) < 1e-9
+    assert q.calls == 3
+
+
+def test_quote_failure_cooldown_and_breaker():
+    """호가 장애 종목은 쿨다운, 연속 실패는 전 종목 조회 차단 — 매 틱 붙잡지 않는다."""
+    clock = _Clock()
+    calls = []
+
+    def boom(sym):
+        calls.append(sym)
+        return None
+
+    g = PriceGuard(boom, clock=clock, quote_fail_cooldown_sec=30, max_quotes_per_sec=10)
+    for s in "ABCDE":
+        g.filter(s, 100.0)
+    for i in range(5):                                   # 매 틱 가격이 바뀌어 캐시 미스
+        for s in "ABCDE":
+            g.filter(s, 70.0 - i)
+        clock.t += 1
+    assert len(calls) == 3                               # 3회 연속 실패 → 차단
+    clock.t += 30
+    g.filter("A", 60.0)
+    assert len(calls) == 4
+
+
+def test_budget_starved_symbol_keeps_rejection():
+    """호가 예산을 못 받는 틱에도 이번 의심 중 호가가 부정했으면 오류가를 채택하지 않는다."""
+    clock = _Clock()
+    g, q = _guard((49.9, 50.1), clock=clock, max_quotes_per_sec=1, confirm_sec=60,
+                  recheck_sec=30)
+    g.filter("A", 50.0)
+    g.filter("B", 50.0)
+    assert g.filter("A", 20.0)[1] == "rejected"
+    clock.t += 61
+    g.filter("B", 20.0)                                  # B 가 이번 초 예산 소진
+    px, verdict = g.filter("A", 20.5)
+    assert verdict == "rejected" and px == 50.0
+
+
+def test_best_quote_single_attempt_short_timeout():
+    client = _SeqClient([], {"bids": [{"price": "10", "volume": "1"}],
+                             "asks": [{"price": "11", "volume": "1"}],
+                             "timestamp": "2026-09-23T06:08:00+09:00"})
+    gw = TossGateway(client, quote_timeout_sec=1.5)
+    bid, ask, at = gw.best_quote("A")
+    assert (bid, ask) == (10.0, 11.0) and at is not None
+    assert client.request_kw == {"max_attempts": 1, "timeout": 1.5}
+
+
+def test_exit_backoff_is_per_trigger_kind(tmp_path):
+    """익절 거부 백오프가 손절·종가청산을 막지 않는다(예전엔 심볼 단위 최대 120초)."""
+    store = Store(tmp_path / "t.db")
+    broker = _RejectingBroker()
+    clock = _Clock()
+    ex = ExitExecutor(broker, store, retry_base_sec=10, retry_max_sec=120, clock=clock)
+
+    class _Target:
+        kind = "target_hit"
+
+    for _ in range(3):
+        ex("A", "US", 38.0, _Target())
+        clock.t += 1
+    assert broker.calls == 1
+    ex("A", "US", 38.0, _Trig())                         # stop_hit 은 즉시 시도
+    assert broker.calls == 2
