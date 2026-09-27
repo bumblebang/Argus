@@ -32,15 +32,18 @@ def test_working_reservation_skipped_after_reconcile(tmp_path):
         return {"cash": dict(a.cash)}
 
     broker.reconcile(_apply)
-    assert broker._cash_reconciled_at is not None
-    assert broker._working_reservations() == []  # 이중 차감 금지
+    assert broker._cash_reconciled_at.get("KR") is not None
+    # 이중 차감 금지 — 현금 예약에선 빠지고(bp_held) 노출 한도용으로만 남는다.
+    res = broker._working_reservations()
+    assert [r.order_id for r in res] == ["W1"] and res[0].bp_held
 
-    # 재대사 **이후** 신규 미체결은 여전히 예약
+    # 재대사 **이후** 신규 미체결은 여전히 현금 예약
     store.upsert_working_order(order_id="W2", symbol="000660", market="KR",
                                side="BUY", qty=1, price=50_000,
                                status="PENDING", filled_qty=0,
-                               placed_at=broker._cash_reconciled_at + 1)
-    assert len(broker._working_reservations()) == 1
+                               placed_at=broker._cash_reconciled_at["KR"] + 1)
+    fresh = [r for r in broker._working_reservations() if not r.bp_held]
+    assert [r.order_id for r in fresh] == ["W2"]
 
 
 def test_gate_not_double_blocked_after_reconcile(tmp_path):

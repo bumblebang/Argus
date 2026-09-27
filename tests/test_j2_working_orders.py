@@ -547,7 +547,9 @@ def test_sweep_survives_api_failure(tmp_path):
 
 
 def test_sweep_sell_fetch_fail_blocks_reconcile(tmp_path):
-    """매도 조회 실패 시 재대사 차단 — 감소 선흡수로 귀속 대상이 사라지는 구멍 방지."""
+    """매도 조회 실패 시 그 심볼 재대사 보류 — 감소 선흡수로 귀속 대상이 사라지는 구멍 방지.
+
+    전체 재대사(block_reconcile)는 막지 않는다 — 다른 심볼·현금은 정상 재대사."""
     class _Boom(_Client):
         def get_order(self, account_seq, order_id):
             raise RuntimeError("api down")
@@ -557,7 +559,8 @@ def test_sweep_sell_fetch_fail_blocks_reconcile(tmp_path):
     store.upsert_working_order(order_id="S1", symbol="005930", market="KR",
                                side="SELL", qty=10, price=71_000, status="PENDING")
     out = broker.sweep_working_orders()
-    assert out["fetch_failed"] == 1 and out["block_reconcile"] is True
+    assert out["fetch_failed"] == 1 and out["block_reconcile"] is False
+    assert out["defer_symbols"] == ["005930"]
     assert len(store.get_working_orders()) == 1
 
 

@@ -37,7 +37,7 @@ RUNTIME_WORKER_KEYS = (
 
 from src.config import load_config, ROOT
 from src import paths as _paths
-from src.day_pool import (day_pool_cfg, load_day_pool, merge_swing_and_day,
+from src.day_pool import (active_day_pool, day_pool_active, day_track_enabled,
                           refresh_all_day_pools)
 from src.gap_decline_pool import (gap_decline_pool_cfg, load_gap_decline_pool,
                                   merge_all_pools, refresh_all_gap_decline_pools)
@@ -107,7 +107,7 @@ def _keep_awake(enable: bool) -> None:
 
 def _refresh_day_pool(gateway, cfg) -> None:
     """뇌 사이클 직전 토스 거래대금 랭킹으로 day_pool 을 맞춘다. 실패는 기존 파일."""
-    if not day_pool_cfg(cfg).get("enabled", True):
+    if not day_pool_active(cfg):
         return
     if getattr(gateway, "get_rankings", None) is None:
         return
@@ -441,15 +441,17 @@ def _start_reconcile_timer(broker, gateway, store, cfg, markets,
             if (sw.get("canceled") or sw.get("cancel_failed") or sw.get("settled")
                     or sw.get("dropped") or sw.get("abandoned")
                     or sw.get("block_reconcile") or sw.get("fetch_failed")
-                    or sw.get("local_resolved") or sw.get("local_absent")):
+                    or sw.get("local_resolved") or sw.get("local_absent")
+                    or sw.get("defer_symbols") or sw.get("register_failed_cleared")):
                 store.log_event("working_orders", None, sw)
         except Exception as e:
             log.warning("미체결 정산 오류(무시): %s", e)
             sw = {"error": str(e), "block_reconcile": True}
         # 매도 체결가 출처(sweep) 없이 재대사하면 감소만 흡수되고 손익이 영구 손실.
+        # sweep 자체가 실패했을 때만 전체 연기 — 개별 미해소 매도는 그 심볼만 보류한다.
         if sw.get("block_reconcile"):
-            log.warning("재대사 연기 — sweep 미완(매도 조회 실패 fetch_failed=%s)",
-                        sw.get("fetch_failed"))
+            log.warning("재대사 연기 — sweep 미완(미체결 레지스트리 조회 실패: %s)",
+                        sw.get("error"))
             try:
                 store.log_event("reconcile_deferred", None, {
                     "reason": "sweep_incomplete",
@@ -467,12 +469,14 @@ def _start_reconcile_timer(broker, gateway, store, cfg, markets,
                     "consecutive_failures", 0) or 0)
             broker.note_sync_result(data)
             record_sync_visibility(broker, store, prev_failures=prev_failures)
+            defer_syms = set(sw.get("defer_symbols") or [])
             res = broker.reconcile(
                 lambda acct: apply_reconcile_from_live(
-                    acct, store, data, markets=tuple(markets)),
-                expect_gen=gen)
+                    acct, store, data, markets=tuple(markets),
+                    defer_symbols=defer_syms),
+                expect_gen=gen, cash_markets=sorted((data.get("cash") or {}).keys()))
             if (res.get("adopted") or res.get("closed") or res.get("error")
-                    or res.get("attributed")
+                    or res.get("attributed") or res.get("deferred_sell_symbols")
                     or not res.get("cash_ok", True)
                     or not res.get("holdings_ok", True)):
                 store.log_event("reconcile", None, res)
@@ -805,7 +809,7 @@ def run_from_args(args) -> int:
     loop_ref: list = []
     def combined_universe():
         return merge_all_pools(
-            provider.markets(), load_day_pool(), load_gap_decline_pool())
+            provider.markets(), active_day_pool(cfg), load_gap_decline_pool())
 
     def pool_refresh_cb(market, hhmm, reason):
         _on_pool_refresh(market, hhmm, reason, cfg=cfg, gateway=gateway)
@@ -822,7 +826,8 @@ def run_from_args(args) -> int:
     # 코드 자율 진입: armed 종목에 전략 BUY 신호 시 매수(진입가 기준 손절/목표 확정).
     entry_executor = EntryExecutor(
         gateway, broker, risk, store,
-        plan_fn=lambda price, hz, params: entry_stop_target(price, hz, params))
+        plan_fn=lambda price, hz, params: entry_stop_target(price, hz, params),
+        day_enabled=lambda: day_track_enabled(cfg))
     loop = WatchLoop(gateway, store,
                      lambda: build_watchlist(cfg, store, universe=combined_universe()),
                      markets=markets, config=watch_config,

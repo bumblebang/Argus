@@ -334,7 +334,8 @@ def _sell_attribution_pending_symbols(store) -> set[str]:
 
 
 def apply_sync_from_live(account, store, data: dict, *, markets=("KR", "US"),
-                         defer_sell_holdings: bool = False) -> dict:
+                         defer_sell_holdings: bool = False,
+                         defer_symbols=None) -> dict:
     """기동 동기화 apply — broker.run_locked 안에서 호출.
 
     순서(재대사와 동일 의도): 귀속 → holdings 덮기 → BUY applied 보정 → store 미러.
@@ -343,6 +344,7 @@ def apply_sync_from_live(account, store, data: dict, *, markets=("KR", "US"),
 
     ``defer_sell_holdings``(sweep ``block_reconcile``): 매도 귀속 대기 심볼은
     수량을 덮지 않고 경고만 — 다음 주기 재대사에 맡긴다.
+    ``defer_symbols``: sweep 이 매도 결과 불명으로 짚은 심볼(항상 보류).
     """
     before = {sym: (float(p.qty), float(p.avg_price),
                     account.symbol_market.get(sym, "KR"))
@@ -366,13 +368,12 @@ def apply_sync_from_live(account, store, data: dict, *, markets=("KR", "US"),
                 **_health_fields(data)}
 
     live_pos, live_mkt = _parse_holdings_items(items)
-    hold_syms: set[str] = set()
+    hold_syms: set[str] = {str(x) for x in (defer_symbols or ())}
     if defer_sell_holdings and store is not None:
-        hold_syms = _sell_attribution_pending_symbols(store)
-        if hold_syms:
-            deferred = sorted(hold_syms)
-            log.warning("기동 sync: sell 귀속 대기 심볼 holdings 덮기 연기 — %s",
-                        deferred)
+        hold_syms |= _sell_attribution_pending_symbols(store)
+    if hold_syms:
+        deferred = sorted(hold_syms)
+        log.warning("기동 sync: sell 귀속 대기 심볼 holdings 덮기 연기 — %s", deferred)
 
     # 귀속 먼저(덮기 전). 연기 심볼은 before 에서 제외 — 실체결가 없이
     # unattributed_delta 만 남기고 감소분을 영구 소진하지 않게.
@@ -456,10 +457,18 @@ def _sync_store(store, synced: list[dict], account, *,
                 log.warning("동기화: store 청산 실패(생략) %s: %s", sym, e)
 
 def _consume_settled_sells(store, symbol: str, need: float) -> list[dict]:
-    """귀속 대기 중인 매도 체결분을 need 만큼 소비. 실체결가 불명 행은 건너뛴다."""
+    """귀속 대기 중인 매도 체결분을 need 만큼 소비. 실체결가 불명 행은 건너뛴다.
+
+    종결(settled) 행 먼저, 그다음 아직 살아 있는 부분체결 매도(filled > applied).
+    지정가 매도가 재대사 사이에 일부 체결되면 보유 감소는 재대사가 흡수하는데 그
+    체결분은 종결 전이라 귀속 대상에서 빠져 손익이 사라졌다. 살아 있는 행은 지우지
+    않고 applied 만 올린다(종결 시 sweep 이 남은 분만 본다).
+    """
     picked: list[dict] = []
     try:
         rows = store.get_working_orders(symbol, settled=True)
+        rows += [r for r in (store.get_working_orders(symbol, settled=False) or [])
+                 if r.get("side") == "SELL"]
     except Exception as e:
         log.warning("귀속: 체결분 조회 실패 %s: %s", symbol, e)
         return picked
@@ -489,7 +498,7 @@ def _consume_settled_sells(store, symbol: str, need: float) -> list[dict]:
                        "order_id": row["order_id"]})
         need -= take
         try:
-            if take >= avail - 1e-9:
+            if take >= avail - 1e-9 and row.get("settled_at"):
                 store.delete_working_order(row["order_id"])
             else:                          # 일부만 소비 — 남은 분은 다음 재대사로
                 store.update_working_order(
@@ -700,8 +709,14 @@ def _sync_buy_working_applied(store, before: dict, live_pos: dict) -> None:
 
 
 def apply_reconcile_from_live(account, store, data: dict,
-                              *, markets=("KR", "US")) -> dict:
-    """주기 재대사 apply — broker.run_locked/reconcile 안에서 호출."""
+                              *, markets=("KR", "US"),
+                              defer_symbols=None) -> dict:
+    """주기 재대사 apply — broker.run_locked/reconcile 안에서 호출.
+
+    defer_symbols: 매도 결과가 아직 불명인 심볼(sweep 의 미해소 SELL). 이 심볼은
+    수량을 덮지 않고(재대사 전 수량 유지) 귀속·store 병합도 건너뛴다 — 감소분을 먼저
+    흡수하면 그 매도의 실현손익이 영구히 사라진다. 나머지 심볼·현금은 정상 재대사.
+    """
     items = data.get("items") or []
     live_pos, live_mkt = (
         _parse_holdings_items(items) if data.get("holdings_ok") else ({}, {}))
@@ -711,11 +726,12 @@ def apply_reconcile_from_live(account, store, data: dict,
 
     for market, cash in new_cash.items():
         account.cash[market] = cash
+    cash_markets = sorted(new_cash)
 
     if not data.get("holdings_ok"):
         return {"cash": dict(account.cash), "holdings": 0,
                 "adopted": [], "updated": [], "closed": [], "attributed": {},
-                "external_cash": ext,
+                "external_cash": ext, "cash_markets": cash_markets,
                 "error": data.get("error", "holdings fetch failed"),
                 **_health_fields(data)}
 
@@ -724,25 +740,42 @@ def apply_reconcile_from_live(account, store, data: dict,
                     account.symbol_market.get(sym, "KR"))
               for sym, p in account.positions.items() if p.is_open}
 
-    account.positions = dict(live_pos)
-    account.symbol_market.update(live_mkt)
+    hold_syms = {str(s) for s in (defer_symbols or ())}
+    merged_pos = dict(live_pos)
+    merged_mkt = dict(live_mkt)
+    for sym in hold_syms:
+        merged_pos.pop(sym, None)
+        merged_mkt.pop(sym, None)
+        if sym in before:
+            q, avg, mkt = before[sym]
+            merged_pos[sym] = Position(symbol=sym, qty=q, avg_price=avg)
+            merged_mkt[sym] = mkt
+    if hold_syms:
+        log.warning("재대사: 매도 결과 불명 심볼 수량 덮기 보류 — %s", sorted(hold_syms))
+
+    account.positions = merged_pos
+    account.symbol_market.update(merged_mkt)
     for sym in list(account.symbol_market):
-        if sym not in live_pos:
+        if sym not in merged_pos:
             account.symbol_market.pop(sym, None)
     account._save()
 
     # store 병합 전에 귀속 — 저널에 실체결 매도가 먼저 들어가야 partial/close 의
-    # pnl 이 그 가격을 쓴다.
-    attributed = _attribute_exits(account, store, before, live_pos)
-    _sync_buy_working_applied(store, before, live_pos)
+    # pnl 이 그 가격을 쓴다. 보류 심볼은 귀속하지 않는다(다음 재대사가 한다).
+    before_attr = {s: v for s, v in before.items() if s not in hold_syms}
+    attributed = _attribute_exits(account, store, before_attr, merged_pos)
+    _sync_buy_working_applied(store, before_attr, merged_pos)
 
     adopted: list[str] = []
     updated: list[str] = []
     closed: list[str] = []
 
     if store is not None:
-        open_rows = {r["symbol"]: r for r in store.get_open_positions()}
+        open_rows = {r["symbol"]: r for r in store.get_open_positions()
+                     if r["symbol"] not in hold_syms}
         for sym, pos in live_pos.items():
+            if sym in hold_syms:
+                continue
             try:
                 row = open_rows.get(sym)
                 if row is not None:
@@ -778,6 +811,8 @@ def apply_reconcile_from_live(account, store, data: dict,
     return {"cash": dict(account.cash), "holdings": len(live_pos),
             "adopted": adopted, "updated": updated, "closed": closed,
             "attributed": attributed, "external_cash": ext,
+            "cash_markets": cash_markets,
+            "deferred_sell_symbols": sorted(hold_syms),
             **_health_fields(data)}
 
 
