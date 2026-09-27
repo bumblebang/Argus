@@ -189,6 +189,33 @@ def test_cycle_day_proposal_arms_not_fills(tmp_path):
     assert "arm" in arm_kinds
 
 
+def test_cycle_day_track_off_blocks_and_tells_brain(tmp_path):
+    """day_track.enabled=false: day BUY 는 day_disabled, 뇌 제약에 꺼짐 명시."""
+    import json as _j
+    seen_ctx = []
+    inner = _day_buy_factory("005930")
+
+    def factory(candidates):
+        llm = inner(candidates)
+        orig = llm.structured
+
+        def structured(system, user, schema):
+            if schema is DecisionOutput:
+                seen_ctx.append(_j.loads(user))
+            return orig(system, user, schema)
+        llm.structured = structured
+        return llm
+
+    store = Store(tmp_path / "t.db")
+    r = _runner_with(tmp_path, store, factory)
+    r.cfg.raw["day_track"] = {"enabled": False}
+    res = r.run()
+    assert [e["status"] for e in res.executed] == ["day_disabled"]
+    assert store.get_armed() == []
+    assert r.account.position("005930").qty == 0
+    assert "off" in seen_ctx[0]["constraints"]["day_track"]
+
+
 def test_arm_is_idempotent(tmp_path):
     store = Store(tmp_path / "t.db")
     r = _runner_with(tmp_path, store, _day_buy_factory("005930"))

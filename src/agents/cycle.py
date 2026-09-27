@@ -148,7 +148,8 @@ def run_cycle(*, context_json: str, decision_agent, validation_agent, broker, ri
               wake_reason: str = "",
               fractional_markets: set[str] | None = None,
               sell_block_fn=None,
-              resolve_price_fn=None) -> CycleResult:
+              resolve_price_fn=None,
+              day_enabled: bool = True) -> CycleResult:
     """결정→검증→집행. 데이트레(horizon='day') BUY 는 즉시 체결 대신 arm_fn 으로 라우팅.
 
     arm_fn(proposal, price)->bool 이 주어지면 day BUY 는 진입대기(armed)로 등록하고
@@ -169,6 +170,9 @@ def run_cycle(*, context_json: str, decision_agent, validation_agent, broker, ri
     **집행하지 않고** status='sell_blocked' 로 기록한다. 트랙 소유권 분리에 쓴다 —
     밸류가 산 포지션을 뇌가 파는 것을 막는다(사는 판단자와 파는 판단자를 일치시킨다).
     코드 바닥(하드스톱·트레일링·빠른손 트리거)은 이 가드와 무관하게 계속 작동한다.
+
+    day_enabled=False 면 horizon=day BUY 는 진입대기·즉시매수 없이 status='day_disabled'.
+    arm_fn 만 빼면 day BUY 가 도시에 면제 경로로 흘러 즉시 매수되므로 별도 차단이 필요하다.
 
     tranche_weights: 심볼→회차 비중(밸류 분할). budget_caps: 심볼→명목 상한(슬리브 room).
     같은 room 이 여러 심볼에 복제된 경우(밸류) 공유 풀로 소진한다 — 앞 주문이 쓴
@@ -273,6 +277,14 @@ def run_cycle(*, context_json: str, decision_agent, validation_agent, broker, ri
                     executed.append({"symbol": p.symbol, "action": "SELL",
                                      "status": "sell_blocked", "reason": _why})
                     continue
+
+            # 데이 트랙 꺼짐(09-27 백테스트: 당일 종가 청산 전 변형 비용 후 음수).
+            if (p.side == "BUY" and not day_enabled
+                    and (p.horizon or "").lower() == "day"):
+                executed.append({"symbol": p.symbol, "action": "BUY",
+                                 "status": "day_disabled",
+                                 "reason": "데이 트랙 꺼짐(day_track.enabled=false)"})
+                continue
 
             # 데이트레 BUY: 코드 자율 진입(armed). 뇌는 종목/전략/파라미터만 배정.
             if p.side == "BUY" and arm_fn and (p.horizon or "").lower() == "day":
