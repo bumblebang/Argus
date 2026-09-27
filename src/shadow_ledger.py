@@ -106,8 +106,16 @@ def book_row(store, *, cycle_ts: float, cycle_ts_iso: str, sleeve: str,
              entry_price: float, cfg: dict | None = None,
              meta_extra: dict | None = None,
              state: str = "open") -> int | None:
-    """단일 차단 BUY → shadow_positions. 중복이면 None."""
+    """단일 차단 BUY → shadow_positions. 중복이면 None.
+
+    같은 종목·슬리브의 그림자가 아직 채점 전이면 새로 넣지 않는다 — 뇌가 매 사이클
+    같은 종목을 다시 제안·차단하면 한 번의 기회가 수십 표본으로 불어나 승률이
+    왜곡된다(09-27 실측: 154행 중 독립 표본 73).
+    """
     if store is None or entry_price <= 0:
+        return None
+    has_live = getattr(store, "has_live_shadow", None)
+    if has_live is not None and has_live(symbol, sleeve):
         return None
     hz = horizon or "swing"
     hdays = horizon_calendar_days(hz, cfg)
@@ -542,14 +550,57 @@ def _agg_rows(rows: list) -> dict:
     }
 
 
+def _row_horizon_days(r: dict, cfg: dict | None) -> float:
+    meta = r.get("meta")
+    if isinstance(meta, str):
+        try:
+            meta = json.loads(meta)
+        except (TypeError, ValueError):
+            meta = {}
+    hd = (meta or {}).get("horizon_days") if isinstance(meta, dict) else None
+    try:
+        return float(hd) if hd else float(horizon_calendar_days(r.get("horizon"), cfg))
+    except (TypeError, ValueError):
+        return float(horizon_calendar_days(r.get("horizon"), cfg))
+
+
+def dedupe_episodes(rows: list[dict], cfg: dict | None = None) -> list[dict]:
+    """같은 종목·슬리브가 첫 행의 보유기간 안에 또 기록된 행은 접는다(첫 행만 표본).
+
+    기록 시점 중복 차단 이전에 쌓인 행을 집계에서 바로잡기 위한 것 — DB 는 건드리지 않는다.
+    """
+    out: list[dict] = []
+    until: dict[tuple, float] = {}
+    for r in sorted(rows, key=lambda x: float(x.get("entry_ts") or x.get("cycle_ts") or 0)):
+        key = (r.get("symbol"), r.get("sleeve"))
+        ts = float(r.get("entry_ts") or r.get("cycle_ts") or 0)
+        if ts < until.get(key, float("-inf")):
+            continue
+        until[key] = ts + _row_horizon_days(r, cfg) * 86400
+        out.append(r)
+    return out
+
+
+# 가격 오류 격리 — 09-27 실측 005930 진입가 64,369(실제 ~25만) → +285% 가 평균을 지배.
+OUTLIER_RET_PCT = 50.0
+
+
 def shadow_stats(store, since_days: float = 90,
                  cfg: dict | None = None) -> dict:
-    """그림자 장부 집계 — attribution 연동."""
+    """그림자 장부 집계 — attribution 연동.
+
+    표본 = 에피소드(종목·슬리브·보유기간) 단위. |ret_pct| > OUTLIER_RET_PCT 는 가격
+    오류로 보고 집계에서 빼고 건수만 보고한다.
+    """
     since = datetime.now(timezone.utc).timestamp() - since_days * 86400
     open_n = len(store.get_open_shadow_positions())
     pending_n = len(store.get_pending_shadow_positions())
     scored = store.get_scored_shadow_positions(since=since)
-    rows = [dict(r) for r in scored]
+    raw_rows = [dict(r) for r in scored]
+    episodes = dedupe_episodes(raw_rows, cfg)
+    outliers = [r for r in episodes
+                if r.get("ret_pct") is not None and abs(float(r["ret_pct"])) > OUTLIER_RET_PCT]
+    rows = [r for r in episodes if r not in outliers]
 
     overall = _agg_rows(rows)
     overall_out = {"n_open": open_n, "n_pending": pending_n,
@@ -589,7 +640,8 @@ def shadow_stats(store, since_days: float = 90,
         "bucket": r.get("block_bucket"),
         "ret_pct": r.get("ret_pct"),
         "thesis": (r.get("thesis") or "")[:80],
-    } for r in rows[:10]]
+    } for r in sorted(rows, key=lambda x: float(x.get("scored_at") or 0),
+                      reverse=True)[:10]]
 
     skipped = {}
     if hasattr(store, "count_shadow_skipped"):
@@ -597,7 +649,14 @@ def shadow_stats(store, since_days: float = 90,
 
     return {
         "note": (f"반사실 페이퍼. n<{MIN_SAMPLE}(small_sample) 과신·승격 금지. "
-                 "뇌/검증 자동 변경에 사용하지 말 것."),
+                 "뇌/검증 자동 변경에 사용하지 말 것. 표본=종목 에피소드(중복 접음)."),
+        "sample": {
+            "rows_raw": len(raw_rows),
+            "episodes": len(episodes),
+            "outliers_excluded": [
+                {"symbol": r.get("symbol"), "ret_pct": r.get("ret_pct"),
+                 "entry_price": r.get("entry_price")} for r in outliers],
+        },
         "overall": overall_out,
         "by_bucket": {k: _agg_rows(v) for k, v in sorted(by_bucket.items())},
         "by_sleeve": {k: _agg_rows(v) for k, v in sorted(by_sleeve.items())},

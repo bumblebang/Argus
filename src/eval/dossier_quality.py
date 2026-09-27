@@ -210,6 +210,7 @@ def _label_outcomes(
             "ORDER BY created_at DESC",
             (since, now)).fetchall()
     by_stance: dict[str, dict[str, Any]] = {}
+    syms_by_stance: dict[str, set[str]] = {}
     skipped: dict[str, int] = {}
     for row in hist:
         r = dict(row)
@@ -241,11 +242,14 @@ def _label_outcomes(
             continue
         bucket = by_stance.setdefault(st, {"n": 0, "target_first": 0})
         bucket["n"] += 1
+        # 같은 종목 도시에가 48h 마다 갱신되며 라벨 창이 겹친다 — 독립 표본 수를 따로 본다.
+        syms_by_stance.setdefault(st, set()).add(str(r["symbol"]))
         if lab is True:
             bucket["target_first"] += 1
     total_n = sum(b["n"] for b in by_stance.values())
-    for b in by_stance.values():
+    for st_key, b in by_stance.items():
         b["target_first_rate"] = round(b["target_first"] / b["n"], 3) if b["n"] else None
+        b["n_symbols"] = len(syms_by_stance.get(st_key, ()))
     status = "scored" if total_n >= MIN_N else "shadow_only"
     return {
         "n": total_n,
