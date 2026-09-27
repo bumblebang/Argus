@@ -166,8 +166,13 @@ class TossGateway:
             return self.client.get_rankings(**kw)
 
     def orderbook(self, symbol: str) -> Any:
+        """주문 직전 리밋가·스프레드 산정용(브로커). 실패하면 브로커가 견적가로 폴백하므로
+        재시도를 짧게 묶는다 — 기본(4회·최대 8초 백오프)이면 호가 장애 한 번에 손절 주문이
+        게이트웨이 락을 쥔 채 수십 초 멈춘다."""
         with self._lock:
-            return self.client._request("orderbook", params={"symbol": symbol})
+            return self.client._request("orderbook", params={"symbol": symbol},
+                                        max_attempts=2,
+                                        timeout=max(self.quote_timeout_sec, 3.0))
 
     def best_quote(self, symbol: str) -> tuple[float | None, float | None, float | None] | None:
         """최우선 (bid, ask, 호가시각). 조회 실패·빈 호가면 None — PriceGuard 교차확인용.

@@ -301,12 +301,23 @@ def test_sweep_drops_local_row_absent_from_server(tmp_path):
     client = _Client()
     store, broker = _setup(tmp_path, client)
     placed = _local_row(store)
-    # 다른 시각·다른 수량 주문은 짝이 아니다
+    # 한참 전 주문·반대 방향 주문은 짝도 근접도 아니다
     client.orders = {"OPEN": [_order(placed - 3600, oid="OLD")],
-                     "CLOSED": [_order(placed, oid="OTHER", qty="3")]}
+                     "CLOSED": [_order(placed, oid="OTHER", side="BUY")]}
     out = broker.sweep_working_orders()
     assert out.get("local_absent") == 1
     assert store.get_working_orders() == []
+
+
+def test_near_miss_order_blocks_absent_verdict(tmp_path):
+    """US 지정가 절삭(12.345→12.34) 등으로 엄격 대조가 빗나가도 근접 주문이 있으면 지우지 않는다."""
+    client = _Client()
+    store, broker = _setup(tmp_path, client)
+    placed = _local_row(store, price=70_050)
+    client.orders = {"OPEN": [_order(placed, oid="NEAR", price="70000")], "CLOSED": []}
+    out = broker.sweep_working_orders()
+    assert out.get("local_absent") is None and out["local_orphan"] == 1
+    assert store.get_working_orders()[0]["order_id"] == "local:abc"
 
 
 def test_sweep_keeps_young_local_row_within_grace(tmp_path):

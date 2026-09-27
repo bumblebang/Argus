@@ -49,6 +49,10 @@ _KST = timezone(timedelta(hours=9))
 # 전송 재시도(멱등키)가 수십 초 안에 끝나므로 넉넉히 잡는다. 시계 오차 여유 포함.
 _LOCAL_MATCH_BEFORE_SEC = 30.0
 _LOCAL_MATCH_AFTER_SEC = 300.0
+# '없음' 확정용 느슨한 창 — 이 창에 같은 종목·방향 주문이 하나라도 있으면(가격 절삭·
+# 시계 오차로 엄격 대조가 빗나갔을 수 있음) 지우지 않고 미확인으로 둔다.
+_LOCAL_LOOSE_BEFORE_SEC = 300.0
+_LOCAL_LOOSE_AFTER_SEC = 900.0
 # 서버 목록 반영 지연 대비 — 이보다 어린 local 행은 '없음' 확정을 미룬다.
 _LOCAL_ABSENT_GRACE_SEC = 60.0
 _LOCAL_LIST_MAX_PAGES = 5
@@ -1110,6 +1114,7 @@ class Broker:
             pass
         amount = meta.get("order_amount")
         cands = []
+        loose = 0
         for o in orders:
             if not isinstance(o, dict) or not o.get("orderId"):
                 continue
@@ -1120,6 +1125,9 @@ class Broker:
             if str(o.get("side") or "").upper() != side:
                 continue
             ts = _parse_ts(o.get("orderedAt"))
+            if ts is None or (placed - _LOCAL_LOOSE_BEFORE_SEC <= ts
+                              <= placed + _LOCAL_LOOSE_AFTER_SEC):
+                loose += 1
             if ts is None or not (placed - _LOCAL_MATCH_BEFORE_SEC <= ts
                                   <= placed + _LOCAL_MATCH_AFTER_SEC):
                 continue
@@ -1137,6 +1145,10 @@ class Broker:
             return "found", cands[0]
         if cands:
             log.error("local 주문 해소 — 후보 %d건(모호) id=%s", len(cands), row.get("order_id"))
+            return "unknown", None
+        if loose:
+            log.error("local 주문 해소 — 엄격 대조 0건·근접 주문 %d건(가격 절삭 등) id=%s",
+                      loose, row.get("order_id"))
             return "unknown", None
         if complete and now - placed >= _LOCAL_ABSENT_GRACE_SEC:
             return "absent", None
