@@ -86,6 +86,17 @@ watch:
   vol_spike_pct: 0.05
   stop_buffer_pct: 0.005
   stale_quote_sec: 600
+  # lastPrice 이상 틱 필터 — 직전 채택가 대비 max_jump_pct 넘게 튄 틱은 호가로 교차확인.
+  # 호가가 부정하면 기각(호가 중간값 사용), 호가를 못 구하면 confirm_sec 유지 후 채택.
+  # 09-23 US 애프터 오류가(HPE 61→21.58)로 가짜 손절 난 사고 대응. enabled:false = 구 동작.
+  price_guard:
+    enabled: true
+    max_jump_pct: 0.08
+    quote_tol_pct: 0.03
+    confirm_sec: 180
+    recheck_sec: 30
+    ref_max_age_sec: 1800
+    max_quotes_per_sec: 3      # 호가 교차확인 상한(MARKET_DATA 10TPS 를 /prices 와 공유)
   brain_backend: "cli"       # cli | live | dry
   brain_interval_sec: 0        # 정각 스케줄은 extra_wakes 전용(상대 주기 끔)
   brain_cooldown_sec: 300
