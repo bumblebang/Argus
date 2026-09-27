@@ -1,0 +1,241 @@
+"""PriceGuard — lastPrice 이상 틱 필터 + gateway 배선 + 청산 재시도 백오프.
+
+재현 사고: 2026-09-23 06:08 KST US 애프터에 /prices lastPrice 가 HPE 61.1→21.58,
+ROIV 38.25→29.12 로 찍혀 가짜 stop_hit 청산.
+"""
+from src.engine.execution import ExitExecutor
+from src.engine.gateway import TossGateway
+from src.engine.price_guard import PriceGuard
+from src.engine.store import Store
+
+
+class _Clock:
+    def __init__(self, t=1_000.0):
+        self.t = t
+
+    def __call__(self):
+        return self.t
+
+
+class _Quotes:
+    def __init__(self, quote):
+        self.quote = quote
+        self.calls = 0
+
+    def __call__(self, symbol):
+        self.calls += 1
+        return self.quote
+
+
+def _guard(quote, clock=None, events=None, **kw):
+    q = _Quotes(quote)
+    g = PriceGuard(q, clock=clock or _Clock(),
+                   on_event=(lambda k, p: events.append(p)) if events is not None else None,
+                   **kw)
+    return g, q
+
+
+def test_normal_ticks_pass_without_quote_calls():
+    g, q = _guard((99.0, 101.0))
+    assert g.filter("A", 100.0) == (100.0, None)       # ref 없음 → 채택
+    assert g.filter("A", 104.0) == (104.0, None)       # 4% — 밴드 안
+    assert q.calls == 0
+
+
+def test_bad_print_rejected_by_quote_hpe_case():
+    events = []
+    g, q = _guard((61.05, 61.15), events=events)
+    g.filter("HPE", 61.1)
+    px, verdict = g.filter("HPE", 21.58)
+    assert verdict == "rejected"
+    assert abs(px - 61.1) < 1e-9                       # 호가 중간값
+    # 같은 오류가가 매 틱 반복돼도 recheck 창 안에선 호가 재조회·이벤트 없음
+    for _ in range(5):
+        assert g.filter("HPE", 21.58)[1] == "rejected"
+    assert q.calls == 1
+    assert len(events) == 1 and events[0]["raw"] == 21.58
+    # 정상가 복귀는 그대로 채택
+    assert g.filter("HPE", 61.1) == (61.1, None)
+
+
+def test_persistent_bad_print_requeried_after_recheck_roiv_case():
+    clock = _Clock()
+    g, q = _guard((37.98, 38.97), clock=clock, recheck_sec=30)
+    g.filter("ROIV", 38.25)
+    for _ in range(40):                                 # 40분간 29.12 고정
+        clock.t += 60
+        px, verdict = g.filter("ROIV", 29.12)
+        assert verdict == "rejected" and px > 37
+    assert q.calls == 40                                # 재확인은 recheck 주기마다 1회
+
+
+def test_real_move_confirmed_by_quote():
+    g, q = _guard((84.9, 85.1))
+    g.filter("A", 100.0)
+    assert g.filter("A", 85.0) == (85.0, "confirmed")
+    assert g.filter("A", 84.5) == (84.5, None)          # 새 기준가 대비 밴드 안
+
+
+def test_wide_spread_real_print_confirmed():
+    """시간외 넓은 스프레드(bid 90 / ask 100)에서 bid 근처 체결은 진짜 — 중간값과 5% 차이."""
+    g, q = _guard((90.0, 100.0))
+    g.filter("A", 105.0)
+    assert g.filter("A", 90.5) == (90.5, "confirmed")
+
+
+def test_no_quote_holds_then_accepts_after_confirm_sec():
+    clock = _Clock()
+    g, q = _guard(None, clock=clock, confirm_sec=180, recheck_sec=30)
+    g.filter("A", 100.0)
+    assert g.filter("A", 70.0) == (100.0, "held")       # 판단 근거 없음 → 직전가 유지
+    clock.t += 100
+    assert g.filter("A", 70.0) == (100.0, "held")
+    clock.t += 100
+    assert g.filter("A", 70.0) == (70.0, "timeout")     # 진짜 급락을 영영 막지 않는다
+    assert g.filter("A", 69.0) == (69.0, None)
+
+
+def test_stale_reference_accepts_without_quote():
+    clock = _Clock()
+    g, q = _guard((1.0, 1.0), clock=clock, ref_max_age_sec=1800)
+    g.filter("A", 100.0)
+    clock.t += 3600                                     # 밤새 안 본 종목의 개장 갭
+    assert g.filter("A", 80.0) == (80.0, None)
+    assert q.calls == 0
+
+
+def test_quote_error_treated_as_unavailable():
+    def boom(symbol):
+        raise RuntimeError("down")
+    g = PriceGuard(boom, clock=_Clock())
+    g.filter("A", 100.0)
+    assert g.filter("A", 50.0) == (100.0, "held")
+
+
+def test_quote_budget_caps_burst_then_catches_up():
+    """오류가가 여러 종목에 동시에 뜨면 초당 상한만큼만 호가 조회, 나머지는 직전가 유지."""
+    clock = _Clock()
+    g, q = _guard((49.9, 50.1), clock=clock, max_quotes_per_sec=3)
+    syms = [f"S{i}" for i in range(8)]
+    for s in syms:
+        g.filter(s, 50.0)
+    first = [g.filter(s, 20.0) for s in syms]
+    assert q.calls == 3
+    assert [v for _, v in first].count("rejected") == 3
+    assert all(px == 50.0 for px, _ in first)          # 미확인분도 오류가를 쓰지 않는다
+    clock.t += 1
+    second = [g.filter(s, 20.0) for s in syms]
+    assert q.calls == 6
+    assert [v for _, v in second].count("rejected") == 6
+
+
+def test_from_config_disabled_returns_none():
+    assert PriceGuard.from_config({"enabled": False}, lambda s: None) is None
+    g = PriceGuard.from_config({"max_jump_pct": 0.2}, lambda s: None)
+    assert g is not None and g.max_jump_pct == 0.2
+
+
+# ── gateway 배선 ─────────────────────────────────────────
+
+class _SeqClient:
+    def __init__(self, prices, book):
+        self.prices = list(prices)
+        self.book = book
+
+    def get_prices(self, symbols):
+        p = self.prices.pop(0)
+        return [{"symbol": s, "lastPrice": str(p)} for s in symbols]
+
+    def _request(self, name, params=None):
+        assert name == "orderbook"
+        return self.book
+
+
+def test_gateway_sanitizes_price_keeps_raw_payload(tmp_path):
+    store = Store(tmp_path / "t.db")
+    client = _SeqClient(["38.25", "29.12"],
+                        {"bids": [{"price": "37.98", "volume": "10"}],
+                         "asks": [{"price": "38.97", "volume": "10"}]})
+    gw = TossGateway(client, store=store)
+    gw.price_guard = PriceGuard(gw.best_quote,
+                                on_event=lambda k, p: store.log_event(k, p["symbol"], p))
+    gw.poll_prices(["ROIV"])
+    row = gw.poll_prices(["ROIV"])[0]
+    assert row["price_guard"] == "rejected"
+    assert row["raw_price"] == 29.12
+    assert 38.4 < row["price"] < 38.5
+    assert row["payload"]["lastPrice"] == "29.12"          # 원시값 감사용 보존
+    snap = store.conn.execute(
+        "SELECT price FROM snapshots ORDER BY id DESC LIMIT 1").fetchone()
+    assert 38.4 < snap["price"] < 38.5
+    kinds = [r["kind"] for r in store.conn.execute("SELECT kind FROM events")]
+    assert "price_guard" in kinds
+
+
+def test_best_quote_handles_empty_book():
+    gw = TossGateway(_SeqClient([], {"bids": [], "asks": []}))
+    assert gw.best_quote("A") is None
+
+
+# ── 청산 재시도 백오프 ─────────────────────────────────────
+
+class _Pos:
+    qty = 3
+
+
+class _Res:
+    def __init__(self, ok, why=None):
+        self.ok, self.reject_reason = ok, why
+        self.avg_price, self.filled_qty, self.order_qty = 38.0, 3, 3
+        self.status, self.partial, self.order_id, self.side = "FILLED", False, "X", "SELL"
+
+    def __bool__(self):
+        return self.ok
+
+
+class _RejectingBroker:
+    def __init__(self):
+        self.calls = 0
+        self.ok = False
+
+    def position(self, symbol):
+        return _Pos()
+
+    def execute_with_mirror(self, order, **kw):
+        self.calls += 1
+        return _Res(self.ok, None if self.ok else "스프레드 초과")
+
+
+class _Trig:
+    kind = "stop_hit"
+
+
+def test_exit_rejections_back_off(tmp_path):
+    store = Store(tmp_path / "t.db")
+    broker = _RejectingBroker()
+    clock = _Clock()
+    ex = ExitExecutor(broker, store, retry_base_sec=10, retry_max_sec=40, clock=clock)
+    attempts = []
+    for _ in range(120):                                # 1초 틱 2분
+        before = broker.calls
+        ex("ROIV", "US", 38.0, _Trig())
+        if broker.calls > before:
+            attempts.append(clock.t - 1_000.0)
+        clock.t += 1
+    # 0, +10, +20(누적30), +40(70), +40(110) — 매초 120회 대신 5회
+    assert attempts == [0, 10, 30, 70, 110]
+    errs = store.conn.execute("SELECT COUNT(*) AS n FROM events WHERE kind='error'").fetchone()
+    assert errs["n"] == 5
+
+
+def test_exit_backoff_clears_on_success(tmp_path):
+    store = Store(tmp_path / "t.db")
+    broker = _RejectingBroker()
+    clock = _Clock()
+    ex = ExitExecutor(broker, store, retry_base_sec=10, clock=clock)
+    assert ex("A", "US", 38.0, _Trig()) is False
+    clock.t += 10
+    broker.ok = True
+    broker.position = lambda s: _Pos()
+    assert ex("A", "US", 38.0, _Trig()) is True
+    assert "A" not in ex._retry

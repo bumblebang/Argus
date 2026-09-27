@@ -16,6 +16,7 @@ from typing import Any, Iterable
 from ..config import AppConfig
 from ..logging_setup import get_logger
 from ..toss_client import TossClient
+from .price_guard import PriceGuard
 from .ratelimit import GroupRateLimiter
 from .store import Store
 
@@ -31,13 +32,28 @@ def _to_float(v: Any) -> float | None:
         return None
 
 
+def _best_level(levels: Any) -> float | None:
+    """호가 레벨 [{price, volume}, ...] 의 첫 유효 가격."""
+    if not isinstance(levels, (list, tuple)):
+        return None
+    for lv in levels:
+        px = _to_float(lv.get("price")) if isinstance(lv, dict) else None
+        if px and px > 0:
+            return px
+    return None
+
+
 class TossGateway:
     def __init__(self, client: TossClient, store: Store | None = None,
                  limiter: GroupRateLimiter | None = None,
-                 candle_ttl_sec: float = 0.0) -> None:
+                 candle_ttl_sec: float = 0.0,
+                 price_guard: PriceGuard | None = None) -> None:
         self.client = client
         self.store = store
         self.limiter = limiter
+        # lastPrice 이상 틱 필터(None=끔). 감시 루프·뇌·밸류가 모두 poll_prices 를 거치므로
+        # 여기 한 곳에서 걸러야 손절·사이징·vol_spike 가 같은 가격을 본다.
+        self.price_guard = price_guard
         # 캔들 TTL 캐시: 1초틱에서 같은 캔들을 매초 재호출하면 CHART 예산(5TPS) 초과 →
         # ttl 동안은 캐시 반환(라이브 반응성은 호출측이 마지막봉 종가를 실시간가로 패치).
         self.candle_ttl_sec = float(candle_ttl_sec)
@@ -51,8 +67,14 @@ class TossGateway:
                     limits: dict[str, float] | None = None, timeout: int = 10) -> "TossGateway":
         limiter = GroupRateLimiter(limits)
         client = TossClient(cfg.creds, timeout=timeout, rate_limiter=limiter)
-        ttl = float(cfg.raw.get("watch", {}).get("candle_ttl_sec", 0.0))
-        return cls(client, store=store, limiter=limiter, candle_ttl_sec=ttl)
+        watch = cfg.raw.get("watch", {}) or {}
+        ttl = float(watch.get("candle_ttl_sec", 0.0))
+        gw = cls(client, store=store, limiter=limiter, candle_ttl_sec=ttl)
+        on_event = ((lambda kind, p: store.log_event(kind, p.get("symbol"), p))
+                    if store is not None else None)
+        gw.price_guard = PriceGuard.from_config(
+            watch.get("price_guard"), gw.best_quote, on_event=on_event)
+        return gw
 
     # ── 감시층: 전종목 현재가 배치 폴링 (싸다) ─────────────
     def poll_prices(self, symbols: Iterable[str], record: bool = True) -> list[dict]:
@@ -71,6 +93,15 @@ class TossGateway:
                         "price": _to_float(r.get("lastPrice")),
                         "payload": r,
                     })
+        # 가드는 락 밖에서 — 의심 틱이면 호가를 부르는데 orderbook() 도 같은 락을 잡는다.
+        # 원시 lastPrice 는 payload 에 그대로 남고 price 만 걸러진 값으로 바뀐다.
+        if self.price_guard is not None:
+            for row in out:
+                px, verdict = self.price_guard.filter(row["symbol"], row["price"])
+                if verdict is not None:
+                    row["raw_price"] = row["price"]
+                    row["price"] = px
+                    row["price_guard"] = verdict
         if record and self.store and out:
             self.store.record_snapshots(out)
         return out
@@ -96,6 +127,18 @@ class TossGateway:
     def orderbook(self, symbol: str) -> Any:
         with self._lock:
             return self.client._request("orderbook", params={"symbol": symbol})
+
+    def best_quote(self, symbol: str) -> tuple[float | None, float | None] | None:
+        """최우선 (bid, ask). 조회 실패·빈 호가면 None — PriceGuard 교차확인용."""
+        try:
+            ob = self.orderbook(symbol) or {}
+        except Exception as e:
+            log.warning("호가 조회 실패(가격 가드) %s: %s", symbol, e)
+            return None
+        if not isinstance(ob, dict):
+            return None
+        bid, ask = _best_level(ob.get("bids")), _best_level(ob.get("asks"))
+        return (bid, ask) if (bid or ask) else None
 
     # ── 계좌/주문 위임 ────────────────────────────────────
     def holdings(self, account_seq: int | str, symbol: str | None = None) -> dict:
