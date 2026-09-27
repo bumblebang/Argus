@@ -304,6 +304,7 @@ def _save_push_state(state: dict) -> None:
 
 
 _SIDE_KO = {"BUY": "매수", "SELL": "매도"}
+_REJECT_PUSH_COOLDOWN_SEC = 1800.0
 
 
 def _load_symbol_names() -> dict[str, str]:
@@ -383,6 +384,11 @@ def _format_live_order_msg(kind: str, symbol: str, p: dict, names: dict[str, str
         side_ko = _SIDE_KO.get(side, side)
         body = (f"[LIVE] {side_ko} {name} x{p.get('qty', '?')} "
                 f"@ {p.get('price', '?')}")
+    elif kind == "live_order_rejected":
+        side = str(p.get("side") or "?").upper()
+        side_ko = _SIDE_KO.get(side, side)
+        code = p.get("code") or p.get("status") or "?"
+        body = f"[LIVE-REJ] {side_ko} {name} 거부: {code}"
     else:
         body = f"[LIVE-ERR] {name}: {p.get('error', '?')}"
     if why:
@@ -398,13 +404,18 @@ def _push_live_orders(now: float) -> None:
     try:
         rows = con.execute(
             "select ts, kind, symbol, payload from events "
-            "where kind in ('live_order','live_order_error') and ts>? order by ts",
+            "where kind in ('live_order','live_order_error','live_order_rejected')"
+            " and ts>? order by ts",
             (since,)).fetchall()
     finally:
         con.close()
     if not rows:
         return
     names = _load_symbol_names()
+    # 확정 거부는 청산 백오프마다 반복될 수 있다 — (종목, 방향, 코드)당 30분 1회만 푸시.
+    rej_seen = dict(_load_push_state().get("rejected_seen") or {})
+    rej_seen = {k: v for k, v in rej_seen.items()
+                if now - float(v or 0) < _REJECT_PUSH_COOLDOWN_SEC}
     # 성공한 이벤트만 커서로 전진 — 실패분을 성공으로 찍어 영구 스킵하지 않는다.
     advanced_to = since
     for ts, kind, symbol, payload in rows:
@@ -412,15 +423,24 @@ def _push_live_orders(now: float) -> None:
             p = json.loads(payload) if payload else {}
         except (ValueError, TypeError):
             p = {}
+        if kind == "live_order_rejected":
+            rkey = f"{symbol}|{p.get('side')}|{p.get('code') or p.get('status')}"
+            if float(ts) - float(rej_seen.get(rkey, 0) or 0) < _REJECT_PUSH_COOLDOWN_SEC:
+                advanced_to = max(advanced_to, float(ts))
+                continue
         msg = _format_live_order_msg(kind, symbol, p, names)
-        title = "Argus 체결" if kind == "live_order" else "Argus 주문실패"
+        title = {"live_order": "Argus 체결",
+                 "live_order_rejected": "Argus 주문거부"}.get(kind, "Argus 주문실패")
         ok = _push(title, msg)
         if not ok:
             break
+        if kind == "live_order_rejected":
+            rej_seen[rkey] = float(ts)
         advanced_to = max(advanced_to, float(ts))
     if advanced_to > since:
         st = _load_push_state()
         st["last_order_ts"] = advanced_to
+        st["rejected_seen"] = rej_seen
         _save_push_state(st)
 
 def _load_prev() -> dict:

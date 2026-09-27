@@ -25,6 +25,9 @@ from .entry_basis import BASIS_SIGNAL, BASIS_ZONE
 
 log = get_logger("engine.execution")
 
+# 가격이 불리하게 움직이는 중이라 빨리 다시 시도해야 하는 청산(백오프 상한을 짧게).
+URGENT_EXIT_KINDS = frozenset({"stop_hit", "trail_stop", "close_scan_exit", "session_end"})
+
 _LOOKBACK_BUFFER = 10        # min_candles 위에 여유분(지표 안정화)
 
 
@@ -103,36 +106,52 @@ def _stamp_basis(store, armed: dict, meta: dict, basis: str) -> None:
 
 
 class ExitExecutor:
-    """거부된 청산은 종목별 지수 백오프(retry_base_sec → 2배 … retry_max_sec)로 재시도.
+    """거부된 청산은 종목별 지수 백오프(retry_base_sec → 2배 … 상한)로 재시도.
 
     감시 루프는 1초 틱이라 백오프가 없으면 시간외 스프레드 초과 같은 거부가 매초
     주문 시도·호가 조회·error 이벤트를 만든다(09-23 ROIV 한 종목 30분간 ~1,400건).
 
-    백오프 키는 (종목, 트리거 kind) — 익절 거부가 뒤이은 손절·종가청산을 최대
-    retry_max_sec 동안 막으면 안 된다. 체결되면 그 종목의 백오프를 전부 푼다.
+    백오프는 종목 단위다 — 브로커는 청산 kind 와 무관하게 같은 전량 매도를 내므로
+    거부 사유도 같다(kind 별로 두면 kind 수만큼 주문을 번갈아 낸다). 대신 상한을
+    kind 긴급도로 가른다: 손절·트레일·종가청산은 urgent_retry_max_sec(30초), 익절·
+    시간손절 등은 retry_max_sec(120초). 익절 거부가 쌓인 streak 이 손절을 2분씩 막지
+    않는다. 체결되면 그 종목의 백오프를 푼다.
     """
 
     def __init__(self, broker, store, *, retry_base_sec: float = 10.0,
-                 retry_max_sec: float = 120.0, clock=time.time) -> None:
+                 retry_max_sec: float = 120.0, urgent_retry_max_sec: float = 30.0,
+                 clock=time.time) -> None:
         self.broker = broker
         self.store = store
         self.retry_base_sec = float(retry_base_sec)
         self.retry_max_sec = float(retry_max_sec)
+        self.urgent_retry_max_sec = float(urgent_retry_max_sec)
         self._clock = clock
-        # (sym, kind) -> (next_ts, streak, last_ts)
-        self._retry: dict[tuple[str, str], tuple[float, int, float]] = {}
+        # sym -> (streak, last_attempt_ts)
+        self._retry: dict[str, tuple[int, float]] = {}
+
+    def _delay(self, kind: str, streak: int) -> float:
+        cap = (self.urgent_retry_max_sec if kind in URGENT_EXIT_KINDS
+               else self.retry_max_sec)
+        return min(self.retry_base_sec * 2 ** max(0, streak - 1), cap)
+
+    def ready(self, symbol: str, kind: str) -> bool:
+        """이 (종목, kind) 로 지금 주문을 내도 되는가(백오프 경과)."""
+        streak, last_ts = self._retry.get(symbol, (0, 0.0))
+        if streak <= 0:
+            return True
+        return self._clock() - last_ts >= self._delay(str(kind), streak)
 
     def __call__(self, symbol: str, market: str, price: float | None, trigger) -> bool:
         """보유 전량 시장 청산. 체결되면 True. (감시 루프가 트리거 시 호출)"""
         pos = self.broker.position(symbol)
         if pos.qty <= 0 or not price or price <= 0:
             return False
-        now = self._clock()
-        kind = getattr(trigger, "kind", "exit")
-        key = (symbol, str(kind))
-        next_ts, streak, last_ts = self._retry.get(key, (0.0, 0, 0.0))
-        if now < next_ts:
+        kind = str(getattr(trigger, "kind", "exit"))
+        if not self.ready(symbol, kind):
             return False
+        now = self._clock()
+        streak, last_ts = self._retry.get(symbol, (0, 0.0))
         if now - last_ts > self.retry_max_sec * 2:
             streak = 0                         # 오래 조용했으면 새 사건으로 본다
         sell_qty = pos.qty
@@ -142,14 +161,13 @@ class ExitExecutor:
         if not res:
             why = res.reject_reason or getattr(self.broker, "last_reject_reason", None) or "gate_rejected"
             streak += 1
-            delay = min(self.retry_base_sec * 2 ** (streak - 1), self.retry_max_sec)
-            self._retry[key] = (now + delay, streak, now)
+            self._retry[symbol] = (streak, now)
             self.store.log_event("error", symbol,
                                  {"where": "exit", "kind": kind, "reason": why,
-                                  "retry_in_sec": delay, "attempt": streak})
+                                  "retry_in_sec": self._delay(kind, streak),
+                                  "attempt": streak})
             return False
-        for k in [k for k in self._retry if k[0] == symbol]:
-            self._retry.pop(k, None)
+        self._retry.pop(symbol, None)
         acct = self.broker.position(symbol)
         self.store.log_event("exit", symbol, fill_event_payload(
             res, kind=kind, price=res.avg_price or price, qty=sell_qty,
@@ -171,12 +189,23 @@ class EntryExecutor:
     배정돼 있으므로(뇌 선택), 여기선 손절/목표만 계산한다.
     """
 
-    def __init__(self, gateway, broker, risk, store, plan_fn=None) -> None:
+    def __init__(self, gateway, broker, risk, store, plan_fn=None,
+                 day_enabled=True) -> None:
         self.gw = gateway
         self.broker = broker
         self.risk = risk
         self.store = store
         self.plan_fn = plan_fn
+        # 데이 트랙 스위치(bool 또는 매 평가마다 부르는 callable — 설정 핫리로드).
+        # 꺼지면 이미 등록된 day armed 도 진입하지 않고 해제한다(끄기 전 등록분).
+        self.day_enabled = day_enabled
+
+    def _day_on(self) -> bool:
+        v = self.day_enabled
+        try:
+            return bool(v() if callable(v) else v)
+        except Exception:
+            return False
 
     def _headroom(self, symbol: str, market: str, price: float,
                   equity: float) -> float:
@@ -203,6 +232,11 @@ class EntryExecutor:
         zone = meta.get("entry_zone")
         if zone:
             return self._evaluate_zone(armed, market, price, meta, zone)
+        if str(meta.get("horizon") or "").lower() == "day" and not self._day_on():
+            self.store.close_position(armed["id"], reason="disarm:day_disabled")
+            self.store.log_event("disarm", armed.get("symbol"), {"reason": "day_disabled"})
+            log.info("진입대기 해제(데이 트랙 꺼짐) %s", armed.get("symbol"))
+            return {"action": "skip", "executed": False, "reason": "day_disabled"}
 
         sym = armed.get("symbol")
         if sym and (any(r["symbol"] == sym for r in self.store.get_open_positions())

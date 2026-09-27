@@ -1575,17 +1575,18 @@ def _gather() -> dict:
     data["disclosures"] = [dict(r) for r in cur.execute(
         "select ts,symbol,payload from events where kind='disclosure' and ts>? "
         "order by ts desc", (now - DISCLOSURE_SEC,))]
-    # 오늘(KST) 봇 라이브 거래: 체결(live_order)·전송실패(live_order_error)·매수차단(buy_blocked)
+    # 오늘(KST) 봇 라이브 거래: 체결(live_order)·전송실패(live_order_error)·
+    # 확정거부(live_order_rejected)·매수차단(buy_blocked)
     kst_midnight = datetime.now(_KST).replace(hour=0, minute=0, second=0,
                                               microsecond=0).timestamp()
     data["live_trades"] = [dict(r) for r in cur.execute(
         "select ts,kind,symbol,payload from events where kind in "
-        "('live_order','live_order_error','buy_blocked') and ts>=? "
+        "('live_order','live_order_error','live_order_rejected','buy_blocked') and ts>=? "
         "order by ts desc limit 10", (kst_midnight,))]
     # 지정가·재대사·프리/애프터 실측 (오늘 KST)
     data["exec_events"] = [dict(r) for r in cur.execute(
         "select ts,kind,symbol,payload from events where kind in "
-        "('live_order','live_order_pending','live_order_error',"
+        "('live_order','live_order_pending','live_order_error','live_order_rejected',"
         "'reconcile','wide_spread_skip','sell_skipped') and ts>=? "
         "order by ts desc limit 400", (kst_midnight,))]
     try:
@@ -1808,6 +1809,12 @@ def _live_trade_chip(kind: str, pl: dict) -> str:
     side = str(pl.get("side") or "").upper()
     if kind == "buy_blocked":
         return "<span class=r-queue>매수차단</span>"
+    if kind == "live_order_rejected":
+        if side == "SELL":
+            return "<span class=veto>매도거부</span>"
+        if side == "BUY":
+            return "<span class=veto>매수거부</span>"
+        return "<span class=veto>주문거부</span>"
     if kind == "live_order_error":
         if side == "SELL":
             return "<span class=veto>매도실패</span>"
@@ -1840,7 +1847,7 @@ def _live_trade_qty_price(kind: str, pl: dict) -> tuple[str, str]:
 def _live_trade_why_thesis(e: dict, pl: dict, d: dict) -> tuple[str, str]:
     """(근거 라벨, thesis 전문)."""
     kind = e.get("kind")
-    if kind == "live_order_error":
+    if kind in ("live_order_error", "live_order_rejected"):
         return _reason_label(pl.get("exit_reason"), pl.get("reason")), ""
     if kind == "buy_blocked":
         return str(pl.get("reason") or "").strip(), ""
@@ -1899,6 +1906,14 @@ def _summarize_trade_note(text: str, *, max_len: int = 96) -> str:
 def _live_trade_detail(e: dict, pl: dict, d: dict) -> str:
     """내용 칸 — 근거 뱃지 + 요약 설명(호버 시 전문)."""
     kind = e.get("kind")
+    if kind == "live_order_rejected":
+        code = pl.get("code") or pl.get("status") or ""
+        err = escape(f"거부 {code}".strip())
+        why, _ = _live_trade_why_thesis(e, pl, d)
+        bits = [f"<div class=tr-err>{err}</div>"]
+        if why:
+            bits.append(f"<span class=tr-why>{escape(why[:60])}</span>")
+        return "".join(bits)
     if kind == "live_order_error":
         err = escape(str(pl.get("error") or "")[:120])
         why, _ = _live_trade_why_thesis(e, pl, d)

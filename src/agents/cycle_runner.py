@@ -592,7 +592,8 @@ class CycleRunner:
                        "max_position_pct": self.cfg.risk.get("max_position_pct", 0.2),
                        "max_positions": self.cfg.risk.get("max_positions"),   # None = 무제한
                        "open_positions": self.account.open_count}
-        day_on = bool((self.cfg.raw.get("day_track") or {}).get("enabled", True))
+        from ..day_pool import day_track_enabled
+        day_on = day_track_enabled(self.cfg)
         if not day_on:
             constraints["day_track"] = ("off — horizon=day BUY 는 집행되지 않는다. "
                                         "swing/position/close_scan 만 제안할 것")

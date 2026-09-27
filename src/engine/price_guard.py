@@ -9,9 +9,11 @@ ROIV 의 오류가는 30분 넘게 그대로 유지돼 "N틱 연속 확인"만�
 교차확인한다(평상시 추가 호출 0).
   - 의심가가 호가 범위 [bid, ask] ± quote_tol_pct 안 → 진짜 급변, 채택.
   - 호가가 의심가를 부정 → 기각. 이번 값은 호가 중간값으로 대체. 기각은 의심 시계를
-    리셋하지 않는다. 호가가 낡았으면(호가 시각이 의심 시작 이전에 멈춤) 의심이
-    confirm_sec 넘게 이어지고 체결가가 2가지 이상 찍힐 때 채택한다 — 멈춘 호가가 진짜
-    급락 손절을 영영 막지 않게. 한 값에 고정된 오류가(ROIV)는 끝까지 기각된다.
+    리셋하지 않는다. 호가가 멈췄다고 **증명될 때만**(호가 시각이 있고 의심 시작 이전에
+    멈춰 있으며, 의심 중 bid/ask 값도 한 번도 안 바뀜) 의심이 confirm_sec 넘게 이어지고
+    체결가가 2가지 이상 찍힐 때 채택한다 — 멈춘 호가가 진짜 급락 손절을 영영 막지
+    않게. 호가 시각이 없으면 멈춤을 증명할 수 없어 기각을 유지한다(시간외에 흔들리는
+    오류가가 3분 뒤 가짜 손절로 채택되던 구멍). 한 값에 고정된 오류가(ROIV)도 기각.
   - 호가를 못 구함 → 의심 상태가 confirm_sec 이상 이어지면 채택(진짜 급락 청산을
     영영 막지 않게), 그 전엔 ref 유지. 이번 의심 중 호가가 한 번이라도 부정했으면
     호가를 못 구하는 틱에도 기각을 유지한다(호가 예산 초과로 굶는 종목 보호).
@@ -64,6 +66,8 @@ class PriceGuard:
         self._suspect_raws: dict[str, set[float]] = {}
         # 이번 의심 중 호가가 의심가를 부정한 마지막 판정 sym -> (mid, ts).
         self._last_reject: dict[str, tuple[float, float]] = {}
+        # 이번 의심 중 처음 본 호가 (bid, ask) — 값이 바뀌었으면 살아 있는 호가.
+        self._suspect_quote: dict[str, tuple[float | None, float | None]] = {}
         # 같은 오류가가 매 틱 반복될 때 호가를 매초 다시 부르지 않도록 판정 캐시.
         # sym -> {raw: (use, verdict, ts)}. 정상 채택 시 종목 단위로 비운다.
         self._verdict: dict[str, dict[float, tuple[float, str, float]]] = {}
@@ -159,11 +163,14 @@ class PriceGuard:
                 self._quote_fail_streak = 0
                 self._quote_fail_until.pop(symbol, None)
                 info["quote_mid"] = mid
+                first_quote = self._suspect_quote.setdefault(symbol, (bid, ask))
+                quote_moved = first_quote != (bid, ask)
                 if _within_quote(price, bid, ask, self.quote_tol_pct):
                     verdict, use = "confirmed", price
                     self._accept(symbol, price, now)
                 elif self._quote_frozen(quote_at, since, now,
-                                        len(self._suspect_raws.get(symbol, ()))):
+                                        len(self._suspect_raws.get(symbol, ())),
+                                        quote_moved=quote_moved):
                     verdict, use = "stale_quote", price
                     info["quote_at"] = quote_at
                     self._accept(symbol, price, now)
@@ -201,14 +208,16 @@ class PriceGuard:
         return ref_px, "held"
 
     def _quote_frozen(self, quote_at: float | None, since: float, now: float,
-                      distinct_raws: int) -> bool:
+                      distinct_raws: int, *, quote_moved: bool = False) -> bool:
         """호가가 의심가를 부정하지만 믿을 수 없는가(멈춘 호가).
 
-        호가 시각이 의심 시작 뒤로 한 번이라도 갱신됐으면 살아 있는 호가 — 기각이 맞다.
-        그 외엔 의심이 confirm_sec 이상 이어지고 체결가가 2가지 이상 찍혔을 때만
+        멈춤은 증명될 때만 인정한다. 호가 시각이 없으면(스펙상 nullable) 증명 불가 —
+        기각 유지. 호가 시각이 의심 시작 뒤로 갱신됐거나 의심 중 bid/ask 값이
+        바뀌었으면 살아 있는 호가 — 기각이 맞다. 그 외(시각이 의심 전에 멈추고 값도
+        그대로)엔 의심이 confirm_sec 이상 이어지고 체결가가 2가지 이상 찍혔을 때만
         멈춘 호가로 본다. 한 값에 고정된 오류가(ROIV 29.12 30분)는 해당 없음.
         """
-        if quote_at is not None and quote_at >= since:
+        if quote_at is None or quote_at >= since or quote_moved:
             return False
         return now - since >= self.confirm_sec and distinct_raws >= 2
 
@@ -224,6 +233,7 @@ class PriceGuard:
         self._suspect_since.pop(symbol, None)
         self._suspect_raws.pop(symbol, None)
         self._last_reject.pop(symbol, None)
+        self._suspect_quote.pop(symbol, None)
         self._verdict.pop(symbol, None)
 
 

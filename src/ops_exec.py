@@ -64,6 +64,7 @@ def summarize_exec(rows: list[dict], *, market: str = "KR",
     fills: list[dict] = []
     pending = 0
     errors = 0
+    rejected = 0
     spread_skips = 0
     sell_skips = 0
     by_sess = {k: 0 for k in _SESSION_KEYS}
@@ -108,6 +109,8 @@ def summarize_exec(rows: list[dict], *, market: str = "KR",
             pending += 1
         elif kind == "live_order_error":
             errors += 1
+        elif kind == "live_order_rejected":
+            rejected += 1
         elif kind == "wide_spread_skip":
             spread_skips += 1
         elif kind == "sell_skipped":
@@ -148,6 +151,8 @@ def summarize_exec(rows: list[dict], *, market: str = "KR",
         f"미체결 {pending}",
         f"실패 {errors}",
     ]
+    if rejected:
+        line_parts.append(f"거부 {rejected}")
     if slips:
         line_parts.append(f"슬립평균 {avg_slip:+.2f}%")
     sess_bits = []
@@ -169,6 +174,7 @@ def summarize_exec(rows: list[dict], *, market: str = "KR",
         "n_fills": len(fills),
         "n_pending": pending,
         "n_errors": errors,
+        "n_rejected": rejected,
         "n_spread_skip": spread_skips,
         "n_sell_skip": sell_skips,
         "by_session": by_sess,

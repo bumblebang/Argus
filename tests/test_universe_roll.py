@@ -168,6 +168,7 @@ def test_core_refresh_liquidity_core_caps_at_core_size(cfg, monkeypatch, _redire
 def test_core_refresh_liquidity_core_light(cfg, monkeypatch, _redirect_out):
     _enable_liquidity_core(cfg, core_size=10, discover_pool=30, light=True,
                            rank_by="discovery_tv", day_tag_top=3)
+    cfg.raw["day_track"] = {"enabled": True}            # 태그는 데이 트랙 켜졌을 때만
     monkeypatch.setattr(UR, "_DRY", True)
     monkeypatch.setattr(
         "src.strategy_scores.refresh_strategy_scores",
@@ -180,6 +181,21 @@ def test_core_refresh_liquidity_core_light(cfg, monkeypatch, _redirect_out):
     assert len(day_tagged) == 3
     assert all(it.get("strategy") == "volatility_breakout" for it in day_tagged)
 
+
+
+def test_core_refresh_no_day_tag_when_day_track_off(cfg, monkeypatch, _redirect_out):
+    _enable_liquidity_core(cfg, core_size=10, discover_pool=30, light=True,
+                           rank_by="discovery_tv", day_tag_top=3)
+    cfg.raw["day_track"] = {"enabled": False}           # 꺼짐 — day_tag_top 무시
+    monkeypatch.setattr(UR, "_DRY", True)
+    monkeypatch.setattr(
+        "src.strategy_scores.refresh_strategy_scores",
+        lambda *a, **k: {})
+    out = UR.core_refresh(cfg, "KR")
+    assert out is not None
+    data = yaml.safe_load(_redirect_out.read_text(encoding="utf-8"))
+    assert len(data["KR"]) == 10
+    assert not [it for it in data["KR"] if it.get("pool") == "day"]
 
 def test_discover_kr_uses_toss_when_rankings_fn(cfg, monkeypatch):
     calls = []
