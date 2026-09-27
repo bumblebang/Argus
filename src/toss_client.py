@@ -42,6 +42,7 @@ EP = {
     "order_cancel": ("POST",   "/api/v1/orders/{order_id}/cancel"),
     "order_modify": ("POST",   "/api/v1/orders/{order_id}/modify"),
     "order_get":    ("GET",    "/api/v1/orders/{order_id}"),
+    "order_list":   ("GET",    "/api/v1/orders"),
     "exchange_rate":("GET",    "/api/v1/exchange-rate"),
     "calendar":     ("GET",    "/api/v1/market-calendar/{country}"),
     "stocks":       ("GET",    "/api/v1/stocks"),
@@ -63,6 +64,7 @@ EP_GROUP = {
     "order_cancel": "ORDER",
     "order_modify": "ORDER",
     "order_get":    "ORDER_HISTORY",
+    "order_list":   "ORDER_HISTORY",
     "exchange_rate":"MARKET_INFO",
     "calendar":     "MARKET_INFO",
     "stocks":       "STOCK",
@@ -74,6 +76,12 @@ _CCY = {"KR": "KRW", "US": "USD"}  # 시장 -> 통화
 
 _RETRY_ATTEMPTS = 4
 _BACKOFF_CAP_SEC = 8.0
+# order_create 는 브로커 락 안에서 불린다 — 재시도 총 대기를 짧게 묶는다.
+_ORDER_RETRY_ATTEMPTS = 3
+_ORDER_BACKOFF_CAP_SEC = 2.0
+# 서버가 주문을 '받지 않았음'이 확정인 4xx 에서 뺄 코드. 408(요청 타임아웃)·409
+# (동일 주문 키 처리 중)는 접수 여부가 불명이다.
+_AMBIGUOUS_4XX = {408, 409}
 
 
 def _backoff_wait(attempt: int, cap: float = _BACKOFF_CAP_SEC) -> float:
@@ -81,10 +89,35 @@ def _backoff_wait(attempt: int, cap: float = _BACKOFF_CAP_SEC) -> float:
 
 
 class TossAPIError(RuntimeError):
-    def __init__(self, status: int, body: Any):
+    """definitive=True 면 서버가 이 요청을 처리하지 않았음이 확정(주문 미접수).
+
+    주문 경로가 '거부'와 '결과 불명'을 가르는 근거다. 4xx(408·409 제외)와 전송 전
+    실패(토큰 발급 등)만 확정으로 본다. 5xx·전송 예외는 접수됐을 수 있다.
+    """
+
+    def __init__(self, status: int, body: Any, *, definitive: bool | None = None):
         super().__init__(f"Toss API error {status}: {body}")
         self.status = status
         self.body = body
+        if definitive is None:
+            st = int(status or 0)
+            definitive = 400 <= st < 500 and st not in _AMBIGUOUS_4XX
+        self.definitive = bool(definitive)
+
+    @property
+    def code(self) -> str:
+        """ErrorResponse.error.code (예: insufficient-buying-power). 없으면 ""."""
+        body = self.body
+        if isinstance(body, str):
+            try:
+                body = json.loads(body)
+            except ValueError:
+                return ""
+        if isinstance(body, dict):
+            err = body.get("error")
+            if isinstance(err, dict):
+                return str(err.get("code") or "")
+        return ""
 
 
 class TossClient:
@@ -195,28 +228,47 @@ class TossClient:
             self.rate_limiter.acquire(EP_GROUP.get(key, ""))
 
     def _request(self, key: str, *, params: dict | None = None, json: dict | None = None,
-                 account_seq: int | str | None = None, path_params: dict | None = None) -> Any:
+                 account_seq: int | str | None = None, path_params: dict | None = None,
+                 max_attempts: int | None = None, timeout: float | None = None) -> Any:
+        """max_attempts·timeout 은 호출별 상한(없으면 기본). 가격 가드 호가처럼 늦느니
+        포기하는 게 나은 조회는 1회·짧은 타임아웃으로 부른다."""
         method, path = EP[key]
         if path_params:
             path = path.format(**path_params)
         url = self.creds.base_url + path
-        # order_create 재시도 금지: 접수 후 응답 유실 시 이중 주문. 첫 실패 즉시 전파.
-        max_attempts = 1 if key == "order_create" else _RETRY_ATTEMPTS
+        # order_create: clientOrderId(10분 멱등키)가 있으면 서버가 같은 키 재요청에 이전
+        # 결과를 돌려주므로 전송 예외·5xx·409 도 재시도해도 이중주문이 안 된다. 키가 없으면
+        # 401·429(서버가 처리 전 거절 — 미접수 확정)만 재시도하고 나머지는 즉시 전파.
+        is_order = key == "order_create"
+        idempotent = bool(is_order and isinstance(json, dict) and json.get("clientOrderId"))
+        if max_attempts is None:
+            max_attempts = _ORDER_RETRY_ATTEMPTS if is_order else _RETRY_ATTEMPTS
+        max_attempts = max(1, int(max_attempts))
+        cap = _ORDER_BACKOFF_CAP_SEC if is_order else _BACKOFF_CAP_SEC
+        req_timeout = self.timeout if timeout is None else timeout
         token_retried = False
         for attempt in range(max_attempts):
             last_try = attempt == max_attempts - 1
             self._acquire(key)                  # 재시도마다 토큰 소비(429 폭주 방지)
             try:
+                headers = self._headers(account_seq)
+            except Exception as e:
+                if not is_order:
+                    raise
+                # 토큰 발급 실패 — 주문 요청은 아직 안 나갔다(미접수 확정).
+                raise TossAPIError(getattr(e, "status", 0) or 0,
+                                   f"토큰 발급 실패(주문 미전송): {e}",
+                                   definitive=True) from e
+            try:
                 resp = self.session.request(method, url, params=params, json=json,
-                                            headers=self._headers(account_seq),
-                                            timeout=self.timeout)
+                                            headers=headers, timeout=req_timeout)
             except requests.exceptions.RequestException as e:
                 # 타임아웃·연결 끊김·DNS 는 곧 회복되는 일과성 장애다. 여기서 그냥
                 # 튀면 계좌 동기화가 조회 1회 실패로 원장을 낡은 채 둔다.
-                # order_create 는 재시도 자체가 이중주문 — 즉시 전파.
-                if last_try:
+                # 멱등키 없는 order_create 는 재시도 자체가 이중주문 — 즉시 전파.
+                if last_try or (is_order and not idempotent):
                     raise
-                wait = _backoff_wait(attempt)
+                wait = _backoff_wait(attempt, cap)
                 log.warning("%s 요청 실패(%s: %s) -> %.1fs 후 재시도",
                             key, type(e).__name__, e, wait)
                 time.sleep(wait)
@@ -233,7 +285,7 @@ class TossClient:
                     continue
                 if last_try:
                     raise TossAPIError(resp.status_code, resp.text)
-                wait = _backoff_wait(attempt)
+                wait = _backoff_wait(attempt, cap)
                 log.warning("401 invalid-token (쓰로틀 추정, 토큰 %.0fs 전 발급) -> 재발급 없이 %.1fs 백오프", age, wait)
                 time.sleep(wait)
                 continue
@@ -243,16 +295,19 @@ class TossClient:
                 # 문서 권장: Retry-After 존중 + 지수 백오프 + 지터
                 retry_after = resp.headers.get("Retry-After")
                 base = float(retry_after) if retry_after else 2 ** attempt
+                if is_order:
+                    base = min(base, cap)
                 wait = base + random.uniform(0, 0.5)
                 log.warning("429 rate limit (group=%s, Retry-After=%s) -> %.1fs 후 재시도",
                             resp.headers.get("X-RateLimit-Group", "?"), retry_after, wait)
                 time.sleep(wait)
                 continue
-            if resp.status_code >= 500:
-                # 서버측 일과성 오류 — 재시도 대상. order_create·4xx 는 재시도 안 함.
-                if last_try:
+            if resp.status_code >= 500 or (idempotent and resp.status_code == 409):
+                # 서버측 일과성 오류·동일 주문키 처리 중 — 재시도 대상.
+                # 멱등키 없는 order_create·그 밖의 4xx 는 재시도 안 함.
+                if last_try or (is_order and not idempotent):
                     raise TossAPIError(resp.status_code, resp.text)
-                wait = _backoff_wait(attempt)
+                wait = _backoff_wait(attempt, cap)
                 log.warning("%s 서버 오류 %s -> %.1fs 후 재시도",
                             key, resp.status_code, wait)
                 time.sleep(wait)
@@ -344,6 +399,30 @@ class TossClient:
     def cancel_order(self, account_seq: int | str, order_id: str) -> dict:
         return self._request("order_cancel", path_params={"order_id": order_id},
                              account_seq=account_seq)
+
+    def list_orders(self, account_seq: int | str, *, status: str,
+                    symbol: str | None = None, date_from: str | None = None,
+                    date_to: str | None = None, cursor: str | None = None,
+                    limit: int | None = None) -> dict:
+        """GET /api/v1/orders — 주문 목록. status=OPEN(전량) | CLOSED(페이지).
+
+        반환 {orders:[Order...], nextCursor, hasNext}. from/to 는 KST 날짜(YYYY-MM-DD).
+        """
+        params: dict[str, Any] = {"status": status}
+        if symbol:
+            params["symbol"] = symbol
+        if date_from:
+            params["from"] = date_from
+        if date_to:
+            params["to"] = date_to
+        if cursor:
+            params["cursor"] = cursor
+        if limit:
+            params["limit"] = int(limit)
+        res = self._request("order_list", params=params, account_seq=account_seq)
+        if isinstance(res, dict):
+            return res
+        return {"orders": res or [], "nextCursor": None, "hasNext": False}
 
     def get_order(self, account_seq: int | str, order_id: str) -> dict:
         """GET /api/v1/orders/{order_id} — 단건 주문 조회(체결 대사용).

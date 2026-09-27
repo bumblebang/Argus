@@ -440,7 +440,8 @@ def _start_reconcile_timer(broker, gateway, store, cfg, markets,
             sw = broker.sweep_working_orders()
             if (sw.get("canceled") or sw.get("cancel_failed") or sw.get("settled")
                     or sw.get("dropped") or sw.get("abandoned")
-                    or sw.get("block_reconcile") or sw.get("fetch_failed")):
+                    or sw.get("block_reconcile") or sw.get("fetch_failed")
+                    or sw.get("local_resolved") or sw.get("local_absent")):
                 store.log_event("working_orders", None, sw)
         except Exception as e:
             log.warning("미체결 정산 오류(무시): %s", e)
