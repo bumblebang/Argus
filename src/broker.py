@@ -1086,7 +1086,7 @@ class Broker:
         meta = _row_meta(row)
         side = str(row.get("side") or "").upper()
         day_from = datetime.fromtimestamp(
-            placed - _LOCAL_MATCH_BEFORE_SEC, tz=_KST).strftime("%Y-%m-%d")
+            placed - _LOCAL_LOOSE_BEFORE_SEC, tz=_KST).strftime("%Y-%m-%d")
         day_to = datetime.fromtimestamp(now, tz=_KST).strftime("%Y-%m-%d")
         orders: list[dict] = []
         complete = True
