@@ -913,6 +913,14 @@ class Store:
         except sqlite3.IntegrityError:
             return None
 
+    def has_live_shadow(self, symbol: str, sleeve: str) -> bool:
+        """같은 종목·슬리브의 채점 전(open/pending) 그림자가 있으면 True."""
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT 1 FROM shadow_positions WHERE symbol=? AND sleeve=?"
+                " AND state IN ('open','pending') LIMIT 1", (symbol, sleeve)).fetchone()
+            return row is not None
+
     def get_open_shadow_positions(self) -> list[sqlite3.Row]:
         with self._lock:
             return self.conn.execute(

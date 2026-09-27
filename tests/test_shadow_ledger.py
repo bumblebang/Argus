@@ -310,3 +310,57 @@ def test_horizon_calendar_days():
     assert horizon_calendar_days("swing") == 20
     cfg = {"exit_policy": {"time_stop": {"by_horizon": {"swing": {"max_days": 15}}}}}
     assert horizon_calendar_days("swing", cfg) == 15
+
+
+# ── 에피소드 단위 표본 (09-27: 154행 중 독립 표본 73) ──────────────
+
+def test_live_shadow_blocks_repeat_booking(tmp_path):
+    """같은 종목이 다음 사이클에 또 차단돼도 채점 전 그림자가 있으면 새 표본 아님."""
+    store = Store(tmp_path / "t.db")
+    t0 = time.time()
+    for i in range(5):
+        res, prices = _vetoed_cycle(cycle_ts=t0 + i * 600)
+        book_blocked(store, res, prices, sleeve="brain")
+    assert len(store.get_open_shadow_positions()) == 1
+    # 다른 종목·다른 슬리브는 별개
+    res, prices = _vetoed_cycle(sym="000660", cycle_ts=t0 + 7000)
+    assert book_blocked(store, res, prices, sleeve="brain") == 1
+    res, prices = _vetoed_cycle(cycle_ts=t0 + 8000)
+    assert book_blocked(store, res, prices, sleeve="value") == 1
+
+
+def test_dedupe_episodes_folds_rows_within_horizon():
+    from src.shadow_ledger import dedupe_episodes
+    day = 86400.0
+    rows = [
+        {"symbol": "A", "sleeve": "brain", "entry_ts": 0, "horizon": "swing", "ret_pct": -10},
+        {"symbol": "A", "sleeve": "brain", "entry_ts": 1 * day, "horizon": "swing", "ret_pct": -10},
+        {"symbol": "A", "sleeve": "brain", "entry_ts": 5 * day, "horizon": "swing", "ret_pct": -9},
+        {"symbol": "A", "sleeve": "brain", "entry_ts": 25 * day, "horizon": "swing", "ret_pct": 3},
+        {"symbol": "B", "sleeve": "brain", "entry_ts": 1 * day, "horizon": "day", "ret_pct": 1},
+        {"symbol": "B", "sleeve": "brain", "entry_ts": 1.5 * day, "horizon": "day", "ret_pct": 1},
+        {"symbol": "B", "sleeve": "brain", "entry_ts": 3 * day, "horizon": "day", "ret_pct": 2},
+    ]
+    out = dedupe_episodes(rows, cfg={"exit_policy": {"time_stop": {
+        "by_horizon": {"swing": {"max_days": 20}}}}})
+    assert [(r["symbol"], r["entry_ts"] / day) for r in out] == [
+        ("A", 0), ("B", 1), ("B", 3), ("A", 25)]
+
+
+def test_shadow_stats_counts_episodes_and_excludes_outliers(tmp_path):
+    store = Store(tmp_path / "t.db")
+    now = time.time()
+    base = dict(sleeve="brain", market="KR", block_status="vetoed",
+                block_bucket="검증:규칙거부", horizon="swing", state="scored",
+                scored_at=now, meta={"horizon_days": 20})
+    for i, (sym, ret) in enumerate([("A", -10.0), ("A", -10.0), ("A", -10.0),
+                                    ("B", 4.0), ("C", 285.8)]):
+        store.insert_shadow_position(cycle_ts=now - 86400 + i, symbol=sym,
+                                     entry_price=100.0, entry_ts=now - 86400 + i,
+                                     ret_pct=ret, **base)
+    st = shadow_stats(store, since_days=30)
+    assert st["sample"]["rows_raw"] == 5
+    assert st["sample"]["episodes"] == 3
+    assert [o["symbol"] for o in st["sample"]["outliers_excluded"]] == ["C"]
+    assert st["overall"]["n_scored"] == 2
+    assert st["overall"]["avg_ret_pct"] == -3.0
