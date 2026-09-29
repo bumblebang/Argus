@@ -37,6 +37,7 @@ from .datasources import discovery
 from .datasources.history import fetch_history
 from .datasources.sector_class import ensure_sectors, sector_for
 from .sector_taxonomy import normalize_sector
+from .day_pool import day_track_enabled
 
 log = get_logger("src.universe_roll")
 
@@ -75,7 +76,10 @@ def _liquidity_core_cfg(cfg) -> dict:
         "discover_pool": int(lc.get("discover_pool", 250)),
         "default_strategy": str(lc.get("default_strategy", "ma_crossover")),
         "rank_by": str(lc.get("rank_by", "avg_turnover")),
-        "day_tag_top": int(lc.get("day_tag_top", 0)),
+        # 데이 트랙이 꺼져 있으면 pool=day 태그도 붙이지 않는다(설정값과 무관).
+        "day_tag_top": (int(lc.get("day_tag_top", 0))
+                        if day_track_enabled(raw if isinstance(raw, dict) else {})
+                        else 0),
         "day_strategy": str(lc.get("day_strategy", "volatility_breakout")),
         "kr_rank_type": str(lc.get("kr_rank_type") or dp.get("type")
                              or "MARKET_TRADING_AMOUNT"),

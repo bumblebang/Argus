@@ -4,6 +4,8 @@
   python scripts/score_shadow_ledger.py --stats
   python scripts/score_shadow_ledger.py --backfill
   python scripts/score_shadow_ledger.py --backfill --limit 500
+  python scripts/score_shadow_ledger.py --rescore-exits --dry-run   # 낡은 청산가 점검만
+  python scripts/score_shadow_ledger.py --rescore-exits             # 교정 적용
 """
 from __future__ import annotations
 
@@ -19,7 +21,7 @@ from src.config import load_config
 from src.engine.store import Store
 from src.logging_setup import setup_logging
 from src.shadow_ledger import (backfill_from_jsonl, rescore_shadow_costs,
-                               score_open_shadows, shadow_stats)
+                               rescore_shadow_exits, score_open_shadows, shadow_stats)
 from src import paths as _paths
 
 DATA = ROOT / "data"
@@ -33,6 +35,10 @@ def main() -> None:
                     help="replay decisions.jsonl (+ value) into shadow_positions")
     ap.add_argument("--rescore-cost", action="store_true",
                     help="scored 행 ret_pct 에 왕복비용 재적용(J11 공백 보정)")
+    ap.add_argument("--rescore-exits", action="store_true",
+                    help="scored 행 청산가를 최신 히스토리로 재채점(낡은 CSV 종가 교정)")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="--rescore-exits 를 DB 변경 없이 집계만")
     ap.add_argument("--limit", type=int, default=None,
                     help="backfill max journal lines per file")
     ap.add_argument("--db", type=Path,
@@ -56,6 +62,12 @@ def main() -> None:
                     store, path, sleeve=sleeve, data_dir=DATA,
                     cfg=cfg.raw, limit=args.limit)
                 print(json.dumps({"backfill": sleeve, **bf}, ensure_ascii=False))
+
+    if args.rescore_exits:
+        rx = rescore_shadow_exits(store, data_dir=DATA, cfg=cfg.raw,
+                                  apply=not args.dry_run)
+        print(json.dumps({"rescore_exits": rx, "applied": not args.dry_run},
+                         ensure_ascii=False, indent=2))
 
     if args.rescore_cost:
         rs = rescore_shadow_costs(store, cfg=cfg.raw)

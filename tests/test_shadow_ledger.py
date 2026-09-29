@@ -126,7 +126,7 @@ def test_idempotent_score(tmp_path):
     (hist / "X_1d_1y.csv").write_text(
         "Date,Open,High,Low,Close,Volume\n"
         f"{base.strftime('%Y-%m-%d')},10,10,10,10,1\n"
-        f"{(base + timedelta(days=25)).strftime('%Y-%m-%d')},11,11,11,11,1\n",
+        f"{(base + timedelta(days=20)).strftime('%Y-%m-%d')},11,11,11,11,1\n",
         encoding="utf-8",
     )
     entry_ts = base.timestamp()
@@ -214,7 +214,7 @@ def test_pending_timeout_score(tmp_path):
     (hist / "ARM_1d_1y.csv").write_text(
         "Date,Open,High,Low,Close,Volume\n"
         f"{base.strftime('%Y-%m-%d')},10,10,10,10,1\n"
-        f"{(base + timedelta(days=25)).strftime('%Y-%m-%d')},9,9,9,9,1\n",
+        f"{(base + timedelta(days=20)).strftime('%Y-%m-%d')},9,9,9,9,1\n",
         encoding="utf-8",
     )
     entry_ts = base.timestamp()

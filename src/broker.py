@@ -117,6 +117,20 @@ def _same_num(a: Any, b: Any, tol: float = 1e-6) -> bool:
     return abs(x - y) <= tol * max(1.0, abs(x), abs(y))
 
 
+def _limit_price_matches(server_px: Any, sent_px: Any) -> bool:
+    """서버 주문가가 보낸 지정가와 같은가. US 는 서버가 소수 자릿수를 절삭한다
+    ($1 이상 둘째 자리, 미만 넷째 자리 — 스펙 v1.2.17) — 절삭값도 같은 주문으로 본다."""
+    if _same_num(server_px, sent_px):
+        return True
+    x, y = _num(server_px), _num(sent_px)
+    if x is None or y is None or y <= 0:
+        return False
+    digits = 2 if y >= 1 else 4
+    q = Decimal(1).scaleb(-digits)
+    trunc = float(Decimal(str(y)).quantize(q, rounding=ROUND_DOWN))
+    return _same_num(x, trunc)
+
+
 def _is_fractional_qty(qty: float) -> bool:
     """부동소수점 잡음을 제외하고 실제 소수점 수량인지 판별."""
     q = float(qty)
@@ -265,9 +279,10 @@ class Broker:
         # 직전 execute 가 거부된 사유(한글). 성공 시 "". 저널/이벤트가 thesis 대신 기록.
         self.last_reject_reason: str = ""
         self.last_result: ExecuteResult | None = None
-        # 재대사가 실계좌 buying_power 로 cash 를 덮은 시각. 그 이전 미체결 BUY 는
-        # 이미 BP 에 홀드돼 있어 _working_reservations 에서 빼면 이중 차감(과차단).
-        self._cash_reconciled_at: float | None = None
+        # 시장별로 재대사가 실계좌 buying_power 로 cash 를 덮은 시각. 그 이전 미체결
+        # BUY 는 이미 BP 에 홀드돼 있어 현금 예약에서 빼야 한다(이중 차감). 시장 단위 —
+        # US BP 조회가 실패한 재대사가 US 예약까지 풀면 같은 현금을 두 번 쓴다.
+        self._cash_reconciled_at: dict[str, float] = {}
         # 실계좌 조회 건강도. 조회가 실패해도 봇은 마지막 성공 스냅샷으로 계속 돌지만,
         # 그 사실이 어디에도 안 남으면 게이트·사이징이 낡은 값을 진실로 믿는다.
         self.sync_health: dict = {
@@ -408,16 +423,20 @@ class Broker:
             log.warning("기동 sweep 실패(동기화는 계속): %s", e)
             sw = {"error": str(e), "block_reconcile": True}
         defer = bool(sw.get("block_reconcile"))
+        defer_syms = set(sw.get("defer_symbols") or [])
         if defer:
             log.warning("기동 sync: sweep 미완(block_reconcile) — sell 귀속 대기 "
                         "심볼 holdings 덮기 보류(fetch_failed=%s)",
                         sw.get("fetch_failed"))
+        elif defer_syms:
+            log.warning("기동 sync: 매도 결과 불명 심볼 holdings 덮기 보류 — %s",
+                        sorted(defer_syms))
         data = fetch_live_account_data(gateway, self.account_seq, markets=markets)
         self.note_sync_result(data)
         out = self.run_locked(
             lambda acct: apply_sync_from_live(
                 acct, store, data, markets=markets,
-                defer_sell_holdings=defer))
+                defer_sell_holdings=defer, defer_symbols=defer_syms))
         if isinstance(out, dict):
             out["sweep"] = sw
         return out
@@ -619,13 +638,13 @@ class Broker:
 
         접수된 주문은 증권사가 현금을 홀드하지만 로컬 원장 cash 는 그대로다.
         다음 재대사가 buying_power 를 실계좌 값으로 덮기 전까지, 다른 종목 주문이
-        그 현금을 다시 쓸 수 있다. in-flight 로 이미 잡힌 종목은 중복 제외.
+        그 현금을 다시 쓸 수 있다.
 
-        재대사 **이후** 접수분(placed_at > _cash_reconciled_at)만 예약한다 — 그 이전
-        미체결은 이미 실계좌 BP 에 홀드돼 cash 덮기에 반영됐으므로 또 빼면 과차단.
+        그 시장 재대사(BP 덮기) **이전** 접수분은 bp_held=True — 이미 실계좌 BP 에
+        홀드돼 cash 덮기에 반영됐으므로 현금 차감에선 빠진다(과차단 방지). 다만 보유엔
+        아직 없는 미체결 매수라 노출 한도(총익스포저·섹터·종목 수)에는 계속 들어간다.
 
         QUARANTINED(abandon) 행도 예약한다 — 증권사 쪽 주문이 살아 있을 수 있다.
-        영구 홀드는 위 재대사 기준이 막는다(다음 BP 덮기 이후 접수분이 아니게 됨).
         in-flight 중복 제외는 **같은 주문(order_id)** 만 — 같은 종목이라도 다른
         주문(예: SELL 처리 중 살아 있는 BUY 미체결)의 홀드를 지우면 안 된다.
         """
@@ -636,25 +655,25 @@ class Broker:
         except Exception:
             return []
         out: list[Reservation] = []
-        since = self._cash_reconciled_at
         inflight_ids = {str(r.order_id) for r in self._inflight.values() if r.order_id}
         for row in rows:
             if str(row.get("order_id") or "") in inflight_ids:
                 continue
             placed = float(row["placed_at"] or 0.0)
-            if since is not None and placed <= since:
-                continue
             remaining = float(row["qty"]) - float(row["filled_qty"] or 0.0)
             if remaining <= 0:
                 continue
+            since = self._cash_reconciled_at.get(str(row["market"] or ""))
             out.append(Reservation(
                 symbol=row["symbol"], market=row["market"], side=row["side"],
                 qty=remaining, price=float(row["price"]),
-                order_id=row["order_id"], placed_at=placed))
+                order_id=row["order_id"], placed_at=placed,
+                bp_held=since is not None and placed <= since))
         return out
 
     def reconcile(self, reconcile_fn: Callable[[PaperAccount], Any],
-                  *, expect_gen: int | None = None) -> Any:
+                  *, expect_gen: int | None = None,
+                  cash_markets: list[str] | None = None) -> Any:
         """주기 재대사를 broker 락 안에서 실행 — gate.check/체결과 원자적으로 원장을 병합.
 
         reconcile_fn(account) 이 실계좌(holdings/buying-power)를 account.cash/positions 에
@@ -666,6 +685,9 @@ class Broker:
 
         expect_gen 이 주어지면 fetch 직전 activity_generation() 과 같아야 한다. 조회
         동안 주문이 시작·끝나 inflight 가드에 안 걸려도, 낡은 API 스냅샷 apply 를 막는다.
+
+        cash_markets: 이번 조회에서 BP 를 받아 cash 를 덮은 시장. None 이면 결과의
+        cash_markets / failed_markets 로 판단한다.
         """
         with self._lock:
             # 연기 판정은 in-flight(폴링 중)만 본다. 미체결 주문으로 연기하면
@@ -682,9 +704,27 @@ class Broker:
                         "expect_gen": expect_gen, "activity_gen": self._activity_gen}
             result = reconcile_fn(self.account)
             # deferred 가 아닌 적용분만 — cash 가 실계좌 BP 기준이 됐음을 표시.
+            # BP 를 실제로 덮은 시장만(조회 실패 시장의 예약은 그대로 둔다).
             if not (isinstance(result, dict) and result.get("deferred")):
-                self._cash_reconciled_at = time.time()
+                now = time.time()
+                for m in self._cash_markets(result, cash_markets):
+                    self._cash_reconciled_at[m] = now
             return result
+
+    def _cash_markets(self, result: Any, cash_markets) -> list[str]:
+        """재대사가 BP 로 cash 를 덮은 시장. 명시가 없으면 결과의 실패 시장을 뺀다."""
+        if cash_markets is not None:
+            return [str(m) for m in cash_markets]
+        if not isinstance(result, dict):
+            return []
+        if "cash_markets" in result:
+            return [str(m) for m in (result.get("cash_markets") or [])]
+        failed = {str(m) for m in (result.get("failed_markets") or [])}
+        if result.get("cash_ok") is False and not failed:
+            return []
+        cash = result.get("cash")
+        markets = cash.keys() if isinstance(cash, dict) else self.account.cash.keys()
+        return [str(m) for m in markets if str(m) not in failed]
 
     def _ledger_already_has_fill(self, order: Order, filled_qty: float,
                                  qty_before: float | None) -> bool:
@@ -939,6 +979,9 @@ class Broker:
                "working": 0, "awaiting_attribution": 0, "dropped": 0,
                "abandoned": 0, "quarantined": 0, "fetch_failed": 0,
                "block_reconcile": False, "local_orphan": 0}
+        # 매도 결과가 불명인 심볼 — 재대사가 이 심볼만 수량 덮기를 보류한다.
+        # 해소(체결 확인·미접수 확정)될 때까지 격리 TTL 과 무관하게 유지한다.
+        defer: set[str] = set()
         now = time.time()
         for row in rows:
             oid = row["order_id"]
@@ -983,10 +1026,11 @@ class Broker:
                     self._emit_symbol("working_order_local_resolved", row.get("symbol"), {
                         "order_id": real_id, "local_order_id": oid,
                         "side": row.get("side"), "status": match.get("status")})
-                    # 실 id 로 바뀌었다 — 아래 일반 경로가 방금 받은 주문 정보로 정산한다.
+                    # 실 id 로 바뀌었다 — 아래 일반 경로가 단건 상세로 정산한다(목록 항목은
+                    # 대조용일 뿐, 상세 조회 실패 시에만 목록 값으로 대신한다).
                     oid = real_id
                     row = {**row, "order_id": real_id, "status": "PENDING"}
-                    prefetched = match
+                    prefetched = self._fetch_order(real_id) or match
                 else:
                     out["local_orphan"] += 1
                     out["working"] += 1
@@ -995,6 +1039,10 @@ class Broker:
                     self._emit_symbol("working_order_local_orphan", row.get("symbol"), {
                         "order_id": oid, "side": row.get("side"), "status": row.get("status"),
                         "age_sec": round(self._working_age(row, now), 1)})
+                    if str(row.get("side") or "").upper() == "SELL":
+                        # 체결됐을 수 있는 매도 — 재대사가 감소를 먼저 흡수하면 손익이
+                        # 영구 소실된다. 해소될 때까지 이 심볼만 재대사를 미룬다.
+                        defer.add(str(row.get("symbol")))
                     if self._should_abandon_working(row, now):
                         with self._lock:
                             fresh = self._working_row_snapshot(oid)
@@ -1002,10 +1050,6 @@ class Broker:
                                 continue
                             self._abandon_working_order(fresh, now, why="local_orphan")
                             out["quarantined"] += 1
-                    elif str(row.get("side") or "").upper() == "SELL":
-                        # 체결됐을 수 있는 매도 — 재대사가 감소를 먼저 흡수하면 손익이
-                        # 영구 소실된다. 격리(abandon TTL) 전까지는 재대사를 미룬다.
-                        out["block_reconcile"] = True
                     continue
             info = prefetched if prefetched is not None else self._fetch_order(oid)
             with self._lock:
@@ -1020,6 +1064,8 @@ class Broker:
                     out["working"] += 1
                     continue
                 if info is None:
+                    if str(fresh.get("side") or "").upper() == "SELL":
+                        defer.add(str(fresh.get("symbol")))
                     if self._should_abandon_working(fresh, now):
                         self._abandon_working_order(fresh, now, why="fetch_failed")
                         out["quarantined"] += 1
@@ -1027,8 +1073,6 @@ class Broker:
                     else:
                         out["working"] += 1
                         out["fetch_failed"] += 1
-                        if str(fresh.get("side") or "").upper() == "SELL":
-                            out["block_reconcile"] = True
                     continue
                 status, filled, avg, fee = _parse_execution(info)
                 self._store_call(self.store.update_working_order, oid, status=status,
@@ -1066,7 +1110,48 @@ class Broker:
                     else:
                         out["cancel_failed"] += 1
                         out["working"] += 1
+        out["defer_symbols"] = sorted(s for s in defer if s)
+        cleared = self._clear_register_failed()
+        if cleared:
+            out["register_failed_cleared"] = cleared
         return out
+
+    def _clear_register_failed(self) -> list[str]:
+        """등록 실패로 막아 둔 심볼을 서버 미체결 목록으로 확인해 푼다(락 밖 I/O).
+
+        기록이 실패한 주문은 레지스트리에 없거나 local 키로만 남는다. 그 종목의 OPEN
+        주문이 전부 레지스트리에 있고(local 해소로 rekey 된 것 포함) 미확인 local 행도
+        없으면 더는 모르는 주문이 없다 — 차단을 푼다. 조회 실패면 유지.
+        """
+        syms = sorted(self._register_failed_symbols)
+        lister = getattr(self.client, "list_orders", None)
+        if not syms or lister is None or self.store is None:
+            return []
+        cleared: list[str] = []
+        for sym in syms:
+            try:
+                res = lister(self.account_seq, status="OPEN", symbol=sym) or {}
+                rows = self.store.get_working_orders(sym, settled=False) or []
+            except Exception as e:
+                log.warning("등록실패 심볼 확인 실패 %s: %s", sym, e)
+                continue
+            if res.get("hasNext"):
+                continue
+            known = {str(r.get("order_id")) for r in rows}
+            if any(_is_local_order_id(r.get("order_id")) for r in rows):
+                continue
+            unknown = [o for o in (res.get("orders") or [])
+                       if isinstance(o, dict) and str(o.get("orderId")) not in known]
+            if unknown:
+                log.error("등록실패 심볼 %s — 레지스트리에 없는 미체결 %d건, 차단 유지",
+                          sym, len(unknown))
+                continue
+            with self._lock:
+                self._register_failed_symbols.discard(sym)
+            cleared.append(sym)
+            log.warning("등록실패 심볼 %s — 서버 미체결이 레지스트리와 일치, 차단 해제", sym)
+            self._emit_symbol("register_failed_cleared", sym, {"symbol": sym})
+        return cleared
 
     def _resolve_local_order(self, row: dict, now: float
                              ) -> tuple[str, dict | None]:
@@ -1093,6 +1178,9 @@ class Broker:
         try:
             res = lister(self.account_seq, status="OPEN", symbol=row["symbol"]) or {}
             orders.extend(res.get("orders") or [])
+            # 스펙상 OPEN 은 전량 반환(hasNext 항상 false). 어겨지면 '없음' 확정 금지.
+            if res.get("hasNext"):
+                complete = False
             cursor = None
             for _ in range(_LOCAL_LIST_MAX_PAGES):
                 res = lister(self.account_seq, status="CLOSED", symbol=row["symbol"],
@@ -1138,7 +1226,7 @@ class Broker:
                 if not _same_num(o.get("quantity"), row.get("qty")):
                     continue
                 if (str(meta.get("order_type") or "LIMIT").upper() == "LIMIT"
-                        and not _same_num(o.get("price"), row.get("price"))):
+                        and not _limit_price_matches(o.get("price"), row.get("price"))):
                     continue
             cands.append(o)
         if len(cands) == 1:

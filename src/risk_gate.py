@@ -39,6 +39,10 @@ class Reservation:
     동안 cash/positions 는 주문 전 그대로다. 게이트가 원장만 보면 그 구간에 들어온
     **다른 종목** 주문이 같은 현금을 다시 쓴다(동일 종목은 in-flight 로 막히지만
     한도는 계좌 단위다). 그래서 미반영 주문을 '예약'으로 들고 게이트에 넘긴다.
+
+    bp_held=True 는 실계좌 매수여력(BP) 재대사가 이미 이 주문의 홀드를 반영한 뒤라는
+    뜻이다 — 현금 차감에선 빼되(이중 차감 방지) 보유에 아직 안 잡힌 미체결이므로
+    총익스포저·섹터·보유종목 수 한도에는 계속 넣는다.
     """
     symbol: str
     market: str
@@ -47,6 +51,7 @@ class Reservation:
     price: float
     order_id: str | None = None
     placed_at: float = 0.0
+    bp_held: bool = False
 
     @property
     def notional(self) -> float:
@@ -408,14 +413,21 @@ class RiskGate:
 
     def _reserved_notional(self, reserved, market: str,
                            sector: str | None = None,
-                           smap: dict | None = None) -> float:
-        """예약된 BUY 명목 합. SELL 예약이 만들 현금은 세지 않는다(미체결일 수 있음)."""
+                           smap: dict | None = None,
+                           *, cash_only: bool = False) -> float:
+        """예약된 BUY 명목 합. SELL 예약이 만들 현금은 세지 않는다(미체결일 수 있음).
+
+        cash_only=True 면 BP 재대사가 이미 홀드를 반영한 예약(bp_held)은 뺀다 — 매수여력
+        차감용. 노출 한도는 bp_held 도 포함(보유에 아직 없는 미체결 매수).
+        """
         if not reserved:
             return 0.0
         smap = smap if smap is not None else self.sector_map
         total = 0.0
         for r in reserved:
             if getattr(r, "side", "BUY") != "BUY":
+                continue
+            if cash_only and getattr(r, "bp_held", False):
                 continue
             if getattr(r, "market", None) != market:
                 continue
@@ -451,6 +463,7 @@ class RiskGate:
         """
         m = order.market
         reserved_buy = self._reserved_notional(reserved, m)
+        reserved_cash = self._reserved_notional(reserved, m, cash_only=True)
 
         # 0) 킬스위치 — 전역 HALT 파일이 있으면 BUY/SELL 전부 차단
         if self.is_globally_halted():
@@ -511,9 +524,10 @@ class RiskGate:
                         f"드로다운 한도 도달 (실현누적+미실현 {drawdown:,.0f})")
 
             # 4) 매수여력(현금) 확인 — 접수 후 미반영 주문(예약)이 쥔 현금을 뺀다.
-            avail = account.buying_power(m) - reserved_buy
+            #    BP 재대사가 이미 반영한 홀드(bp_held)는 빼지 않는다(이중 차감).
+            avail = account.buying_power(m) - reserved_cash
             if order.notional > avail:
-                held = f" (예약 {reserved_buy:,.0f} 차감)" if reserved_buy else ""
+                held = f" (예약 {reserved_cash:,.0f} 차감)" if reserved_cash else ""
                 return GateDecision(False,
                     f"매수여력 부족 ({order.notional:,.0f} > {avail:,.0f}){held}")
 

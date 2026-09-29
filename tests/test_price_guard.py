@@ -231,7 +231,8 @@ def test_exit_rejections_back_off(tmp_path):
     store = Store(tmp_path / "t.db")
     broker = _RejectingBroker()
     clock = _Clock()
-    ex = ExitExecutor(broker, store, retry_base_sec=10, retry_max_sec=40, clock=clock)
+    ex = ExitExecutor(broker, store, retry_base_sec=10, retry_max_sec=40,
+                      urgent_retry_max_sec=40, clock=clock)
     attempts = []
     for _ in range(120):                                # 1초 틱 2분
         before = broker.calls
@@ -391,19 +392,29 @@ def test_best_quote_single_attempt_short_timeout():
     assert client.request_kw == {"max_attempts": 1, "timeout": 1.5}
 
 
-def test_exit_backoff_is_per_trigger_kind(tmp_path):
-    """익절 거부 백오프가 손절·종가청산을 막지 않는다(예전엔 심볼 단위 최대 120초)."""
+def test_exit_backoff_urgent_kind_capped_shorter(tmp_path):
+    """익절 거부가 쌓은 streak 이 손절을 최대 120초 막지 않는다 — 손절은 30초 상한.
+
+    백오프는 종목 단위(브로커는 kind 무관 같은 전량 매도)라 거부 직후엔 kind 를 바꿔도
+    바로 다시 내지 않는다. 대신 긴급 kind 의 상한이 짧다.
+    """
     store = Store(tmp_path / "t.db")
     broker = _RejectingBroker()
     clock = _Clock()
-    ex = ExitExecutor(broker, store, retry_base_sec=10, retry_max_sec=120, clock=clock)
+    ex = ExitExecutor(broker, store, retry_base_sec=10, retry_max_sec=120,
+                      urgent_retry_max_sec=30, clock=clock)
 
     class _Target:
         kind = "target_hit"
 
-    for _ in range(3):
+    for _ in range(400):                                 # 익절만 계속 거부 → 상한 120초
         ex("A", "US", 38.0, _Target())
         clock.t += 1
-    assert broker.calls == 1
-    ex("A", "US", 38.0, _Trig())                         # stop_hit 은 즉시 시도
-    assert broker.calls == 2
+    streak, last = ex._retry["A"]
+    assert streak >= 4 and ex._delay("target_hit", streak) == 120
+    clock.t = last + 31
+    assert not ex.ready("A", "target_hit")
+    assert ex.ready("A", "stop_hit")
+    calls = broker.calls
+    ex("A", "US", 38.0, _Trig())
+    assert broker.calls == calls + 1

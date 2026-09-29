@@ -329,9 +329,10 @@ def test_order_create_no_retry_on_transport(tmp_path, monkeypatch):
         raise requests.exceptions.Timeout("slow")
 
     client.session.request = fake_request
-    with pytest.raises(requests.exceptions.Timeout):
+    with pytest.raises(TossAPIError) as ei:
         client._request("order_create", json={"symbol": "005930"})
     assert calls["n"] == 1
+    assert ei.value.definitive is False       # 응답 타임아웃 — 서버가 받았을 수 있다
 
 
 def test_request_4xx_raises_without_retry(tmp_path, monkeypatch):

@@ -432,7 +432,7 @@ def test_broker_sync_from_live_defers_when_sweep_blocks(tmp_path):
         order_id="O1", symbol="005930", market="KR", side="SELL",
         qty=10, price=71_000, status="PENDING", filled_qty=0)
     out = broker.sync_from_live(client, store, markets=("KR",))
-    assert out["sweep"].get("block_reconcile") is True
+    assert out["sweep"].get("defer_symbols") == ["005930"]
     assert "005930" in out.get("deferred_sell_symbols", [])
     assert broker.account.positions["005930"].qty == 10.0
     assert abs(broker.account.realized_pnl.get("KR", 0.0)) < 1e-9
@@ -566,12 +566,16 @@ def test_sweep_fail_then_recover_attributes_pnl(tmp_path):
     broker.account = acct
 
     sw1 = broker.sweep_working_orders()
-    assert sw1["block_reconcile"] is True and sw1["fetch_failed"] == 1
-    # 타이머가 여기서 return — 재대사하면 감소만 흡수되고 아래 귀속이 실패한다.
+    assert sw1["block_reconcile"] is False and sw1["fetch_failed"] == 1
+    assert sw1["defer_symbols"] == ["005930"]
+    # 재대사는 돌지만 이 심볼만 보류 — 감소를 먼저 흡수하면 아래 귀속이 실패한다.
+    res0 = apply_reconcile_from_live(acct, store, _holdings([]), markets=("KR",),
+                                     defer_symbols=set(sw1["defer_symbols"]))
+    assert res0["deferred_sell_symbols"] == ["005930"] and res0["attributed"] == {}
     assert acct.position("005930").qty == 10.0
 
     sw2 = broker.sweep_working_orders()
-    assert sw2["block_reconcile"] is False and sw2["settled"] == 1
+    assert sw2["defer_symbols"] == [] and sw2["settled"] == 1
     assert sw2["awaiting_attribution"] == 1
 
     res = apply_reconcile_from_live(acct, store, _holdings([]), markets=("KR",))

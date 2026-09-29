@@ -435,9 +435,16 @@ class TickResult:
 # 코드(빠른손)가 즉시 처리하는 청산 트리거 — 뇌를 거치지 않는다.
 _EXIT_KINDS = {"stop_hit", "trail_stop", "target_hit", "time_stop",
                "close_scan_exit", "value_fair_high"}
-# 같은 (종목, kind) 트리거 이벤트 기록 간격. 조건이 유지되는 동안 트리거는 매 틱
-# 다시 뜬다(청산 백오프 중 stop_hit, 무효화 등) — 판단은 매 틱 하되 기록만 줄인다.
+# 청산 트리거 시도 우선순위(작을수록 먼저). 한 틱에 종목당 주문은 한 번만 낸다 —
+# 브로커 주문은 kind 와 무관하게 같은 전량 매도라, 거부되면 다른 kind 로 또 내도
+# 같은 이유로 거부된다. 손절이 늘 먼저 시도·기록되게 한다.
+_EXIT_PRIORITY = {"stop_hit": 0, "trail_stop": 1, "close_scan_exit": 2,
+                  "time_stop": 3, "target_hit": 4, "value_fair_high": 5}
+# 같은 (종목, kind) 트리거 이벤트 기록 간격. 조건이 유지되는 동안 매 틱 다시 뜨는
+# 상태형 트리거(청산 조건·논거 무효화)만 줄인다 — 판단은 매 틱 그대로.
+# 급등락·국면 반전 같은 사건형 트리거는 발생마다 기록한다.
 _TRIGGER_LOG_COOLDOWN_SEC = 60.0
+_THROTTLED_TRIGGER_KINDS = _EXIT_KINDS | {"thesis_invalidation"}
 
 
 class WatchLoop:
@@ -984,10 +991,13 @@ class WatchLoop:
                     trigs.append(vt)
 
                 for t in trigs:
-                    key = (sym, t.kind)
-                    last = self._trigger_logged.get(key)
-                    if last is None or now_ts - last >= _TRIGGER_LOG_COOLDOWN_SEC:
-                        self._trigger_logged[key] = now_ts
+                    if t.kind in _THROTTLED_TRIGGER_KINDS:
+                        key = (sym, t.kind)
+                        last = self._trigger_logged.get(key)
+                        if last is None or now_ts - last >= _TRIGGER_LOG_COOLDOWN_SEC:
+                            self._trigger_logged[key] = now_ts
+                            self.store.log_event("trigger", sym, t.as_event())
+                    else:
                         self.store.log_event("trigger", sym, t.as_event())
                     res.triggers.append(t)
                 if len(self._trigger_logged) > 5000:
@@ -1000,22 +1010,24 @@ class WatchLoop:
                 exited = False
                 if self.executor and sym in positions:
                     pos_market = positions[sym].get("market", market)
-                    # 청산 트리거를 우선순위대로 시도하고 체결되면 멈춘다. 앞 kind 가
-                    # 백오프·거부로 False 면 다음 kind(손절 등)를 이어서 본다 — 첫 kind 만
-                    # 보면 백오프 중인 time_stop 이 같은 틱의 stop_hit 을 가린다.
-                    for t in trigs:
-                        if t.kind not in _EXIT_KINDS:
+                    # 청산 트리거를 우선순위(손절 먼저)로 보고, 백오프가 끝난 첫 kind 로
+                    # 한 번만 주문한다. 거부되면 이번 틱은 끝 — 다른 kind 로 같은 매도를
+                    # 또 내지 않는다(백오프 중인 kind 는 건너뛰고 다음 kind 를 본다).
+                    exit_trigs = sorted((t for t in trigs if t.kind in _EXIT_KINDS),
+                                        key=lambda t: _EXIT_PRIORITY.get(t.kind, 99))
+                    ready = getattr(self.executor, "ready", None)
+                    for t in exit_trigs:
+                        if ready is not None and not ready(sym, t.kind):
                             continue
                         try:
                             if self.executor(sym, pos_market, price, t):
                                 res.exits.append(sym)
                                 exited = True
-                                break
                         except Exception as e:
                             log.error("코드 청산 실패 %s: %s", sym, e)
                             self.store.log_event("error", sym,
                                                  {"where": "exit", "err": str(e)})
-                            break
+                        break
                 if exited:
                     continue
                 if sym in positions:                 # 보유분 → 전략기반 청산 대상

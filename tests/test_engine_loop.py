@@ -114,7 +114,8 @@ def test_backing_off_exit_kind_does_not_shadow_stop_hit(tmp_path, monkeypatch):
     loop = WatchLoop(gw, store, lambda: {"KR": {"positions": [pos], "candidates": []}},
                      executor=execu, config=WatchConfig(exit_policy=ep))
     res = loop.run_once()
-    assert tried == ["time_stop", "stop_hit"] and res.exits == ["005930"]
+    # 손절이 우선순위 1순위 — 시간손절보다 먼저, 한 틱에 한 번만 시도한다.
+    assert tried == ["stop_hit"] and res.exits == ["005930"]
 
 
 def test_repeated_trigger_events_are_throttled(tmp_path, monkeypatch):

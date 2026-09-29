@@ -188,7 +188,7 @@ def test_order_create_retries_401_and_429_without_key(tmp_path, monkeypatch):
     """401 invalid-token·429 는 서버가 처리 전 거절 — 멱등키 없어도 재시도 안전."""
     client = _order_client(tmp_path, monkeypatch)
     client._ensure_token = lambda: "tok"
-    seq = [_resp(401, "invalid-token"), _resp(429, "x", headers={"Retry-After": "30"}),
+    seq = [_resp(401, "invalid-token"), _resp(429, "x", headers={"Retry-After": "1"}),
            _resp(200, "{}", {"result": {"orderId": "OK2"}})]
     client.session.request = lambda *a, **k: seq.pop(0)
     assert client._request("order_create", json={"symbol": "A"}) == {"orderId": "OK2"}
@@ -243,10 +243,13 @@ def test_quarantined_row_keeps_hold_until_cash_reconciled(tmp_path):
                                side="BUY", qty=1, price=600_000, status="QUARANTINED",
                                placed_at=time.time() - 3600)
     with broker._lock:
-        assert [r.order_id for r in broker._active_reservations()] == ["Q1"]
-    broker.reconcile(lambda acct: {})
+        res = broker._active_reservations()
+        assert [r.order_id for r in res] == ["Q1"] and not res[0].bp_held
+    broker.reconcile(lambda acct: {"cash_markets": ["KR"]})
     with broker._lock:
-        assert broker._active_reservations() == []
+        # BP 재대사 이후엔 현금 홀드는 BP 에 반영됨(bp_held) — 노출 한도에만 남는다.
+        res = broker._active_reservations()
+        assert [r.order_id for r in res] == ["Q1"] and res[0].bp_held
 
 
 # ── 8) activity_gen ──────────────────────────────────────────
@@ -326,7 +329,8 @@ def test_sweep_keeps_young_local_row_within_grace(tmp_path):
     out = broker.sweep_working_orders()
     assert out.get("local_absent") is None
     assert len(store.get_working_orders()) == 1
-    assert out["block_reconcile"]                         # SELL — 재대사 보류
+    assert out["defer_symbols"] == ["005930"]             # SELL — 그 심볼만 재대사 보류
+    assert not out["block_reconcile"]
 
 
 def test_unresolved_local_sell_blocks_reconcile(tmp_path):
@@ -334,7 +338,19 @@ def test_unresolved_local_sell_blocks_reconcile(tmp_path):
     store, broker = _setup(tmp_path, client)
     _local_row(store, side="SELL")
     out = broker.sweep_working_orders()
-    assert out["block_reconcile"] and out["local_orphan"] == 1
+    assert out["defer_symbols"] == ["005930"] and out["local_orphan"] == 1
+    assert not out["block_reconcile"]
+
+
+def test_unresolved_local_sell_stays_deferred_after_quarantine(tmp_path):
+    """격리 TTL 이 지나도 해소 전까진 그 심볼 재대사 보류 유지(손익 소실 방지)."""
+    client = _Client(list_exc=RuntimeError("ORDER_HISTORY down"))
+    store, broker = _setup(tmp_path, client, working_order_abandon_ttl_sec=60.0)
+    _local_row(store, side="SELL", age=3600.0)
+    out1 = broker.sweep_working_orders()
+    assert out1["quarantined"] == 1 and out1["defer_symbols"] == ["005930"]
+    out2 = broker.sweep_working_orders()
+    assert out2["defer_symbols"] == ["005930"]
 
 
 def test_unresolved_local_buy_does_not_block_reconcile(tmp_path):
@@ -343,6 +359,7 @@ def test_unresolved_local_buy_does_not_block_reconcile(tmp_path):
     _local_row(store, side="BUY")
     out = broker.sweep_working_orders()
     assert not out["block_reconcile"] and out["local_orphan"] == 1
+    assert out["defer_symbols"] == []
 
 
 def test_ambiguous_local_match_not_resolved(tmp_path):

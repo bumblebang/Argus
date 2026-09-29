@@ -31,6 +31,29 @@ def day_pool_cfg(cfg) -> dict:
     return (raw.get("day_pool") or {}) if isinstance(raw, dict) else {}
 
 
+def day_track_enabled(cfg) -> bool:
+    """데이 트랙(horizon=day BUY) 사용 여부. 키가 없으면 **꺼짐**.
+
+    09-27 백테스트로 끈 트랙이다 — 설정 누락·새 설정 파일이 조용히 되살리지 않게
+    코드 기본값도 꺼짐으로 둔다. 켜려면 config day_track.enabled: true.
+    """
+    raw = cfg.raw if hasattr(cfg, "raw") else (cfg or {})
+    block = (raw.get("day_track") or {}) if isinstance(raw, dict) else {}
+    return bool(block.get("enabled", False))
+
+
+def day_pool_active(cfg) -> bool:
+    """day_pool 갱신·감시 합류 여부 — 데이 트랙이 꺼져 있으면 항상 False."""
+    return day_track_enabled(cfg) and bool(day_pool_cfg(cfg).get("enabled", True))
+
+
+def active_day_pool(cfg, path: Path | None = None) -> dict:
+    """감시·후보에 합칠 day_pool. 비활성이면 {} — 끄기 전 파일이 계속 합류하지 않게."""
+    if not day_pool_active(cfg):
+        return {}
+    return load_day_pool(path)
+
+
 def load_day_pool(path: Path | None = None) -> dict:
     """{market: [item,...]}. 없거나 깨지면 {}."""
     p = path or OUT

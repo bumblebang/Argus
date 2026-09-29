@@ -76,16 +76,40 @@ _CCY = {"KR": "KRW", "US": "USD"}  # 시장 -> 통화
 
 _RETRY_ATTEMPTS = 4
 _BACKOFF_CAP_SEC = 8.0
-# order_create 는 브로커 락 안에서 불린다 — 재시도 총 대기를 짧게 묶는다.
+# order_create 는 브로커 락 + 게이트웨이 락 안에서 불린다 — 전체 소요를 짧게 묶는다.
+# 시도당 (연결, 응답) 타임아웃과 재시도 포함 총 데드라인. 데드라인을 넘길 대기는
+# 하지 않고 마지막 결과로 끝낸다(멱등키가 있으면 결과 불명은 local 해소가 푼다).
 _ORDER_RETRY_ATTEMPTS = 3
 _ORDER_BACKOFF_CAP_SEC = 2.0
-# 서버가 주문을 '받지 않았음'이 확정인 4xx 에서 뺄 코드. 408(요청 타임아웃)·409
+_ORDER_TIMEOUT = (3.05, 5.0)
+_ORDER_DEADLINE_SEC = 10.0
+# 서버가 주문을 '받지 않았음'이 확정인 4xx 에서 뺄 상태. 408(요청 타임아웃)·409
 # (동일 주문 키 처리 중)는 접수 여부가 불명이다.
 _AMBIGUOUS_4XX = {408, 409}
+# 공식 스펙(v1.2.17) 409 중 확정 거부 — 주문키 처리 중이 아니라 반대방향 미체결 존재.
+_DEFINITIVE_CODES = {"opposite-pending-order-exists"}
+# 4xx 지만 같은 키의 이전 주문이 접수됐을 수 있는 코드(다른 본문으로 같은 키 재요청).
+_AMBIGUOUS_CODES = {"idempotency-key-conflict", "request-in-progress"}
+# 401 중 토큰을 새로 받아 한 번 더 시도할 코드. invalid-token 은 쓰로틀 신호일 수도
+# 있어 별도 처리(토큰 나이로 판별).
+_REISSUE_401_CODES = ("expired-token", "token-revoked")
 
 
 def _backoff_wait(attempt: int, cap: float = _BACKOFF_CAP_SEC) -> float:
     return min(2 ** attempt, cap) + random.uniform(0, 0.5)
+
+
+def _error_code(body: Any) -> str:
+    if isinstance(body, str):
+        try:
+            body = json.loads(body)
+        except ValueError:
+            return ""
+    if isinstance(body, dict):
+        err = body.get("error")
+        if isinstance(err, dict):
+            return str(err.get("code") or "")
+    return ""
 
 
 class TossAPIError(RuntimeError):
@@ -93,6 +117,8 @@ class TossAPIError(RuntimeError):
 
     주문 경로가 '거부'와 '결과 불명'을 가르는 근거다. 4xx(408·409 제외)와 전송 전
     실패(토큰 발급 등)만 확정으로 본다. 5xx·전송 예외는 접수됐을 수 있다.
+    409 opposite-pending-order-exists 는 확정, 422 idempotency-key-conflict 는 불명.
+    재시도 중 한 번이라도 결과 불명 시도가 있었으면 호출측이 definitive=False 로 넘긴다.
     """
 
     def __init__(self, status: int, body: Any, *, definitive: bool | None = None):
@@ -101,23 +127,19 @@ class TossAPIError(RuntimeError):
         self.body = body
         if definitive is None:
             st = int(status or 0)
-            definitive = 400 <= st < 500 and st not in _AMBIGUOUS_4XX
+            code = _error_code(body)
+            if code in _DEFINITIVE_CODES:
+                definitive = True
+            elif code in _AMBIGUOUS_CODES:
+                definitive = False
+            else:
+                definitive = 400 <= st < 500 and st not in _AMBIGUOUS_4XX
         self.definitive = bool(definitive)
 
     @property
     def code(self) -> str:
         """ErrorResponse.error.code (예: insufficient-buying-power). 없으면 ""."""
-        body = self.body
-        if isinstance(body, str):
-            try:
-                body = json.loads(body)
-            except ValueError:
-                return ""
-        if isinstance(body, dict):
-            err = body.get("error")
-            if isinstance(err, dict):
-                return str(err.get("code") or "")
-        return ""
+        return _error_code(self.body)
 
 
 class TossClient:
@@ -236,17 +258,37 @@ class TossClient:
         if path_params:
             path = path.format(**path_params)
         url = self.creds.base_url + path
-        # order_create: clientOrderId(10분 멱등키)가 있으면 서버가 같은 키 재요청에 이전
-        # 결과를 돌려주므로 전송 예외·5xx·409 도 재시도해도 이중주문이 안 된다. 키가 없으면
-        # 401·429(서버가 처리 전 거절 — 미접수 확정)만 재시도하고 나머지는 즉시 전파.
+        # order_create: clientOrderId(10분 멱등키, 공식 스펙 v1.2.17)가 있으면 서버가 같은
+        # 키 재요청에 이전 결과를 돌려주고 처리 중이면 409 request-in-progress 를 준다 —
+        # 전송 예외·5xx·409 재시도가 이중주문이 되지 않는다. 키가 없으면 401·429(서버가
+        # 처리 전 거절 — 미접수 확정)만 재시도하고 나머지는 즉시 전파.
         is_order = key == "order_create"
         idempotent = bool(is_order and isinstance(json, dict) and json.get("clientOrderId"))
         if max_attempts is None:
             max_attempts = _ORDER_RETRY_ATTEMPTS if is_order else _RETRY_ATTEMPTS
         max_attempts = max(1, int(max_attempts))
         cap = _ORDER_BACKOFF_CAP_SEC if is_order else _BACKOFF_CAP_SEC
-        req_timeout = self.timeout if timeout is None else timeout
+        if timeout is not None:
+            req_timeout: Any = timeout
+        else:
+            req_timeout = _ORDER_TIMEOUT if is_order else self.timeout
+        started = time.monotonic()
+        # 주문: 한 번이라도 '서버가 받았을 수 있는' 시도가 있었으면 이후 어떤 실패도
+        # 미접수 확정이 아니다(재시도가 401·429 로 거절돼도 첫 요청은 접수됐을 수 있다).
+        ambiguous = False
         token_retried = False
+
+        def _fail(status: int, body: Any) -> TossAPIError:
+            if is_order and ambiguous:
+                return TossAPIError(status, body, definitive=False)
+            return TossAPIError(status, body)
+
+        def _can_wait(wait: float) -> bool:
+            """주문은 총 데드라인 안에서만 기다린다(브로커·게이트웨이 락 점유 상한)."""
+            if not is_order:
+                return True
+            return time.monotonic() - started + wait <= _ORDER_DEADLINE_SEC
+
         for attempt in range(max_attempts):
             last_try = attempt == max_attempts - 1
             self._acquire(key)                  # 재시도마다 토큰 소비(429 폭주 방지)
@@ -255,10 +297,10 @@ class TossClient:
             except Exception as e:
                 if not is_order:
                     raise
-                # 토큰 발급 실패 — 주문 요청은 아직 안 나갔다(미접수 확정).
+                # 토큰 발급 실패 — 이번 요청은 안 나갔다. 앞선 시도가 불명이면 불명 유지.
                 raise TossAPIError(getattr(e, "status", 0) or 0,
                                    f"토큰 발급 실패(주문 미전송): {e}",
-                                   definitive=True) from e
+                                   definitive=not ambiguous) from e
             try:
                 resp = self.session.request(method, url, params=params, json=json,
                                             headers=headers, timeout=req_timeout)
@@ -266,13 +308,34 @@ class TossClient:
                 # 타임아웃·연결 끊김·DNS 는 곧 회복되는 일과성 장애다. 여기서 그냥
                 # 튀면 계좌 동기화가 조회 1회 실패로 원장을 낡은 채 둔다.
                 # 멱등키 없는 order_create 는 재시도 자체가 이중주문 — 즉시 전파.
-                if last_try or (is_order and not idempotent):
-                    raise
+                if not is_order:
+                    if last_try:
+                        raise
+                    wait = _backoff_wait(attempt, cap)
+                    log.warning("%s 요청 실패(%s: %s) -> %.1fs 후 재시도",
+                                key, type(e).__name__, e, wait)
+                    time.sleep(wait)
+                    continue
+                # 연결 수립 전 타임아웃만 '안 보냄' 확정. 그 외(응답 타임아웃·끊김)는
+                # 서버가 받았을 수 있다.
+                if not isinstance(e, requests.exceptions.ConnectTimeout):
+                    ambiguous = True
                 wait = _backoff_wait(attempt, cap)
+                if last_try or not idempotent or not _can_wait(wait):
+                    raise _fail(0, f"주문 전송 실패({type(e).__name__}): {e}") from e
                 log.warning("%s 요청 실패(%s: %s) -> %.1fs 후 재시도",
                             key, type(e).__name__, e, wait)
                 time.sleep(wait)
                 continue
+            code = _error_code(resp.text) if resp.status_code >= 400 else ""
+            if resp.status_code == 401 and code in _REISSUE_401_CODES:
+                # 만료·다른 발급으로 대체 — 새 토큰으로 1회 재시도(처리 전 거절).
+                if not token_retried and not last_try:
+                    log.warning("401 %s -> 토큰 재발급 후 재시도", code)
+                    self._invalidate_token()
+                    token_retried = True
+                    continue
+                raise _fail(resp.status_code, resp.text)
             if resp.status_code == 401 and "invalid-token" in resp.text:
                 # 401 invalid-token 은 (a)stale 토큰 또는 (b)BASIC tier 쓰로틀 신호다.
                 # 방금 발급한 토큰이 401 이면 쓰로틀/경합이므로 '재발급하지 말고' 백오프 후 같은
@@ -283,40 +346,47 @@ class TossClient:
                     self._invalidate_token()
                     token_retried = True
                     continue
-                if last_try:
-                    raise TossAPIError(resp.status_code, resp.text)
                 wait = _backoff_wait(attempt, cap)
+                if last_try or not _can_wait(wait):
+                    raise _fail(resp.status_code, resp.text)
                 log.warning("401 invalid-token (쓰로틀 추정, 토큰 %.0fs 전 발급) -> 재발급 없이 %.1fs 백오프", age, wait)
                 time.sleep(wait)
                 continue
             if resp.status_code == 429:
-                if last_try:
-                    raise TossAPIError(resp.status_code, resp.text)
-                # 문서 권장: Retry-After 존중 + 지수 백오프 + 지터
+                # 문서 권장: Retry-After 존중 + 지수 백오프 + 지터. 주문도 Retry-After 를
+                # 줄이지 않는다 — 더 일찍 보내면 또 429 다. 데드라인을 넘기면 대기 대신
+                # 여기서 끝낸다(미접수 확정, 앞선 불명 시도가 없을 때).
                 retry_after = resp.headers.get("Retry-After")
-                base = float(retry_after) if retry_after else 2 ** attempt
-                if is_order:
-                    base = min(base, cap)
+                try:
+                    base = float(retry_after) if retry_after else float(2 ** attempt)
+                except ValueError:
+                    base = float(2 ** attempt)
                 wait = base + random.uniform(0, 0.5)
+                if last_try or not _can_wait(wait):
+                    raise _fail(resp.status_code, resp.text)
                 log.warning("429 rate limit (group=%s, Retry-After=%s) -> %.1fs 후 재시도",
                             resp.headers.get("X-RateLimit-Group", "?"), retry_after, wait)
                 time.sleep(wait)
                 continue
-            if resp.status_code >= 500 or (idempotent and resp.status_code == 409):
+            if resp.status_code >= 500 or (
+                    idempotent and resp.status_code == 409
+                    and code not in _DEFINITIVE_CODES):
                 # 서버측 일과성 오류·동일 주문키 처리 중 — 재시도 대상.
                 # 멱등키 없는 order_create·그 밖의 4xx 는 재시도 안 함.
-                if last_try or (is_order and not idempotent):
-                    raise TossAPIError(resp.status_code, resp.text)
+                if is_order:
+                    ambiguous = True
                 wait = _backoff_wait(attempt, cap)
+                if last_try or (is_order and not idempotent) or not _can_wait(wait):
+                    raise _fail(resp.status_code, resp.text)
                 log.warning("%s 서버 오류 %s -> %.1fs 후 재시도",
                             key, resp.status_code, wait)
                 time.sleep(wait)
                 continue
             if resp.status_code >= 400:
-                raise TossAPIError(resp.status_code, resp.text)
+                raise _fail(resp.status_code, resp.text)
             body = resp.json() if resp.content else {}
             return body.get("result", body) if isinstance(body, dict) else body
-        raise TossAPIError(429, "rate limit 재시도 초과")
+        raise _fail(429, "rate limit 재시도 초과")
 
     # ── 계좌 ──────────────────────────────────────────────
     def get_accounts(self) -> list[dict]:
