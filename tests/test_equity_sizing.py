@@ -212,7 +212,8 @@ def test_cycle_live_pending_buy_pre_deducts_sleeve(tmp_path):
         journal_path=tmp_path / "d.jsonl",
         conviction_sizing=True,
         budget_caps={"005930": room, "000660": room})
-    assert res.executed[0]["status"] == "gate_rejected"  # 미체결
+    assert res.executed[0]["status"] == "pending"  # 접수·미체결(거부 아님)
+    assert res.executed[0]["order_id"] == "L1"
     assert len(client.calls) == 1
     # 첫 PENDING 이 room 전량 선차감 → 둘째는 qty=0 거부(place 안 함)
     assert res.executed[1]["status"] == "gate_rejected"

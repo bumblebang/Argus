@@ -149,7 +149,8 @@ def run_cycle(*, context_json: str, decision_agent, validation_agent, broker, ri
               fractional_markets: set[str] | None = None,
               sell_block_fn=None,
               resolve_price_fn=None,
-              day_enabled: bool = True) -> CycleResult:
+              day_enabled: bool = True,
+              entry_plan_fn=None) -> CycleResult:
     """결정→검증→집행. 데이트레(horizon='day') BUY 는 즉시 체결 대신 arm_fn 으로 라우팅.
 
     arm_fn(proposal, price)->bool 이 주어지면 day BUY 는 진입대기(armed)로 등록하고
@@ -173,6 +174,11 @@ def run_cycle(*, context_json: str, decision_agent, validation_agent, broker, ri
 
     day_enabled=False 면 horizon=day BUY 는 진입대기·즉시매수 없이 status='day_disabled'.
     arm_fn 만 빼면 day BUY 가 도시에 면제 경로로 흘러 즉시 매수되므로 별도 차단이 필요하다.
+
+    entry_plan_fn(proposal)->dict|None 이 주어지면 BUY 주문에 진입 계획을 실어 보낸다
+    (라이브 working_orders meta). 접수는 됐지만 폴링 창 안에 안 채워진 주문(종가
+    동시호가 등)은 status='pending' — 거부가 아니다. 나중에 체결되면 재대사 채택이
+    이 계획으로 포지션을 연다(고아 채택 대신).
 
     tranche_weights: 심볼→회차 비중(밸류 분할). budget_caps: 심볼→명목 상한(슬리브 room).
     같은 room 이 여러 심볼에 복제된 경우(밸류) 공유 풀로 소진한다 — 앞 주문이 쓴
@@ -223,6 +229,9 @@ def run_cycle(*, context_json: str, decision_agent, validation_agent, broker, ri
                 pass
         if _cap_vals and abs(max(_cap_vals) - min(_cap_vals)) < 1e-6:
             _sleeve_left = [_cap_vals[0]]
+
+    # 매니저 정체성은 에이전트만으로 정해진다 — 집행 전에 잡아 진입 계획에도 싣는다.
+    manager = _manager_of(decision_agent, validation_agent)
 
     executed: list[dict] = []
     try:
@@ -406,19 +415,33 @@ def run_cycle(*, context_json: str, decision_agent, validation_agent, broker, ri
                 qty = broker.position(p.symbol).qty
             exit_reason = "brain" if p.side == "SELL" else None
             buy_cap = notional_cap if p.side == "BUY" else None
+            plan = None
+            if p.side == "BUY" and entry_plan_fn is not None:
+                try:
+                    plan = entry_plan_fn(p)
+                    if plan:
+                        plan = {**plan, "manager_epoch": manager.get("epoch")}
+                except Exception as e:
+                    log.warning("진입 계획 산출 실패 %s — 계획 없이 주문: %s", p.symbol, e)
+                    plan = None
             res = broker.execute(
                 Order(p.symbol, p.market, p.side, qty, price,
-                      notional_cap=buy_cap),
+                      notional_cap=buy_cap, entry_plan=plan),
                 reason=f"[agent] {p.thesis[:60]}",
                 store=store, exit_reason=exit_reason)
             if res.partial:
                 st = "partial"
             elif res.ok:
                 st = "filled"
+            elif _is_live_pending(res):
+                st = "pending"
             else:
                 st = "gate_rejected"
             if st == "filled" or st == "partial":
                 exec_reason = p.thesis[:80]
+            elif st == "pending":
+                exec_reason = (f"체결 대기({res.status}) — 체결 시 계획대로 개설: "
+                               f"{p.thesis[:60]}")
             else:
                 exec_reason = (res.reject_reason
                                or getattr(broker, "last_reject_reason", None)
@@ -442,10 +465,13 @@ def run_cycle(*, context_json: str, decision_agent, validation_agent, broker, ri
                         spent += rem * lim
                 if spent > 0:
                     _sleeve_left[0] = max(0.0, _sleeve_left[0] - spent)
-            executed.append({"symbol": p.symbol, "action": p.side,
-                             "status": st, "reason": exec_reason,
-                             "avg_price": res.avg_price,
-                             "filled_qty": res.filled_qty if res.ok else 0.0})
+            entry = {"symbol": p.symbol, "action": p.side,
+                     "status": st, "reason": exec_reason,
+                     "avg_price": res.avg_price,
+                     "filled_qty": res.filled_qty if res.ok else 0.0}
+            if st == "pending":
+                entry["order_id"] = res.order_id
+            executed.append(entry)
 
     except Exception:
         # 부분 체결이 이미 paper 에 남았을 수 있음 — 저널만이라도 남기고 재전파.
@@ -461,6 +487,16 @@ def run_cycle(*, context_json: str, decision_agent, validation_agent, broker, ri
 
     cycle_ts = time.time()
     cycle_ts_iso = datetime.fromtimestamp(cycle_ts, tz=timezone.utc).isoformat()
+    archive_meta = _archive_context(context_json, cycle_ts, journal_path, manager)
+    _journal(journal_path, decision, validation, executed, conv_audit=conv_audit,
+             cycle_ts_iso=cycle_ts_iso, manager=manager, archive_meta=archive_meta)
+    log.info("사이클 완료: 집행시도 %d건 epoch=%s", len(executed), manager.get("epoch"))
+    return CycleResult(decision, validation, executed,
+                       cycle_ts=cycle_ts, cycle_ts_iso=cycle_ts_iso, manager=manager)
+
+
+def _manager_of(decision_agent, validation_agent) -> dict:
+    """사이클 매니저 정체성(모델·프롬프트 해시) — 에이전트만으로 결정된다."""
     from .manager_id import manager_snapshot
     dec_prompt = getattr(decision_agent, "SYSTEM", "") or ""
     val_prompt = getattr(validation_agent, "SYSTEM", "") or ""
@@ -471,18 +507,18 @@ def run_cycle(*, context_json: str, decision_agent, validation_agent, broker, ri
     if not val_prompt:
         from . import validation_agent as _va
         val_prompt = getattr(_va, "SYSTEM", "") or ""
-    manager = manager_snapshot(
+    return manager_snapshot(
         decision_llm=getattr(decision_agent, "llm", None),
         validation_llm=getattr(validation_agent, "llm", None),
         decision_prompt=dec_prompt,
         validation_prompt=val_prompt,
     )
-    archive_meta = _archive_context(context_json, cycle_ts, journal_path, manager)
-    _journal(journal_path, decision, validation, executed, conv_audit=conv_audit,
-             cycle_ts_iso=cycle_ts_iso, manager=manager, archive_meta=archive_meta)
-    log.info("사이클 완료: 집행시도 %d건 epoch=%s", len(executed), manager.get("epoch"))
-    return CycleResult(decision, validation, executed,
-                       cycle_ts=cycle_ts, cycle_ts_iso=cycle_ts_iso, manager=manager)
+
+
+def _is_live_pending(res) -> bool:
+    """접수됐지만 아직 안 채워진 라이브 주문(거부 아님). UNKNOWN(조회 불능)은 제외."""
+    from ..broker import _PENDING
+    return bool(res.order_id) and str(res.status or "").upper() in _PENDING
 
 
 def _archive_context(context_json: str, cycle_ts: float, journal_path: str | Path,

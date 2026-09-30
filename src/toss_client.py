@@ -467,8 +467,10 @@ class TossClient:
         return self._request("order_create", json=body, account_seq=account_seq)
 
     def cancel_order(self, account_seq: int | str, order_id: str) -> dict:
+        # 본문이 없으면 Content-Type 이 빠져 서버가 415 unsupported-content-type 로
+        # 거절한다(09-17~09-29 취소 전부 실패). 스펙 예시대로 빈 JSON 객체를 보낸다.
         return self._request("order_cancel", path_params={"order_id": order_id},
-                             account_seq=account_seq)
+                             json={}, account_seq=account_seq)
 
     def list_orders(self, account_seq: int | str, *, status: str,
                     symbol: str | None = None, date_from: str | None = None,

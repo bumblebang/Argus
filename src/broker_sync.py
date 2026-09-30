@@ -40,12 +40,18 @@ def _qty_map(positions: dict) -> dict[str, float]:
 
 
 def _note_external_cash(account, new_cash: dict, new_pos: dict,
-                        new_mkt: dict) -> dict[str, float]:
+                        new_mkt: dict, *,
+                        skip_markets: set[str] | None = None) -> dict[str, float]:
     """매매로 설명되지 않는 현금 증감 → SoD 기준 이동.
 
     입금: 현금↑ + 해당 시장 매도 없음. 출금: 현금↓ + 해당 시장 매수 없음.
     같은 창에 매매+입출금이 겹치면 보수적으로 스킵(오보정 방지).
+
+    skip_markets: 미체결 BUY 홀드가 있거나 있었던 시장. 매수여력(cash)은 접수 순간
+    홀드만큼 빠지고 취소·체결 때 돌아온다 — 보유 변화 없이 움직이므로 출금·입금으로
+    오인된다(09-30 −298,845 '출금'). 그 창은 판정하지 않는다.
     """
+    skip = {str(m).upper() for m in (skip_markets or ())}
     noted: dict[str, float] = {}
     if not hasattr(account, "adjust_sod_for_external_cash"):
         return noted
@@ -60,6 +66,10 @@ def _note_external_cash(account, new_cash: dict, new_pos: dict,
             continue
         d_cash = new_c - old_c
         if abs(d_cash) < _EXT_CASH_EPS:
+            continue
+        if str(market).upper() in skip:
+            log.info("[SoD] %s 현금 %+.0f — 미체결 BUY 홀드 창, 입출금 판정 생략",
+                     market, d_cash)
             continue
         sold = bought = False
         for sym in set(old_qty) | set(new_qty):
@@ -78,6 +88,60 @@ def _note_external_cash(account, new_cash: dict, new_pos: dict,
             account.adjust_sod_for_external_cash(market, d_cash)
             noted[market] = d_cash
     return noted
+
+
+def _working_buy_hold(store) -> dict[str, float]:
+    """접수 확인된 미결 BUY 잔량×주문가(시장별) — 증권사가 매수여력에서 묶은 금액 추정.
+
+    local:(접수 불명)·UNKNOWN·QUARANTINED 는 넣지 않는다 — 홀드가 없을 수도 있는
+    행을 영구히 자산에 더하면 일손실 게이트가 헐거워진다.
+    """
+    if store is None:
+        return {}
+    from .broker import _PENDING, _is_local_order_id
+    try:
+        rows = store.get_working_orders(side="BUY", settled=False) or []
+    except Exception as e:
+        log.warning("미체결 BUY 홀드 조회 실패(0 으로 봄): %s", e)
+        return {}
+    out: dict[str, float] = {}
+    for row in rows:
+        if _is_local_order_id(row.get("order_id")):
+            continue
+        if str(row.get("status") or "").upper() not in _PENDING:
+            continue
+        try:
+            done = max(float(row.get("filled_qty") or 0.0),
+                       float(row.get("applied_qty") or 0.0))
+            rem = float(row.get("qty") or 0.0) - done
+            px = float(row.get("price") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if rem <= 1e-9 or px <= 0:
+            continue
+        mkt = str(row.get("market") or "KR").upper()
+        out[mkt] = out.get(mkt, 0.0) + rem * px
+    return out
+
+
+def _hold_markets(account, store) -> set[str]:
+    """이번 재대사 창에 BUY 홀드가 있거나(지금) 있었던(직전) 시장."""
+    prev = {str(m).upper() for m, v in (getattr(account, "cash_hold", None) or {}).items()
+            if float(v or 0) > 0}
+    return prev | set(_working_buy_hold(store))
+
+
+def _refresh_cash_hold(account, store, markets) -> None:
+    """cash 를 덮은 시장의 홀드 추정을 갱신 — equity 가 홀드만큼 빠져 보이지 않게."""
+    if not hasattr(account, "cash_hold"):
+        return
+    now = _working_buy_hold(store)
+    for m in markets or ():
+        mk = str(m).upper()
+        if now.get(mk, 0.0) > 0:
+            account.cash_hold[mk] = now[mk]
+        else:
+            account.cash_hold.pop(mk, None)
 
 
 def should_sync(broker) -> bool:
@@ -338,7 +402,8 @@ def apply_sync_from_live(account, store, data: dict, *, markets=("KR", "US"),
                          defer_symbols=None) -> dict:
     """기동 동기화 apply — broker.run_locked 안에서 호출.
 
-    순서(재대사와 동일 의도): 귀속 → holdings 덮기 → BUY applied 보정 → store 미러.
+    순서(재대사와 동일 의도): 귀속 → holdings 덮기 → store 미러(채택) → BUY applied 보정.
+    채택이 applied 보정보다 먼저여야 지연 체결 BUY 의 진입 계획(working meta)을 쓴다.
     종료 중 체결된 SELL 을 holdings 로만 덮으면 실현손익이 저널에 안 들어가고
     settled 행이 TTL 뒤 귀속실패로 버려진다.
 
@@ -362,6 +427,7 @@ def apply_sync_from_live(account, store, data: dict, *, markets=("KR", "US"),
 
     if not holdings_ok:
         account._save()
+        _refresh_cash_hold(account, store, (data.get("cash") or {}).keys())
         return {"cash": dict(account.cash), "positions": [], "synced": 0,
                 "attributed": {}, "deferred_sell_symbols": [],
                 "error": data.get("error", "holdings fetch failed"),
@@ -399,9 +465,11 @@ def apply_sync_from_live(account, store, data: dict, *, markets=("KR", "US"),
         for s, p in merged_pos.items()
     ]
     if store is not None:
-        _sync_buy_working_applied(store, before, merged_pos)
+        # 채택(_sync_store) 먼저 — applied 보정이 working 행을 지우면 진입 계획이 사라진다.
         _sync_store(store, synced, account,
                     attributed=attributed, skip_symbols=hold_syms)
+        _sync_buy_working_applied(store, before, merged_pos)
+    _refresh_cash_hold(account, store, (data.get("cash") or {}).keys())
 
     return {"cash": dict(account.cash),
             "positions": [{"symbol": s["symbol"], "qty": s["qty"], "avg": s["avg"]}
@@ -722,13 +790,17 @@ def apply_reconcile_from_live(account, store, data: dict,
         _parse_holdings_items(items) if data.get("holdings_ok") else ({}, {}))
     new_cash = dict(data.get("cash") or {})
     # 현금 덮기 전에 입출금 보정 — SoD 델타가 입금을 이익으로 위장하지 않게.
-    ext = _note_external_cash(account, new_cash, live_pos, live_mkt) if new_cash else {}
+    # 미체결 BUY 홀드 창은 제외(홀드 증감은 입출금이 아니다).
+    ext = (_note_external_cash(account, new_cash, live_pos, live_mkt,
+                               skip_markets=_hold_markets(account, store))
+           if new_cash else {})
 
     for market, cash in new_cash.items():
         account.cash[market] = cash
     cash_markets = sorted(new_cash)
 
     if not data.get("holdings_ok"):
+        _refresh_cash_hold(account, store, cash_markets)
         return {"cash": dict(account.cash), "holdings": 0,
                 "adopted": [], "updated": [], "closed": [], "attributed": {},
                 "external_cash": ext, "cash_markets": cash_markets,
@@ -764,7 +836,6 @@ def apply_reconcile_from_live(account, store, data: dict,
     # pnl 이 그 가격을 쓴다. 보류 심볼은 귀속하지 않는다(다음 재대사가 한다).
     before_attr = {s: v for s, v in before.items() if s not in hold_syms}
     attributed = _attribute_exits(account, store, before_attr, merged_pos)
-    _sync_buy_working_applied(store, before_attr, merged_pos)
 
     adopted: list[str] = []
     updated: list[str] = []
@@ -805,6 +876,13 @@ def apply_reconcile_from_live(account, store, data: dict,
                     closed.append(sym)
                 except Exception as e:
                     log.warning("재대사: store 유령 청산 실패(생략) %s: %s", sym, e)
+
+    # 채택 **뒤에** — BUY applied 보정은 전량 반영된 working 행을 지운다. 먼저 돌면
+    # 지연 체결 BUY 의 진입 계획(meta.entry_plan)이 사라져 고아로 채택된다(09-30).
+    _sync_buy_working_applied(store, before_attr, merged_pos)
+    # 홀드 추정은 applied 보정 뒤(반영된 체결분은 잔량에서 빠진다). sweep→조회 사이에
+    # 체결된 분은 다음 sweep 까지(최대 1주기) 홀드로 한 번 더 잡힐 수 있다.
+    _refresh_cash_hold(account, store, cash_markets)
 
     if adopted or closed:
         log.info("재대사 병합 — 채택=%s, 청산(유령)=%s, 갱신=%s", adopted, closed, updated)

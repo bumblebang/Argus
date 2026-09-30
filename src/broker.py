@@ -67,6 +67,27 @@ def _is_blocking_working_status(status: str | None) -> bool:
     return s in ("UNKNOWN", "QUARANTINED") or s.startswith("LOCAL")
 
 
+# KRX 단일가(동시호가) 접수 창(KST 분) → 창 끝이 체결 시각. 이 창에 낸 지정가는 체결
+# 시각 전에는 채워질 수 없다 — 60s TTL 로 취소하면 close_scan(15:20~) 매수가 영영
+# 체결되지 않는다(취소가 415 로 전부 실패하던 동안 가려져 있었다).
+_KR_CALL_AUCTIONS = ((8 * 60 + 50, 9 * 60), (15 * 60 + 20, 15 * 60 + 30))
+# 체결 시각 뒤 여유 — 체결 통보·조회 반영 지연.
+_CALL_AUCTION_GRACE_SEC = 120.0
+
+
+def _call_auction_hold_until(market: str | None, placed_at: float) -> float | None:
+    """KR 동시호가 창에 접수된 주문이면 TTL 취소를 미룰 시각(epoch), 아니면 None."""
+    if str(market or "").upper() != "KR":
+        return None
+    dt = datetime.fromtimestamp(float(placed_at), tz=_KST)
+    minute = dt.hour * 60 + dt.minute
+    for start, end in _KR_CALL_AUCTIONS:
+        if start <= minute < end:
+            match = dt.replace(hour=end // 60, minute=end % 60, second=0, microsecond=0)
+            return match.timestamp() + _CALL_AUCTION_GRACE_SEC
+    return None
+
+
 def _more_aggressive(side: str, new_px: float, old_px: float) -> bool:
     """재지정가가 기존 미체결보다 공격적인지. SELL 은 더 낮은 가, BUY 는 더 높은 가."""
     if old_px <= 0 or new_px <= 0:
@@ -578,6 +599,16 @@ class Broker:
         now = time.time() if now is None else now
         return now - float(row.get("placed_at") or now)
 
+    def _working_ttl_due(self, row: dict, now: float) -> bool:
+        """미체결 TTL 취소 대상인지. KR 동시호가 접수분은 단일가 체결 시각까지 보류."""
+        if self.working_order_ttl_sec < 0:
+            return False
+        if self._working_age(row, now) < self.working_order_ttl_sec:
+            return False
+        hold = _call_auction_hold_until(row.get("market"),
+                                        float(row.get("placed_at") or now))
+        return hold is None or now >= hold
+
     def _should_abandon_working(self, row: dict, now: float | None = None) -> bool:
         """미체결 행을 강제 회수할지. settled 행은 _expire_settled 담당."""
         if self.working_order_abandon_ttl_sec < 0:
@@ -896,9 +927,7 @@ class Broker:
                 continue
             if str(row.get("status") or "").upper() in ("UNKNOWN", "QUARANTINED"):
                 continue
-            age = now - float(row.get("placed_at") or now)
-            ttl_due = (self.working_order_ttl_sec >= 0
-                       and age >= self.working_order_ttl_sec)
+            ttl_due = self._working_ttl_due(row, now)
             aggressive = _more_aggressive(
                 order.side, float(order.price), float(row.get("price") or 0.0))
             if not ttl_due and not aggressive:
@@ -1079,14 +1108,14 @@ class Broker:
                                  filled_qty=filled, filled_avg=avg, fee=fee)
                 if status in _TERMINAL:
                     out["settled"] += 1
+                    self._emit_deferred_fill(fresh, status, filled, avg, fee)
                     if self._settle_or_drop(oid, fresh, filled, now):
                         out["awaiting_attribution"] += 1
                     self._emit_symbol("working_order_settled", fresh["symbol"], {
                         "order_id": oid, "status": status, "filled_qty": filled,
                         "avg_price": avg, "qty": fresh["qty"], "side": fresh["side"]})
                     continue
-                age = now - float(fresh["placed_at"] or now)
-                if self.working_order_ttl_sec < 0 or age < self.working_order_ttl_sec:
+                if not self._working_ttl_due(fresh, now):
                     if (str(fresh.get("status") or "").upper() != "QUARANTINED"
                             and self._should_abandon_working(fresh, now)):
                         self._abandon_working_order(fresh, now, why="ttl_no_cancel")
@@ -1255,6 +1284,28 @@ class Broker:
                 return r
         return None
 
+    def _emit_deferred_fill(self, row: dict, status: str, filled: float,
+                            avg: float | None, fee: float) -> None:
+        """폴링 창 밖에서 채워진 체결분(filled − applied)을 live_order 로 알린다.
+
+        즉시 체결분은 _finish_live 가 live_order 를 냈고 applied_qty 로 남아 있다.
+        종결 확인 시 그 위의 증분만 낸다 — 없으면 체결 알림(ntfy)·대시보드 체결 표에서
+        종가 동시호가 체결 같은 지연 체결이 통째로 빠진다(09-30 001820).
+        """
+        applied = float(row.get("applied_qty") or 0.0)
+        inc = float(filled or 0.0) - applied
+        if inc <= 1e-9:
+            return
+        log.info("[LIVE] 지연 체결 id=%s status=%s — %s %s x%s @ %s (누적 filled=%s)",
+                 row.get("order_id"), status, row.get("side"), row.get("symbol"),
+                 inc, avg, filled)
+        self._emit_symbol("live_order", row.get("symbol"), {
+            "symbol": row.get("symbol"), "side": row.get("side"), "qty": inc,
+            "price": avg, "fee": fee, "order_id": row.get("order_id"),
+            "status": status, "limit_price": row.get("price"),
+            "reason": row.get("reason") or "", "deferred": True,
+            "filled_qty": filled})
+
     def _settle_or_drop(self, order_id: str, row: dict,
                         filled: float, now: float) -> bool:
         """종결 주문 처리. 원장 미반영 체결분이 남았으면 귀속 대기로 보존(True)."""
@@ -1329,6 +1380,7 @@ class Broker:
             log.warning("[LIVE] 취소 미확인 id=%s status=%s — working 유지", order_id, status)
             return False
         # 취소 전 일부 체결됐으면 실체결가를 귀속에 넘겨야 한다 — 바로 지우지 않는다.
+        self._emit_deferred_fill(row, status, filled, avg, fee)
         self._settle_or_drop(order_id, row, filled, time.time())
         log.info("[LIVE] 미체결 취소 확인 id=%s status=%s (체결 %s/%s)",
                  order_id, status, filled, row["qty"])
@@ -1803,7 +1855,9 @@ class Broker:
                 status="UNKNOWN", filled_qty=0.0, reason=reason,
                 meta={"client_order_id": client_order_id, "order_type": order_type,
                       **({"order_amount": order_amount}
-                         if order_amount is not None else {})})
+                         if order_amount is not None else {}),
+                      **({"entry_plan": order.entry_plan}
+                         if order.side == "BUY" and order.entry_plan else {})})
         except Exception as e:
             log.error("[LIVE] local UNKNOWN commit 실패 — POST 안 함: %s", e)
             self.last_result = ExecuteResult.unknown(
