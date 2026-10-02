@@ -115,6 +115,11 @@ def ma20_reader(path: str | Path | None = None, max_age_sec: float = _MA20_MAX_A
     return read
 
 
+# 트레일 래칫 확인 기본값 — 단일 이상 틱(10-01 PLTR +19.9% 1체결)이 손절가를 끌어올리지 않게.
+_TRAIL_CONFIRM_SEC = 60.0
+_TRAIL_CONFIRM_PRINTS = 2
+
+
 @dataclass
 class WatchConfig:
     watch_interval_sec: float = 5.0    # 감시층 폴링 주기(장중)
@@ -212,12 +217,24 @@ class WatchConfig:
             value_base = float(value_base) if value_base is not None else None
         except (TypeError, ValueError):
             value_base = None
+        # 래칫 확인(이상 틱 가드): 활성화·peak 갱신은 confirm_sec 동안 지속되고 서로 다른
+        # 체결이 confirm_prints 건 이상 찍힌 가격 수준만 쓴다. 0 이면 확인 없음(구 동작).
+        try:
+            confirm_sec = max(0.0, float(block.get("confirm_sec", _TRAIL_CONFIRM_SEC)))
+        except (TypeError, ValueError):
+            confirm_sec = _TRAIL_CONFIRM_SEC
+        try:
+            confirm_prints = max(1, int(block.get("confirm_prints", _TRAIL_CONFIRM_PRINTS)))
+        except (TypeError, ValueError):
+            confirm_prints = _TRAIL_CONFIRM_PRINTS
         return {
             "enabled": True,
             "base_pct": float(block.get("base_pct", 0.05)),
             "value_base_pct": value_base,
             "regime_mult": regime_mult,
             "horizons": tuple(str(h) for h in horizons),
+            "confirm_sec": confirm_sec,
+            "confirm_prints": confirm_prints,
         }
 
     @classmethod
@@ -479,6 +496,9 @@ class WatchLoop:
         self._ticks = 0
         # 변동성 트리거용 심볼별 가격 링버퍼(인메모리; 재시작 시 수 틱 만에 재축적).
         self._hist: dict[str, deque] = defaultdict(lambda: deque(maxlen=self.cfg.vol_window))
+        # 트레일 래칫 확인용 심볼별 (ts, price, 체결키) 창(인메모리). 재시작 직후엔 창이
+        # confirm_sec 를 덮을 때까지 래칫을 쉰다 — 영속된 손절가는 그대로 집행된다.
+        self._trail_samples: dict[str, deque] = {}
         # regime_flip 중복 각성 방지: 심볼→마지막으로 각성시킨 국면(인메모리, 재시작 시 1회 재평가).
         self._regime_acked: dict[str, str] = {}
         # 강등된 전략 반대신호의 마지막 각성 시각 {(symbol, strategy): ts} — 쿨다운.
@@ -754,8 +774,47 @@ class WatchLoop:
             return
         self.store.update_position(pid, stop_price=new_stop, meta=meta)
 
+    def _trail_confirmed_price(self, sym: str, price: float | None,
+                               payload: dict | None, now: float) -> float | None:
+        """트레일 래칫에 쓸 '지속 확인가' — 단일 이상 틱이 손절가를 끌어올리지 못하게.
+
+        사고(2026-10-01 06:09 KST, US 애프터): PLTR lastPrice 가 186.49→223.59 로 1체결만
+        튀었다가 186.38 로 돌아왔다. 그 한 틱으로 트레일이 켜져 손절가가 212.41(현재가 위)로
+        영속돼 매 틱 trail_stop 매도를 시도했다. 그 틱은 ~6초간 매 폴링에 같은 값으로 보여
+        "N틱 연속"으로는 못 막는다.
+
+        정책: 최근 confirm_sec 창(창 시작 시점의 직전 가격 포함)의 최저가를 확인가로 쓴다.
+        가격이 창 내내 그 수준 이상이었다는 뜻이라 단발 스파이크는 확인가가 될 수 없고,
+        확인가 ≤ 현재가라 트레일 손절가가 현재가를 넘을 수도 없다. 추가로 창 안에 서로 다른
+        체결(payload.timestamp, 없으면 가격값)이 confirm_prints 건 미만이면 None — 한 값에
+        고정된 오류가(09-23 ROIV 30분)도 확인되지 않는다. 창이 confirm_sec 를 아직 못
+        덮었으면(재시작·첫 보유) None. 상향 래칫 전용 — 손절 하향 돌파는 지연시키지 않는다.
+        """
+        if price is None or price <= 0:
+            return None
+        # 키 없음(직접 구성한 설정) = 기본 가드 켬 — 끄려면 명시적으로 0.
+        confirm_sec = float(self.cfg.trailing.get("confirm_sec", _TRAIL_CONFIRM_SEC) or 0.0)
+        if confirm_sec <= 0:
+            return price                          # 확인 비활성 — 구 동작(틱 즉시 반영)
+        ts_raw = payload.get("timestamp") if isinstance(payload, dict) else None
+        key = ts_raw or price
+        # maxlen 없음 — 아래 시간 prune 이 크기를 창 길이로 묶는다(maxlen 이 앵커를 밀어내면
+        # confirm_sec 가 길 때 영영 확인되지 않는다).
+        q = self._trail_samples.setdefault(sym, deque())
+        q.append((now, price, key))
+        cutoff = now - confirm_sec
+        # 창 시작 시점에 유효했던 가격(cutoff 이전 마지막 표본) 하나만 앵커로 남긴다.
+        while len(q) >= 2 and q[1][0] <= cutoff:
+            q.popleft()
+        if q[0][0] > cutoff:
+            return None                           # 창이 confirm_sec 를 아직 못 덮음
+        need = int(self.cfg.trailing.get("confirm_prints", _TRAIL_CONFIRM_PRINTS) or 1)
+        if len({k for _, _, k in q}) < need:
+            return None
+        return min(p for _, p, _ in q)
+
     def _update_trailing(self, pos: dict, price: float | None, market: str,
-                         cur_regime: dict) -> None:
+                         cur_regime: dict, last: float | None = None) -> None:
         """트레일 대상 포지션의 상태기계 갱신(활성화 / 최고가 래칫). 손절가는 올리기만.
 
         빠른손 청산 트리거 평가 '전에' 호출된다 — 여기서 stop_price 를 끌어올려 두면 같은 틱의
@@ -763,6 +822,7 @@ class WatchLoop:
           1) 미활성 + price>=target → 활성화: trail_active, trail_peak=price, 손절가 상향.
           2) 활성 + price>trail_peak → trail_peak 갱신, 손절가 래칫업(올라갔을 때만 영속).
         손절가는 항상 max(현재 stop, peak×(1-trail_pct)) — 절대 내리지 않는다(래칫 불변식).
+        price 는 _trail_confirmed_price 의 확인가(단일 틱 아님), last 는 이번 틱 원시가(기록용).
         """
         if price is None or price <= 0:
             return
@@ -784,10 +844,10 @@ class WatchLoop:
             pos["stop_price"] = new_stop
             self._persist_trail(pos, new_stop, meta)
             self.store.log_event("trail_activated", sym,
-                                 {"price": price, "target": target,
+                                 {"price": price, "last": last, "target": target,
                                   "stop": new_stop, "trail_pct": pct})
-            log.info("트레일링 활성 %s — 목표가 %s 돌파, 손절가 %.2f 로 상향(트레일 %.1f%%)",
-                     sym, target, new_stop, pct * 100)
+            log.info("트레일링 활성 %s — 목표가 %s 돌파(확인가 %.2f), 손절가 %.2f 로 상향"
+                     "(트레일 %.1f%%)", sym, target, price, new_stop, pct * 100)
             return
 
         peak = meta.get("trail_peak") or 0.0
@@ -799,7 +859,7 @@ class WatchLoop:
         pos["stop_price"] = new_stop
         self._persist_trail(pos, new_stop, meta)
         self.store.log_event("trail_raised", sym,
-                             {"price": price, "peak": price, "stop": new_stop})
+                             {"price": price, "last": last, "peak": price, "stop": new_stop})
 
     def _mark_brain_wake(self) -> None:
         """정기 각성 시계를 지금으로. Athena 훅·08:00 extra 가 시간 그리드를 맞춘다."""
@@ -968,7 +1028,11 @@ class WatchLoop:
                     # target_hit 을 억제(목표가는 청산가가 아니라 활성화 지점).
                     suppress_target = self._is_trail_target(positions[sym])
                     if suppress_target:
-                        self._update_trailing(positions[sym], price, market, cur_regime)
+                        # 래칫은 지속 확인가로만 — 단일 이상 틱이 손절가를 현재가 위로 못 올린다.
+                        level = self._trail_confirmed_price(sym, price, payload_of.get(sym),
+                                                            now_ts)
+                        self._update_trailing(positions[sym], level, market, cur_regime,
+                                              last=price)
                     # 래칫된 stop 을 깨는 건 손절이 아니라 이익 확정 — kind=trail_stop.
                     trail_on = bool(_meta_dict(positions[sym]).get("trail_active"))
                     trigs += T.position_triggers(positions[sym], price,
