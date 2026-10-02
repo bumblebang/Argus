@@ -248,6 +248,7 @@ _ZONE_LABEL = {
 
 _EXEC_FLOW = {
     "filled": ("fl-ok", "매수 체결"),
+    "pending": ("fl-wait", "주문 접수 · 체결 대기"),
     "armed": ("fl-wait", "진입대기 등록"),
     "gap_armed": ("fl-wait", "존 재진입 대기"),
     "vetoed": ("fl-cut", "매수 제안 → 검증 거부"),

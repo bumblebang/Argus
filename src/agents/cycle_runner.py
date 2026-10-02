@@ -27,7 +27,7 @@ from .brain_model_policy import decision_tier
 from .wiring import (
     DATA, LLMFactory, FetchCandles,
     build_paper_core, sector_map_from_universe, earnings_near,
-    resolve_strategy, combine_stop_target,
+    resolve_strategy,
     dry_llm_factory, synth_candles,
 )
 from .. import paths as _paths
@@ -697,7 +697,8 @@ class CycleRunner:
                         resolve_price_fn=self._resolve_price,
                         store=self.store,
                         wake_reason=wake_reason,
-                        day_enabled=day_on)
+                        day_enabled=day_on,
+                        entry_plan_fn=(self._proposal_entry_plan if self.store else None))
         self._record(res)
         if self.store:
             from ..shadow_ledger import book_blocked, book_soft_pending
@@ -771,6 +772,37 @@ class CycleRunner:
         log.info("진입대기 등록 %s (%s, horizon=%s) @ %.2f", sym, strat, horizon, price)
         return True
 
+    def _entry_plan(self, sym: str, prop, market: str, *,
+                    manager_epoch: str | None = None) -> dict:
+        """뇌 BUY 진입 계획(JSON 직렬화 가능). 손절·목표는 체결 평단으로 나중에 산출.
+
+        즉시 체결 개설과 지연 체결 채택(working_orders meta)이 이 한 곳의 계획을 쓴다.
+        """
+        from ..thesis_watch import default_spec_from_dossier
+        horizon = getattr(prop, "horizon", "swing") or "swing"
+        strat, params = resolve_strategy(self.cfg, sym, prop)
+        d = self._dossier_brief(sym)
+        meta = {"horizon": horizon, "params": params,
+                # 뇌 체결 — 도시에 논거로 산 자리다(전략 신호 청산 OFF)
+                "entry_basis": BASIS_THESIS,
+                "entry_regime": self._regime_now.get(market),
+                "dossier_id": (d["id"] if d else None),
+                "conviction": getattr(prop, "conviction", None) if prop else None,
+                "thesis_invalidation": default_spec_from_dossier(d, horizon)}
+        item = self._universe_item(sym)
+        if item and item.get("source"):
+            meta["source"] = item["source"]
+        return {"strategy": strat,
+                "thesis": (prop.thesis if prop else None),
+                "invalidation": (d or {}).get("invalidation"),
+                "target": (d or {}).get("target"),
+                "manager_epoch": manager_epoch,
+                "meta": meta}
+
+    def _proposal_entry_plan(self, prop) -> dict:
+        """run_cycle entry_plan_fn — 주문에 실어 보낼 계획(epoch 는 run_cycle 이 채운다)."""
+        return self._entry_plan(prop.symbol, prop, prop.market)
+
     def sync_store_positions(self, res: CycleResult) -> None:
         """페이퍼 계좌 ↔ store.positions 정합화(멱등). broker 락 안에서 실행."""
         if not self.store:
@@ -779,7 +811,8 @@ class CycleRunner:
 
     def _sync_store_positions_locked(self, res: CycleResult, acct) -> None:
         """execute+mirror 후 orphan 승격·안전망 청산·메타 보강."""
-        from ..store_sync import is_orphan_store_row, sync_open_qty, _row_get
+        from ..store_sync import (
+            is_orphan_store_row, plan_position_fields, sync_open_qty, _row_get)
 
         prop_by_sym = {p.symbol: p for p in res.decision.proposals}
         fill_by_sym = {
@@ -788,6 +821,7 @@ class CycleRunner:
             and e.get("action") in ("BUY", "SELL")
         }
         open_rows = {r["symbol"]: r for r in self.store.get_open_positions()}
+        epoch = (res.manager or {}).get("epoch") if res else None
         for sym, pos in list(acct.positions.items()):
             if not pos.is_open:
                 continue
@@ -796,26 +830,8 @@ class CycleRunner:
                 if is_orphan_store_row(row):
                     market = acct.symbol_market.get(sym, "KR")
                     prop = prop_by_sym.get(sym)
-                    horizon = getattr(prop, "horizon", "swing") or "swing"
-                    strat, params = resolve_strategy(self.cfg, sym, prop)
-                    d = self._dossier_brief(sym)
-                    stop, target, stop_note = combine_stop_target(
-                        pos.avg_price, horizon, params,
-                        (d or {}).get("invalidation"), (d or {}).get("target"))
-                    meta = {"horizon": horizon, "params": params,
-                            # 뇌 즉시 체결 — 도시에 논거로 산 자리다(전략 신호 청산 OFF)
-                            "entry_basis": BASIS_THESIS,
-                            "entry_regime": self._regime_now.get(market),
-                            "dossier_id": (d["id"] if d else None),
-                            "conviction": getattr(prop, "conviction", None) if prop else None,
-                            "manager_epoch": (res.manager or {}).get("epoch") if res else None}
-                    from ..thesis_watch import default_spec_from_dossier
-                    meta["thesis_invalidation"] = default_spec_from_dossier(d, horizon)
-                    if stop_note:
-                        meta["stop_note"] = stop_note
-                    item = self._universe_item(sym)
-                    if item and item.get("source"):
-                        meta["source"] = item["source"]
+                    plan = self._entry_plan(sym, prop, market, manager_epoch=epoch)
+                    strat, _, stop, target, meta = plan_position_fields(plan, pos.avg_price)
                     # provisional_stop 은 넣지 않는다 — 뇌가 손절/목표를 덮어쓰면 임시 표식 해제.
                     self.store.update_position(
                         row["id"], qty=pos.qty, avg_price=pos.avg_price,
@@ -833,29 +849,11 @@ class CycleRunner:
                 continue
             market = acct.symbol_market.get(sym, "KR")
             prop = prop_by_sym.get(sym)
-            horizon = getattr(prop, "horizon", "swing") or "swing"
-            strat, params = resolve_strategy(self.cfg, sym, prop)
-            d = self._dossier_brief(sym)
-            stop, target, stop_note = combine_stop_target(
-                pos.avg_price, horizon, params,
-                (d or {}).get("invalidation"), (d or {}).get("target"))
-            meta = {"horizon": horizon, "params": params,
-                    "entry_basis": BASIS_THESIS,
-                    "entry_regime": self._regime_now.get(market),
-                    "dossier_id": (d["id"] if d else None),
-                    "conviction": getattr(prop, "conviction", None) if prop else None,
-                    "manager_epoch": (res.manager or {}).get("epoch") if res else None}
-            from ..thesis_watch import default_spec_from_dossier
-            meta["thesis_invalidation"] = default_spec_from_dossier(d, horizon)
-            if stop_note:
-                meta["stop_note"] = stop_note
-            item = self._universe_item(sym)
-            if item and item.get("source"):
-                meta["source"] = item["source"]
+            plan = self._entry_plan(sym, prop, market, manager_epoch=epoch)
+            strat, thesis, stop, target, meta = plan_position_fields(plan, pos.avg_price)
             self.store.open_position(
                 sym, market, pos.qty, pos.avg_price, strategy=strat,
-                thesis=(prop.thesis if prop else None),
-                target_price=target, stop_price=stop, meta=meta)
+                thesis=thesis, target_price=target, stop_price=stop, meta=meta)
             self.store.disarm_symbol(sym)
             from ..shadow_ledger import cancel_shadow_on_fill
             cancel_shadow_on_fill(self.store, sym)

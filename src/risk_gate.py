@@ -25,6 +25,10 @@ class Order:
     price: float
     # 라이브 마켓터블 리밋가 상향 후 qty 재절사 한도(없으면 재절사 생략).
     notional_cap: float | None = None
+    # 뇌 BUY 진입 계획(전략·horizon·thesis·도시에 레벨). 라이브 접수 시 working_orders
+    # meta 에 같이 박아, 폴링 창 밖 지연 체결(종가 동시호가 등)을 채택할 때 고아가 아닌
+    # 원래 계획으로 개설한다.
+    entry_plan: dict | None = None
 
     @property
     def notional(self) -> float:

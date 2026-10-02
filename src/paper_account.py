@@ -59,6 +59,10 @@ class PaperAccount:
         self._sod_equity: dict[str, float] = {}
         self._last_fill_day: dict[str, str] = {}   # 시장별 마지막 체결 거래일(장중 SoD 판정)
         self.marks: dict[str, float] = {}   # 실시간 평가가(감시 루프가 갱신, 비영속)
+        # 미체결 BUY 로 증권사가 묶어 둔 현금(시장별, 비영속). 라이브 재대사가 cash 를
+        # 매수여력(홀드 차감)으로 덮으므로 equity 에 되더해야 한다 — 안 그러면 종가
+        # 동시호가 대기 동안 자산이 주문금액만큼 빠져 보이고 출금으로 오인된다.
+        self.cash_hold: dict[str, float] = {}
         self.journal: list[Fill] = []
         self._load()
 
@@ -211,8 +215,9 @@ class PaperAccount:
         return total
 
     def equity(self, market: str, price_lookup: dict[str, float] | None = None) -> float:
-        """해당 시장의 현금 + 보유평가액. price_lookup 없으면 평균단가로 평가."""
-        total = self.cash.get(market, 0.0)
+        """해당 시장의 현금(+미체결 BUY 홀드) + 보유평가액. price_lookup 없으면 평균단가로 평가."""
+        total = self.cash.get(market, 0.0) + float(
+            (getattr(self, "cash_hold", None) or {}).get(market, 0.0) or 0.0)
         for sym, p in list(self.positions.items()):   # 스냅샷(재대사 스레드와 경합 방지)
             if not p.is_open or self.symbol_market.get(sym) != market:
                 continue

@@ -1084,6 +1084,9 @@ class ValueRunner:
             },
             budget_caps={c["symbol"]: float(sleeve.get("room") or 0) for c in gated},
             fractional_markets=set(cfg_v.get("fractional_markets") or []),
+            entry_plan_fn=(
+                (lambda p: self._value_entry_plan(p, brief_by_sym, cfg_v))
+                if self.store else None),
         )
 
         if self.store:
@@ -1230,14 +1233,7 @@ class ValueRunner:
                 # run_cycle(store=) mirror 가 fill_mirror 행을 만들었으면 value 메타로 승격.
                 log.info("[value] promote fill_mirror → value meta sym=%s id=%s", sym, row["id"])
                 fpl = fair_price_low(cand)
-                fph = fair_price_high(cand)
-                promote_meta = {"source": "value", "horizon": "position",
-                        "entry_basis": BASIS_VALUE,
-                        "entry_thesis": (prop.thesis if prop else cand.get("thesis")),
-                        "fair_low": fpl, "fair_high": fph,
-                        "scan_ts": cand.get("ts"),
-                        "tranches": list(cfg_v["tranches"]), "tranche_idx": 1,
-                        "last_tranche_at": self.now_fn()}
+                promote_meta = self._value_entry_meta(cand, prop, cfg_v)
                 self.store.update_position(
                     int(row["id"]), qty=pos.qty, avg_price=entry, strategy="value",
                     thesis=(prop.thesis if prop else cand.get("thesis")),
@@ -1250,15 +1246,7 @@ class ValueRunner:
                                       "qty": pos.qty})
                 continue
             fpl = fair_price_low(cand)
-            fph = fair_price_high(cand)
-            meta = {"source": "value", "horizon": "position",
-                    "entry_basis": BASIS_VALUE,
-                    "entry_thesis": (prop.thesis if prop else cand.get("thesis")),
-                    "fair_low": fpl, "fair_high": fph,
-                    "scan_ts": cand.get("ts"),
-                    # 분할 매수 상태(기본 [1.0] 이면 1회차로 즉시 소진 = 기존 전량 진입).
-                    "tranches": list(cfg_v["tranches"]), "tranche_idx": 1,
-                    "last_tranche_at": self.now_fn()}
+            meta = self._value_entry_meta(cand, prop, cfg_v)
             self.store.open_position(
                 sym, market, pos.qty, entry, strategy="value",
                 thesis=(prop.thesis if prop else cand.get("thesis")),
@@ -1269,6 +1257,28 @@ class ValueRunner:
             self.store.log_event("value_entry", sym,
                                  {"entry": entry, "stop": stop, "target": fpl,
                                   "qty": pos.qty})
+
+    def _value_entry_meta(self, cand: dict, prop, cfg_v: dict) -> dict:
+        """밸류 신규 진입 store meta — 즉시 체결 미러·지연 체결 계획 공통."""
+        return {"source": "value", "horizon": "position",
+                "entry_basis": BASIS_VALUE,
+                "entry_thesis": (prop.thesis if prop else cand.get("thesis")),
+                "fair_low": fair_price_low(cand), "fair_high": fair_price_high(cand),
+                "scan_ts": cand.get("ts"),
+                # 분할 매수 상태(기본 [1.0] 이면 1회차로 즉시 소진 = 기존 전량 진입).
+                "tranches": list(cfg_v["tranches"]), "tranche_idx": 1,
+                "last_tranche_at": self.now_fn()}
+
+    def _value_entry_plan(self, prop, by_sym: dict, cfg_v: dict) -> dict | None:
+        """run_cycle entry_plan_fn — 신규 밸류 진입만. 추가 트랜치는 이미 보유 행이 있다."""
+        cand = by_sym.get(prop.symbol) or {}
+        if cand.get("_tranche"):
+            return None
+        return {"strategy": "value",
+                "thesis": (prop.thesis if prop else cand.get("thesis")),
+                "stop_pct": float(cfg_v["hard_stop_pct"]),
+                "target_price": fair_price_low(cand),
+                "meta": self._value_entry_meta(cand, prop, cfg_v)}
 
     def _mirror_tranche(self, row, sym: str, cand: dict, pos, stop) -> None:
         """추가 트랜치 체결을 기존 store 행에 반영(수량·평단·손절가·회차 갱신).
