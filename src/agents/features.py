@@ -204,7 +204,8 @@ def assemble(items: list[dict], market_state: dict,
              enrich_strategy: bool = False,
              base_rates: dict | None = None,
              live_prices: dict[str, float] | None = None,
-             daily_fetch_fresh: bool = False) -> tuple[list[dict], dict]:
+             daily_fetch_fresh: bool = False,
+             fit_exclude: frozenset[str] = frozenset()) -> tuple[list[dict], dict]:
     """items: [{symbol,name,market,...}]. fetch_raw(symbol,market)->캔들 리스트(None 가능).
     enrich_strategy=True 면 후보별 전략추천(도구 계산)을 strategy_fit 으로 덧붙인다.
     base_rates: {symbol: analyze 결과}(data/base_rates.json) — 지금 활성인 셋업의
@@ -212,6 +213,7 @@ def assemble(items: list[dict], market_state: dict,
     live_prices: {symbol: 현재가} — 토스 배치 시세. 있으면 마지막 봉 종가·price_lookup·
     intraday_ret_pct 가 라이브가 우선(Yahoo 캐시 종가 대체). 갭반등·수량 산정 필수.
     daily_fetch_fresh: True 면 fetch_raw 가 이미 fresh Yahoo — stale 시 재조회 1회 생략.
+    fit_exclude: strategy_fit 에서 뺄 전략(집행 불가 — 예: 데이 트랙 꺼짐 시 day 전략).
     반환: (candidates, price_lookup{symbol:price})."""
     funds = (market_state or {}).get("fundamentals", {})
     flows = (market_state or {}).get("flows", {})
@@ -325,7 +327,7 @@ def assemble(items: list[dict], market_state: dict,
                 if enrich_strategy:   # 도구: 후보 캔들에 전략 적합도 랭킹
                     from ..strategy_scores import strategy_fit_brief
                     rec = recommend_strategy(df)
-                    brief = strategy_fit_brief(rec)
+                    brief = strategy_fit_brief(rec, exclude=fit_exclude)
                     if brief:
                         feat["strategy_fit"] = brief
         except Exception as e:
