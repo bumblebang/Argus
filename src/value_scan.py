@@ -26,6 +26,20 @@ from .config import ROOT
 from .logging_setup import get_logger
 
 log = get_logger("value_scan")
+
+# 판정 이력 — watchlist 는 종목별 최신으로 덮어써서 라벨 변별력(eval.stance_excess)을
+# 사후에 잴 수 없었다. 스캔마다 한 줄씩 쌓는다(append-only, 실패해도 스캔은 계속).
+STANCE_HISTORY_NAME = "value_stance_history.jsonl"
+
+
+def _append_stance_history(path: Path, row: dict) -> None:
+    try:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(row, ensure_ascii=False) + "\n")
+    except OSError as e:
+        log.warning("[value] 판정 이력 기록 실패(스킵): %s", e)
+
+
 _KST = ZoneInfo("Asia/Seoul")
 
 WATCHLIST = ROOT / "data" / "value_watchlist.json"
@@ -775,6 +789,11 @@ def run_scan(cfg, llm, *, limit: int | None = None,
         if c.get("recent_news"):        # 주입된 하락 촉매 헤드라인 — 후속 활용용 보존
             watchlist[sym]["recent_news"] = c["recent_news"]
         save_watchlist(watchlist, watchlist_path)
+        _append_stance_history(Path(watchlist_path).parent / STANCE_HISTORY_NAME, {
+            "ts": entry["ts"], "symbol": sym, "market": c["market"],
+            "stance": out.stance, "conviction": out.conviction,
+            "price": metrics.get("price"), "score": metrics.get("score"),
+        })
         done += 1
         log.info("[value][%s] %s (conv %.2f): %s",
                  sym, out.stance, out.conviction, out.thesis[:60])

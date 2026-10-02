@@ -187,6 +187,21 @@ def test_target_hit_before_stop_labels(tmp_path):
     assert amb["reason"] in ("target_first", "same_bar_ambiguous", "stop_first")
 
 
+def test_target_hit_before_stop_pending_until_horizon_ends(tmp_path):
+    """창이 안 끝난 미도달은 '기간 내 미도달'(False)이 아니라 미확정(None)."""
+    data = _history(tmp_path)          # 마지막 봉 01-29
+    # 01-20 생성 swing(20일) → 창 끝 02-09 > 마지막 봉: 아직 모른다
+    pend = target_hit_before_stop(
+        data, "005930", "2026-01-20", target=150, invalidation=50, horizon="swing")
+    assert pend["target_hit_before_stop"] is None
+    assert pend["reason"] == "pending_horizon" and pend["resolved"] is False
+    # 01-05 생성 → 창 끝 01-25 < 마지막 봉: 진짜 미도달
+    done = target_hit_before_stop(
+        data, "005930", "2026-01-05", target=150, invalidation=50, horizon="swing")
+    assert done["target_hit_before_stop"] is False
+    assert done["reason"] == "neither_by_horizon"
+
+
 def test_score_journal_hold_matrix_and_min_n(tmp_path):
     data = _history(tmp_path)
     ctx = _ctx()

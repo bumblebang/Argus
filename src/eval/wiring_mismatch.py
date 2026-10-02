@@ -23,6 +23,9 @@ REVERSION_STRATEGIES = frozenset({"rsi_reversion", "bollinger_reversion"})
 GAP_POOLS = frozenset({"close_scan", "gap", "gap_rebound", "nxt_gap"})
 DAY_POOLS = frozenset({"day", "discovery", "day_pool"})
 
+# 참고용 kind — actionable 집계(flagged·mismatch_n)에서 뺀다.
+INFO_KINDS = frozenset({"fit_cross_horizon"})
+
 DEFAULT_THRESHOLD = 3
 DEFAULT_WINDOW_DAYS = 14
 
@@ -94,9 +97,16 @@ def classify_buy(
             **extra,
         })
 
-    # 1) fit vs 배정 — best 가 있고 thin 아닐 때만
+    # 1) fit vs 배정 — best 가 있고 thin 아닐 때만.
+    # fit 랭킹은 horizon 을 가리지 않는다. 뇌가 swing 을 정했으면 day/position 전략인
+    # best 를 못 고르는 게 규칙대로다(horizon 맞춤) — 그건 어긋남이 아니라 참고용.
     if best and not thin and strat and str(best) != str(strat):
-        _hit("fit_vs_assigned", detail=f"fit={best} assigned={strat}")
+        best_hz = _catalog_horizon(str(best))
+        if best_hz and hz and str(best_hz) != str(hz):
+            _hit("fit_cross_horizon",
+                 detail=f"fit={best}({best_hz}) assigned={strat}({hz})")
+        else:
+            _hit("fit_vs_assigned", detail=f"fit={best} assigned={strat}")
 
     # 2) horizon vs 카탈로그 — close_scan 은 갭반등 전용이라 카탈로그와 다를 수 있음
     cat_hz = _catalog_horizon(str(strat) if strat else None)
@@ -193,15 +203,21 @@ def summarize_wiring(
     thin_fit_skip = 0
     events: list[dict] = []
     by_kind: Counter[str] = Counter()
+    info_by_kind: Counter[str] = Counter()
+    assigned: Counter[str] = Counter()
 
     for rec, prop, cand in iter_journal_buys(journal, since=since, until=now):
         buy_n += 1
+        assigned[f"{prop.get('strategy')}/{prop.get('horizon')}"] += 1
         if cand is None and not rec.get("context_ref"):
             missing_context += 1
         fit = (cand or {}).get("strategy_fit") if isinstance((cand or {}).get("strategy_fit"), dict) else {}
         if fit.get("thin_sample") and fit.get("best") is None:
             thin_fit_skip += 1
         for hit in classify_buy(prop, cand, cycle_ts=rec.get("ts")):
+            if hit["kind"] in INFO_KINDS:
+                info_by_kind[hit["kind"]] += 1
+                continue
             events.append(hit)
             by_kind[hit["kind"]] += 1
 
@@ -230,6 +246,11 @@ def summarize_wiring(
         "thin_fit_noted": thin_fit_skip,
         "mismatch_n": len(events),
         "by_kind": dict(by_kind),
+        "info_by_kind": dict(info_by_kind),
+        # 배정 쏠림 — 한 전략이 BUY 대부분이면 카탈로그 다양성이 죽은 것(mismatch 와 별개 신호).
+        "assigned_by_strategy": dict(assigned.most_common()),
+        "top_assigned_share": (round(assigned.most_common(1)[0][1] / buy_n, 3)
+                               if buy_n else None),
         "flagged_kinds": flagged,
         "actionable": bool(flagged),
         "examples": dict(examples),
