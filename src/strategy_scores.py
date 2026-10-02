@@ -138,9 +138,11 @@ def refresh_strategy_scores(
                     continue
                 rec = recommend_strategy(df)
                 if rec.get("best"):
+                    # 전 전략 보관 — strategy_fit_brief 가 horizon 별 best·제외 전략을
+                    # 고르려면 상위 3개로는 부족하다(상위가 전부 day 전략인 종목이 흔함).
                     scores[sym] = {
                         "best": rec["best"],
-                        "ranking": rec.get("ranking", [])[:3],
+                        "ranking": rec.get("ranking", []),
                     }
                     n_ok += 1
                 else:
@@ -181,12 +183,40 @@ def pad_score(scores: dict[str, dict], symbol: str) -> float:
         return float("-inf")
 
 
-def strategy_fit_brief(rec: dict | None, *, min_trades: int = MIN_TRADES_BEST) -> dict | None:
-    """뇌 컨텍스트용 strategy_fit — best 는 min_trades 미만이면 null + thin_sample."""
+def _catalog_horizon(name: str | None) -> str | None:
+    from .strategies import REGISTRY
+    cls = REGISTRY.get(str(name)) if name else None
+    return getattr(cls, "horizon", None) if cls else None
+
+
+def day_strategy_names() -> frozenset[str]:
+    """카탈로그 horizon=day 전략 — 데이 트랙이 꺼지면 추천에서 뺀다."""
+    from .strategies import REGISTRY
+    return frozenset(n for n, cls in REGISTRY.items()
+                     if getattr(cls, "horizon", None) == "day")
+
+
+def strategy_fit_brief(rec: dict | None, *, min_trades: int = MIN_TRADES_BEST,
+                       exclude: frozenset[str] | set[str] = frozenset()) -> dict | None:
+    """뇌 컨텍스트용 strategy_fit — best 는 min_trades 미만이면 null + thin_sample.
+
+    exclude: 지금 집행 불가한 전략(예: 데이 트랙 꺼짐 → day 전략). 랭킹·best 에서 뺀다 —
+      못 쓰는 전략이 best 로 뜨면 뇌가 같은 horizon 대안을 볼 길이 없었다(10-02 실측:
+      fit≠배정 38건 중 34건이 best=day/position, 배정=swing).
+    best_by_horizon: horizon 별 표본 충분한 1위. 뇌는 horizon 을 먼저 정하고 그 안에서
+      전략을 고르므로(프롬프트 규칙) 전체 1위보다 이게 직접 쓸 수 있는 신호다.
+    """
     if not rec:
         return None
-    ranking = list(rec.get("ranking") or [])[:3]
-    best = rec.get("best")
+    full = [r for r in (rec.get("ranking") or [])
+            if isinstance(r, dict) and r.get("strategy") not in exclude]
+    ranking = full[:3]
+    if ranking:
+        best = ranking[0].get("strategy")
+    elif not rec.get("ranking") and rec.get("best") not in exclude:
+        best = rec.get("best")          # 랭킹 없이 best 만 있는 구형 레코드
+    else:
+        best = None
     thin = True
     if ranking:
         try:
@@ -198,4 +228,18 @@ def strategy_fit_brief(rec: dict | None, *, min_trades: int = MIN_TRADES_BEST) -
     out: dict = {"ranking": ranking, "best": best if not thin else None}
     if thin:
         out["thin_sample"] = True
+    by_hz: dict[str, dict] = {}
+    for r in full:
+        hz = _catalog_horizon(r.get("strategy"))
+        if not hz or hz in by_hz:
+            continue
+        try:
+            n = int(r.get("n_trades") or 0)
+        except (TypeError, ValueError):
+            n = 0
+        if n < min_trades:
+            continue
+        by_hz[hz] = {k: r.get(k) for k in ("strategy", "return_pct", "win_rate", "n_trades")}
+    if by_hz:
+        out["best_by_horizon"] = by_hz
     return out

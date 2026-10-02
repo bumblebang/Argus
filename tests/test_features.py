@@ -38,3 +38,15 @@ def test_assemble_includes_long_horizon_fields():
     c = cands[0]
     assert "pct_from_52w_high" in c and "ret_60d_pct" in c
     assert "vs_sma60_pct" in c and c.get("drawdown_lookback") == 60
+
+
+def test_assemble_strategy_fit_excludes_given_strategies():
+    from src.strategy_scores import day_strategy_names
+    items = [{"symbol": "005930", "name": "삼성", "market": "KR"}]
+    day = day_strategy_names()
+    cands, _ = assemble(items, {}, lambda s, m: _candles(), enrich_strategy=True,
+                        fit_exclude=day)
+    fit = cands[0].get("strategy_fit") or {}
+    names = {r["strategy"] for r in fit.get("ranking") or []}
+    assert names and not (names & day)
+    assert not (set(fit.get("best_by_horizon") or {}) & {"day"})

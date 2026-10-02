@@ -481,8 +481,12 @@ class CycleRunner:
                  if self.store else [])
         bullish = (self.store.list_fresh_bullish_symbols()
                    if self.store else [])
-        from ..strategy_scores import (load_strategy_scores, strategy_fit_brief,
-                                       strategy_scores_asof, strategy_scores_stale)
+        from ..day_pool import day_track_enabled
+        from ..strategy_scores import (day_strategy_names, load_strategy_scores,
+                                       strategy_fit_brief, strategy_scores_asof,
+                                       strategy_scores_stale)
+        fit_exclude = (frozenset() if day_track_enabled(self.cfg)
+                       else day_strategy_names())
         scores_stale = strategy_scores_stale()
         strat_scores = load_strategy_scores() if not scores_stale else {}
         scores_asof = strategy_scores_asof()
@@ -514,11 +518,12 @@ class CycleRunner:
                                             enrich_strategy=enrich_strategy,
                                             base_rates=self._base_rates(),
                                             live_prices=live_prices or None,
-                                            daily_fetch_fresh=gap_scan)
+                                            daily_fetch_fresh=gap_scan,
+                                            fit_exclude=fit_exclude)
         if scan_shortlist:
             for c in candidates:
                 rec = strat_scores.get(str(c.get("symbol") or ""))
-                brief = strategy_fit_brief(rec)
+                brief = strategy_fit_brief(rec, exclude=fit_exclude)
                 if brief:
                     c["strategy_fit"] = brief
         if wake_has_gap_scan(wake_reason):
