@@ -29,11 +29,15 @@ def _only_kr_open(monkeypatch):
 
 
 def _trail_config() -> WatchConfig:
-    """트레일링 활성 설정(risk_off 타이트·neutral 기본·risk_on 루즈, swing/position 대상)."""
+    """트레일링 활성 설정(risk_off 타이트·neutral 기본·risk_on 루즈, swing/position 대상).
+
+    confirm_sec=0: 래칫 산식만 보는 테스트라 이상 틱 확인 창을 끈다(틱 즉시 반영).
+    확인 창 동작은 test_trail_spike_guard.py 가 검증한다.
+    """
     return WatchConfig(trailing={
         "enabled": True, "base_pct": 0.05,
         "regime_mult": {"risk_off": 0.6, "neutral": 1.0, "risk_on": 1.6},
-        "horizons": ("swing", "position")})
+        "horizons": ("swing", "position"), "confirm_sec": 0.0})
 
 
 class FakeGateway:
@@ -305,7 +309,7 @@ def _value_trail_config() -> WatchConfig:
     return WatchConfig(trailing={
         "enabled": True, "base_pct": 0.05, "value_base_pct": 0.12,
         "regime_mult": {"risk_off": 0.6, "neutral": 1.0, "risk_on": 1.6},
-        "horizons": ("swing", "position")})
+        "horizons": ("swing", "position"), "confirm_sec": 0.0})
 
 
 def test_value_position_uses_wider_trail():

@@ -52,6 +52,11 @@ trailing:
     neutral: 1.0
     risk_on: 1.6
   horizons: [swing, position]
+  # 이상 틱 가드: 활성화·최고가 래칫은 confirm_sec 동안 지속되고 서로 다른 체결이
+  # confirm_prints 건 이상인 가격 수준(창 최저가)만 쓴다. 단발 스파이크(10-01 PLTR +19.9%
+  # 1체결)가 손절가를 현재가 위로 올리던 사고 대응. 0 이면 확인 없음(틱 즉시 반영).
+  confirm_sec: 60
+  confirm_prints: 2
 
 # 공통 청산 바닥 — 전략 decide() 와 무관. day 는 watch.session_end_exit_min 이 담당.
 exit_policy:
