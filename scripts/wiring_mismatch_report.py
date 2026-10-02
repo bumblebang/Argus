@@ -32,6 +32,13 @@ def _print_human(rep: dict) -> None:
         for k, n in sorted(by.items(), key=lambda x: -x[1]):
             flag = " **FLAG**" if k in (rep.get("flagged_kinds") or {}) else ""
             print(f"  {k}: {n}{flag}")
+    info = rep.get("info_by_kind") or {}
+    if info:
+        print("참고(어긋남 아님): " + ", ".join(f"{k}={n}" for k, n in info.items()))
+    assigned = rep.get("assigned_by_strategy") or {}
+    if assigned:
+        top = ", ".join(f"{k}={n}" for k, n in list(assigned.items())[:5])
+        print(f"배정 분포: {top}  (최다 비중 {rep.get('top_assigned_share')})")
     if rep.get("actionable"):
         print(f"\nactionable=YES - {list((rep.get('flagged_kinds') or {}).keys())}")
         print("-> LIVE_OBS: wiring review (not promote)")

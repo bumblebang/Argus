@@ -288,6 +288,18 @@ class TestRunScan:
         e = next(iter(wl.values()))
         assert e["stance"] == "undervalued" and "metrics" in e and e["ts"] > 0
 
+    def test_판정_이력_누적(self, tmp_path):
+        # watchlist 는 덮어쓰지만 판정 이력은 스캔마다 쌓인다(라벨 변별력 측정용).
+        import json as _json
+        from src.value_scan import STANCE_HISTORY_NAME
+        kw = self._setup(tmp_path)
+        run_scan(_cfg(), _ok_llm(), limit=2, **kw)
+        hist = tmp_path / STANCE_HISTORY_NAME
+        rows = [_json.loads(l) for l in hist.read_text(encoding="utf-8").splitlines()]
+        assert len(rows) == 2
+        assert {r["stance"] for r in rows} == {"undervalued"}
+        assert all(r["symbol"] and r["ts"] > 0 and "conviction" in r for r in rows)
+
     def test_US_fundamentals_watchlist_에_저장(self, tmp_path):
         # US 후보의 fundamentals 가 watchlist 항목에 남아 후속 소비 가능해야 한다.
         fund = {"pe_trailing": 12.3, "pe_forward": 10.0, "pb": 1.2,

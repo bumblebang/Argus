@@ -133,6 +133,7 @@ def target_hit_before_stop(data_dir: Path | str, symbol: str, asof, *,
 
     같은 봉에서 둘 다 터치되면 순서 불명이라 None.
     horizon 내 미도달이면 False (라벨은 적립, 확률 필드는 스키마에 없음).
+    창이 아직 안 끝났으면(마지막 봉 < 창 끝) None — reason=pending_horizon.
     """
     out: dict[str, Any] = {
         "target_hit_before_stop": None, "resolved": False, "reason": "no_levels",
@@ -155,6 +156,7 @@ def target_hit_before_stop(data_dir: Path | str, symbol: str, asof, *,
         return out
     start = asof_local_date(dt, mkt)
     end = start + timedelta(days=days)
+    last_day = bars[-1][0].date()
     for d, high, low, _c in bars:
         day = d.date()
         if day <= start:
@@ -172,6 +174,11 @@ def target_hit_before_stop(data_dir: Path | str, symbol: str, asof, *,
         if hit_tgt:
             out.update(target_hit_before_stop=True, resolved=True, reason="target_first")
             return out
+    if last_day < end:
+        # 창이 아직 안 끝났다 — 미도달을 '기간 내 미도달'로 세면 최근 표본이 전부
+        # 실패로 잡혀 적중률이 과소 추정된다(10-02 실측: 90일 중 229건이 미성숙).
+        out.update(reason="pending_horizon", resolved=False)
+        return out
     out.update(target_hit_before_stop=False, resolved=True, reason="neither_by_horizon")
     return out
 

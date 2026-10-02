@@ -84,6 +84,8 @@
 - [ ] **성과 탭** — brain / value / close_scan **트랙별** n·승률·MDD(거래별 최대 낙폭 눈대)
 - [ ] **캘리브** — `measurement_baseline` → `calibrated` 여부 (n≥20 전엔 사이징 잠금 정상)
 - [ ] **그림자** — 성과 탭 shadow avg_ret (게이트 막은 BUY vs 실제)
+- [ ] **판정 변별력** — `python scripts/stance_report.py` — 도시에 bullish·밸류 undervalued 가 나머지 라벨보다 지수 대비 초과가 높은지(종목 에피소드). 10-02 첫 집계: KR bullish −2.8%p(n=71) < neutral +0.7, 밸류 undervalued ≈ fair → 둘 다 변별력 없음
+- [ ] **배선** — `wiring_mismatch_report.py` 의 `배정 분포`(한 전략 쏠림) · fit_cross_horizon 은 참고용
 - [ ] **운용 이상** — J1~J13 adopt 이후: 현금 음수·중복 주문·재대사 pnl 누락 **재발 없음** 확인
 
 ---

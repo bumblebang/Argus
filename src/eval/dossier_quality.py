@@ -145,6 +145,12 @@ def summarize_dossiers(
                                since=now - label_days * 86400, now=now)
     reach_out = reach_outcomes(store, data_dir=data_path, cfg=cfg,
                                since=now - label_days * 86400, now=now)
+    stance_ex = None
+    if data_path:
+        from .stance_excess import dossier_observations, stance_excess
+        stance_ex = stance_excess(
+            dossier_observations(store, since=now - label_days * 86400, now=now),
+            data_dir=data_path, cfg=cfg)
 
     n = len(rows)
     bullish_n = stance_ct["bullish"]
@@ -165,6 +171,7 @@ def summarize_dossiers(
         "coverage": coverage,
         "outcomes": outcomes,
         "reach_outcomes": reach_out,
+        "stance_excess": stance_ex,
         "note": ("Tier 0 도시어 품질. stance 라벨 평가는 outcomes 참고. "
                  "프롬프트 승격 근거로 단독 쓰지 말 것(min_n). "
                  "zone_unknown_rate 높으면 가격 센서 실패(승격 아님)."),

@@ -63,7 +63,20 @@ def _print_human(rep: dict) -> None:
     if skipped:
         top = sorted(skipped.items(), key=lambda x: -x[1])[:6]
         print(f"  skipped: {dict(top)}")
+    _print_stance_excess(rep.get("stance_excess"))
     print()
+
+
+def _print_stance_excess(sx: dict | None) -> None:
+    """판정별 지수 대비 초과수익 — bullish 가 neutral 보다 높아야 라벨이 정보다."""
+    if not sx or not sx.get("by_market"):
+        return
+    print(f"판정별 지수 대비 초과({sx.get('window_days')}일, 종목 에피소드):")
+    for mkt, by in sx["by_market"].items():
+        for label, b in by.items():
+            flag = " (small)" if b.get("small_sample") else ""
+            print(f"  [{mkt}] {label}: n={b['n']} 평균 {b['excess_avg_pp']:+.2f}%p "
+                  f"중앙 {b['excess_median_pp']:+.2f}%p 이긴비율 {b['beat_rate']:.0%}{flag}")
 
 
 def main() -> int:

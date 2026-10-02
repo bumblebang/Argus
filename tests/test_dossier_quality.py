@@ -74,7 +74,7 @@ def test_reach_outcomes_buckets_by_target_atr(tmp_path):
     hist.mkdir()
     lines = ["Date,Open,High,Low,Close,Volume"]
     d0 = datetime(2026, 1, 1)
-    for i in range(60):                                  # 폭 ±1 → ATR 2%
+    for i in range(70):            # 폭 ±1 → ATR 2%. 창(생성+20일)이 다 지나도록 70일
         day = (d0 + timedelta(days=i)).strftime("%Y-%m-%d")
         hi = 105.0 if i == 45 else 101.0                 # 45일째 하루 105 터치
         lines.append(f"{day},100,{hi},99,100,1")
