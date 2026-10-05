@@ -109,3 +109,4 @@ def test_run_batch_fills_inputs_and_records_flags(tmp_path, monkeypatch):
     assert seen[0]["fundamentals"] == {"pb": 1.1} and seen[0]["flows"]["foreign_5d"] == -3.0
     ev = json.loads(store.get_fresh_dossier("AAA")["evidence"])
     assert ev["inputs"]["fundamentals"] is True and ev["inputs"]["positioning"] is False
+    assert ev["stance_feedback"] is False           # 성적표 없이 만든 도시에

@@ -614,7 +614,9 @@ def run_batch(cfg, store, llm, market: str, *,
             ev_payload = {"stance": out.stance, "horizon": out.horizon,
                           "evidence": out.evidence, "key_risks": out.key_risks,
                           "sanitize_notes": notes, "refresh_mode": mode,
-                          "inputs": input_flags(ctx)}
+                          "inputs": input_flags(ctx),
+                          # 성적 피드백 실험 표본 구분 — 꺼진 채 같은 prompt_rev 로 만든 도시에 제외용
+                          "stance_feedback": bool(ctx.get("stance_track_record"))}
             if level_note:
                 ev_payload["level_note"] = level_note
             # stance 를 만든 프롬프트 판본 — level_only 는 직전 full 의 stance 를 잇는다.
