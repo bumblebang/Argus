@@ -343,6 +343,9 @@ athena:
   stance_feedback: true
   # 신선 도시에 시장별 bullish 비중 하한 — 미만이면 평일 측정 작업이 ntfy(과보정 감시).
   bullish_floor_pct: 0.10
+  # 재무(DART 캐시)·수급·공매도(KRX)·US 재무(Finnhub)를 Athena 대상 종목에 보강.
+  # market_state 는 base_universe 앞 10종목만 채워 유니버스 91% 가 비어 있었다(10-05).
+  inputs_enrich: true
   timeout: 240
   windows:
     KR:

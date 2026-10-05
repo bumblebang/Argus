@@ -106,12 +106,16 @@ def _save_hist(path: Path, hist: dict) -> None:
     tmp.replace(path)
 
 
-def _latest_balance_map(client, mkt_tp: str, lookback: int = 10
+def _latest_balance_map(client, mkt_tp: str, lookback: int = 10,
+                        end: date | None = None
                         ) -> tuple[str | None, dict[str, dict]]:
-    """30501 전종목 → {ISU_CD: row}. T+2 라 최근 휴일 스킵."""
+    """30501 전종목 → {ISU_CD: row}. T+2 라 최근 휴일 스킵.
+
+    end: 이 날짜부터 거꾸로 찾는다(기본 오늘) — 과거 시점 재현(Athena 리플레이)용.
+    """
     bld = bld_for("short_잔고_전종목") or _BAL_BLD
     for lag in range(lookback):
-        d = date.today() - timedelta(days=lag)
+        d = (end or date.today()) - timedelta(days=lag)
         ds = d.strftime("%Y%m%d")
         rows = client.get_rows(bld, trdDd=ds, mktTpCd=mkt_tp)
         if not rows:

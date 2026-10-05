@@ -24,6 +24,7 @@ from ..baserate import analyze
 from ..focus import build_focus, attach_krx_fields
 from ..logging_setup import get_logger
 from .features import technical_summary
+from .athena_inputs import AthenaInputs, fill_missing, input_flags
 from .schemas import DossierLevelOutput, DossierOutput
 from .athena_phase2 import (
     ATHENA_LEVEL_SYSTEM, _athena_queued, build_level_context, merge_level_refresh,
@@ -564,6 +565,8 @@ def run_batch(cfg, store, llm, market: str, *,
     earnings_cal = _load_earnings_calendar()
     ers_by_sym = _earnings_results_by_symbol(store)
     track = _stance_track_record(cfg, store, market)
+    inputs = _athena_inputs(cfg)
+    asof_day = _market_today(market, now_fn())
     done, failed, stopped, level_only_n = 0, 0, False, 0
     for t in targets:
         if stop_at is not None and now_fn() >= stop_at:
@@ -588,6 +591,11 @@ def run_batch(cfg, store, llm, market: str, *,
             px = tech.get("price") if isinstance(tech, dict) else None
             if px is None:
                 px = prices.get(sym)
+            if inputs is not None:          # market_state 가 비운 재무·수급·공매도 보강
+                try:
+                    fill_missing(ctx, inputs.for_symbol(sym, market, price=px, asof=asof_day))
+                except Exception as e:
+                    log.warning("[%s] 입력 보강 실패(생략): %s", sym, e)
             use_level, prev_row = should_level_only(
                 store, sym, px, p2, now=now_fn())
             if use_level and prev_row:
@@ -605,7 +613,8 @@ def run_batch(cfg, store, llm, market: str, *,
             rr = compute_rr(out.entry_low, out.entry_high, out.invalidation, out.target)
             ev_payload = {"stance": out.stance, "horizon": out.horizon,
                           "evidence": out.evidence, "key_risks": out.key_risks,
-                          "sanitize_notes": notes, "refresh_mode": mode}
+                          "sanitize_notes": notes, "refresh_mode": mode,
+                          "inputs": input_flags(ctx)}
             if level_note:
                 ev_payload["level_note"] = level_note
             # stance 를 만든 프롬프트 판본 — level_only 는 직전 full 의 stance 를 잇는다.
@@ -642,6 +651,26 @@ def run_batch(cfg, store, llm, market: str, *,
     store.log_event("athena_done", None, summary)
     log.info("Athena %s 창 종료: %s", market, summary)
     return summary
+
+
+def _athena_inputs(cfg):
+    """창 1회 — 재무·수급·공매도 보강기. config athena.inputs_enrich: false 면 끔."""
+    raw = getattr(cfg, "raw", cfg) or {}
+    if not ((raw.get("athena") or {}).get("inputs_enrich", True)):
+        return None
+    try:
+        from ..config import ROOT
+        return AthenaInputs.load(ROOT / "data")
+    except Exception as e:
+        log.warning("Athena 입력 보강기 생성 실패(생략): %s", e)
+        return None
+
+
+def _market_today(market: str, now: float):
+    """시장 현지 날짜 — 입력 보강의 asof(그 날 이전 공개분만)."""
+    from datetime import datetime, timezone
+    from ..eval.labels import asof_local_date
+    return asof_local_date(datetime.fromtimestamp(now, tz=timezone.utc), market)
 
 
 def _stance_track_record(cfg, store, market: str) -> dict | None:
