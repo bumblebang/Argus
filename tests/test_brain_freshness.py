@@ -128,6 +128,40 @@ def test_strategy_fit_brief_ok_when_enough_trades():
     assert "thin_sample" not in brief
 
 
+def _rec_day_top():
+    # 실측 흔한 모양: 1위가 day 전략(volatility_breakout), swing·position 은 아래.
+    return {"best": "volatility_breakout", "ranking": [
+        {"strategy": "volatility_breakout", "return_pct": 0.33, "n_trades": 17},
+        {"strategy": "bollinger_breakout", "return_pct": 0.20, "n_trades": 6},
+        {"strategy": "donchian_breakout", "return_pct": 0.15, "n_trades": 2},
+        {"strategy": "macd", "return_pct": 0.08, "n_trades": 4},
+        {"strategy": "ma_crossover", "return_pct": 0.05, "n_trades": 3},
+        {"strategy": "rsi_reversion", "return_pct": 0.02, "n_trades": 5},
+    ]}
+
+
+def test_strategy_fit_brief_excludes_day_when_track_off():
+    brief = ss.strategy_fit_brief(_rec_day_top(), exclude=ss.day_strategy_names())
+    names = [r["strategy"] for r in brief["ranking"]]
+    assert "volatility_breakout" not in names and "bollinger_breakout" not in names
+    assert brief["best"] is None and brief["thin_sample"] is True   # donchian n=2
+    # horizon 별: 표본 충분한 1위만 (donchian n=2 는 건너뛰고 ma_crossover)
+    assert brief["best_by_horizon"]["swing"]["strategy"] == "macd"
+    assert brief["best_by_horizon"]["position"]["strategy"] == "ma_crossover"
+    assert "day" not in brief["best_by_horizon"]
+
+
+def test_strategy_fit_brief_keeps_day_when_not_excluded():
+    brief = ss.strategy_fit_brief(_rec_day_top())
+    assert brief["best"] == "volatility_breakout"
+    assert brief["best_by_horizon"]["day"]["strategy"] == "volatility_breakout"
+    assert len(brief["ranking"]) == 3
+
+
+def test_day_strategy_names_from_catalog():
+    assert ss.day_strategy_names() == {"volatility_breakout", "bollinger_breakout"}
+
+
 def test_portfolio_mark_to_market(tmp_path):
     from src.agents.cycle_runner import CycleRunner
     from src.config import load_config
