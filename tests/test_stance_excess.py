@@ -50,3 +50,24 @@ def test_load_value_history_since(tmp_path):
         "garbage"]) + "\n", encoding="utf-8")
     rows = load_value_history(p, since=150.0)
     assert rows == [{"symbol": "B", "ts": 200.0, "label": "undervalued"}]
+
+
+def test_stance_track_record_and_prompt_rev_filter(tmp_path):
+    from src.engine.store import Store
+    from src.eval.stance_excess import dossier_observations, stance_track_record
+    data = _setup(tmp_path)
+    store = Store(tmp_path / "t.db")
+    created = datetime(2026, 1, 5, 12).timestamp()
+    for sym, stance, rev in (("UP", "bullish", "aaa"), ("DOWN", "neutral", "bbb")):
+        store.save_dossier(sym, "US", thesis="t", entry_low=1, entry_high=2,
+                           invalidation=0.5, target=3, rr=2.0, conviction=0.6,
+                           evidence={"stance": stance, "prompt_rev": rev}, ttl_hours=48)
+    store.conn.execute("UPDATE dossiers SET created_at=?", (created,))
+    store.conn.commit()
+    now = created + 86400
+    rec = stance_track_record(store, data_dir=data, since_days=30, now=now)
+    us = rec["by_market"]["US"]
+    assert us["bullish"]["excess_avg_pp"] > 0 > us["neutral"]["excess_avg_pp"]
+    assert rec["by_symbol"]["UP"][0]["stance"] == "bullish"
+    only = dossier_observations(store, since=created - 1, now=now, prompt_rev="aaa")
+    assert [o["symbol"] for o in only] == ["UP"]

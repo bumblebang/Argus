@@ -13,6 +13,7 @@
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import time
 from typing import Callable
@@ -48,6 +49,20 @@ ATHENA_SYSTEM = """\
   진입 논리와 보유기간(horizon)에 직접 반영하고 evidence 에 수치로 인용하라.
 - past_trades(이 시스템이 이 종목을 거래한 결과)가 있으면 복기하라 — 같은 논리로
   졌던 자리면 무엇이 달라졌는지 명시해야 한다.
+
+자기 판정 성적(stance_track_record — 있으면 반드시 반영):
+- by_stance 는 이 시장에서 네가 과거에 낸 stance 별로, 이후 window_days 일 동안 그 종목이
+  지수를 얼마나 이겼는지의 실측이다(excess_avg_pp·excess_median_pp = 지수 대비 %p,
+  beat_rate = 지수를 이긴 비율). 네 bullish 가 정보를 담았다면 bullish 의 성적이
+  neutral 보다 좋아야 한다.
+- bullish 성적이 neutral 보다 나쁘면 네 bullish 기준이 헐겁다는 뜻이다. 이번 판단에서
+  bullish 문턱을 높여라: 서로 독립적인 증거 갈래가 둘 이상 정렬되고 진입존이 추격이 아닌
+  자리일 때만 bullish 를 내고, 애매하면 neutral 로 둬라.
+- 그렇다고 기계적으로 neutral/bearish 로 돌리지 마라. 성적표는 문턱을 조정하는 근거지
+  결론이 아니다 — 종목 고유 증거가 강하면 bullish 가 맞다. small_sample=true 인 칸은
+  참고만 하라.
+- this_symbol 에 이 종목의 과거 판정과 결과가 있으면 복기하라. bullish 였는데 지수에
+  크게 졌다면 그때와 무엇이 다른지 evidence 에 명시하라.
 - 증거(evidence)는 서로 독립적인 갈래로: 기술적 구조 / 베이스레이트 / 재무·펀더멘털 /
   수급 / 뉴스·재료 / 실적(예정·발표 결과). 갈래가 많이 정렬될수록 conviction 을 높여라.
   한 갈래뿐이면 0.5 이하.
@@ -99,6 +114,9 @@ ATHENA_SYSTEM = """\
 - 미국 종목이면 macro(FRED: 기준금리·국채·달러인덱스·실업·CPI 등)가 거시 배경이다.
   macro_kr 로 US 금리·물가를 대신하지 마라. 금리 민감이면 evidence 에 수치로 인용하라."""
 
+# 프롬프트 판본 — 도시에 evidence 에 남겨 변경 전후 성적을 가른다(eval.stance_excess).
+ATHENA_PROMPT_REV = hashlib.sha256(ATHENA_SYSTEM.encode("utf-8")).hexdigest()[:12]
+
 
 def _batch_symbol_news(market_state: dict | None, symbol: str, *, limit: int = 10) -> list[dict]:
     ms = market_state or {}
@@ -139,7 +157,8 @@ def build_research_context(symbol: str, name: str, market: str, *,
                            earnings: dict | None = None,
                            earnings_results: list[dict] | None = None,
                            live_news: bool = True,
-                           news_per: int = 5) -> dict:
+                           news_per: int = 5,
+                           stance_track_record: dict | None = None) -> dict:
     """종목 1개의 딥리서치 입력 묶음(~수 KB). LLM 이 이걸 보고 도시에를 쓴다.
 
     focus: 주의층 렌즈. None 이면 이 호출에서 build_focus 로 계산한다.
@@ -187,6 +206,8 @@ def build_research_context(symbol: str, name: str, market: str, *,
         ctx["earnings"] = earnings
     if earnings_results:
         ctx["earnings_results"] = earnings_results
+    if stance_track_record:
+        ctx["stance_track_record"] = stance_track_record
     return ctx
 
 
@@ -542,6 +563,7 @@ def run_batch(cfg, store, llm, market: str, *,
         positions=held)
     earnings_cal = _load_earnings_calendar()
     ers_by_sym = _earnings_results_by_symbol(store)
+    track = _stance_track_record(cfg, store, market)
     done, failed, stopped, level_only_n = 0, 0, False, 0
     for t in targets:
         if stop_at is not None and now_fn() >= stop_at:
@@ -560,7 +582,8 @@ def run_batch(cfg, store, llm, market: str, *,
                                          market_state=ms,
                                          base_rates=br, past_trades=past,
                                          focus=focus, earnings=earn,
-                                         earnings_results=ers)
+                                         earnings_results=ers,
+                                         stance_track_record=_track_for(track, sym))
             tech = ctx.get("technical") or {}
             px = tech.get("price") if isinstance(tech, dict) else None
             if px is None:
@@ -585,6 +608,11 @@ def run_batch(cfg, store, llm, market: str, *,
                           "sanitize_notes": notes, "refresh_mode": mode}
             if level_note:
                 ev_payload["level_note"] = level_note
+            # stance 를 만든 프롬프트 판본 — level_only 는 직전 full 의 stance 를 잇는다.
+            if mode == "full":
+                ev_payload["prompt_rev"] = ATHENA_PROMPT_REV
+            elif prev_row and _parse_evidence(prev_row).get("prompt_rev"):
+                ev_payload["prompt_rev"] = _parse_evidence(prev_row)["prompt_rev"]
             if mode == "full" and px and float(px) > 0:
                 ev_payload["ref_price"] = round(float(px), 4)
             elif mode == "level_only" and prev_row:
@@ -614,6 +642,40 @@ def run_batch(cfg, store, llm, market: str, *,
     store.log_event("athena_done", None, summary)
     log.info("Athena %s 창 종료: %s", market, summary)
     return summary
+
+
+def _stance_track_record(cfg, store, market: str) -> dict | None:
+    """창 1회 계산 — 이 시장 stance 별 지수 대비 성적 + 종목별 최근 결과.
+
+    config athena.stance_feedback: false 면 끈다(실험 kill 시 코드 없이 되돌림).
+    실패는 None(도시에 생성은 계속).
+    """
+    raw = getattr(cfg, "raw", cfg) or {}
+    if not ((raw.get("athena") or {}).get("stance_feedback", True)):
+        return None
+    try:
+        from ..config import ROOT
+        from ..eval.stance_excess import stance_track_record
+        rec = stance_track_record(store, data_dir=ROOT / "data", cfg=raw)
+    except Exception as e:
+        log.warning("stance_track_record 계산 실패(생략): %s", e)
+        return None
+    by = (rec.get("by_market") or {}).get(market)
+    if not by:
+        return None
+    return {"window_days": rec.get("window_days"), "since_days": rec.get("since_days"),
+            "by_stance": by, "_by_symbol": rec.get("by_symbol") or {}}
+
+
+def _track_for(track: dict | None, symbol: str) -> dict | None:
+    """종목별 컨텍스트 조각 — 시장 성적 + 이 종목 과거 판정 결과."""
+    if not track:
+        return None
+    out = {k: v for k, v in track.items() if not k.startswith("_")}
+    mine = (track.get("_by_symbol") or {}).get(symbol)
+    if mine:
+        out["this_symbol"] = mine
+    return out
 
 
 def _past_trades(store) -> list[dict]:
