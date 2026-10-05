@@ -42,6 +42,7 @@ data/day_pool.yaml
 data/gap_decline_pool.yaml
 data/history/
 data/context_archive/
+data/athena_replay/
 data/krx_cache/
 data/llm_inbox/
 # Phase 2 레이아웃 — nested 원장/인박스/백업(git add -A 사고 방지)
