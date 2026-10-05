@@ -33,21 +33,66 @@ def _empty() -> dict:
     return {"version": 1, "experiments": []}
 
 
-def load_registry(path: Path | str = DEFAULT_PATH) -> dict:
+# 실행 중 바뀌는 필드 — 정의 파일(git 추적)이 아니라 옆의 *_state.json(미추적)에 쓴다.
+# 정의 파일이 매일 수정되면 라이브 checkout 이 dirty 해져 pull 이 막힌다.
+RUNTIME_KEYS = frozenset({
+    "status", "status_reason", "evidence_n", "last_n", "last_metrics", "evaluated_at",
+})
+
+
+def state_path_for(path: Path | str) -> Path:
     p = Path(path)
+    return p.with_name(f"{p.stem}_state{p.suffix}")
+
+
+def _read_json(p: Path) -> dict | None:
     if not p.exists():
-        return _empty()
+        return None
     try:
-        return json.loads(p.read_text(encoding="utf-8"))
+        data = json.loads(p.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else None
     except (OSError, ValueError) as e:
-        log.warning("eval_registry 읽기 실패: %s", e)
-        return _empty()
+        log.warning("eval_registry 읽기 실패 %s: %s", p.name, e)
+        return None
+
+
+def load_registry(path: Path | str = DEFAULT_PATH) -> dict:
+    """정의(path) 위에 실행 상태(*_state.json)를 덮어 돌려준다."""
+    reg = _read_json(Path(path)) or _empty()
+    state = (_read_json(state_path_for(path)) or {}).get("experiments") or {}
+    for exp in reg.get("experiments") or []:
+        over = state.get(exp.get("id"))
+        if isinstance(over, dict):
+            exp.update({k: v for k, v in over.items() if k in RUNTIME_KEYS})
+    return reg
 
 
 def save_registry(reg: dict, path: Path | str = DEFAULT_PATH) -> None:
+    """실행 상태는 state 파일에, 정의 파일은 새 실험이 생겼을 때만 덧붙인다.
+
+    이미 정의 파일에 있는 실험은 그 파일에서 건드리지 않는다(사람이 PR 로 바꾼다).
+    """
     p = Path(path)
     p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps(reg, ensure_ascii=False, indent=2), encoding="utf-8")
+    exps = reg.get("experiments") or []
+    # 실제로 채점된(evaluated_at) 실험만 state 에 — 등록만 된 실험의 초기 status 가
+    # state 로 굳으면 사람이 정의 파일에서 고친 값을 덮어쓴다.
+    state = {"experiments": {
+        e["id"]: {k: e[k] for k in RUNTIME_KEYS if k in e}
+        for e in exps if e.get("id") and e.get("evaluated_at")}}
+    state_path_for(p).write_text(json.dumps(state, ensure_ascii=False, indent=2),
+                                 encoding="utf-8")
+    on_disk = _read_json(p)
+    if on_disk is None:
+        on_disk = {k: v for k, v in reg.items() if k != "experiments"}
+        on_disk.setdefault("version", 1)
+        on_disk["experiments"] = []
+    have = {e.get("id") for e in on_disk.get("experiments") or []}
+    new = [e for e in exps if e.get("id") not in have]
+    if new or not p.exists():
+        on_disk.setdefault("experiments", []).extend(new)
+        p.write_text(json.dumps(on_disk, ensure_ascii=False, indent=2) + "\n",
+                     encoding="utf-8")
 
 
 _OPS = {
@@ -107,6 +152,7 @@ def apply_kill_rules(*, metrics: dict[str, Any], n: int | None = None,
     """
     reg = load_registry(path)
     changed: list[dict] = []
+    dirty = False
     for exp in reg.get("experiments") or []:
         if exp.get("status") == "kill":
             continue
@@ -114,6 +160,10 @@ def apply_kill_rules(*, metrics: dict[str, Any], n: int | None = None,
         if not isinstance(kill, dict) or kill.get("threshold") is None:
             continue
         metric = str(kill.get("metric") or exp.get("metric") or "")
+        # 이 실험의 지표가 안 들어온 호출은 건너뛴다 — 그림자 채점이 남의 실험
+        # evidence_n 을 그림자 표본 수로 덮어쓰던 결함(10-05).
+        if metric not in metrics:
+            continue
         val = metrics.get(metric)
         min_n = int(kill.get("min_n") or exp.get("min_n") or 20)
         obs_n = n
@@ -127,8 +177,10 @@ def apply_kill_rules(*, metrics: dict[str, Any], n: int | None = None,
             continue
         exp["evidence_n"] = int(obs_n)
         exp["last_n"] = int(obs_n)
+        exp["evaluated_at"] = time.time()
         if metrics:
             exp["last_metrics"] = dict(metrics)
+        dirty = True
         reason = None
         new_status = None
         if obs_n < min_n:
@@ -154,7 +206,7 @@ def apply_kill_rules(*, metrics: dict[str, Any], n: int | None = None,
             exp["status"] = new_status
             exp["status_reason"] = reason
             changed.append(dict(exp))
-    if changed:
+    if dirty:                       # 상태 전이 없이 표본·지표만 갱신돼도 남긴다
         save_registry(reg, path)
     return changed
 
@@ -197,6 +249,7 @@ def record_experiment_evidence(*, experiment_id: str,
             continue
         exp["evidence_n"] = int(n)
         exp["last_n"] = int(n)
+        exp["evaluated_at"] = time.time()
         if metrics:
             exp["last_metrics"] = dict(metrics)
         save_registry(reg, path)

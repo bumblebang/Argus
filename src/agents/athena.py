@@ -656,7 +656,8 @@ def _stance_track_record(cfg, store, market: str) -> dict | None:
     try:
         from ..config import ROOT
         from ..eval.stance_excess import stance_track_record
-        rec = stance_track_record(store, data_dir=ROOT / "data", cfg=raw)
+        rec = stance_track_record(store, data_dir=ROOT / "data", cfg=raw,
+                                  prompt_rev=ATHENA_PROMPT_REV)
     except Exception as e:
         log.warning("stance_track_record 계산 실패(생략): %s", e)
         return None
@@ -664,6 +665,7 @@ def _stance_track_record(cfg, store, market: str) -> dict | None:
     if not by:
         return None
     return {"window_days": rec.get("window_days"), "since_days": rec.get("since_days"),
+            "basis": (rec.get("basis") or {}).get(market, "rolling"),
             "by_stance": by, "_by_symbol": rec.get("by_symbol") or {}}
 
 

@@ -71,3 +71,29 @@ def test_stance_track_record_and_prompt_rev_filter(tmp_path):
     assert rec["by_symbol"]["UP"][0]["stance"] == "bullish"
     only = dossier_observations(store, since=created - 1, now=now, prompt_rev="aaa")
     assert [o["symbol"] for o in only] == ["UP"]
+
+
+def test_stance_track_record_basis_switches_to_current_prompt(tmp_path):
+    from src.engine.store import Store
+    from src.eval.stance_excess import stance_track_record
+    data = _setup(tmp_path)
+    store = Store(tmp_path / "t.db")
+    created = datetime(2026, 1, 5, 12).timestamp()
+    for sym, rev in (("UP", "old"), ("DOWN", "new")):
+        store.save_dossier(sym, "US", thesis="t", entry_low=1, entry_high=2,
+                           invalidation=0.5, target=3, rr=2.0, conviction=0.6,
+                           evidence={"stance": "bullish", "prompt_rev": rev}, ttl_hours=48)
+    store.conn.execute("UPDATE dossiers SET created_at=?", (created,))
+    store.conn.commit()
+    now = created + 86400
+    # 현재 판본 표본 충분(min_current=1) → 현재 판본만(DOWN, 음수)
+    cur = stance_track_record(store, data_dir=data, since_days=30, now=now,
+                              prompt_rev="new", min_current=1)
+    assert cur["basis"]["US"] == "current_prompt"
+    assert cur["by_market"]["US"]["bullish"]["n"] == 1
+    assert cur["by_market"]["US"]["bullish"]["excess_avg_pp"] < 0
+    # 부족(min_current=5) → 전체 rolling (UP+DOWN)
+    roll = stance_track_record(store, data_dir=data, since_days=30, now=now,
+                               prompt_rev="new", min_current=5)
+    assert roll["basis"]["US"] == "rolling"
+    assert roll["by_market"]["US"]["bullish"]["n"] == 2
