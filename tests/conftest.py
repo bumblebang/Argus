@@ -55,3 +55,14 @@ def _isolate_operational_gap_pool(request, monkeypatch):
         return
     monkeypatch.setattr("src.gap_decline_pool.load_gap_decline_pool", lambda *a, **k: {})
     monkeypatch.setattr("src.gap_decline_pool.fresh_gap_symbols", lambda *a, **k: {})
+
+
+@pytest.fixture(autouse=True)
+def _no_live_athena_inputs(request, monkeypatch):
+    """Athena 입력 보강(KRX·Finnhub 네트워크)을 테스트에서 끈다 — .env 가 있으면 실접속하므로.
+
+    보강 자체를 검증하는 테스트는 `athena_inputs_live` 마커 대신 직접 주입한다.
+    """
+    if request.module.__name__ == "test_athena_inputs":
+        return
+    monkeypatch.setattr("src.agents.athena._athena_inputs", lambda cfg: None)
