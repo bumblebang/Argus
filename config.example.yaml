@@ -338,6 +338,9 @@ athena:
   # 우회하므로(새 재료 즉시 반응) 상한이 없으면 미커버 발굴이 굶는다.
   # 0=무제한(권장 안 함 — 큐가 max_per_run 을 다 먹을 수 있다)
   queue_max_per_run: 10
+  # 자기 판정 성적 피드백(exp_athena_stance_feedback) — 컨텍스트에 stance 별 지수 대비
+  # 성적·종목별 과거 결과를 싣는다. 실험 kill 시 false 로 끈다(코드 수정 불필요).
+  stance_feedback: true
   timeout: 240
   windows:
     KR:

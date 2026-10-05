@@ -300,3 +300,65 @@ def test_athena_cli_skips_brain_wake_after_batch(tmp_path, monkeypatch):
     assert athena_cli.main() == 0
     assert calls == []
     assert "request_brain_wake" not in inspect.getsource(athena_cli.main)
+
+
+# ── 자기 판정 성적 피드백 (exp_athena_stance_feedback) ──────────────────
+def _capture_llm(seen):
+    inner = _mock_llm()
+
+    def responder(schema, system, user):
+        seen.append(json.loads(user))
+        return inner._responder(schema, system, user)
+    return MockLLM(responder)
+
+
+def _fake_track(monkeypatch):
+    import src.eval.stance_excess as sx
+    fake = {"window_days": 20, "since_days": 120.0,
+            "by_market": {"KR": {"bullish": {"n": 71, "excess_avg_pp": -2.8},
+                                 "neutral": {"n": 206, "excess_avg_pp": 0.7}}},
+            "by_symbol": {"AAA": [{"date": "2026-08-20", "stance": "bullish",
+                                   "excess_pp": -9.1}]}}
+    monkeypatch.setattr(sx, "stance_track_record", lambda *a, **k: fake)
+
+
+def test_run_batch_injects_stance_track_record(tmp_path, monkeypatch):
+    _fake_track(monkeypatch)
+    cfg = load_config()
+    cfg.universe["KR"] = [{"symbol": "AAA", "name": "a"}, {"symbol": "BBB", "name": "b"}]
+    seen = []
+    run_batch(cfg, Store(tmp_path / "t.db"), _capture_llm(seen), "KR",
+              fetch_df=lambda s_, m: _df())
+    by_sym = {c["symbol"]: c["stance_track_record"] for c in seen}
+    assert by_sym["AAA"]["by_stance"]["bullish"]["excess_avg_pp"] == -2.8
+    assert by_sym["AAA"]["this_symbol"][0]["excess_pp"] == -9.1
+    assert "this_symbol" not in by_sym["BBB"]
+    assert not any(k.startswith("_") for k in by_sym["AAA"])   # 내부 키 누출 금지
+
+
+def test_run_batch_stance_feedback_off(tmp_path, monkeypatch):
+    _fake_track(monkeypatch)
+    cfg = load_config()
+    cfg.raw.setdefault("athena", {})["stance_feedback"] = False
+    cfg.universe["KR"] = [{"symbol": "AAA", "name": "a"}]
+    seen = []
+    run_batch(cfg, Store(tmp_path / "t.db"), _capture_llm(seen), "KR",
+              fetch_df=lambda s_, m: _df())
+    assert seen and "stance_track_record" not in seen[0]
+
+
+def test_run_batch_records_prompt_rev(tmp_path):
+    from src.agents.athena import ATHENA_PROMPT_REV
+    cfg = load_config()
+    cfg.universe["KR"] = [{"symbol": "AAA", "name": "a"}]
+    store = Store(tmp_path / "t.db")
+    run_batch(cfg, store, _mock_llm(), "KR", fetch_df=lambda s_, m: _df())
+    ev = json.loads(store.get_fresh_dossier("AAA")["evidence"])
+    assert ev["prompt_rev"] == ATHENA_PROMPT_REV and len(ATHENA_PROMPT_REV) == 12
+
+
+def test_athena_prompt_has_stance_feedback_rules():
+    from src.agents.athena import ATHENA_SYSTEM
+    assert "stance_track_record" in ATHENA_SYSTEM
+    assert "bullish 문턱을 높여라" in ATHENA_SYSTEM
+    assert "기계적으로 neutral/bearish 로 돌리지 마라" in ATHENA_SYSTEM

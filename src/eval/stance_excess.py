@@ -47,11 +47,13 @@ def _window_return(series, start, end) -> float | None:
     return b[1] / a[1] - 1.0
 
 
-def stance_excess(observations: Iterable[dict], *, data_dir: Path | str,
-                  horizon: str = "swing", cfg: dict | None = None,
-                  benchmarks: dict[str, str] | None = None) -> dict[str, Any]:
-    """observations: [{symbol, ts(epoch|iso), label}] → 시장×라벨 초과수익 요약.
+def stance_episodes(observations: Iterable[dict], *, data_dir: Path | str,
+                    horizon: str = "swing", cfg: dict | None = None,
+                    benchmarks: dict[str, str] | None = None
+                    ) -> tuple[list[dict], dict[str, int]]:
+    """observations: [{symbol, ts(epoch|iso), label}] → (성숙 에피소드 행, skipped).
 
+    행: {symbol, market, label, start(date), excess_pp}.
     excess = 종목 창 수익 − 같은 창 벤치마크 수익 (%p).
     """
     from .labels import parse_asof
@@ -66,24 +68,24 @@ def stance_excess(observations: Iterable[dict], *, data_dir: Path | str,
             cache[sym] = load_daily_series(data_dir, sym)
         return cache[sym]
 
-    rows = []
+    obs = []
     for o in observations:
         dt = parse_asof(o.get("ts"))
         sym = str(o.get("symbol") or "")
         label = o.get("label")
         if dt is None or not sym or not label:
             continue
-        rows.append((dt, sym, str(label)))
-    rows.sort(key=lambda r: r[0])
+        obs.append((dt, sym, str(label)))
+    obs.sort(key=lambda r: r[0])
 
     until: dict[tuple[str, str], Any] = {}
-    groups: dict[str, dict[str, list]] = {}
+    rows: list[dict] = []
     skipped: dict[str, int] = {}
 
     def skip(reason: str) -> None:
         skipped[reason] = skipped.get(reason, 0) + 1
 
-    for dt, sym, label in rows:
+    for dt, sym, label in obs:
         mkt = symbol_market(sym)
         start = asof_local_date(dt, mkt)
         key = (sym, label)
@@ -98,27 +100,43 @@ def stance_excess(observations: Iterable[dict], *, data_dir: Path | str,
             skip("immature_or_no_data")
             continue
         until[key] = end
-        g = groups.setdefault(mkt, {}).setdefault(label, [])
-        g.append(((s_ret - b_ret) * 100, sym))
+        rows.append({"symbol": sym, "market": mkt, "label": label, "start": start,
+                     "excess_pp": round((s_ret - b_ret) * 100, 2)})
+    return rows, skipped
 
-    out: dict[str, Any] = {}
+
+def summarize_episodes(rows: Iterable[dict]) -> dict[str, dict[str, dict]]:
+    """에피소드 행 → {market: {label: {n, n_symbols, excess_*, beat_rate, small_sample}}}."""
+    groups: dict[str, dict[str, list]] = {}
+    for r in rows:
+        groups.setdefault(r["market"], {}).setdefault(r["label"], []).append(r)
+    out: dict[str, dict[str, dict]] = {}
     for mkt, by_label in sorted(groups.items()):
         out[mkt] = {}
         for label, vals in sorted(by_label.items()):
-            ex = [v for v, _ in vals]
+            ex = [v["excess_pp"] for v in vals]
             out[mkt][label] = {
                 "n": len(ex),
-                "n_symbols": len({s for _, s in vals}),
+                "n_symbols": len({v["symbol"] for v in vals}),
                 "excess_avg_pp": round(statistics.mean(ex), 2),
                 "excess_median_pp": round(statistics.median(ex), 2),
                 "beat_rate": round(sum(1 for v in ex if v > 0) / len(ex), 3),
                 "small_sample": len(ex) < MIN_N,
             }
+    return out
+
+
+def stance_excess(observations: Iterable[dict], *, data_dir: Path | str,
+                  horizon: str = "swing", cfg: dict | None = None,
+                  benchmarks: dict[str, str] | None = None) -> dict[str, Any]:
+    """observations → 시장×라벨 초과수익 요약."""
+    rows, skipped = stance_episodes(observations, data_dir=data_dir, horizon=horizon,
+                                    cfg=cfg, benchmarks=benchmarks)
     return {
         "horizon": horizon,
-        "window_days": days,
-        "benchmarks": bench_syms,
-        "by_market": out,
+        "window_days": horizon_calendar_days(horizon, cfg),
+        "benchmarks": benchmarks or BENCHMARKS,
+        "by_market": summarize_episodes(rows),
         "skipped": skipped,
         "note": ("라벨별 지수 대비 초과수익(종목 에피소드). 좋은 라벨이 나쁜 라벨보다 "
                  "높아야 라벨이 정보를 담은 것. 같은 기간 표본이라 국면 편중 주의 — "
@@ -126,8 +144,37 @@ def stance_excess(observations: Iterable[dict], *, data_dir: Path | str,
     }
 
 
-def dossier_observations(store, *, since: float, now: float | None = None) -> list[dict]:
-    """store.dossiers → [{symbol, ts, label=stance}]."""
+def stance_track_record(store, *, data_dir: Path | str, cfg: dict | None = None,
+                        since_days: float = 120.0, now: float | None = None,
+                        per_symbol: int = 3) -> dict[str, Any]:
+    """Athena 컨텍스트용 자기 판정 성적 — 시장별 stance 성적 + 종목별 최근 결과.
+
+    반환: {window_days, since_days, by_market: {mkt: {label: 요약}},
+           by_symbol: {sym: [{date, stance, excess_pp}] 최신순 per_symbol 개}}.
+    """
+    now = now or datetime.now(timezone.utc).timestamp()
+    obs = dossier_observations(store, since=now - since_days * 86400, now=now)
+    rows, _ = stance_episodes(obs, data_dir=data_dir, cfg=cfg)
+    by_symbol: dict[str, list] = {}
+    for r in sorted(rows, key=lambda x: x["start"], reverse=True):
+        lst = by_symbol.setdefault(r["symbol"], [])
+        if len(lst) < per_symbol:
+            lst.append({"date": r["start"].isoformat(), "stance": r["label"],
+                        "excess_pp": r["excess_pp"]})
+    return {
+        "window_days": horizon_calendar_days("swing", cfg),
+        "since_days": since_days,
+        "by_market": summarize_episodes(rows),
+        "by_symbol": by_symbol,
+    }
+
+
+def dossier_observations(store, *, since: float, now: float | None = None,
+                         prompt_rev: str | None = None) -> list[dict]:
+    """store.dossiers → [{symbol, ts, label=stance}].
+
+    prompt_rev: 주면 evidence.prompt_rev 가 같은 도시에만(프롬프트 변경 전후 분리).
+    """
     from .dossier_quality import dossier_stance
 
     now = now or datetime.now(timezone.utc).timestamp()
@@ -135,8 +182,19 @@ def dossier_observations(store, *, since: float, now: float | None = None) -> li
         hist = store.conn.execute(
             "SELECT symbol, created_at, evidence FROM dossiers "
             "WHERE created_at >= ? AND created_at <= ?", (since, now)).fetchall()
-    return [{"symbol": r["symbol"], "ts": float(r["created_at"]),
-             "label": dossier_stance(dict(r))} for r in hist]
+    out = []
+    for r in hist:
+        row = dict(r)
+        if prompt_rev is not None:
+            try:
+                ev = json.loads(row.get("evidence") or "{}")
+            except (TypeError, ValueError):
+                ev = {}
+            if not isinstance(ev, dict) or ev.get("prompt_rev") != prompt_rev:
+                continue
+        out.append({"symbol": row["symbol"], "ts": float(row["created_at"]),
+                    "label": dossier_stance(row)})
+    return out
 
 
 def load_value_history(path: Path | str, *, since: float | None = None) -> list[dict]:

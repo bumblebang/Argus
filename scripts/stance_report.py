@@ -82,6 +82,8 @@ def main() -> int:
     ap.add_argument("--days", type=float, default=120.0, help="관측 윈도(일)")
     ap.add_argument("--json", action="store_true")
     ap.add_argument("--backfill-value-log", type=Path, default=None)
+    ap.add_argument("--prompt-rev", default=None,
+                    help="도시에를 이 Athena 프롬프트 판본(evidence.prompt_rev)으로 한정 — 실험 전후 비교")
     args = ap.parse_args()
 
     cfg = load_config(ROOT / "config.yaml")
@@ -94,7 +96,8 @@ def main() -> int:
     since = time.time() - args.days * 86400
     store = Store(_paths.resolve("db", configured="data/bot.db"))
     rep = {
-        "dossier": stance_excess(dossier_observations(store, since=since),
+        "dossier": stance_excess(dossier_observations(store, since=since,
+                                                      prompt_rev=args.prompt_rev),
                                  data_dir=data_dir, cfg=cfg.raw),
         "value": stance_excess(load_value_history(hist_path, since=since),
                                data_dir=data_dir, cfg=cfg.raw),
@@ -102,7 +105,8 @@ def main() -> int:
     if args.json:
         print(json.dumps(rep, ensure_ascii=False, indent=2))
     else:
-        _print("도시에 stance", rep["dossier"])
+        title = "도시에 stance" + (f" (prompt_rev={args.prompt_rev})" if args.prompt_rev else "")
+        _print(title, rep["dossier"])
         _print("밸류 stance", rep["value"])
         print("\n좋은 라벨(bullish·undervalued)이 나머지보다 높아야 라벨이 정보를 담은 것. "
               "같은 기간 표본이라 국면 편중 주의 — 승격·튜닝 단독 근거 금지.\n")
