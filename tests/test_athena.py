@@ -331,6 +331,7 @@ def test_run_batch_injects_stance_track_record(tmp_path, monkeypatch):
               fetch_df=lambda s_, m: _df())
     by_sym = {c["symbol"]: c["stance_track_record"] for c in seen}
     assert by_sym["AAA"]["by_stance"]["bullish"]["excess_avg_pp"] == -2.8
+    assert by_sym["AAA"]["basis"] == "rolling"          # fake 에 basis 없음 → 기본
     assert by_sym["AAA"]["this_symbol"][0]["excess_pp"] == -9.1
     assert "this_symbol" not in by_sym["BBB"]
     assert not any(k.startswith("_") for k in by_sym["AAA"])   # 내부 키 누출 금지

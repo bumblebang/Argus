@@ -80,8 +80,9 @@ def test_experiment_evidence_n_from_registry(tmp_path):
         touches=["risk_gate"], path=reg)
     assert experiment_evidence_n(exp) is None
     record_experiment_evidence(experiment_id=exp["id"], n=25, path=reg)
-    import json
-    saved = json.loads(reg.read_text(encoding="utf-8"))["experiments"][0]
+    # 실행 상태는 *_state.json 으로 — load_registry 가 정의 위에 덮는다
+    from src.eval_protocol import load_registry
+    saved = load_registry(reg)["experiments"][0]
     assert experiment_evidence_n(saved) == 25
 
 

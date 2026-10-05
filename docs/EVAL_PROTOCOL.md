@@ -17,6 +17,21 @@
 `can_promote` 는 리플레이/널 Δ 에 항상 False 이고, PROTECTED 변경은
 `scripts/check_protected_changes.py`(CI) 가 PR 에서 `eval_experiment:` 또는 `defect-fix:` 를 검사한다.
 
+## 레지스트리 파일 두 개 · 자동 채점
+
+- `data/eval_registry.json` — **정의**(가설·지표·kill·touches). git 추적 — CI 가드가 읽는다.
+  새 실험은 PR 로 추가한다. 이미 있는 실험 항목은 코드가 다시 쓰지 않는다.
+- `data/eval_registry_state.json` — **실행 상태**(status·evidence_n·last_metrics·evaluated_at).
+  미추적. `load_registry` 가 정의 위에 덮는다. 채점된 적 있는 실험만 기록되므로,
+  채점 이후 사람이 status 를 바꾸려면 이 파일의 해당 항목을 고치거나 지운다.
+- `apply_kill_rules` 는 **자기 지표가 들어온 실험만** 갱신한다(그림자 채점이 다른 실험을
+  덮어쓰던 결함 수정).
+- 평일 19:00 `run_measurement_reports.bat` → `scripts/eval_experiments.py`: 계산할 줄 아는
+  지표(`dossier.<MKT>.bullish_minus_neutral_excess_pp`, 실험의 `prompt_rev`·`created_at`
+  이후 표본)를 채점해 상태를 갱신하고, 상태 전이·도시에 bullish 비중 하한
+  (`athena.bullish_floor_pct`) 위반을 ntfy 로 알린다. **kill 이어도 스위치는 자동으로
+  끄지 않는다** — 알림에 되돌리는 방법을 적는다.
+
 ## 결함 수정 예외 (defect fix)
 
 규칙 1은 **전략 변경**에만 적용된다. 코드가 자기 사양을 못 지키는 것을 고치는 일은

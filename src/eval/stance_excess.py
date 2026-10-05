@@ -146,15 +146,30 @@ def stance_excess(observations: Iterable[dict], *, data_dir: Path | str,
 
 def stance_track_record(store, *, data_dir: Path | str, cfg: dict | None = None,
                         since_days: float = 120.0, now: float | None = None,
-                        per_symbol: int = 3) -> dict[str, Any]:
+                        per_symbol: int = 3, prompt_rev: str | None = None,
+                        min_current: int = MIN_N) -> dict[str, Any]:
     """Athena 컨텍스트용 자기 판정 성적 — 시장별 stance 성적 + 종목별 최근 결과.
 
+    prompt_rev: 현재 프롬프트 판본. 그 판본의 bullish 성숙 에피소드가 시장별로
+      min_current 이상이면 그 시장 성적은 현재 판본 표본만으로 낸다(basis=current_prompt).
+      아니면 최근 since_days 전체(basis=rolling). 옛 판본 성적이 몇 달씩 남아 새 판본을
+      계속 '헐겁다'고 몰아 bullish 를 과하게 줄이는 지연 과보정을 막는다.
+
     반환: {window_days, since_days, by_market: {mkt: {label: 요약}},
-           by_symbol: {sym: [{date, stance, excess_pp}] 최신순 per_symbol 개}}.
+           basis: {mkt: current_prompt|rolling}, by_symbol: {sym: [...]}}.
     """
     now = now or datetime.now(timezone.utc).timestamp()
     obs = dossier_observations(store, since=now - since_days * 86400, now=now)
     rows, _ = stance_episodes(obs, data_dir=data_dir, cfg=cfg)
+    by_market = summarize_episodes(rows)
+    basis = {m: "rolling" for m in by_market}
+    if prompt_rev:
+        cur_rows, _ = stance_episodes([o for o in obs if o.get("prompt_rev") == prompt_rev],
+                                      data_dir=data_dir, cfg=cfg)
+        for mkt, labels in summarize_episodes(cur_rows).items():
+            if (labels.get("bullish") or {}).get("n", 0) >= min_current:
+                by_market[mkt] = labels
+                basis[mkt] = "current_prompt"
     by_symbol: dict[str, list] = {}
     for r in sorted(rows, key=lambda x: x["start"], reverse=True):
         lst = by_symbol.setdefault(r["symbol"], [])
@@ -164,7 +179,8 @@ def stance_track_record(store, *, data_dir: Path | str, cfg: dict | None = None,
     return {
         "window_days": horizon_calendar_days("swing", cfg),
         "since_days": since_days,
-        "by_market": summarize_episodes(rows),
+        "by_market": by_market,
+        "basis": basis,
         "by_symbol": by_symbol,
     }
 
@@ -192,8 +208,17 @@ def dossier_observations(store, *, since: float, now: float | None = None,
                 ev = {}
             if not isinstance(ev, dict) or ev.get("prompt_rev") != prompt_rev:
                 continue
+        rev = None
+        if prompt_rev is None:
+            try:
+                ev = json.loads(row.get("evidence") or "{}")
+                rev = ev.get("prompt_rev") if isinstance(ev, dict) else None
+            except (TypeError, ValueError):
+                rev = None
+        else:
+            rev = prompt_rev
         out.append({"symbol": row["symbol"], "ts": float(row["created_at"]),
-                    "label": dossier_stance(row)})
+                    "label": dossier_stance(row), "prompt_rev": rev})
     return out
 
 

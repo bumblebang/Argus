@@ -37,6 +37,12 @@ if errorlevel 1 (
   set "ERR=1"
 )
 
+"%PY%" scripts\eval_experiments.py >> logs\measurement_reports.run.log 2>&1
+if errorlevel 1 (
+  echo [eval_experiments] FAIL>> logs\measurement_reports.run.log
+  set "ERR=1"
+)
+
 if "!ERR!"=="1" (
   echo [run_measurement_reports] done with errors>> logs\measurement_reports.run.log
   endlocal & exit /b 1
