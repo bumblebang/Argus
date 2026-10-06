@@ -36,7 +36,8 @@ def compute_metric(exp: dict, *, store, data_dir: Path | str,
         return None
     mkt = m.group(1)
     since = float(exp.get("created_at") or 0)
-    obs = dossier_observations(store, since=since, prompt_rev=exp.get("prompt_rev"))
+    obs = dossier_observations(store, since=since, prompt_rev=exp.get("prompt_rev"),
+                               evidence_match=exp.get("evidence_match"))
     labels = (stance_excess(obs, data_dir=data_dir, cfg=cfg)["by_market"].get(mkt) or {})
     bull, neu = labels.get("bullish") or {}, labels.get("neutral") or {}
     n = int(bull.get("n") or 0)

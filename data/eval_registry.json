@@ -6,7 +6,7 @@
       "name": "athena_stance_feedback",
       "hypothesis": "Athena 컨텍스트에 자기 stance 별 지수 대비 성적(stance_track_record)과 bullish 문턱 규칙을 주면, KR bullish 도시에의 20일 지수 대비 초과수익이 neutral 보다 낮지 않게 된다 (변경 전 bullish−neutral = −3.55%p).",
       "metric": "dossier.KR.bullish_minus_neutral_excess_pp",
-      "kill_if": "메모: prompt_rev 한정 KR bullish 에피소드 n>=30 에서 bullish−neutral 차이 < 0 이면 kill → config athena.stance_feedback:false 로 끔. 측정: scripts/stance_report.py --prompt-rev cb15d43e3420",
+      "kill_if": "메모: prompt_rev 한정 KR bullish 에피소드 n>=30 에서 bullish−neutral 차이 < 0 이면 kill → config athena.stance_feedback:false 로 끔. 측정: scripts/stance_report.py --prompt-rev cb15d43e3420 | 10-05 밤 피드백 OFF(데이터 연결 효과 분리) — 같은 판본이라도 stance_feedback=true 도시에만 채점.",
       "kill": {
         "metric": "dossier.KR.bullish_minus_neutral_excess_pp",
         "op": "<",
@@ -49,7 +49,10 @@
         "same_day_paired": "bullish vs 비bullish 같은 날 −4.97%p(23일, 78% 날에서 열위), 08-23~09-11"
       },
       "evidence_n": 71,
-      "evidence_note": "사전 표본 = 변경 전 KR bullish 에피소드 수. 사후 판정은 prompt_rev 한정 표본으로 apply_kill_rules."
+      "evidence_note": "사전 표본 = 변경 전 KR bullish 에피소드 수. 사후 판정은 prompt_rev 한정 표본으로 apply_kill_rules.",
+      "evidence_match": {
+        "stance_feedback": true
+      }
     }
   ]
 }
