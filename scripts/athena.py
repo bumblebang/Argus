@@ -28,7 +28,7 @@ from src.logging_setup import setup_logging, get_logger
 from src.engine.store import Store
 from src.agents.athena import run_batch
 from src.universe_roll import sort_core_by_turnover
-from src.agents.llm import ClaudeCLIClient, MockLLM
+from src.agents.llm import ClaudeCLIClient, MockLLM, claude_lean_for
 from src.agents.schemas import DossierLevelOutput, DossierOutput
 from src.datasources.history import fetch_history
 
@@ -113,7 +113,8 @@ def main() -> int:
         llm = ClaudeCLIClient(command=a.get("claude_command", "claude"),
                               model=(acfg.get("model") or "sonnet"),
                               timeout=int(acfg.get("timeout", 240)),
-                              fallback_model=(a.get("claude_fallback_model") or None))
+                              fallback_model=(a.get("claude_fallback_model") or None),
+                              lean=claude_lean_for(a, "athena"))
 
     ms = (json.loads((DATA / "market_state.json").read_text(encoding="utf-8"))
           if (DATA / "market_state.json").exists() else {})

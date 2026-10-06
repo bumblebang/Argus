@@ -156,3 +156,23 @@ def test_sample_cases_stratifies_bullish(tmp_path):
     assert sum(c["live_stance"] == "bullish" for c in cases) == 2   # 절반까지 bullish
     # asof 는 시장 현지 날짜 — KST 6/5 12시 = 뉴욕 6/4
     assert all(c["asof"] == "2026-06-04" and "live_excess_pp" in c for c in cases)
+
+
+def test_lean_arm_uses_lean_llm_and_scores_agreement(tmp_path):
+    _hist(tmp_path)
+    cases = [{"symbol": "111111", "market": "KR", "asof": "2026-07-20",
+              "live_stance": "neutral", "live_excess_pp": 1.0}]
+    out = tmp_path / "r.jsonl"
+    main, lean = _llm(), _llm()
+    lean.calls.append({"marker": "pre"})               # 경량 쪽 계측 분리 확인용
+    r = ar.run_cases(cases, llm=main, data_dir=tmp_path, out_path=out,
+                     arms=("inputs", "inputs_lean"), inputs=_FakeInputs(), llm_lean=lean)
+    assert r["calls"] == 2
+    rows = ar.load_results(out)
+    assert {x["arm"] for x in rows} == {"inputs", "inputs_lean"}
+    assert all(x["inputs"]["fundamentals"] for x in rows)   # 같은 컨텍스트(inputs)
+    rep = ar.score_results(rows, data_dir=tmp_path)
+    assert rep["lean_agreement"]["inputs"] == {"agree": 1, "n": 1, "conv_diff_abs": 0.0}
+    with pytest.raises(ValueError):
+        ar.run_cases(cases, llm=main, data_dir=tmp_path, out_path=tmp_path / "x.jsonl",
+                     arms=("base_lean",))

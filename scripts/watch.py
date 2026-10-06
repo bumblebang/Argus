@@ -68,7 +68,7 @@ from src.agents.pipeline import (CycleRunner, select_backend, build_live_llm,
                                  synth_candles, history_candles_1y, dry_llm_factory,
                                  build_paper_core,
                                  entry_stop_target, sector_map_from_items)
-from src.agents.llm import ClaudeCLIClient
+from src.agents.llm import ClaudeCLIClient, claude_lean_for
 from src.agents.value_trade import ValueRunner, value_trade_cfg
 from src.broker_sync import (apply_reconcile_from_live,
                              fetch_live_account_data, halt_after_live_sync_failure,
@@ -261,7 +261,8 @@ def _build_value_worker(cfg, gateway, store, broker, risk, args) -> BrainWorker 
         dec_llm = ClaudeCLIClient(command=acfg.get("claude_command", "claude"),
                                   model=vt["model"], timeout=vt["timeout"],
                                   fallback_model=(acfg.get("claude_fallback_model") or None),
-                                  error_dump_path="data/value_trade_cli_error.json")
+                                  error_dump_path="data/value_trade_cli_error.json",
+                                  lean=claude_lean_for(acfg, "value_trade"))
         # 검증 LLM: 브레인의 val 구성 방식(claude_val_model, 독립 티어). 미설정이면 결정과 공유.
         val_model = acfg.get("claude_val_model")
         val_llm = dec_llm

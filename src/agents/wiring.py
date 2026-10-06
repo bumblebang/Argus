@@ -21,6 +21,7 @@ from ..risk_gate import RiskGate, warn_capital_coverage
 from ..sector_taxonomy import normalize_sector
 from ..broker import Broker
 from ..datasources.earnings import dday_of
+from .llm import claude_lean_for
 from . import (LLMClient, ClaudeCLIClient, MockLLM,
                FileInboxLLM,
                DecisionOutput, ValidationOutput, Proposal, ValidationVerdict)
@@ -429,7 +430,8 @@ def build_live_llm(cfg: AppConfig, *, use_cli: bool, subscription: bool,
                                model=(model_override or a.get("claude_model") or None),
                                timeout=int(a.get("claude_timeout", 120)),
                                fallback_model=(a.get("claude_fallback_model") or None),
-                               cursor_bridge=bridge, **opts)
+                               cursor_bridge=bridge, lean=claude_lean_for(a, "brain"),
+                               **opts)
     return LLMClient(model=(model_override or a.get("model", "claude-opus-4-8")),
                      api_key=api_key, subscription=subscription,
                      thinking=bool(a.get("thinking", True)),

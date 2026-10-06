@@ -19,7 +19,7 @@ sys.path.insert(0, str(ROOT))
 
 from src.config import load_config
 from src.logging_setup import setup_logging, get_logger
-from src.agents.llm import ClaudeCLIClient, MockLLM
+from src.agents.llm import ClaudeCLIClient, MockLLM, claude_lean_for
 from src.public_brief import BRIEF_PATH, PublicBrief, generate, load_brief
 
 log = get_logger("public_brief.cli")
@@ -94,7 +94,8 @@ def refresh_brief(*, force: bool = False, dry: bool = False) -> dict:
                               model=pcfg["brief_model"],
                               timeout=pcfg["brief_timeout"],
                               fallback_model=(a.get("claude_fallback_model") or None),
-                              error_dump_path="data/public_brief_cli_error.json")
+                              error_dump_path="data/public_brief_cli_error.json",
+                              lean=claude_lean_for(a, "public_brief"))
 
     brief = generate(llm, _market_state(), _dossier_stances())
     if brief is None:

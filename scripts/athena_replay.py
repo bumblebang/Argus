@@ -69,7 +69,7 @@ def _in_athena_window(cfg_raw: dict, now: datetime | None = None) -> bool:
     return False
 
 
-def _llm(cfg_raw: dict, *, dry: bool):
+def _llm(cfg_raw: dict, *, dry: bool, lean: bool = False):
     if dry:
         from src.agents.llm import MockLLM
         from src.agents.schemas import DossierOutput
@@ -90,7 +90,8 @@ def _llm(cfg_raw: dict, *, dry: bool):
     return ar.usage_cli_client(
         ClaudeCLIClient, command=a.get("claude_command", "claude"),
         model=(acfg.get("model") or "sonnet"), timeout=int(acfg.get("timeout", 240)),
-        fallback_model=None, error_dump_path=OUT / "cli_error.json")
+        fallback_model=None, error_dump_path=OUT / "cli_error.json",
+        lean=lean, lean_dir=OUT / "llm_lean")
 
 
 def cmd_probe(args, cfg) -> int:
@@ -127,7 +128,7 @@ def cmd_run(args, cfg) -> int:
         return 1
     inputs = None
     arms = tuple(a for a in args.arms.split(",") if a)
-    if "inputs" in arms:
+    if any(a.split("_")[0] == "inputs" for a in arms):
         from src.agents.athena_inputs import AthenaInputs
         inputs = AthenaInputs.load(DATA, connect_krx=not args.dry)
     names = {}
@@ -139,17 +140,23 @@ def cmd_run(args, cfg) -> int:
     except Exception:
         pass
     llm = _llm(cfg.raw, dry=args.dry)
+    llm_lean = (_llm(cfg.raw, dry=args.dry, lean=True)
+                if any(a.endswith(ar.LEAN_SUFFIX) for a in arms) else None)
     stop = None if (args.dry or args.force) else (lambda: _in_athena_window(cfg.raw))
     res = ar.run_cases(cases, llm=llm, data_dir=DATA, out_path=rpath, arms=arms,
-                       inputs=inputs, limit=args.limit, stop_fn=stop, names=names)
+                       inputs=inputs, limit=args.limit, stop_fn=stop, names=names,
+                       llm_lean=llm_lean)
     print("실행:", res)
-    _print_tokens(llm.calls)
+    _print_tokens(llm.calls, "현행")
+    if llm_lean is not None:
+        _print_tokens(llm_lean.calls, "경량")
     return 0
 
 
-def _print_tokens(calls: list[dict]) -> None:
+def _print_tokens(calls: list[dict], label: str = "") -> None:
     if not calls:
         return
+    print(f"[{label}]", end=" ")
     tot = {k: sum(int(c.get(k) or 0) for c in calls)
            for k in ("input_tokens", "cache_creation_input_tokens",
                      "cache_read_input_tokens", "output_tokens")}
@@ -186,7 +193,8 @@ def main() -> int:
     r = sub.add_parser("run")
     r.add_argument("--tag", required=True)
     r.add_argument("--limit", type=int, default=4, help="이번 실행 최대 LLM 콜")
-    r.add_argument("--arms", default="base,inputs")
+    r.add_argument("--arms", default="base,inputs",
+                   help="base,inputs 와 *_lean(같은 컨텍스트를 경량 CLI 로) 조합")
     r.add_argument("--dry", action="store_true")
     r.add_argument("--force", action="store_true")
     c = sub.add_parser("score")

@@ -26,6 +26,14 @@ from .labels import asof_local_date, symbol_market
 log = get_logger("eval.athena_replay")
 
 ARMS = ("base", "inputs")
+LEAN_SUFFIX = "_lean"          # "inputs_lean" = inputs 컨텍스트를 경량 CLI 로 판정
+
+
+def split_arm(arm: str) -> tuple[str, bool]:
+    """"inputs_lean" → ("inputs", True)."""
+    if arm.endswith(LEAN_SUFFIX):
+        return arm[: -len(LEAN_SUFFIX)], True
+    return arm, False
 
 
 # ── 표본 ──────────────────────────────────────────────────────────
@@ -127,8 +135,8 @@ def usage_cli_client(base_cls, **kw):
             self.base_args = [*self.base_args, "--output-format", "json"]
             self.calls: list[dict] = []
 
-        def _invoke(self, prompt: str, model: str | None) -> str:
-            raw = super()._invoke(prompt, model)
+        def _invoke(self, prompt: str, model: str | None, *a, **k) -> str:
+            raw = super()._invoke(prompt, model, *a, **k)
             try:
                 data = json.loads(raw)
             except ValueError:
@@ -166,11 +174,11 @@ def _done_keys(out_path: Path) -> set[tuple[str, str, str]]:
 def run_cases(cases: list[dict], *, llm, data_dir: Path | str, out_path: Path,
               arms: tuple[str, ...] = ARMS, inputs: Any = None, limit: int | None = None,
               stop_fn: Callable[[], bool] | None = None,
-              names: dict[str, str] | None = None) -> dict:
+              names: dict[str, str] | None = None, llm_lean=None) -> dict:
     """case × arm 판정 → out_path jsonl 에 한 줄씩(이어하기 지원). 반환: 이번 실행 요약."""
     from ..agents.athena import ATHENA_PROMPT_REV, AthenaAgent, sanitize
 
-    agent = AthenaAgent(llm)
+    agents = {False: AthenaAgent(llm), True: AthenaAgent(llm_lean) if llm_lean else None}
     done = _done_keys(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     n_calls, n_fail, n_skip = 0, 0, 0
@@ -183,12 +191,17 @@ def run_cases(cases: list[dict], *, llm, data_dir: Path | str, out_path: Path,
                 return {"calls": n_calls, "failed": n_fail, "skipped": n_skip, "stopped": "limit"}
             if stop_fn and stop_fn():
                 return {"calls": n_calls, "failed": n_fail, "skipped": n_skip, "stopped": "window"}
-            ctx = build_case_context(case, arm, data_dir=data_dir, inputs=inputs,
+            ctx_arm, lean = split_arm(arm)
+            agent = agents[lean]
+            if agent is None:
+                raise ValueError(f"{arm}: 경량 LLM(llm_lean) 이 필요하다")
+            cur_llm = llm_lean if lean else llm
+            ctx = build_case_context(case, ctx_arm, data_dir=data_dir, inputs=inputs,
                                      name=(names or {}).get(case["symbol"]))
             if ctx is None:
                 n_skip += 1
                 continue
-            before = len(getattr(llm, "calls", []))
+            before = len(getattr(cur_llm, "calls", []))
             t0 = time.time()
             row = {**case, "arm": arm, "prompt_rev": ATHENA_PROMPT_REV,
                    "ctx_bytes": len(json.dumps(ctx, ensure_ascii=False)),
@@ -207,7 +220,7 @@ def run_cases(cases: list[dict], *, llm, data_dir: Path | str, out_path: Path,
                 row["error"] = str(e)[:300]
                 n_fail += 1
             row["elapsed_s"] = round(time.time() - t0, 1)
-            row["usage"] = getattr(llm, "calls", [])[before:]
+            row["usage"] = getattr(cur_llm, "calls", [])[before:]
             with open(out_path, "a", encoding="utf-8") as f:
                 f.write(json.dumps(row, ensure_ascii=False) + "\n")
     return {"calls": n_calls, "failed": n_fail, "skipped": n_skip, "stopped": None}
@@ -250,16 +263,38 @@ def score_results(rows: list[dict], *, data_dir: Path | str, cfg: dict | None = 
                 a = agree_live.setdefault(arm, [0, 0])
                 a[0] += int(c[arm] == c["live"])
                 a[1] += 1
-    tok = {"calls": 0, "input": 0, "cache_create": 0, "cache_read": 0, "output": 0, "cost_usd": 0.0}
-    for r in rows:
-        for u in r.get("usage") or []:
-            tok["calls"] += 1
-            tok["input"] += int(u.get("input_tokens") or 0)
-            tok["cache_create"] += int(u.get("cache_creation_input_tokens") or 0)
-            tok["cache_read"] += int(u.get("cache_read_input_tokens") or 0)
-            tok["output"] += int(u.get("output_tokens") or 0)
-            tok["cost_usd"] += float(u.get("cost_usd") or 0)
-    tok["cost_usd"] = round(tok["cost_usd"], 4)
+    def _tok(rs: list[dict]) -> dict:
+        t = {"calls": 0, "input": 0, "cache_create": 0, "cache_read": 0, "output": 0,
+             "cost_usd": 0.0}
+        for r in rs:
+            for u in r.get("usage") or []:
+                t["calls"] += 1
+                t["input"] += int(u.get("input_tokens") or 0)
+                t["cache_create"] += int(u.get("cache_creation_input_tokens") or 0)
+                t["cache_read"] += int(u.get("cache_read_input_tokens") or 0)
+                t["output"] += int(u.get("output_tokens") or 0)
+                t["cost_usd"] += float(u.get("cost_usd") or 0)
+        t["cost_usd"] = round(t["cost_usd"], 4)
+        return t
+
+    tok = _tok(rows)
+    tok_by_arm = {arm: _tok([r for r in rows if r["arm"] == arm])
+                  for arm in sorted({r["arm"] for r in rows})}
+    # 경량 CLI 검증 — 같은 case·같은 컨텍스트에서 현행 vs 경량 판정 일치
+    lean_agree: dict[str, dict] = {}
+    by_case_arm = {(r["symbol"], r["asof"], r["arm"]): r for r in rows}
+    for (sym, asof, arm), r in by_case_arm.items():
+        if arm.endswith(LEAN_SUFFIX):
+            continue
+        rl = by_case_arm.get((sym, asof, arm + LEAN_SUFFIX))
+        if not rl:
+            continue
+        a = lean_agree.setdefault(arm, {"agree": 0, "n": 0, "conv_diff_abs": 0.0})
+        a["n"] += 1
+        a["agree"] += int(r["stance"] == rl["stance"])
+        a["conv_diff_abs"] += abs(float(r.get("conviction") or 0) - float(rl.get("conviction") or 0))
+    for a in lean_agree.values():
+        a["conv_diff_abs"] = round(a["conv_diff_abs"] / a["n"], 3) if a["n"] else None
     return {"n_cases": len(cases), "by_arm": by_arm, "base_to_inputs": flips,
             "agree_with_live": {k: {"agree": v[0], "n": v[1]} for k, v in agree_live.items()},
-            "tokens": tok}
+            "tokens": tok, "tokens_by_arm": tok_by_arm, "lean_agreement": lean_agree}
