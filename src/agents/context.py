@@ -6,7 +6,6 @@ market_state(시황·재무·수급·심리·매크로·뉴스) + 후보 종목 
 from __future__ import annotations
 
 import json
-import os
 import time
 from collections import Counter
 from datetime import datetime, timezone
@@ -157,11 +156,11 @@ def select_headlines(news: list[dict], *,
                      candidates: list[dict] | None = None,
                      ttl_hours: float = _DEFAULT_HEADLINE_TTL_HOURS,
                      focus_macro_pad: int = _DEFAULT_FOCUS_MACRO_PAD,
-                     notify_trim: bool = True,
+                     notify_trim: bool = False,
                      now_ts: float | None = None) -> list[dict]:
     """티어별 headlines 선택.
 
-    scan: TTL 필터 후 배치 순서 상한(기본 200). 초과 시 notify_trim 이면 ntfy.
+    scan: TTL 필터 후 배치 순서 상한(기본 200). 초과 시 notify_trim 이면 로그만.
     focus: global 은 macro 위주(종목 뉴스는 candidates[].news·온디맨드).
       KR focus → macro_kr 우선 + macro_us pad(기본 8). US 종목 헤드라인 제외.
     """
@@ -211,8 +210,7 @@ def _trim_news(news: list[dict], *, limit: int = HEADLINE_LIMIT) -> list[dict]:
 
 
 def _notify_headline_trim(total: int, limit: int) -> None:
-    """헤드라인이 한도에 잘렸을 때 로그 + ntfy(토픽 없으면 로그만). 6h 쿨다운."""
-    log.warning("헤드라인 한도 초과 — 전체 %d건 중 앞 %d건만 뇌에 전달", total, limit)
+    """헤드라인이 한도에 잘렸을 때 로그만(푸시 알림 없음). 6h 쿨다운."""
     now = time.time()
     try:
         prev = json.loads(_TRIM_STATE.read_text(encoding="utf-8"))
@@ -222,18 +220,7 @@ def _notify_headline_trim(total: int, limit: int) -> None:
     last_total = prev.get("total")
     if last_ts and (now - last_ts) < _TRIM_COOLDOWN_SEC and last_total == total:
         return
-    topic = (os.getenv("NTFY_TOPIC") or "").strip()
-    if topic:
-        try:
-            import requests
-            msg = (f"뇌 headlines 한도 초과: 전체 {total}건 → {limit}건만 전달. "
-                   f"한도 상향 또는 소스 축소를 검토하세요.")
-            requests.post(f"https://ntfy.sh/{topic}",
-                          data=msg.encode("utf-8"),
-                          headers={"Title": "Argus headlines trim"},
-                          timeout=5)
-        except Exception as e:
-            log.warning("헤드라인 잘림 ntfy 실패: %s", e)
+    log.warning("헤드라인 한도 초과 — 전체 %d건 중 앞 %d건만 뇌에 전달", total, limit)
     try:
         _TRIM_STATE.parent.mkdir(parents=True, exist_ok=True)
         _TRIM_STATE.write_text(json.dumps(
@@ -364,7 +351,7 @@ def build_context(market_state: dict, candidates: list[dict], portfolio: dict,
                   headline_limit: int | None = None,
                   headline_ttl_hours: float = _DEFAULT_HEADLINE_TTL_HOURS,
                   focus_macro_pad: int = _DEFAULT_FOCUS_MACRO_PAD,
-                  notify_headline_trim: bool = True,
+                  notify_headline_trim: bool = False,
                   compact: bool = False,
                   now_ts: float | None = None,
                   strategy_scores_asof: float | None = None,
@@ -379,7 +366,7 @@ def build_context(market_state: dict, candidates: list[dict], portfolio: dict,
     regime_flip/disclosure 등. 없으면 정기 각성으로 보면 된다.
     tier: scan | focus — headlines 선택 정책.
     headline_limit: None 이면 scan=HEADLINE_LIMIT, focus=12(macro). 0 이면 focus global off.
-    notify_headline_trim: focus 기본 False(config).
+    notify_headline_trim: True 면 한도 초과 시 로그만(푸시 알림 없음). 기본 False.
     compact: True 면 indent 없이 직렬화(토큰/바이트 절약, meaning 동일).
     """
     ms = market_state or {}

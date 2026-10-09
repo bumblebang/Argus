@@ -472,6 +472,7 @@ def _start_reconcile_timer(broker, gateway, store, cfg, markets,
                 expect_gen=gen, cash_markets=sorted((data.get("cash") or {}).keys()))
             if (res.get("adopted") or res.get("closed") or res.get("error")
                     or res.get("attributed") or res.get("deferred_sell_symbols")
+                    or res.get("external_cash")
                     or not res.get("cash_ok", True)
                     or not res.get("holdings_ok", True)):
                 store.log_event("reconcile", None, res)

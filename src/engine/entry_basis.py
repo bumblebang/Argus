@@ -13,8 +13,10 @@
 
 **전략 신호 청산이 켜지는 조건은 basis=signal 하나뿐이다**(대칭). 나머지는 신호가
 떠도 팔지 않고 뇌를 깨워 논거를 재평가한다(loop 의 strategy_signal 트리거).
-예외로 horizon 이 day/close_scan 이면 basis 와 무관하게 켠다 — 코드가 당일 안에
-자기가 연 자리를 자기가 닫는 트랙이고 세션 종료 강제청산과 짝이기 때문이다.
+예외로 horizon 이 day 이면 basis 와 무관하게 켠다 — 코드가 당일 안에 자기가 연
+자리를 자기가 닫는 트랙이고 세션 종료 강제청산과 짝이기 때문이다.
+close_scan 은 예외에서 뺀다(2026-10-08 103590): 익일 close_scan_exit 가 정답인데
+볼린저 등 배정 라벨 신호가 당일 즉시 매도하던 사고.
 
 전략 라벨(`positions.strategy`)과 파라미터는 그대로 둔다 — 손절폭 계산
 (wiring.combine_stop_target)과 성과 측정(strategy_stats)이 그 값을 쓴다. 여기서
@@ -34,8 +36,9 @@ BASIS_ORPHAN = "orphan"
 KNOWN_BASES = frozenset({BASIS_SIGNAL, BASIS_ZONE, BASIS_THESIS,
                          BASIS_VALUE, BASIS_ORPHAN})
 
-# basis 와 무관하게 신호 청산을 켜는 보유기간(코드 소유 트랙).
-SIGNAL_EXIT_HORIZONS = frozenset({"day", "close_scan"})
+# basis 와 무관하게 신호 청산을 켜는 보유기간(코드 소유·당일 청산 트랙).
+# close_scan 제외 — 익일 close_scan_exit 전용(당일 전략신호 매도 금지).
+SIGNAL_EXIT_HORIZONS = frozenset({"day"})
 
 
 def meta_of(pos: dict | None) -> dict:
@@ -90,7 +93,7 @@ def signal_exit_allowed(pos: dict | None) -> tuple[bool, str]:
 class SignalExitConfig:
     """전략 신호 청산의 공통 가드.
 
-    bind_to_entry_basis: basis=signal(+day/close_scan) 에만 신호 청산 허용.
+    bind_to_entry_basis: basis=signal(+day) 에만 신호 청산 허용.
       False 면 구 동작(라벨만 있으면 청산) — 롤백 스위치.
     min_hold_sec: 진입 후 이 시간 안에는 **신호** 청산 금지. 손절/목표(ExitExecutor)와
       세션 종료 청산은 이 가드와 무관하게 즉시 작동한다.

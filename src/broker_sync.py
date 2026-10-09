@@ -90,15 +90,19 @@ def _note_external_cash(account, new_cash: dict, new_pos: dict,
     return noted
 
 
-def _working_buy_hold(store) -> dict[str, float]:
-    """접수 확인된 미결 BUY 잔량×주문가(시장별) — 증권사가 매수여력에서 묶은 금액 추정.
+def _working_buy_hold(store, *, for_equity: bool = True) -> dict[str, float]:
+    """미결 BUY 잔량×주문가(시장별).
 
-    local:(접수 불명)·UNKNOWN·QUARANTINED 는 넣지 않는다 — 홀드가 없을 수도 있는
-    행을 영구히 자산에 더하면 일손실 게이트가 헐거워진다.
+    for_equity=True (기본): 접수 확인된 PENDING 계열만 — 홀드가 없을 수도 있는
+    local/UNKNOWN/QUARANTINED 를 equity 에 더하면 일손실 게이트가 헐거워진다.
+
+    for_equity=False (입출금 판정 skip): 미종결 BUY 전부 — 상태 표기 흔들림·UNKNOWN
+    창에서 매수여력 감소를 '출금'으로 오인해 start_cash/SoD 를 깎는 쪽이 더 위험
+    (09-30 −298,845 · 10-02 ISC −412,061 재발).
     """
     if store is None:
         return {}
-    from .broker import _PENDING, _is_local_order_id
+    from .broker import _PENDING, _TERMINAL, _is_local_order_id
     try:
         rows = store.get_working_orders(side="BUY", settled=False) or []
     except Exception as e:
@@ -106,10 +110,16 @@ def _working_buy_hold(store) -> dict[str, float]:
         return {}
     out: dict[str, float] = {}
     for row in rows:
-        if _is_local_order_id(row.get("order_id")):
-            continue
-        if str(row.get("status") or "").upper() not in _PENDING:
-            continue
+        status = str(row.get("status") or "").upper()
+        if for_equity:
+            if _is_local_order_id(row.get("order_id")):
+                continue
+            if status not in _PENDING:
+                continue
+        else:
+            # 입출금 skip: 종결 상태만 제외. local·UNKNOWN 도 현금↓ 창을 막는다.
+            if status in _TERMINAL:
+                continue
         try:
             done = max(float(row.get("filled_qty") or 0.0),
                        float(row.get("applied_qty") or 0.0))
@@ -125,17 +135,20 @@ def _working_buy_hold(store) -> dict[str, float]:
 
 
 def _hold_markets(account, store) -> set[str]:
-    """이번 재대사 창에 BUY 홀드가 있거나(지금) 있었던(직전) 시장."""
+    """이번 재대사 창에 BUY 홀드가 있거나(지금) 있었던(직전) 시장.
+
+    입출금 오인 방지용 — equity cash_hold 보다 넓게(UNKNOWN·local 포함).
+    """
     prev = {str(m).upper() for m, v in (getattr(account, "cash_hold", None) or {}).items()
             if float(v or 0) > 0}
-    return prev | set(_working_buy_hold(store))
+    return prev | set(_working_buy_hold(store, for_equity=False))
 
 
 def _refresh_cash_hold(account, store, markets) -> None:
     """cash 를 덮은 시장의 홀드 추정을 갱신 — equity 가 홀드만큼 빠져 보이지 않게."""
     if not hasattr(account, "cash_hold"):
         return
-    now = _working_buy_hold(store)
+    now = _working_buy_hold(store, for_equity=True)
     for m in markets or ():
         mk = str(m).upper()
         if now.get(mk, 0.0) > 0:

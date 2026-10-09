@@ -63,7 +63,11 @@ def serve_cfg(agents_cfg: dict | None) -> dict:
             if raw.get("focus_headline_limit") is not None else 12),
         "focus_macro_pad": int(raw.get("focus_macro_pad", 8)),
         "headline_ttl_hours": float(raw.get("headline_ttl_hours", 24)),
-        "focus_trim_notify": bool(raw.get("focus_trim_notify", False)),
+        # 헤드라인 한도 초과 시 푸시 알림 안 함(로그만). focus_trim_notify 는 구키 호환.
+        "headline_trim_notify": bool(raw.get(
+            "headline_trim_notify", raw.get("focus_trim_notify", False))),
+        "focus_trim_notify": bool(raw.get(
+            "headline_trim_notify", raw.get("focus_trim_notify", False))),
         "focus_reasons": fr,
         "compact_json": bool(raw.get("compact_json", True)),
         "enrich_fundamentals": bool(raw.get("enrich_fundamentals", True)),

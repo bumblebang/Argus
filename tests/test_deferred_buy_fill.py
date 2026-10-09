@@ -321,6 +321,27 @@ def test_pending_buy_hold_is_not_withdrawal_and_equity_kept(tmp_path):
     assert acct.cash_hold["KR"] == 298_600
     # equity 가 주문금액만큼 빠져 보이지 않는다(홀드 수수료 여유 245 만 차이)
     assert abs(acct.equity("KR") - 2_000_000) < 300
+    assert abs(acct.start_cash["KR"] - 2_000_000) < 1
+
+
+def test_unknown_buy_is_not_withdrawal_even_if_equity_hold_skipped(tmp_path):
+    """UNKNOWN BUY: equity cash_hold 는 안 잡되, 입출금 판정은 skip (start_cash 보호).
+
+    get_order 상태 누락·표기 흔들림으로 PENDING→UNKNOWN 이 되면, 예전엔 매수여력
+    감소를 출금으로 오인해 원금대비 수익률이 부풀었다(10-02 ISC).
+    """
+    store, acct = Store(tmp_path / "t.db"), _acct_sod(tmp_path)
+    base = acct.ensure_sod_equity("KR")
+    seed = acct.start_cash["KR"]
+    store.upsert_working_order(
+        order_id="H1", symbol=SYM, market="KR", side="BUY", qty=2, price=206_000,
+        status="UNKNOWN", filled_qty=0)
+    data = {"cash": {"KR": 2_000_000 - 412_061}, "holdings_ok": True, "items": []}
+    res = apply_reconcile_from_live(acct, store, data, markets=("KR",))
+    assert res["external_cash"] == {}
+    assert acct.start_cash["KR"] == seed
+    assert acct.ensure_sod_equity("KR") == base
+    assert acct.cash_hold == {}          # equity 가산은 보수적으로 비움
 
 
 def test_hold_release_after_cancel_is_not_deposit(tmp_path):
@@ -339,6 +360,7 @@ def test_hold_release_after_cancel_is_not_deposit(tmp_path):
     assert res["external_cash"] == {}
     assert acct.ensure_sod_equity("KR") == base
     assert acct.cash_hold == {}
+    assert abs(acct.start_cash["KR"] - 2_000_000) < 1
 
 
 def test_real_withdrawal_still_detected_without_hold(tmp_path):
@@ -347,6 +369,7 @@ def test_real_withdrawal_still_detected_without_hold(tmp_path):
         acct, store, {"cash": {"KR": 1_500_000}, "holdings_ok": True, "items": []},
         markets=("KR",))
     assert res["external_cash"] == {"KR": -500_000}
+    assert acct.start_cash["KR"] == 1_500_000
 
 
 # ── 7) 밸류 계획: 하드손절 %·적정가 목표 ─────────────────────────────────────

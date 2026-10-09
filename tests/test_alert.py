@@ -156,6 +156,26 @@ def test_actions_for_heartbeat_auth_circuit():
     assert "미무장" in body
 
 
+def test_quarantine_renotify_is_3h_not_5min():
+    """격리 잔존 재푸시는 3시간. 첫 발화·사유 변경은 호출측 should_fire 가 담당."""
+    reasons = ["격리(QUARANTINED) 주문 심볼: 103590"]
+    due0, has_q, has_o = ac.unresolved_renotify_due(
+        reasons, NOW, last_quarantine_push=0)
+    assert due0 and has_q and not has_o
+    due_soon, _, _ = ac.unresolved_renotify_due(
+        reasons, NOW + 600, last_quarantine_push=NOW)
+    assert due_soon is False
+    due_later, _, _ = ac.unresolved_renotify_due(
+        reasons, NOW + 3 * 3600, last_quarantine_push=NOW)
+    assert due_later is True
+    # HALT 등 기타 미해소는 300s 유지
+    halt = ["전역 HALT 활성 — BUY/SELL 전부 차단"]
+    assert ac.unresolved_renotify_due(
+        halt, NOW + 299, last_unresolved_push=NOW)[0] is False
+    assert ac.unresolved_renotify_due(
+        halt, NOW + 300, last_unresolved_push=NOW)[0] is True
+
+
 def test_ops_card_html_renders():
     import dashboard as dash
     html = dash._ops_card_html({

@@ -611,7 +611,8 @@ class CycleRunner:
         compact = bool(scfg.get("compact_json")) and tier == "focus"
         wake_ctx = (wake if wake and (wake.get("reason") or wake.get("triggers"))
                     else None)
-        notify_hl = bool(scfg.get("focus_trim_notify", False)) if tier == "focus" else True
+        notify_hl = bool(scfg.get(
+            "headline_trim_notify", scfg.get("focus_trim_notify", False)))
         context = build_context(ms, candidates, portfolio, constraints,
                                 track_record=(track_record(self.store)
                                               if self.store else None),
