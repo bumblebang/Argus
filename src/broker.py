@@ -280,6 +280,8 @@ class Broker:
         self._inflight: dict[str, Reservation] = {}
         # upsert_working_order 실패 시 메모리에 남겨 심볼 양방향 차단 + heartbeat 노출.
         self._register_failed_symbols: set[str] = set()
+        # 이미 QUARANTINED 행의 quarantine_alert 이벤트 스로틀(종목:oid → last emit ts).
+        self._quarantine_alert_ts: dict[str, float] = {}
         # 예약이 새면 매수가 영구히 막히므로 TTL 로 강제 회수(+경보). 0 이하면 비활성.
         self.reservation_ttl_sec = float(reservation_ttl_sec)
         # 미체결 주문 방치 시간. 넘으면 취소한다. 0 이면 즉시 취소, 음수면 취소 안 함.
@@ -627,14 +629,18 @@ class Broker:
         oid = row["order_id"]
         status = str(row.get("status") or "").upper()
         if status == "QUARANTINED":
-            # 이미 격리 — prune 재호출 시 이벤트 노이즈 방지. 경보만 주기적으로.
+            # 이미 격리 — prune 재호출 시 이벤트 노이즈 방지. 경보만 주기적으로(3h).
             age = self._working_age(row, now)
             log.error("[미체결 격리 유지] %s %s (id=%s, %.0f초, %s)",
                       row.get("side"), row.get("symbol"), oid, age, why)
-            self._emit_symbol("working_order_quarantine_alert", row.get("symbol"), {
-                "order_id": oid, "side": row.get("side"), "qty": row.get("qty"),
-                "price": row.get("price"), "filled_qty": row.get("filled_qty"),
-                "status": "QUARANTINED", "age_sec": round(age, 1), "why": why})
+            key = f"{row.get('symbol')}:{oid}"
+            last = float(self._quarantine_alert_ts.get(key) or 0)
+            if now - last >= 3 * 3600:
+                self._quarantine_alert_ts[key] = now
+                self._emit_symbol("working_order_quarantine_alert", row.get("symbol"), {
+                    "order_id": oid, "side": row.get("side"), "qty": row.get("qty"),
+                    "price": row.get("price"), "filled_qty": row.get("filled_qty"),
+                    "status": "QUARANTINED", "age_sec": round(age, 1), "why": why})
             return
         age = self._working_age(row, now)
         log.error("[미체결 격리] %s %s x%s @ %s (id=%s, %.0f초, %s) — QUARANTINED",

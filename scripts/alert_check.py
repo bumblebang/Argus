@@ -61,7 +61,36 @@ ALERTS_LOG = ROOT / "data" / "alerts.jsonl"
 _PUSH_STATE = ROOT / "data" / "alert_push_state.json"
 
 HB_STALE_SEC = 300
+# 미해소(미확인·pause/HALT·sync) 재푸시. 격리는 잔존 스팸이 커서 별도 텀.
+UNRESOLVED_RENOTIFY_SEC = 300
+QUARANTINE_RENOTIFY_SEC = 3 * 3600  # 격리(QUARANTINED) 잔존 재통지 3시간
 _SEOUL = ZoneInfo("Asia/Seoul")
+
+
+def _is_quarantine_reason(r: str) -> bool:
+    return "격리" in r
+
+
+def _is_other_unresolved_reason(r: str) -> bool:
+    if _is_quarantine_reason(r):
+        return False
+    return (("미확인" in r) or ("등록실패" in r) or ("pause" in r)
+            or ("HALT" in r) or ("sync 불량" in r))
+
+
+def unresolved_renotify_due(
+        reasons: list[str], now: float, *,
+        last_unresolved_push: float = 0.0,
+        last_quarantine_push: float = 0.0,
+        unresolved_sec: float = UNRESOLVED_RENOTIFY_SEC,
+        quarantine_sec: float = QUARANTINE_RENOTIFY_SEC,
+) -> tuple[bool, bool, bool]:
+    """(due, has_quarantine, has_other_unresolved). 격리는 3h, 그 외 미해소는 300s."""
+    has_q = any(_is_quarantine_reason(r) for r in reasons)
+    has_o = any(_is_other_unresolved_reason(r) for r in reasons)
+    q_due = has_q and (now - float(last_quarantine_push or 0) >= quarantine_sec)
+    o_due = has_o and (now - float(last_unresolved_push or 0) >= unresolved_sec)
+    return (q_due or o_due), has_q, has_o
 
 # 인증 만료 마커(DB 폴백용). 세션/주간 한도와 구분.
 _AUTH_MARKERS = ("access token", "oauth", "expired", "authenticate",
@@ -514,12 +543,11 @@ def main() -> int:
     prev_reasons = list(prev.get("reasons") or [])
     prev_push_ok = prev.get("push_ok", True)
     last_unresolved_push = float(prev.get("last_unresolved_push") or 0)
-    unresolved = any(
-        ("미확인" in r) or ("격리" in r) or ("등록실패" in r) or ("pause" in r)
-        or ("HALT" in r) or ("sync 불량" in r)
-        for r in reasons)
-    # 미해소 주문·pause/HALT 는 300초마다 재통지.
-    unresolved_due = unresolved and (now - last_unresolved_push >= 300)
+    last_quarantine_push = float(prev.get("last_quarantine_push") or 0)
+    unresolved_due, has_quarantine, has_other_unresolved = unresolved_renotify_due(
+        reasons, now,
+        last_unresolved_push=last_unresolved_push,
+        last_quarantine_push=last_quarantine_push)
 
     if reasons:
         since = prev.get("since") if was_active else now
@@ -536,8 +564,11 @@ def main() -> int:
                     format_push_body(reasons, next_actions, budget_line=budget_line))
             else:
                 push_ok = False
-            if unresolved and push_ok:
-                last_unresolved_push = now
+            if push_ok:
+                if has_other_unresolved:
+                    last_unresolved_push = now
+                if has_quarantine:
+                    last_quarantine_push = now
         else:
             push_ok = bool(prev_push_ok)
         payload = {
@@ -549,6 +580,7 @@ def main() -> int:
             "budget": gauge,
             "push_ok": push_ok,
             "last_unresolved_push": last_unresolved_push,
+            "last_quarantine_push": last_quarantine_push,
         }
         ALERT.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
         print("[alert] ACTIVE:", " | ".join(reasons))

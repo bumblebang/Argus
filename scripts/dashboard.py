@@ -4142,10 +4142,11 @@ def render(d: dict) -> str:
              "<script>(function(){try{var s=localStorage.getItem('argusTab');"
              "if(s)document.documentElement.setAttribute('data-tab',s);}catch(e){}})();</script>",
              "</head><body><div class=wrap>"]
+    mode_label = "LIVE 실계좌" if d.get("live_mode") else "페이퍼 모드"
     parts.append(
         f"<h1><span class=eye>&#128065;</span> Argus <span style='color:#8b94a3'>Night Watch</span></h1>"
         f"<div class=sub>{datetime.fromtimestamp(now).strftime('%Y-%m-%d %H:%M:%S')} 기준 · "
-        f"{REFRESH_SEC}초마다 자동 갱신 · 페이퍼 모드</div>")
+        f"{REFRESH_SEC}초마다 자동 갱신 · {mode_label}</div>")
     # 경보 배너(탭 위, 항상 노출)
     a = d.get("alert")
     if a:

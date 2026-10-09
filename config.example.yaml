@@ -69,9 +69,9 @@ exit_policy:
     exclude_strategy: ["value"]
 
 strategy_exit:
-  # 전략 신호 청산(데드크로스 등)은 **그 전략 신호로 진입한 자리**에만 적용한다.
-  # 도시에 진입존·뇌 논거·밸류로 산 자리는 신호가 떠도 팔지 않고 뇌를 깨워 재평가.
-  # false 로 두면 구 동작(strategy 라벨만 있으면 청산) — 롤백 스위치.
+  # 전략 신호 청산(데드크로스 등)은 **그 전략 신호로 진입한 자리**(+day)에만 적용한다.
+  # close_scan·도시에·뇌 thesis·밸류는 신호가 떠도 팔지 않고 뇌를 깨워 재평가
+  # (close_scan 청산은 익일 close_scan_exit). false 면 구 동작 — 롤백 스위치.
   bind_to_entry_basis: true
   # 진입 직후 반대신호 방어(초). 손절/목표·세션종료 청산은 이 가드와 무관하다.
   min_hold_sec: 60
@@ -275,6 +275,8 @@ agents:
     focus_headline_limit: 12
     focus_macro_pad: 8
     headline_ttl_hours: 24
+    # 헤드라인 한도 초과 푸시 알림 끔(로그만). 구키 focus_trim_notify 도 동일 의미.
+    headline_trim_notify: false
     focus_trim_notify: false
     compact_json: true
     enrich_fundamentals: true

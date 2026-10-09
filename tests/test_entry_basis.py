@@ -68,12 +68,36 @@ def test_unknown_defaults_to_thesis_not_signal():
     ({"entry_basis": "thesis"}, False),
     ({"entry_basis": "value"}, False),
     ({"entry_basis": "orphan"}, False),
-    # 코드 소유 트랙은 basis 와 무관하게 신호 청산 ON(세션종료 청산과 짝)
+    # day 만 코드 소유·당일 청산 트랙(세션종료와 짝). close_scan 은 익일 exit.
     ({"entry_basis": "thesis", "horizon": "day"}, True),
-    ({"entry_basis": "thesis", "horizon": "close_scan"}, True),
+    ({"entry_basis": "thesis", "horizon": "close_scan"}, False),
 ])
 def test_signal_exit_matrix(meta, allowed):
     assert signal_exit_allowed({"meta": meta})[0] is allowed
+
+
+def test_close_scan_thesis_demotes_bollinger_same_day(tmp_path):
+    """103590 회귀: gap_rebound close_scan+thesis 를 볼린저 중심선 신호로 당일 팔지 않는다."""
+    # 종가 이미 mid 위 → bollinger_reversion SELL. 예전엔 horizon=close_scan 예외로 집행됨.
+    n = 30
+    closes = [70.0 + i * 0.1 for i in range(n - 1)] + [81.4]
+    candles = [{"open": c, "high": c * 1.01, "low": c * 0.99, "close": c, "volume": 1000}
+               for c in closes]
+    store = Store(tmp_path / "t.db")
+    broker = _broker(tmp_path)
+    broker.account.fill("103590", "KR", "BUY", 5, 81400)
+    store.open_position(
+        "103590", "KR", 5, 81400, strategy="bollinger_reversion",
+        meta={"entry_basis": "thesis", "horizon": "close_scan",
+              "params": {"period": 20, "num_std": 2.0}})
+    sr = StrategyRunner(FakeGW(candles), broker, store,
+                        cfg=SignalExitConfig(min_hold_sec=0))
+    r = sr.evaluate(dict(store.get_open_positions()[0]), "KR")
+    assert r["executed"] is False and r.get("demoted") is True
+    assert r["basis"] == BASIS_THESIS
+    assert broker.position("103590").qty == 5
+    kinds = {e["kind"] for e in store.conn.execute("SELECT kind FROM events")}
+    assert "strategy_exit" not in kinds
 
 
 def test_day_horizon_falls_back_to_strategy_class():

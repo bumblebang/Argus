@@ -7,9 +7,10 @@
 코드 자율 '진입'은 다음 증분(현재는 보유분의 전략기반 '청산'까지).
 
 **신호 청산 권한은 진입 근거에 묶인다**(engine.entry_basis) — 전략 신호로 진입한
-포지션(basis=signal)과 코드 소유 트랙(day/close_scan)만 신호로 청산한다. 도시에
-진입존·뇌 논거·밸류로 산 포지션은 신호가 떠도 팔지 않고 `demoted` 를 돌려주고,
-감시 루프가 뇌를 깨워 논거를 재평가하게 한다(triggers.strategy_signal_trigger).
+포지션(basis=signal)과 코드 소유 당일 트랙(day)만 신호로 청산한다. close_scan 은
+익일 close_scan_exit 전용이라 배정 라벨 신호로 당일 팔지 않는다. 도시에 진입존·뇌
+논거·밸류로 산 포지션은 신호가 떠도 팔지 않고 `demoted` 를 돌려주고, 감시 루프가
+뇌를 깨워 논거를 재평가하게 한다(triggers.strategy_signal_trigger).
 """
 from __future__ import annotations
 
