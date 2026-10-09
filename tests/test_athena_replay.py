@@ -132,6 +132,24 @@ def test_score_results_flips_agreement_tokens(tmp_path):
     assert rep["tokens"]["calls"] == 4 and rep["tokens"]["cost_usd"] == pytest.approx(0.4)
 
 
+def test_score_results_lean_arms_flips_and_flip_excess(tmp_path):
+    rows = []
+    for sym, live, ex, b, i in (("A", "neutral", 4.0, "neutral", "bullish"),
+                                ("B", "bullish", -3.0, "bullish", "neutral"),
+                                ("C", "bullish", 2.0, "bullish", "neutral")):
+        for arm, st in (("base_lean", b), ("inputs_lean", i)):
+            rows.append({"symbol": sym, "asof": "2026-06-05", "arm": arm, "stance": st,
+                         "live_stance": live, "live_excess_pp": ex})
+    rep = ar.score_results(rows, data_dir=tmp_path)
+    assert rep["base_to_inputs"] == {}
+    assert rep["base_to_inputs_lean"] == {"neutral->bullish": 1, "bullish->neutral": 2}
+    assert rep["agree_with_live"]["base_lean"] == {"agree": 3, "n": 3}
+    assert rep["agree_with_live"]["inputs_lean"] == {"agree": 0, "n": 3}
+    assert rep["flip_excess"]["base_to_inputs_lean"] == {
+        "bullish->neutral": {"n": 2, "excess_avg_pp": -0.5},
+        "neutral->bullish": {"n": 1, "excess_avg_pp": 4.0}}
+
+
 def test_sample_cases_stratifies_bullish(tmp_path):
     from src.engine.store import Store
     h = tmp_path / "history"

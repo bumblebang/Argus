@@ -251,18 +251,30 @@ def score_results(rows: list[dict], *, data_dir: Path | str, cfg: dict | None = 
     # 같은 case 의 안끼리·라이브와 stance 비교
     cases: dict[tuple[str, str], dict] = {}
     for r in rows:
-        cases.setdefault((r["symbol"], r["asof"]), {"live": r.get("live_stance")})[r["arm"]] = r["stance"]
-    flips: dict[str, int] = {}
+        c = cases.setdefault((r["symbol"], r["asof"]), {
+            "live": r.get("live_stance"), "excess": r.get("live_excess_pp"), "arms": {}})
+        c["arms"][r["arm"]] = r["stance"]
+    # A→B 이동은 같은 CLI 변형끼리만 짝짓는다(base↔inputs, base_lean↔inputs_lean)
+    flips: dict[str, dict[str, int]] = {}
+    flip_excess: dict[str, dict[str, list[float]]] = {}
     agree_live: dict[str, list[int]] = {}
     for c in cases.values():
-        if c.get("base") and c.get("inputs"):
-            k = f"{c['base']}->{c['inputs']}"
-            flips[k] = flips.get(k, 0) + 1
-        for arm in ARMS:
-            if c.get(arm) and c.get("live"):
+        for sfx in ("", LEAN_SUFFIX):
+            b, i = c["arms"].get("base" + sfx), c["arms"].get("inputs" + sfx)
+            if not (b and i):
+                continue
+            name, k = "base_to_inputs" + sfx, f"{b}->{i}"
+            flips.setdefault(name, {})[k] = flips.get(name, {}).get(k, 0) + 1
+            if c["excess"] is not None:
+                flip_excess.setdefault(name, {}).setdefault(k, []).append(float(c["excess"]))
+        for arm, st in c["arms"].items():
+            if c.get("live"):
                 a = agree_live.setdefault(arm, [0, 0])
-                a[0] += int(c[arm] == c["live"])
+                a[0] += int(st == c["live"])
                 a[1] += 1
+    flip_perf = {name: {k: {"n": len(v), "excess_avg_pp": round(sum(v) / len(v), 2)}
+                        for k, v in sorted(d.items())}
+                 for name, d in flip_excess.items()}
     def _tok(rs: list[dict]) -> dict:
         t = {"calls": 0, "input": 0, "cache_create": 0, "cache_read": 0, "output": 0,
              "cost_usd": 0.0}
@@ -295,6 +307,9 @@ def score_results(rows: list[dict], *, data_dir: Path | str, cfg: dict | None = 
         a["conv_diff_abs"] += abs(float(r.get("conviction") or 0) - float(rl.get("conviction") or 0))
     for a in lean_agree.values():
         a["conv_diff_abs"] = round(a["conv_diff_abs"] / a["n"], 3) if a["n"] else None
-    return {"n_cases": len(cases), "by_arm": by_arm, "base_to_inputs": flips,
+    return {"n_cases": len(cases), "by_arm": by_arm,
+            "base_to_inputs": flips.get("base_to_inputs", {}),
+            "base_to_inputs_lean": flips.get("base_to_inputs" + LEAN_SUFFIX, {}),
+            "flip_excess": flip_perf,
             "agree_with_live": {k: {"agree": v[0], "n": v[1]} for k, v in agree_live.items()},
             "tokens": tok, "tokens_by_arm": tok_by_arm, "lean_agreement": lean_agree}
