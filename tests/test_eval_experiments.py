@@ -128,3 +128,22 @@ def test_dedupe_daily(tmp_path):
     assert dedupe_daily(["a", "b"], p, now=1_790_000_000) == ["a", "b"]
     assert dedupe_daily(["a", "c"], p, now=1_790_000_100) == ["c"]
     assert dedupe_daily(["a"], p, now=1_790_000_000 + 86400 * 2) == ["a"]
+
+
+def test_compute_metric_evidence_match_excludes_feedback_off(tmp_path):
+    data = _hist(tmp_path)
+    store = Store(tmp_path / "t.db")
+    created = datetime(2026, 1, 5, 12).timestamp()
+    for sym, stance, fb in (("DOWN", "bullish", True), ("UP", "neutral", True),
+                            ("UP", "bullish", False)):
+        store.save_dossier(sym, "US", thesis="t", entry_low=1, entry_high=2,
+                           invalidation=0.5, target=3, rr=2.0, conviction=0.6,
+                           evidence={"stance": stance, "prompt_rev": "new",
+                                     "stance_feedback": fb}, ttl_hours=48)
+    store.conn.execute("UPDATE dossiers SET created_at=?", (created,))
+    store.conn.commit()
+    exp = load_registry(_registry(tmp_path, created))["experiments"][0]
+    assert compute_metric(exp, store=store, data_dir=data)[f"{METRIC}__n"] == 2  # 필터 없음
+    exp["evidence_match"] = {"stance_feedback": True}
+    m = compute_metric(exp, store=store, data_dir=data)
+    assert m[f"{METRIC}__n"] == 1 and m[METRIC] < 0          # 피드백 꺼진 UP bullish 제외

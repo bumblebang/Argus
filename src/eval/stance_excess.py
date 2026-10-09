@@ -186,10 +186,13 @@ def stance_track_record(store, *, data_dir: Path | str, cfg: dict | None = None,
 
 
 def dossier_observations(store, *, since: float, now: float | None = None,
-                         prompt_rev: str | None = None) -> list[dict]:
+                         prompt_rev: str | None = None,
+                         evidence_match: dict | None = None) -> list[dict]:
     """store.dossiers → [{symbol, ts, label=stance}].
 
     prompt_rev: 주면 evidence.prompt_rev 가 같은 도시에만(프롬프트 변경 전후 분리).
+    evidence_match: {키: 값} 이 evidence 와 모두 같은 도시에만(예: stance_feedback=True —
+      같은 판본이라도 피드백이 꺼진 채 만든 도시에는 실험 표본에서 뺀다).
     """
     from .dossier_quality import dossier_stance
 
@@ -201,6 +204,14 @@ def dossier_observations(store, *, since: float, now: float | None = None,
     out = []
     for r in hist:
         row = dict(r)
+        if evidence_match:
+            try:
+                ev_m = json.loads(row.get("evidence") or "{}")
+            except (TypeError, ValueError):
+                ev_m = {}
+            if not isinstance(ev_m, dict) or any(ev_m.get(k) != v
+                                                 for k, v in evidence_match.items()):
+                continue
         if prompt_rev is not None:
             try:
                 ev = json.loads(row.get("evidence") or "{}")
