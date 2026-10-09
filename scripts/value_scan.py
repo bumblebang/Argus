@@ -18,7 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from src.config import load_config, ROOT
 from src.logging_setup import setup_logging, get_logger
-from src.agents.llm import ClaudeCLIClient, MockLLM
+from src.agents.llm import ClaudeCLIClient, MockLLM, claude_lean_for
 from src.agents.schemas import ValueDossier
 from src.value_scan import run_scan
 from src import paths as _paths
@@ -71,7 +71,8 @@ def main() -> int:
                               model=(vcfg.get("model") or "sonnet"),
                               timeout=int(vcfg.get("timeout", 240)),
                               fallback_model=(a.get("claude_fallback_model") or None),
-                              error_dump_path="data/value_scan_cli_error.json")
+                              error_dump_path="data/value_scan_cli_error.json",
+                              lean=claude_lean_for(a, "value_scan"))
 
     summary = run_scan(cfg, llm, limit=args.limit, held_symbols=_held_symbols())
     print(json.dumps(summary, ensure_ascii=False))

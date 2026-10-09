@@ -122,14 +122,40 @@ class LLMClient:
         raise ValueError(f"LLM 구조화 출력 실패: {last_err}")
 
 
-def _build_prompt(system: str, user: str, schema: Type[BaseModel], retry: bool = False) -> str:
-    p = (system + "\n\n--- 입력 데이터(JSON) ---\n" + user
+def _build_user_prompt(user: str, schema: Type[BaseModel], retry: bool = False) -> str:
+    """입력 데이터 + 출력 지시(스키마). 경량 모드에선 이것만 stdin 으로, 지시문은 시스템 프롬프트로."""
+    p = ("--- 입력 데이터(JSON) ---\n" + user
          + "\n\n--- 출력 지시 ---\n아래 JSON 스키마에 정확히 맞는 JSON 객체 하나만 출력하라. "
          "코드블록·설명·머리말 없이 순수 JSON만.\n스키마:\n"
          + json.dumps(schema.model_json_schema(), ensure_ascii=False))
     if retry:
         p += "\n\n(직전 출력이 유효한 JSON이 아니었다. 순수 JSON만 다시 출력하라.)"
     return p
+
+
+def _build_prompt(system: str, user: str, schema: Type[BaseModel], retry: bool = False) -> str:
+    return system + "\n\n" + _build_user_prompt(user, schema, retry)
+
+
+# 경량 CLI 호출 — `claude -p` 가 매번 싣는 Claude Code 기본 시스템 프롬프트·내장 도구·MCP
+# 도구·스킬 목록(~48k 토큰)을 뺀다. 10-06 실측: 같은 질문 입력 47,956 → 840 토큰.
+# 구독(OAuth) 인증은 유지된다(--bare 는 API 키 전용이라 못 쓴다). 우리 호출은 도구를
+# 쓰지 않는 순수 JSON 응답이라 기능 손실이 없다.
+LEAN_ARGS = ("--tools", "", "--strict-mcp-config", "--disable-slash-commands",
+             "--no-session-persistence")
+LEAN_COMPONENTS = ("brain", "value_trade", "athena", "value_scan", "public_brief")
+
+
+def claude_lean_for(agents_cfg: dict | None, component: str) -> bool:
+    """agents.claude_lean — true(전체) | {component: bool} | [component, ...]."""
+    v = (agents_cfg or {}).get("claude_lean")
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, dict):
+        return bool(v.get(component, False))
+    if isinstance(v, (list, tuple)):
+        return component in v
+    return False
 
 
 def _ver_key(name: str) -> list[int]:
@@ -433,7 +459,9 @@ class ClaudeCLIClient:
                  cursor_bridge: Any | None = None,
                  *,
                  require_bridge_armed: bool = True,
-                 bridge_armed_max_age_sec: float = 90.0):
+                 bridge_armed_max_age_sec: float = 90.0,
+                 lean: bool = False,
+                 lean_dir: str | Path = "data/llm_lean"):
         self._command_cfg = command
         self.command = resolve_claude_command(command)
         if self.command != command:
@@ -456,13 +484,33 @@ class ClaudeCLIClient:
         self.last_quota_error: str | None = None
         self.last_quota_reset_at: float | None = None
         self.last_quota_kind: str | None = None
+        self.lean = bool(lean)
+        self.lean_dir = Path(lean_dir)
+        if self.lean and self.cwd is None:
+            # 빈 작업 폴더 — CLAUDE.md·메모리·git 상태 자동 로드를 피한다.
+            lean_cwd = self.lean_dir / "cwd"
+            lean_cwd.mkdir(parents=True, exist_ok=True)
+            self.cwd = str(lean_cwd)
 
-    def _invoke(self, prompt: str, model: str | None) -> str:
+    def _system_file(self, system: str) -> Path:
+        """지시문 → 내용 해시 이름의 파일(같은 지시문은 재사용). 명령줄 길이 제한 회피."""
+        import hashlib
+        d = self.lean_dir / "sys"
+        d.mkdir(parents=True, exist_ok=True)
+        p = d / f"{hashlib.sha256(system.encode('utf-8')).hexdigest()[:16]}.txt"
+        if not p.exists():
+            p.write_text(system, encoding="utf-8")
+        return p.resolve()
+
+    def _invoke(self, prompt: str, model: str | None, extra: Sequence[str] = ()) -> str:
         def _args(cmd: str) -> list[str]:
             a = [cmd, *self.base_args]
             if model:
                 a += ["--model", model]
+            if self.lean:
+                a += list(LEAN_ARGS)
             a += self.extra_args
+            a += list(extra)
             return a
 
         # Windows: pythonw(무콘솔) 데몬이 콘솔 앱(claude.exe)을 subprocess 로 부르면 매 호출마다
@@ -507,9 +555,9 @@ class ClaudeCLIClient:
                 rc=proc.returncode)
         return proc.stdout
 
-    def _run(self, prompt: str) -> str:
+    def _run(self, prompt: str, extra: Sequence[str] = ()) -> str:
         try:
-            out = self._invoke(prompt, self.model)
+            out = self._invoke(prompt, self.model, extra)
             self.last_model = self.model
             self.used_fallback = False
             return out
@@ -517,7 +565,7 @@ class ClaudeCLIClient:
             if self.fallback_model and self.fallback_model != self.model:
                 log.warning("claude(%s) 실패 → 폴백 모델 %s 재시도: %s",
                             self.model or "default", self.fallback_model, e)
-                out = self._invoke(prompt, self.fallback_model)
+                out = self._invoke(prompt, self.fallback_model, extra)
                 self.last_model = self.fallback_model
                 self.used_fallback = True
                 return out
@@ -535,7 +583,11 @@ class ClaudeCLIClient:
         self.last_source = None
         try:
             for attempt in range(2):
-                out = self._run(_build_prompt(system, user, schema, retry=attempt > 0))
+                if self.lean:
+                    out = self._run(_build_user_prompt(user, schema, retry=attempt > 0),
+                                    extra=("--system-prompt-file", str(self._system_file(system))))
+                else:
+                    out = self._run(_build_prompt(system, user, schema, retry=attempt > 0))
                 data = _extract_json(out)
                 if data is not None:
                     try:

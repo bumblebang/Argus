@@ -53,6 +53,45 @@
       "evidence_match": {
         "stance_feedback": true
       }
+    },
+    {
+      "id": "exp_claude_cli_lean_20261009",
+      "name": "claude_cli_lean",
+      "hypothesis": "claude CLI 경량 호출(Claude Code 하네스 프롬프트·도구·MCP·스킬 제거, 우리 지시문을 시스템 프롬프트로)은 판정 분포를 바꾸지 않으면서 호출당 입력 토큰을 ~90% 줄인다.",
+      "metric": "replay.stance_agreement_lean_vs_default",
+      "kill_if": "메모: 컴포넌트별 켠 뒤 JSON 파싱 실패율 상승, 또는 리플레이/consistency 대조에서 경량-현행 일치가 현행-현행 반복 일치보다 뚜렷이 낮으면(예: 2건 이상 차) 해당 컴포넌트 끔 (agents.claude_lean.<component>: false). 자동 채점 지표 없음 — 수동 판정.",
+      "kill": null,
+      "min_n": 10,
+      "touches": [
+        "validation_rules",
+        "athena"
+      ],
+      "status": "running",
+      "created_at": 1791551896.737942,
+      "evidence_n": 10,
+      "evidence": {
+        "replay_tag": "leanv / leanv_rep (KR 10건, inputs 컨텍스트, Sonnet 5)",
+        "agreement": {
+          "default1_vs_default2": "7/10",
+          "default1_vs_lean": "7/10",
+          "default2_vs_lean": "8/10"
+        },
+        "tokens_per_call": {
+          "default_input": 71668,
+          "lean_input": 6928,
+          "default_output": 4332,
+          "lean_output": 4043
+        },
+        "cost_usd_per_call": {
+          "default": 0.136,
+          "lean": 0.057
+        },
+        "parse_failures": {
+          "default": 0,
+          "lean": 0
+        }
+      },
+      "rollout": "athena → value_scan → value_trade → brain(consistency_manager 대조 후)"
     }
   ]
 }
