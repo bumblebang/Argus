@@ -128,7 +128,7 @@ def cmd_run(args, cfg) -> int:
         return 1
     inputs = None
     arms = tuple(a for a in args.arms.split(",") if a)
-    if any(a.split("_")[0] == "inputs" for a in arms):
+    if any(ar.split_arm(a)[0] in ("inputs", "market_inputs") for a in arms):
         from src.agents.athena_inputs import AthenaInputs
         inputs = AthenaInputs.load(DATA, connect_krx=not args.dry)
     names = {}

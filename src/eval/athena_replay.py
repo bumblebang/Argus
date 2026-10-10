@@ -5,6 +5,9 @@
 - B안(inputs): A안 + 재무·수급·공매도(AthenaInputs, asof 이전 공개분만).
 두 안은 같은 프롬프트·같은 모델·같은 표본이고 입력만 다르다. 뉴스·시황·매크로는 과거
 시점 재현이 어려워 **두 안 모두 뺀다**(실전보다 정보가 적은 공정 비교).
+- market / market_inputs: 위 두 안에 그 시점 뇌 컨텍스트 아카이브의 시황·매크로·종목 뉴스를
+  더한 라이브 근사판(아카이브 08-23~). kr40 에서 base 가 bullish 를 거의 안 내 라이브를
+  재현하지 못해 추가.
 
 표본은 라이브 도시에가 실제로 만들어진 (종목, 날짜) 중 20일 창이 끝난 것만.
 리플레이 결과는 라이브 store·저널에 쓰지 않는다(전용 jsonl). 승격 근거 아님(Tier 0).
@@ -26,7 +29,17 @@ from .labels import asof_local_date, symbol_market
 log = get_logger("eval.athena_replay")
 
 ARMS = ("base", "inputs")
+# market*: 그 시점 뇌 컨텍스트 아카이브(data/context_archive, 08-23~)의 시황·매크로·종목 뉴스를
+# 싣는 라이브 근사 A/B. 아카이브가 없는 날짜의 case 는 건너뛴다.
+MARKET_ARMS = ("market", "market_inputs")
+# (A안, B안, 이동표 이름) — 같은 CLI 변형끼리만 짝짓는다
+ARM_PAIRS = (("base", "inputs", "base_to_inputs"),
+             ("market", "market_inputs", "market_to_inputs"))
 LEAN_SUFFIX = "_lean"          # "inputs_lean" = inputs 컨텍스트를 경량 CLI 로 판정
+ARCHIVE_SLOTS = ("regime", "sentiment", "markets", "macro", "macro_kr", "flows_market")
+# Athena 창 종료(KST) — 이 시각 이전 아카이브만 쓴다. US asof(뉴욕 날짜) 저녁 창은 같은 KST 날짜.
+_WINDOW_END_KST = {"KR": (7, 30), "US": (21, 50)}
+ARCHIVE_MAX_AGE_H = 48.0
 
 
 def split_arm(arm: str) -> tuple[str, bool]:
@@ -98,9 +111,68 @@ def load_history_before(data_dir: Path | str, symbol: str, asof: date) -> pd.Dat
     return best
 
 
+def _archive_index(data_dir: Path | str) -> list[tuple[float, Path]]:
+    """context_archive 의 (생성 epoch, 경로) — 파일명 `<epoch>p<ms>_<hash>.json.gz`."""
+    out = []
+    for p in (Path(data_dir) / "context_archive").glob("**/*.json.gz"):
+        head = p.name.split("p", 1)[0]
+        if head.isdigit():
+            out.append((float(head), p))
+    return sorted(out)
+
+
+def _read_archive(path: Path) -> dict:
+    import gzip
+    with gzip.open(path, "rt", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def archive_cutoff(asof: date, market: str) -> float:
+    from zoneinfo import ZoneInfo
+    hh, mm = _WINDOW_END_KST.get(market, (7, 30))
+    return datetime(asof.year, asof.month, asof.day, hh, mm,
+                    tzinfo=ZoneInfo("Asia/Seoul")).timestamp()
+
+
+def market_archive_context(data_dir: Path | str, symbol: str, market: str, asof: date, *,
+                           index: list[tuple[float, Path]] | None = None,
+                           news_limit: int = 10) -> dict | None:
+    """그 날 Athena 창 종료 전 마지막 아카이브의 시황 슬롯 + 직전 48h 아카이브의 종목 뉴스.
+
+    라이브 Athena 는 네이버/Finnhub 종목 뉴스를 직접 받았으므로 뉴스는 부분 재현이다.
+    """
+    idx = index if index is not None else _archive_index(data_dir)
+    cut = archive_cutoff(asof, market)
+    window = [(t, p) for t, p in idx if cut - ARCHIVE_MAX_AGE_H * 3600 <= t < cut]
+    if not window:
+        return None
+    last = _read_archive(window[-1][1])
+    mk = last.get("market") or {}
+    slots = {k: mk.get(k) for k in ARCHIVE_SLOTS if mk.get(k) is not None}
+    if isinstance(slots.get("regime"), dict):
+        slots["regime"] = slots["regime"].get(market)
+    news, seen = [], set()
+    for _, p in reversed(window):
+        d = last if p == window[-1][1] else _read_archive(p)
+        rows = [n for c in (d.get("candidates") or []) if c.get("symbol") == symbol
+                for n in (c.get("news") or [])]
+        rows += [h for h in (d.get("headlines") or []) if h.get("symbol") == symbol]
+        for n in rows:
+            key = n.get("title")
+            if key and key not in seen:
+                seen.add(key)
+                news.append(n)
+        if len(news) >= news_limit:
+            break
+    slots["news"] = news[:news_limit]
+    slots["archive_ts"] = window[-1][0]
+    return slots
+
+
 def build_case_context(case: dict, arm: str, *, data_dir: Path | str,
-                       inputs: Any = None, name: str | None = None) -> dict | None:
-    """case → Athena 리서치 컨텍스트(그 날 시점). 봉 부족이면 None."""
+                       inputs: Any = None, name: str | None = None,
+                       archive_index: list[tuple[float, Path]] | None = None) -> dict | None:
+    """case → Athena 리서치 컨텍스트(그 날 시점). 봉 부족·(market*) 아카이브 없음이면 None."""
     from ..agents.athena import build_research_context
     from ..agents.athena_inputs import fill_missing
     from ..baserate import analyze
@@ -115,8 +187,15 @@ def build_case_context(case: dict, arm: str, *, data_dir: Path | str,
         live_news=False)
     for k in ("sentiment", "markets", "macro", "macro_kr", "flows_market",
               "program_flows", "short_market", "regime", "focus"):
-        ctx.pop(k, None)                          # 두 안 공통 — 과거 재현 불가 슬롯
-    if arm == "inputs" and inputs is not None:
+        ctx.pop(k, None)                          # base/inputs — 과거 재현 불가 슬롯
+    if arm in MARKET_ARMS:
+        arch = market_archive_context(data_dir, case["symbol"], case["market"], asof,
+                                      index=archive_index)
+        if arch is None:
+            return None
+        arch.pop("archive_ts", None)
+        ctx.update(arch)
+    if arm in ("inputs", "market_inputs") and inputs is not None:
         px = (ctx.get("technical") or {}).get("price")
         fill_missing(ctx, inputs.for_symbol(case["symbol"], case["market"], price=px,
                                             asof=asof, live=False))
@@ -181,6 +260,8 @@ def run_cases(cases: list[dict], *, llm, data_dir: Path | str, out_path: Path,
     agents = {False: AthenaAgent(llm), True: AthenaAgent(llm_lean) if llm_lean else None}
     done = _done_keys(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    arch_idx = (_archive_index(data_dir)
+                if any(split_arm(a)[0] in MARKET_ARMS for a in arms) else None)
     n_calls, n_fail, n_skip = 0, 0, 0
     for case in cases:
         for arm in arms:
@@ -197,7 +278,8 @@ def run_cases(cases: list[dict], *, llm, data_dir: Path | str, out_path: Path,
                 raise ValueError(f"{arm}: 경량 LLM(llm_lean) 이 필요하다")
             cur_llm = llm_lean if lean else llm
             ctx = build_case_context(case, ctx_arm, data_dir=data_dir, inputs=inputs,
-                                     name=(names or {}).get(case["symbol"]))
+                                     name=(names or {}).get(case["symbol"]),
+                                     archive_index=arch_idx)
             if ctx is None:
                 n_skip += 1
                 continue
@@ -259,11 +341,13 @@ def score_results(rows: list[dict], *, data_dir: Path | str, cfg: dict | None = 
     flip_excess: dict[str, dict[str, list[float]]] = {}
     agree_live: dict[str, list[int]] = {}
     for c in cases.values():
-        for sfx in ("", LEAN_SUFFIX):
-            b, i = c["arms"].get("base" + sfx), c["arms"].get("inputs" + sfx)
+        pairs = [(a + sfx, b + sfx, name + sfx)
+                 for a, b, name in ARM_PAIRS for sfx in ("", LEAN_SUFFIX)]
+        for a_arm, b_arm, name in pairs:
+            b, i = c["arms"].get(a_arm), c["arms"].get(b_arm)
             if not (b and i):
                 continue
-            name, k = "base_to_inputs" + sfx, f"{b}->{i}"
+            k = f"{b}->{i}"
             flips.setdefault(name, {})[k] = flips.get(name, {}).get(k, 0) + 1
             if c["excess"] is not None:
                 flip_excess.setdefault(name, {}).setdefault(k, []).append(float(c["excess"]))
@@ -310,6 +394,8 @@ def score_results(rows: list[dict], *, data_dir: Path | str, cfg: dict | None = 
     return {"n_cases": len(cases), "by_arm": by_arm,
             "base_to_inputs": flips.get("base_to_inputs", {}),
             "base_to_inputs_lean": flips.get("base_to_inputs" + LEAN_SUFFIX, {}),
+            "market_to_inputs": flips.get("market_to_inputs", {}),
+            "market_to_inputs_lean": flips.get("market_to_inputs" + LEAN_SUFFIX, {}),
             "flip_excess": flip_perf,
             "agree_with_live": {k: {"agree": v[0], "n": v[1]} for k, v in agree_live.items()},
             "tokens": tok, "tokens_by_arm": tok_by_arm, "lean_agreement": lean_agree}
