@@ -128,7 +128,7 @@ def cmd_run(args, cfg) -> int:
         return 1
     inputs = None
     arms = tuple(a for a in args.arms.split(",") if a)
-    if any(a.split("_")[0] == "inputs" for a in arms):
+    if any(ar.split_arm(a)[0] in ("inputs", "market_inputs") for a in arms):
         from src.agents.athena_inputs import AthenaInputs
         inputs = AthenaInputs.load(DATA, connect_krx=not args.dry)
     names = {}
@@ -143,9 +143,10 @@ def cmd_run(args, cfg) -> int:
     llm_lean = (_llm(cfg.raw, dry=args.dry, lean=True)
                 if any(a.endswith(ar.LEAN_SUFFIX) for a in arms) else None)
     stop = None if (args.dry or args.force) else (lambda: _in_athena_window(cfg.raw))
+    system = ar.athena_system_at(args.prompt_ref, repo=ROOT) if args.prompt_ref else None
     res = ar.run_cases(cases, llm=llm, data_dir=DATA, out_path=rpath, arms=arms,
                        inputs=inputs, limit=args.limit, stop_fn=stop, names=names,
-                       llm_lean=llm_lean)
+                       llm_lean=llm_lean, system_prompt=system)
     print("실행:", res)
     _print_tokens(llm.calls, "현행")
     if llm_lean is not None:
@@ -195,6 +196,8 @@ def main() -> int:
     r.add_argument("--limit", type=int, default=4, help="이번 실행 최대 LLM 콜")
     r.add_argument("--arms", default="base,inputs",
                    help="base,inputs 와 *_lean(같은 컨텍스트를 경량 CLI 로) 조합")
+    r.add_argument("--prompt-ref", default=None,
+                   help="이 git ref 의 ATHENA_SYSTEM 으로 판정(예: 34938d8~1 = 성적 피드백 규칙 전)")
     r.add_argument("--dry", action="store_true")
     r.add_argument("--force", action="store_true")
     c = sub.add_parser("score")

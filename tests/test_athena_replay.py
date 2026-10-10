@@ -51,6 +51,106 @@ def test_build_case_context_arms(tmp_path):
                                  data_dir=tmp_path) is None        # 봉 부족
 
 
+def _archive(tmp_path, ts, *, regime_kr="risk_on", news=(), headlines=()):
+    import gzip
+    d = tmp_path / "context_archive" / "day"
+    d.mkdir(parents=True, exist_ok=True)
+    body = {"market": {"regime": {"KR": {"label": regime_kr}, "US": {"label": "x"}},
+                       "sentiment": {"vix": 17.0}, "macro_kr": {"bok_base_rate": 3.0},
+                       "sectors": {"US": {}}},
+            "headlines": list(headlines),
+            "candidates": [{"symbol": "111111", "news": list(news)}]}
+    with gzip.open(d / f"{int(ts)}p001_abc.json.gz", "wt", encoding="utf-8") as f:
+        json.dump(body, f, ensure_ascii=False)
+
+
+def test_market_archive_context_uses_last_before_window_end(tmp_path):
+    asof = date(2026, 7, 20)
+    cut = ar.archive_cutoff(asof, "KR")                       # 07-20 07:30 KST
+    _archive(tmp_path, cut - 30 * 3600, regime_kr="old", news=[{"title": "a"}])
+    _archive(tmp_path, cut - 3600, regime_kr="risk_off",
+             headlines=[{"title": "b", "symbol": "111111"}, {"title": "c", "symbol": "999"}])
+    _archive(tmp_path, cut + 60, regime_kr="future")          # 창 뒤 — 미래 유출 금지
+    m = ar.market_archive_context(tmp_path, "111111", "KR", asof)
+    assert m["regime"] == {"label": "risk_off"}               # 시장별 regime 만
+    assert m["sentiment"] == {"vix": 17.0} and "sectors" not in m
+    assert [n["title"] for n in m["news"]] == ["b", "a"]      # 최신 먼저, 다른 종목 제외
+    assert ar.market_archive_context(tmp_path, "111111", "KR", date(2026, 7, 25)) is None
+
+
+def test_build_case_context_market_arms(tmp_path):
+    _hist(tmp_path)
+    case = {"symbol": "111111", "market": "KR", "asof": "2026-07-20"}
+    _archive(tmp_path, ar.archive_cutoff(date(2026, 7, 20), "KR") - 3600,
+             news=[{"title": "n1"}])
+    fake = _FakeInputs()
+    no_news = lambda code, page, size: []                     # noqa: E731
+    m = ar.build_case_context(case, "market", data_dir=tmp_path, inputs=fake,
+                              news_fetch=no_news)
+    mi = ar.build_case_context(case, "market_inputs", data_dir=tmp_path, inputs=fake,
+                               news_fetch=no_news)
+    assert m["regime"] == {"label": "risk_on"} and m["news"] == [{"title": "n1"}]
+    assert not m.get("fundamentals") and mi["fundamentals"] == {"pb": 1.2}
+    assert mi["macro_kr"] == m["macro_kr"]
+    assert ar.build_case_context({**case, "asof": "2026-07-28"}, "market",
+                                 data_dir=tmp_path) is None    # 아카이브 없음 → 건너뜀
+
+
+def test_kr_news_asof_pages_back_and_caches(tmp_path):
+    from zoneinfo import ZoneInfo
+    cut = datetime(2026, 9, 3, 7, 30, tzinfo=ZoneInfo("Asia/Seoul")).timestamp()
+    pages = {1: [{"datetime": "202609031000", "title": "after"},
+                 {"datetime": "202609030800", "title": "after2"}],
+             2: [{"datetime": "202609030701", "title": "<b>b1</b>", "officeName": "S"},
+                 {"datetime": "202609021200", "title": "b2"}],
+             5: [{"datetime": "202609011200", "title": "b3"}]}     # 3·4 페이지 빈 구간
+    calls = []
+
+    def fetch(code, page, size):
+        calls.append(page)
+        return pages.get(page, [])
+    out = ar.kr_news_asof(tmp_path, "111111", cut, per=3, fetch=fetch)
+    assert [n["title"] for n in out] == ["b1", "b2", "b3"]       # 창 이후 기사 제외·태그 제거
+    assert out[0]["source"] == "S" and calls == [1, 2, 3, 4, 5]
+    assert ar.kr_news_asof(tmp_path, "111111", cut, per=3, fetch=fetch) == out
+    assert calls == [1, 2, 3, 4, 5]                              # 캐시 적중
+    assert ar.kr_news_asof(tmp_path, "222222", cut, fetch=lambda *a: [],
+                           max_empty_run=3) is None              # 끝까지 비면 None(캐시 안 함)
+
+
+def test_run_cases_pinned_system_prompt(tmp_path):
+    _hist(tmp_path)
+    cases = [{"symbol": "111111", "market": "KR", "asof": "2026-07-20"}]
+    seen = []
+
+    def respond(schema, system, user):
+        seen.append(system)
+        px = float(json.loads(user)["technical"]["price"])
+        return DossierOutput(stance="neutral", thesis="t", conviction=0.5, entry_low=px * .98,
+                             entry_high=px, invalidation=px * .94, target=px * 1.1)
+    out = tmp_path / "r.jsonl"
+    ar.run_cases(cases, llm=MockLLM(respond), data_dir=tmp_path, out_path=out,
+                 arms=("base",), system_prompt="OLD PROMPT")
+    from src.agents.athena import ATHENA_PROMPT_REV
+    row = ar.load_results(out)[0]
+    assert seen == ["OLD PROMPT"] and row["prompt_rev"] != ATHENA_PROMPT_REV
+
+
+def test_athena_system_at_head_matches_module():
+    from src.agents.athena import ATHENA_SYSTEM
+    assert ar.athena_system_at("HEAD") == ATHENA_SYSTEM
+
+
+def test_score_results_market_pair(tmp_path):
+    rows = [{"symbol": "A", "asof": "2026-09-01", "arm": arm, "stance": st,
+             "live_stance": "bullish", "live_excess_pp": -2.0}
+            for arm, st in (("market_lean", "bullish"), ("market_inputs_lean", "neutral"))]
+    rep = ar.score_results(rows, data_dir=tmp_path)
+    assert rep["market_to_inputs_lean"] == {"bullish->neutral": 1}
+    assert rep["base_to_inputs_lean"] == {}
+    assert rep["flip_excess"]["market_to_inputs_lean"]["bullish->neutral"]["n"] == 1
+
+
 def _llm():
     def respond(schema, system, user):
         ctx = json.loads(user)
