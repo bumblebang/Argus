@@ -182,9 +182,69 @@ def market_archive_context(data_dir: Path | str, symbol: str, market: str, asof:
     return slots
 
 
+def kr_news_asof(data_dir: Path | str, code: str, cutoff: float, *, per: int = 5,
+                 page_size: int = 50, max_pages: int = 80, max_empty_run: int = 20,
+                 fetch: Callable[[str, int, int], list[dict]] | None = None) -> list[dict] | None:
+    """네이버 종목뉴스를 과거로 넘겨 cutoff(epoch) 이전 최신 per 건 — 라이브 fetch_kr_stock_news 형식.
+
+    캐시: data/athena_replay/news_cache/<code>_<cutoff>.json. 끝까지 못 내려가면 None.
+    """
+    from zoneinfo import ZoneInfo
+    cache = Path(data_dir) / "athena_replay" / "news_cache" / f"{code}_{int(cutoff)}.json"
+    if cache.exists():
+        return json.loads(cache.read_text(encoding="utf-8"))
+    cut = datetime.fromtimestamp(cutoff, ZoneInfo("Asia/Seoul")).strftime("%Y%m%d%H%M")
+    fetch = fetch or _naver_news_page
+    found: list[dict] = []
+    reached = False
+    empty_run = 0
+    for page in range(1, max_pages + 1):
+        items = fetch(code, page, page_size)
+        if not items:                              # 네이버는 중간에 빈 페이지 구간이 있다
+            empty_run += 1
+            if empty_run >= max_empty_run:
+                break
+            continue
+        empty_run = 0
+        found += [it for it in items if str(it.get("datetime", "")) < cut]
+        if min(str(it.get("datetime", "")) for it in items) < cut and len(found) >= per:
+            reached = True
+            break
+    if not reached and not found:
+        return None
+    found.sort(key=lambda x: str(x.get("datetime", "")), reverse=True)
+    import html
+    import re
+    out = []
+    for it in found:
+        title = html.unescape(re.sub(r"<[^>]+>", "", it.get("titleFull") or it.get("title") or "")).strip()
+        if title:
+            out.append({"source": it.get("officeName", ""), "title": title})
+        if len(out) >= per:
+            break
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    cache.write_text(json.dumps(out, ensure_ascii=False), encoding="utf-8")
+    return out
+
+
+def _naver_news_page(code: str, page: int, page_size: int) -> list[dict]:
+    import requests
+
+    from ..datasources.news import NAVER_STOCK_NEWS_URL, _NAVER_UA
+    time.sleep(0.2)
+    r = requests.get(NAVER_STOCK_NEWS_URL.format(code=code), headers=_NAVER_UA,
+                     params={"pageSize": page_size, "page": page}, timeout=10)
+    r.raise_for_status()
+    data = r.json()
+    return [it for b in (data if isinstance(data, list) else []) if isinstance(b, dict)
+            for it in (b.get("items") or [])]
+
+
 def build_case_context(case: dict, arm: str, *, data_dir: Path | str,
                        inputs: Any = None, name: str | None = None,
-                       archive_index: list[tuple[float, Path]] | None = None) -> dict | None:
+                       archive_index: list[tuple[float, Path]] | None = None,
+                       news_fetch: Callable[[str, int, int], list[dict]] | None = None
+                       ) -> dict | None:
     """case → Athena 리서치 컨텍스트(그 날 시점). 봉 부족·(market*) 아카이브 없음이면 None."""
     from ..agents.athena import build_research_context
     from ..agents.athena_inputs import fill_missing
@@ -207,6 +267,16 @@ def build_case_context(case: dict, arm: str, *, data_dir: Path | str,
         if arch is None:
             return None
         arch.pop("archive_ts", None)
+        if case["market"] == "KR":
+            try:
+                news = kr_news_asof(data_dir, case["symbol"], archive_cutoff(asof, "KR"),
+                                    fetch=news_fetch)
+            except Exception as e:
+                log.warning("[%s %s] 과거 종목뉴스 실패(아카이브 뉴스 유지): %s",
+                            case["symbol"], case["asof"], e)
+                news = None
+            if news:
+                arch["news"] = news                # 라이브처럼 종목 뉴스 5건(그 시점)
         ctx.update(arch)
     if arm in ("inputs", "market_inputs") and inputs is not None:
         px = (ctx.get("technical") or {}).get("price")

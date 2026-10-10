@@ -84,13 +84,38 @@ def test_build_case_context_market_arms(tmp_path):
     _archive(tmp_path, ar.archive_cutoff(date(2026, 7, 20), "KR") - 3600,
              news=[{"title": "n1"}])
     fake = _FakeInputs()
-    m = ar.build_case_context(case, "market", data_dir=tmp_path, inputs=fake)
-    mi = ar.build_case_context(case, "market_inputs", data_dir=tmp_path, inputs=fake)
+    no_news = lambda code, page, size: []                     # noqa: E731
+    m = ar.build_case_context(case, "market", data_dir=tmp_path, inputs=fake,
+                              news_fetch=no_news)
+    mi = ar.build_case_context(case, "market_inputs", data_dir=tmp_path, inputs=fake,
+                               news_fetch=no_news)
     assert m["regime"] == {"label": "risk_on"} and m["news"] == [{"title": "n1"}]
     assert not m.get("fundamentals") and mi["fundamentals"] == {"pb": 1.2}
     assert mi["macro_kr"] == m["macro_kr"]
     assert ar.build_case_context({**case, "asof": "2026-07-28"}, "market",
                                  data_dir=tmp_path) is None    # 아카이브 없음 → 건너뜀
+
+
+def test_kr_news_asof_pages_back_and_caches(tmp_path):
+    from zoneinfo import ZoneInfo
+    cut = datetime(2026, 9, 3, 7, 30, tzinfo=ZoneInfo("Asia/Seoul")).timestamp()
+    pages = {1: [{"datetime": "202609031000", "title": "after"},
+                 {"datetime": "202609030800", "title": "after2"}],
+             2: [{"datetime": "202609030701", "title": "<b>b1</b>", "officeName": "S"},
+                 {"datetime": "202609021200", "title": "b2"}],
+             5: [{"datetime": "202609011200", "title": "b3"}]}     # 3·4 페이지 빈 구간
+    calls = []
+
+    def fetch(code, page, size):
+        calls.append(page)
+        return pages.get(page, [])
+    out = ar.kr_news_asof(tmp_path, "111111", cut, per=3, fetch=fetch)
+    assert [n["title"] for n in out] == ["b1", "b2", "b3"]       # 창 이후 기사 제외·태그 제거
+    assert out[0]["source"] == "S" and calls == [1, 2, 3, 4, 5]
+    assert ar.kr_news_asof(tmp_path, "111111", cut, per=3, fetch=fetch) == out
+    assert calls == [1, 2, 3, 4, 5]                              # 캐시 적중
+    assert ar.kr_news_asof(tmp_path, "222222", cut, fetch=lambda *a: [],
+                           max_empty_run=3) is None              # 끝까지 비면 None(캐시 안 함)
 
 
 def test_run_cases_pinned_system_prompt(tmp_path):
