@@ -111,6 +111,19 @@ def load_history_before(data_dir: Path | str, symbol: str, asof: date) -> pd.Dat
     return best
 
 
+def athena_system_at(ref: str, *, repo: Path | str = ".") -> str:
+    """git ref 시점 src/agents/athena.py 의 ATHENA_SYSTEM 문자열(모듈 실행 없이 AST 로)."""
+    import ast
+    import subprocess
+    src = subprocess.run(["git", "show", f"{ref}:src/agents/athena.py"], cwd=str(repo),
+                         capture_output=True, text=True, encoding="utf-8", check=True).stdout
+    for node in ast.parse(src).body:
+        if (isinstance(node, ast.Assign) and len(node.targets) == 1
+                and getattr(node.targets[0], "id", None) == "ATHENA_SYSTEM"):
+            return ast.literal_eval(node.value)
+    raise ValueError(f"{ref}: ATHENA_SYSTEM 없음")
+
+
 def _archive_index(data_dir: Path | str) -> list[tuple[float, Path]]:
     """context_archive 의 (생성 epoch, 경로) — 파일명 `<epoch>p<ms>_<hash>.json.gz`."""
     out = []
@@ -253,11 +266,30 @@ def _done_keys(out_path: Path) -> set[tuple[str, str, str]]:
 def run_cases(cases: list[dict], *, llm, data_dir: Path | str, out_path: Path,
               arms: tuple[str, ...] = ARMS, inputs: Any = None, limit: int | None = None,
               stop_fn: Callable[[], bool] | None = None,
-              names: dict[str, str] | None = None, llm_lean=None) -> dict:
-    """case × arm 판정 → out_path jsonl 에 한 줄씩(이어하기 지원). 반환: 이번 실행 요약."""
+              names: dict[str, str] | None = None, llm_lean=None,
+              system_prompt: str | None = None) -> dict:
+    """case × arm 판정 → out_path jsonl 에 한 줄씩(이어하기 지원). 반환: 이번 실행 요약.
+
+    system_prompt: 과거 판본 ATHENA_SYSTEM 으로 판정(라이브 표본과 프롬프트 맞추기).
+    이어하기 키에 판본이 없으므로 판본마다 다른 tag 로 돌린다.
+    """
+    import hashlib
+
     from ..agents.athena import ATHENA_PROMPT_REV, AthenaAgent, sanitize
 
-    agents = {False: AthenaAgent(llm), True: AthenaAgent(llm_lean) if llm_lean else None}
+    prompt_rev = ATHENA_PROMPT_REV
+    agent_cls = AthenaAgent
+    if system_prompt is not None:
+        prompt_rev = hashlib.sha256(system_prompt.encode("utf-8")).hexdigest()[:12]
+
+        class _PinnedAthena(AthenaAgent):
+            def research(self, context: dict):
+                from ..agents.schemas import DossierOutput
+                return self.llm.structured(system_prompt,
+                                           json.dumps(context, ensure_ascii=False),
+                                           DossierOutput)
+        agent_cls = _PinnedAthena
+    agents = {False: agent_cls(llm), True: agent_cls(llm_lean) if llm_lean else None}
     done = _done_keys(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
     arch_idx = (_archive_index(data_dir)
@@ -285,7 +317,7 @@ def run_cases(cases: list[dict], *, llm, data_dir: Path | str, out_path: Path,
                 continue
             before = len(getattr(cur_llm, "calls", []))
             t0 = time.time()
-            row = {**case, "arm": arm, "prompt_rev": ATHENA_PROMPT_REV,
+            row = {**case, "arm": arm, "prompt_rev": prompt_rev,
                    "ctx_bytes": len(json.dumps(ctx, ensure_ascii=False)),
                    "inputs": {k: bool(ctx.get(k)) for k in ("fundamentals", "flows", "positioning")},
                    "ts": datetime.now(timezone.utc).isoformat()}

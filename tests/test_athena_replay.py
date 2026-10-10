@@ -93,6 +93,29 @@ def test_build_case_context_market_arms(tmp_path):
                                  data_dir=tmp_path) is None    # 아카이브 없음 → 건너뜀
 
 
+def test_run_cases_pinned_system_prompt(tmp_path):
+    _hist(tmp_path)
+    cases = [{"symbol": "111111", "market": "KR", "asof": "2026-07-20"}]
+    seen = []
+
+    def respond(schema, system, user):
+        seen.append(system)
+        px = float(json.loads(user)["technical"]["price"])
+        return DossierOutput(stance="neutral", thesis="t", conviction=0.5, entry_low=px * .98,
+                             entry_high=px, invalidation=px * .94, target=px * 1.1)
+    out = tmp_path / "r.jsonl"
+    ar.run_cases(cases, llm=MockLLM(respond), data_dir=tmp_path, out_path=out,
+                 arms=("base",), system_prompt="OLD PROMPT")
+    from src.agents.athena import ATHENA_PROMPT_REV
+    row = ar.load_results(out)[0]
+    assert seen == ["OLD PROMPT"] and row["prompt_rev"] != ATHENA_PROMPT_REV
+
+
+def test_athena_system_at_head_matches_module():
+    from src.agents.athena import ATHENA_SYSTEM
+    assert ar.athena_system_at("HEAD") == ATHENA_SYSTEM
+
+
 def test_score_results_market_pair(tmp_path):
     rows = [{"symbol": "A", "asof": "2026-09-01", "arm": arm, "stance": st,
              "live_stance": "bullish", "live_excess_pp": -2.0}
