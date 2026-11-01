@@ -10,6 +10,9 @@
        auth_needed   -> 인증 만료(재로그인 필요)
   B2. bridge 모드 + bridge.heartbeat 미무장     -> circuit 위험(조기 경보)
   B3. 장 상태 교차검증(정규장) — 토스 캐시 vs US Finnhub/Yahoo, KR 정규장 달력
+  B4. LLM 정지 — 모드가 ok 인 채 조용히 실패(CLI 경로 오류 등, 2026-10 일주일 무음 사고)
+       뇌: 마지막 brain_done 이후 에러 N건 / Athena·밸류 스캔: 마지막 실행이 done 0·failed>0
+       시간 창이 아니라 '성공 기록'으로만 풀린다(재기동·휴장으로 꺼지지 않음).
   C. (레거시 폴백) DB 최근 인증 에러 — mode 파일 없을 때
 
 푸시/대시보드 '다음:' 액션은 src.ops_playbook.
@@ -64,6 +67,9 @@ HB_STALE_SEC = 300
 # 미해소(미확인·pause/HALT·sync) 재푸시. 격리는 잔존 스팸이 커서 별도 텀.
 UNRESOLVED_RENOTIFY_SEC = 300
 QUARANTINE_RENOTIFY_SEC = 3 * 3600  # 격리(QUARANTINED) 잔존 재통지 3시간
+BRAIN_STALL_MIN_FAILS = 3           # 마지막 성공 이후 뇌 에러 N건부터 LLM 정지
+LLM_RENOTIFY_SEC = 12 * 3600        # LLM 정지 잔존 재통지 12시간
+LLM_STALL_TAG = "LLM 정지"
 _SEOUL = ZoneInfo("Asia/Seoul")
 
 
@@ -140,7 +146,8 @@ def evaluate(now: float, hb_age: float | None, market_open: bool = True,
              hb_markets_open: list | None = None,
              hb_should_be_open: list | None = None,
              expects_polling: bool = False,
-             trading_health: dict | None = None) -> list[str]:
+             trading_health: dict | None = None,
+             llm_health: dict | None = None) -> list[str]:
     """순수 판정 — 경보 사유 리스트(빈 리스트=정상).
 
     brain_errors_recent / last_brain_done_age 는 하위호환으로 받지만 **무시**한다
@@ -152,6 +159,7 @@ def evaluate(now: float, hb_age: float | None, market_open: bool = True,
     expects_polling 은 구 하트비트(should_be_open 없음) 폴백용.
 
     trading_health: 장 개폐와 무관 — HALT/pause/sync/미확인·격리 주문.
+    llm_health: _llm_health() — 모드 ok 인 채 실패 중인 뇌·Athena·밸류 스캔.
     """
     del brain_errors_recent, last_brain_done_age, market_open  # 명시적 미사용
     reasons: list[str] = []
@@ -186,7 +194,73 @@ def evaluate(now: float, hb_age: float | None, market_open: bool = True,
             "브릿지 모드인데 미무장 — bridge.heartbeat 만료/없음 → circuit 위험")
 
     reasons.extend(_trading_health_reasons(trading_health))
+    reasons.extend(_llm_stall_reasons(llm_health, brain_mode=mode))
     return reasons
+
+
+def _llm_stall_reasons(h: dict | None, *, brain_mode: str = "ok") -> list[str]:
+    """LLM 정지 경보. 문구는 실패 건수가 늘어도 그대로 — 사이클마다 재푸시되지 않게."""
+    if not h:
+        return []
+    out: list[str] = []
+    since = h.get("brain_fail_since")
+    # 모드가 이미 경보 중이면(인증·한도·회로) 뇌 사유는 mode_reasons 로 충분하다.
+    if brain_mode == "ok" and int(h.get("brain_fails") or 0) >= BRAIN_STALL_MIN_FAILS and since:
+        out.append(f"{LLM_STALL_TAG}: 뇌 — {_fmt_reset(since)} 부터 성공 없음")
+    for label, run in (h.get("batches") or {}).items():
+        out.append(f"{LLM_STALL_TAG}: {label} — {_fmt_reset(run['ts'])} 실행 "
+                   f"{run['failed']}건 전부 실패")
+    return out
+
+
+def _is_all_failed(run: dict) -> bool:
+    return not run.get("done") and bool(run.get("failed"))
+
+
+def _llm_health() -> dict:
+    """events 로 본 LLM 소비자 상태. 조회 실패는 {}(경보 훅이 죽지 않게)."""
+    if not DB.exists():
+        return {}
+    con = sqlite3.connect(f"file:{DB}?mode=ro", uri=True, timeout=2.0)
+    try:
+        last_ok = con.execute(
+            "select max(ts) from events where kind='brain_done'").fetchone()[0] or 0
+        fails, since = con.execute(
+            "select count(*), min(ts) from events where kind='error' and ts>? "
+            "and payload like '%\"where\": \"brain\"%'", (last_ok,)).fetchone()
+        athena_rows = con.execute(
+            "select ts, payload from events where kind='athena_done' "
+            "order by ts desc limit 20").fetchall()
+        value_rows = con.execute(
+            "select ts, payload from events where kind='value_scan_done' "
+            "order by ts desc limit 1").fetchall()
+    except sqlite3.Error:
+        return {}
+    finally:
+        con.close()
+
+    def _run(ts, payload) -> dict:
+        try:
+            d = json.loads(payload) if payload else {}
+        except (ValueError, TypeError):
+            d = {}
+        return {**d, "ts": ts} if isinstance(d, dict) else {"ts": ts}
+
+    batches: dict[str, dict] = {}
+    latest: set = set()
+    for ts, payload in athena_rows:        # 시장별 최신 1건만 — 다음 성공 창이 지운다
+        run = _run(ts, payload)
+        market = run.get("market")
+        if market in latest:
+            continue
+        latest.add(market)
+        if _is_all_failed(run):
+            batches[f"Athena {market}"] = run
+    for ts, payload in value_rows:
+        run = _run(ts, payload)
+        if _is_all_failed(run):
+            batches["밸류 스캔"] = run
+    return {"brain_fails": int(fails or 0), "brain_fail_since": since, "batches": batches}
 
 
 def _trading_health_reasons(th: dict | None) -> list[str]:
@@ -314,6 +388,8 @@ def _push_title_for(reasons: list[str], mode: str) -> str:
             or any("폴링 실패" in r for r in reasons)
             or any("장 상태 불일치" in r or "세션 캐시" in r for r in reasons)):
         return "Argus daemon"
+    if any(LLM_STALL_TAG in r for r in reasons):
+        return "Argus LLM"
     return "Argus alert"
 
 
@@ -532,6 +608,7 @@ def main() -> int:
         hb_should_be_open=list(hb.get("should_be_open") or []) if hb else None,
         expects_polling=expects_polling if not hb.get("should_be_open") else False,
         trading_health=hb.get("trading_health") if isinstance(hb.get("trading_health"), dict) else None,
+        llm_health=_llm_health(),
     )
     reasons.extend(crosscheck_reasons(now))
     next_actions = actions_for(reasons, brain_mode=mode)
@@ -544,16 +621,19 @@ def main() -> int:
     prev_push_ok = prev.get("push_ok", True)
     last_unresolved_push = float(prev.get("last_unresolved_push") or 0)
     last_quarantine_push = float(prev.get("last_quarantine_push") or 0)
+    last_llm_push = float(prev.get("last_llm_push") or 0)
     unresolved_due, has_quarantine, has_other_unresolved = unresolved_renotify_due(
         reasons, now,
         last_unresolved_push=last_unresolved_push,
         last_quarantine_push=last_quarantine_push)
+    has_llm_stall = any(LLM_STALL_TAG in r for r in reasons)
+    llm_due = has_llm_stall and (now - last_llm_push >= LLM_RENOTIFY_SEC)
 
     if reasons:
         since = prev.get("since") if was_active else now
         should_fire = ((not was_active) or (prev_mode != mode)
                        or (prev_reasons != reasons) or (not prev_push_ok)
-                       or unresolved_due)
+                       or unresolved_due or llm_due)
         push_ok = True
         if should_fire:
             _log("FIRED", reasons, brain_mode=mode, actions=next_actions,
@@ -569,6 +649,8 @@ def main() -> int:
                     last_unresolved_push = now
                 if has_quarantine:
                     last_quarantine_push = now
+                if has_llm_stall:
+                    last_llm_push = now
         else:
             push_ok = bool(prev_push_ok)
         payload = {
@@ -581,6 +663,7 @@ def main() -> int:
             "push_ok": push_ok,
             "last_unresolved_push": last_unresolved_push,
             "last_quarantine_push": last_quarantine_push,
+            "last_llm_push": last_llm_push,
         }
         ALERT.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
         print("[alert] ACTIVE:", " | ".join(reasons))

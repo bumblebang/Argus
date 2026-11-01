@@ -26,6 +26,10 @@ def actions_for(reasons: list[str], *, brain_mode: str = "ok") -> list[str]:
     if any("인증" in r for r in reasons) or mode == "auth_needed":
         add("scripts\\claude_login.bat 로 재로그인 후 다음 사이클 대기")
 
+    if any("LLM 정지" in r for r in reasons):
+        add("claude CLI 점검: python scripts/which_claude.py --check (경로·인증)")
+        add("실패 원인: logs/watch.log · athena.log · value_scan.log")
+
     if any("미무장" in r for r in reasons):
         add("브릿지 재무장: argus bridge --serve 60 (또는 bridge_hb_window.cmd)")
         add("PokeTokenBarWin 트레이 「브릿지 judge 켜기」도 동일")
