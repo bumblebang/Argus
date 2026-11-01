@@ -37,6 +37,16 @@ def _held_symbols() -> set[str]:
         return set()
 
 
+def _log_scan_done(summary: dict) -> None:
+    """스캔 결과를 events 에 남긴다 — alert_check 가 전부 실패를 잡는 근거."""
+    try:
+        from src.engine.store import Store
+        Store(_paths.resolve("db", configured="data/bot.db")).log_event(
+            "value_scan_done", None, summary)
+    except Exception as e:
+        log.warning("value_scan_done 기록 실패: %s", e)
+
+
 def _dry_llm() -> MockLLM:
     def responder(schema, system, user):
         assert schema is ValueDossier
@@ -75,6 +85,8 @@ def main() -> int:
                               lean=claude_lean_for(a, "value_scan"))
 
     summary = run_scan(cfg, llm, limit=args.limit, held_symbols=_held_symbols())
+    if not args.dry:
+        _log_scan_done(summary)
     print(json.dumps(summary, ensure_ascii=False))
     return 0
 
