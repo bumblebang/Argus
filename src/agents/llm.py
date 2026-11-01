@@ -164,18 +164,24 @@ def _ver_key(name: str) -> list[int]:
 
 
 def _latest_claude_in(claude_code_dir: Path) -> Path | None:
-    """claude-code/<ver>/claude.exe 중 가장 높은 버전의 실재 exe 경로를 반환."""
+    """claude-code/<ver>/claude.exe 중 가장 높은 버전의 실재 exe 경로를 반환.
+
+    2.1.308 부터 데스크톱 앱이 `<ver>/<해시>/claude.exe` 로 한 단계 깊게 깐다 →
+    버전 폴더 바로 아래와 그 하위 1단계를 모두 본다. 같은 버전에 여러 개면 최신 mtime.
+    """
     if not claude_code_dir.is_dir():
         return None
     found = []
     for vdir in claude_code_dir.iterdir():
-        exe = vdir / "claude.exe"
-        if exe.is_file():
-            found.append((_ver_key(vdir.name), exe))
+        if not vdir.is_dir():
+            continue
+        for exe in (vdir / "claude.exe", *vdir.glob("*/claude.exe")):
+            if exe.is_file():
+                found.append((_ver_key(vdir.name), exe.stat().st_mtime, exe))
     if not found:
         return None
-    found.sort()
-    return found[-1][1]
+    found.sort(key=lambda t: (t[0], t[1]))
+    return found[-1][2]
 
 
 def resolve_claude_command(command: str) -> str:
@@ -201,10 +207,13 @@ def resolve_claude_command(command: str) -> str:
                 local, "Packages", "Claude_*", "LocalCache",
                 "Roaming", "Claude", "claude-code")):
             bases.append(Path(d))
-    # 2) 설정 경로에서 유추한 claude-code 디렉터리(…/claude-code/<ver>/claude.exe)
+    # 2) 설정 경로에서 유추한 claude-code 디렉터리(…/claude-code/<ver>[/<해시>]/claude.exe)
     p = Path(command)
-    if p.name.lower() == "claude.exe" and p.parent.parent.name == "claude-code":
-        bases.append(p.parent.parent)
+    if p.name.lower() == "claude.exe":
+        for anc in (p.parent.parent, p.parent.parent.parent):
+            if anc.name == "claude-code":
+                bases.append(anc)
+                break
     # 3) 가상화 Roaming 경로(최후순위)
     appdata = os.environ.get("APPDATA", "")
     if appdata:
