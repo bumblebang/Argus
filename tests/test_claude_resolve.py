@@ -97,3 +97,52 @@ def test_runtime_rediscovers_after_app_update(tmp_path, monkeypatch):
     assert c.structured("SYS", "{}", _Out).ok == "yes"
     assert calls == [str(old), str(new)]
     assert c.command == str(new)
+
+
+def _data_base(tmp_path: Path) -> Path:
+    """LOCALAPPDATA/Claude-Data/claude_*/claude-code (2026-11-06 앱 데이터 이전 위치)."""
+    base = tmp_path / "Local" / "Claude-Data" / "claude_test" / "claude-code"
+    base.mkdir(parents=True)
+    return base
+
+
+def test_stale_packages_pin_resolves_to_claude_data(tmp_path, monkeypatch):
+    """앱이 Packages/…/Roaming/Claude 를 비우고 Claude-Data 로 옮긴 뒤에도 옛 핀이 새 exe 로 해석된다."""
+    pkg = _pkg_base(tmp_path, monkeypatch)
+    pkg.rmdir()                                         # 옛 위치는 통째로 사라짐
+    data = _data_base(tmp_path)
+    _exe(data, "2.1.309", "9078b9c1d466")
+    want = _exe(data, "2.1.317", "a33aa5518497")
+    stale = str(pkg / "2.1.237" / "claude.exe")
+    assert L.resolve_claude_command(stale) == str(want)
+
+
+def test_claude_data_preferred_over_leftover_packages(tmp_path, monkeypatch):
+    """옛 Packages 위치에 잔재가 있어도 새 Claude-Data 위치를 먼저 쓴다."""
+    pkg = _pkg_base(tmp_path, monkeypatch)
+    _exe(pkg, "2.1.309", "9078b9c1d466")
+    data = _data_base(tmp_path)
+    want = _exe(data, "2.1.317", "a33aa5518497")
+    assert L.resolve_claude_command(str(pkg / "2.1.309" / "9078b9c1d466" / "claude.exe")) == str(want)
+
+
+def test_runtime_rediscovers_after_data_migration(tmp_path, monkeypatch):
+    """데몬 기동 후 앱이 데이터 폴더를 옮기면 다음 호출에서 Claude-Data 경로로 갈아탄다."""
+    pkg = _pkg_base(tmp_path, monkeypatch)
+    old = _exe(pkg, "2.1.309", "9078b9c1d466")
+    c = L.ClaudeCLIClient(command=str(old), model="sonnet", error_dump_path=None)
+    assert c.command == str(old)
+    new = _exe(_data_base(tmp_path), "2.1.317", "a33aa5518497")
+    old.unlink()
+    calls = []
+
+    def run(args, **kw):
+        calls.append(args[0])
+        if not Path(args[0]).is_file():
+            raise FileNotFoundError(args[0])
+        return SimpleNamespace(returncode=0, stdout='{"ok": "yes"}', stderr="")
+
+    monkeypatch.setattr(L.subprocess, "run", run)
+    assert c.structured("SYS", "{}", _Out).ok == "yes"
+    assert calls == [str(old), str(new)]
+    assert c.command == str(new)

@@ -191,6 +191,7 @@ def resolve_claude_command(command: str) -> str:
     세션에선 보이지만 작업스케줄러가 띄운 pythonw 데몬에선 FileNotFoundError 가 난다.
     실제 패키지 경로(`AppData/Local/Packages/Claude_*/LocalCache/...`)는 비가상화라
     모든 프로세스에서 보인다. 동시에 버전 폴더를 스캔해 핀(2.1.187) 의존도 제거한다.
+    2026-11-06 부터 앱이 데이터를 `AppData/Local/Claude-Data/claude_*/` 로 옮겨 그곳을 최우선으로 본다.
     """
     # bare 명령(예: 'claude')은 PATH 에 맡긴다.
     if not command or ("/" not in command and os.path.sep not in command):
@@ -200,8 +201,14 @@ def resolve_claude_command(command: str) -> str:
     if "claude-code/" not in low and Path(command).name.lower() not in ("claude.exe", "claude"):
         return command
     bases: list[Path] = []
-    # 1) 실제 MSIX 패키지 경로(비가상화, 데몬에서도 보임) — 패밀리명 변해도 글롭으로 잡음.
     local = os.environ.get("LOCALAPPDATA", "")
+    # 0) 데스크톱 앱 데이터 이전 위치(2026-11-06~): `AppData/Local/Claude-Data/claude_*/claude-code`.
+    #    앱이 옛 Packages/…/Roaming/Claude 를 비우고(`.user-data-left.*` 표식) 여기로 옮겼다.
+    #    비가상화 경로라 데몬에서도 보인다. 옛 위치에 잔재가 남아도 새 위치를 먼저 본다.
+    if local:
+        for d in glob.glob(os.path.join(local, "Claude-Data", "claude_*", "claude-code")):
+            bases.append(Path(d))
+    # 1) 실제 MSIX 패키지 경로(비가상화, 데몬에서도 보임) — 패밀리명 변해도 글롭으로 잡음.
     if local:
         for d in glob.glob(os.path.join(
                 local, "Packages", "Claude_*", "LocalCache",
