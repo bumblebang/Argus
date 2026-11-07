@@ -87,7 +87,8 @@ def test_athena_all_failed_per_market(tmp_path, monkeypatch):
 
 
 def test_athena_next_success_clears_only_that_market(tmp_path, monkeypatch):
-    _db(tmp_path, monkeypatch, [_athena(NOW - 500, "US", 0, 30),
+    """서로 다른 때(창 밖) 실패 — 공통 장애가 아니므로 KR 성공이 US 를 지우지 않는다."""
+    _db(tmp_path, monkeypatch, [_athena(NOW - 7 * 3600 - 500, "US", 0, 30),
                                 _athena(NOW - 400, "KR", 0, 30),
                                 _athena(NOW - 100, "KR", 12, 18)])
     r = _reasons(brain_mode="ok")
@@ -158,3 +159,69 @@ def test_main_pushes_once_then_renotifies_after_12h(tmp_path, monkeypatch):
     assert _run_main(tmp_path, monkeypatch, NOW + 11 * 3600, rows) == []
     p = _run_main(tmp_path, monkeypatch, NOW + 12 * 3600 + 1, rows)
     assert len(p) == 1 and p[0][0] == "Argus LLM"
+
+
+# ── 공통 원인 복구 — 휴장 시장 경보가 원인 복구 뒤에도 며칠 남던 문제(2026-11-06) ──
+
+H = 3600
+
+
+def _value(ts, done, failed):
+    return (ts, "value_scan_done", {"done": done, "failed": failed})
+
+
+def test_closed_market_cleared_when_shared_outage_recovered(tmp_path, monkeypatch):
+    """11-06 재현: KR 05:35 전부 실패 + 밸류 07:49 전부 실패 → 밸류 15:49 성공. KR 은 주말 내내 창 없음."""
+    _db(tmp_path, monkeypatch, [_athena(NOW - 40 * H, "KR", 0, 30),
+                                _value(NOW - 38 * H, 0, 15),
+                                _value(NOW - 30 * H, 15, 0)])
+    assert _reasons(brain_mode="ok") == []
+    assert ac._llm_health()["recovered"] == ["Athena KR"]
+
+
+def test_brain_outage_recovery_clears_batch(tmp_path, monkeypatch):
+    _db(tmp_path, monkeypatch, [_err(NOW - 41 * H), _err(NOW - 40 * H), _err(NOW - 39 * H),
+                                _athena(NOW - 40 * H, "KR", 0, 30),
+                                (NOW - 20 * H, "brain_done", {})])
+    assert _reasons(brain_mode="ok") == []
+
+
+def test_isolated_market_failure_stays(tmp_path, monkeypatch):
+    """다른 소비자는 멀쩡 — 시장 단독 장애(데이터 원천 등)는 해제하지 않는다."""
+    _db(tmp_path, monkeypatch, [_value(NOW - 50 * H, 10, 0),
+                                _athena(NOW - 40 * H, "KR", 0, 30),
+                                _athena(NOW - 30 * H, "US", 30, 0),
+                                _value(NOW - 20 * H, 10, 0),
+                                (NOW - 10 * H, "brain_done", {})])
+    r = _reasons(brain_mode="ok")
+    assert len(r) == 1 and "Athena KR" in r[0]
+
+
+def test_sporadic_brain_errors_do_not_clear(tmp_path, monkeypatch):
+    """뇌 에러 1~2건은 흔하다 — 공통 장애로 치지 않는다."""
+    _db(tmp_path, monkeypatch, [_err(NOW - 40 * H), _err(NOW - 39 * H),
+                                _athena(NOW - 40 * H, "KR", 0, 30),
+                                (NOW - 20 * H, "brain_done", {})])
+    assert any("Athena KR" in x for x in _reasons(brain_mode="ok"))
+
+
+def test_concurrent_failure_outside_window_stays(tmp_path, monkeypatch):
+    _db(tmp_path, monkeypatch, [_value(NOW - 50 * H, 0, 15),
+                                _athena(NOW - 40 * H, "KR", 0, 30),
+                                _value(NOW - 20 * H, 15, 0)])
+    assert any("Athena KR" in x for x in _reasons(brain_mode="ok"))
+
+
+def test_shared_outage_not_yet_recovered_keeps_both(tmp_path, monkeypatch):
+    _db(tmp_path, monkeypatch, [_athena(NOW - 4 * H, "KR", 0, 30),
+                                _value(NOW - 2 * H, 0, 15)])
+    r = _reasons(brain_mode="ok")
+    assert len(r) == 2
+
+
+def test_other_market_recovery_clears_sibling(tmp_path, monkeypatch):
+    """US·KR 이 같은 장애로 함께 실패 → US 가 다음 창에서 성공하면 KR 도 해제."""
+    _db(tmp_path, monkeypatch, [_athena(NOW - 50 * H, "US", 0, 30),
+                                _athena(NOW - 46 * H, "KR", 0, 30),
+                                _athena(NOW - 26 * H, "US", 30, 0)])
+    assert _reasons(brain_mode="ok") == []
