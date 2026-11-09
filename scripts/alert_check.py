@@ -70,6 +70,8 @@ QUARANTINE_RENOTIFY_SEC = 3 * 3600  # 격리(QUARANTINED) 잔존 재통지 3시�
 BRAIN_STALL_MIN_FAILS = 3           # 마지막 성공 이후 뇌 에러 N건부터 LLM 정지
 LLM_RENOTIFY_SEC = 12 * 3600        # LLM 정지 잔존 재통지 12시간
 LLM_STALL_TAG = "LLM 정지"
+# 공통 원인 판정 창 — 다른 LLM 소비자도 이 안에서 실패했다가 그 뒤 성공했으면 복구로 본다.
+SHARED_OUTAGE_WINDOW_SEC = 6 * 3600
 _SEOUL = ZoneInfo("Asia/Seoul")
 
 
@@ -233,7 +235,11 @@ def _llm_health() -> dict:
             "order by ts desc limit 20").fetchall()
         value_rows = con.execute(
             "select ts, payload from events where kind='value_scan_done' "
-            "order by ts desc limit 1").fetchall()
+            "order by ts desc limit 10").fetchall()
+        brain_err_ts = [r[0] for r in con.execute(
+            "select ts from events where kind='error' "
+            "and payload like '%\"where\": \"brain\"%' "
+            "order by ts desc limit 300").fetchall()]
     except sqlite3.Error:
         return {}
     finally:
@@ -246,21 +252,66 @@ def _llm_health() -> dict:
             d = {}
         return {**d, "ts": ts} if isinstance(d, dict) else {"ts": ts}
 
+    # 소비자별 (전부 실패한 시각들, 마지막 성공 시각) — 공통 원인 복구 판정용.
+    signals: dict[str, tuple[list[float], float]] = {
+        "뇌": (_brain_outage_ts(brain_err_ts), float(last_ok or 0))}
     batches: dict[str, dict] = {}
-    latest: set = set()
-    for ts, payload in athena_rows:        # 시장별 최신 1건만 — 다음 성공 창이 지운다
-        run = _run(ts, payload)
-        market = run.get("market")
-        if market in latest:
-            continue
-        latest.add(market)
-        if _is_all_failed(run):
-            batches[f"Athena {market}"] = run
+    for label, run in _batch_runs(athena_rows, value_rows, _run, signals):
+        if _is_all_failed(run):            # 소비자별 최신 1건만 — 다음 성공 창이 지운다
+            batches[label] = run
+    recovered = [lb for lb, run in batches.items()
+                 if _shared_outage_recovered(lb, float(run["ts"]), signals)]
+    for lb in recovered:                   # 공통 원인(CLI 등)이 이미 복구 — 휴장 시장도 해제
+        batches.pop(lb)
+    return {"brain_fails": int(fails or 0), "brain_fail_since": since,
+            "batches": batches, "recovered": recovered}
+
+
+def _batch_runs(athena_rows, value_rows, run_of, signals: dict):
+    """(라벨, 최신 실행) 을 내면서 signals 에 소비자별 실패·성공 시각을 채운다."""
+    groups: dict[str, list[dict]] = {}
+    for ts, payload in athena_rows:
+        run = run_of(ts, payload)
+        groups.setdefault(f"Athena {run.get('market')}", []).append(run)
     for ts, payload in value_rows:
-        run = _run(ts, payload)
-        if _is_all_failed(run):
-            batches["밸류 스캔"] = run
-    return {"brain_fails": int(fails or 0), "brain_fail_since": since, "batches": batches}
+        groups.setdefault("밸류 스캔", []).append(run_of(ts, payload))
+    for label, runs in groups.items():     # 각 runs 는 ts 내림차순
+        fails = [float(r["ts"]) for r in runs if _is_all_failed(r)]
+        last_ok = max((float(r["ts"]) for r in runs if r.get("done")), default=0.0)
+        signals[label] = (fails, last_ok)
+        yield label, runs[0]
+
+
+def _brain_outage_ts(err_ts: list[float]) -> list[float]:
+    """뇌 에러 중 '정지'로 볼 만한 시각 — 창 안에 BRAIN_STALL_MIN_FAILS 건 이상 몰린 것만.
+
+    뇌 에러 1~2건(파싱 실패 등)은 흔하다. 그것까지 공통 장애로 치면 시장 단독 장애를 가린다.
+    """
+    ts = sorted(err_ts)
+    out: list[float] = []
+    j = 0
+    for i, t in enumerate(ts):
+        while ts[j] < t - SHARED_OUTAGE_WINDOW_SEC:
+            j += 1
+        if i - j + 1 >= BRAIN_STALL_MIN_FAILS:
+            out.append(t)
+    return out
+
+
+def _shared_outage_recovered(label: str, t: float,
+                             signals: dict[str, tuple[list[float], float]]) -> bool:
+    """`label` 의 전부 실패(t)가 공통 장애의 일부였고 그 장애가 이미 복구됐는가.
+
+    다른 소비자가 t±창 안에서도 실패했고, 그 소비자가 두 실패 이후 성공했으면 True.
+    시장 단독 장애(데이터 원천 등)는 다른 소비자의 동시 실패가 없어 그대로 남는다.
+    """
+    for name, (fails, last_ok) in signals.items():
+        if name == label or not last_ok:
+            continue
+        for tc in fails:
+            if abs(tc - t) <= SHARED_OUTAGE_WINDOW_SEC and last_ok > max(t, tc):
+                return True
+    return False
 
 
 def _trading_health_reasons(th: dict | None) -> list[str]:
