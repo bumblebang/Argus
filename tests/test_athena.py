@@ -363,3 +363,31 @@ def test_athena_prompt_has_stance_feedback_rules():
     assert "stance_track_record" in ATHENA_SYSTEM
     assert "bullish 문턱을 높여라" in ATHENA_SYSTEM
     assert "기계적으로 neutral/bearish 로 돌리지 마라" in ATHENA_SYSTEM
+
+
+def test_run_batch_records_llm_model_and_effort(tmp_path):
+    cfg = load_config()
+    cfg.universe["KR"] = [{"symbol": "AAA", "name": "a"}]
+    store = Store(tmp_path / "t.db")
+    llm = _mock_llm()
+    llm.model = llm.last_model = "claude-sonnet-5-5"
+    llm.effort = "high"
+    run_batch(cfg, store, llm, "KR", fetch_df=lambda s_, m: _df())
+    ev = json.loads(store.get_fresh_dossier("AAA")["evidence"])
+    assert ev["llm_model"] == "claude-sonnet-5-5" and ev["llm_effort"] == "high"
+    assert "llm_fallback" not in ev
+
+
+def test_stance_llm_meta_fallback_and_level_only():
+    from types import SimpleNamespace
+    from src.agents.athena import _stance_llm_meta
+    llm = SimpleNamespace(model="claude-sonnet-5-5", last_model="sonnet",
+                          effort="high", used_fallback=True)
+    assert _stance_llm_meta(llm, "full", None) == {
+        "llm_model": "sonnet", "llm_effort": "high", "llm_fallback": True}
+    # level_only: 직전 full 의 값을 잇는다(이번 호출 모델이 아니라)
+    prev = {"evidence": json.dumps({"llm_model": "claude-sonnet-5", "llm_effort": None})}
+    assert _stance_llm_meta(llm, "level_only", prev) == {
+        "llm_model": "claude-sonnet-5", "llm_effort": None}
+    assert _stance_llm_meta(llm, "level_only", {"evidence": "{}"}) == {}
+    assert _stance_llm_meta(llm, "level_only", None) == {}

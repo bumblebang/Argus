@@ -519,6 +519,23 @@ def select_symbols(cfg, store, market: str, limit: int | None = None, *,
     return out[:limit] if limit else out
 
 
+def _stance_llm_meta(llm, mode: str, prev_row) -> dict:
+    """evidence 에 남길 stance 생성 LLM 정보: llm_model·llm_effort·llm_fallback.
+
+    full = 이번 호출(폴백이 쓰였으면 폴백 모델). level_only = 직전 full 값 승계(없으면 생략).
+    """
+    if mode != "full":
+        if not prev_row:
+            return {}
+        prev = _parse_evidence(prev_row)
+        return {k: prev[k] for k in ("llm_model", "llm_effort", "llm_fallback") if k in prev}
+    meta = {"llm_model": getattr(llm, "last_model", None) or getattr(llm, "model", None),
+            "llm_effort": getattr(llm, "effort", None)}
+    if getattr(llm, "used_fallback", False):
+        meta["llm_fallback"] = True
+    return meta
+
+
 def run_batch(cfg, store, llm, market: str, *,
               limit: int = 30, ttl_hours: float = 60.0,
               stop_at: float | None = None,
@@ -624,6 +641,9 @@ def run_batch(cfg, store, llm, market: str, *,
                 ev_payload["prompt_rev"] = ATHENA_PROMPT_REV
             elif prev_row and _parse_evidence(prev_row).get("prompt_rev"):
                 ev_payload["prompt_rev"] = _parse_evidence(prev_row)["prompt_rev"]
+            # stance 를 만든 모델·추론 강도 — 11-01 별칭 drift(sonnet→5.5)를 DB 만으로 가르지
+            # 못했던 문제. prompt_rev 와 같은 규칙(level_only 는 직전 full 을 잇는다).
+            ev_payload.update(_stance_llm_meta(llm, mode, prev_row))
             if mode == "full" and px and float(px) > 0:
                 ev_payload["ref_price"] = round(float(px), 4)
             elif mode == "level_only" and prev_row:

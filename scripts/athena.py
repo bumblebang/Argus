@@ -114,7 +114,8 @@ def main() -> int:
                               model=(acfg.get("model") or "sonnet"),
                               timeout=int(acfg.get("timeout", 240)),
                               fallback_model=(a.get("claude_fallback_model") or None),
-                              lean=claude_lean_for(a, "athena"))
+                              lean=claude_lean_for(a, "athena"),
+                              effort=acfg.get("effort"))
 
     ms = (json.loads((DATA / "market_state.json").read_text(encoding="utf-8"))
           if (DATA / "market_state.json").exists() else {})
