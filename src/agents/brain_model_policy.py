@@ -5,7 +5,9 @@
 from __future__ import annotations
 
 _DEFAULT_OPUS_REASONS = frozenset({"athena_done", "gap_rebound_scan", "nxt_gap_scan"})
-_DEFAULT_OPUS_EXTRA_SLOTS = {"KR": ("08:00", "09:00"), "US": ("22:30",)}
+# extra_wakes 와 같은 시장 로컬 벽시계(KR=KST, US=ET·DST 자동). 구 KST 표기 US 22:30 은
+# ET 슬롯(09:30)과 영영 안 맞아 미장 opus 슬롯이 한 번도 안 돌았다.
+_DEFAULT_OPUS_EXTRA_SLOTS = {"KR": ("08:00", "09:00"), "US": ("09:30",)}
 
 
 def brain_decision_cfg(agents_cfg: dict | None) -> dict:

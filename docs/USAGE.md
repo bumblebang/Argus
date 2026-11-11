@@ -86,7 +86,7 @@ API 키(`ANTHROPIC_API_KEY`)는 종량제 토큰 과금. 둘 다 쓰면 백엔�
 |---|---|---|
 | `watch.brain_interval_sec` | 0 | 정각은 extra_wakes. 0=상대 주기 끔 |
 | `watch.brain_sessions` | KR/US premarket+regular | |
-| `watch.extra_wakes` | KR 08/09/11/13, US 17/22:30/… | KST 벽시계. US는 DST ±1h 수동 |
+| `watch.extra_wakes` | KR 08/09/11/13/…, US 04:00/09:30/… | 시장 로컬 벽시계(KR=KST, US=ET·DST 자동). `brain_decision.opus_extra_slots` 도 같은 기준 |
 | `watch.extra_wake_grace_sec` | 120 | 재기동 직후 extra 억제 |
 | Athena 종료 훅 | `data/brain_wake_request.json` | 배치 직후 뇌 1회(시장 개장 전에도 소비) |
 | `athena.max_per_run` | 30 | 5–10 |
