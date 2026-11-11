@@ -23,6 +23,11 @@ SCAN_REASONS = frozenset({
     "periodic", "extra", "athena_done", "gap_rebound_scan", "nxt_gap_scan", "",
 })
 
+# 정기 슬롯 — 이벤트와 coalesce 돼도 reason 에 보존하고 scan(전량 검토)으로 분류한다.
+# 보존 안 하면 슬롯 시각에 트리거가 대기 중일 때 사유가 wake_triggers 로 덮여 후보가
+# 보유+트리거 2~3종으로 쪼그라든다(11월 미장 개장 슬롯 7회 중 5회).
+SLOT_REASONS = frozenset({"periodic", "extra", "athena_done"})
+
 # 이벤트 — 기본 focus. 설정 agents.serve.focus_reasons 로 덮어쓸 수 있다.
 DEFAULT_FOCUS_REASONS = frozenset({
     "wake_triggers", "disclosure", "earnings_result", "movers", "act_triggers",
@@ -93,6 +98,7 @@ def classify_tier(wake: dict | None, *, cfg: dict | None = None) -> str:
     reason 이 focus_reasons 에 있으면 focus, SCAN_REASONS 또는 미지·빈 값은 scan.
     복합 reason('disclosure+wake_triggers')은 focus 토큰이 하나라도 있으면 focus.
     단, gap_rebound_scan/nxt_gap_scan 토큰이 있으면 focus 와 coalesce 돼도 scan(갭풀 전량).
+    정기 슬롯(extra/periodic/athena_done) 토큰이 있어도 scan — 트리거 심볼은 scan must 에 합류.
     """
     from .features import wake_has_gap_scan
 
@@ -103,6 +109,8 @@ def classify_tier(wake: dict | None, *, cfg: dict | None = None) -> str:
     if wake_has_gap_scan(reason):
         return "scan"
     parts = [p.strip() for p in reason.replace("|", "+").split("+") if p.strip()]
+    if any(p in SLOT_REASONS for p in parts):
+        return "scan"
     if not parts:
         # triggers 만 있고 reason 빈 경우 — 이벤트 취급
         if wake and (wake.get("triggers") or wake.get("n")):
@@ -211,10 +219,12 @@ def select_scan_candidates(
     bullish: list[str] | None = None,
     scores: dict[str, dict] | None = None,
     cfg: dict | None = None,
+    wake_syms: list[str] | None = None,
 ) -> list[dict]:
-    """scan tier shortlist — must(held∪armed∪bullish∩universe) + pad(strategy_scores 순).
+    """scan tier shortlist — must(held∪armed∪wake∪bullish∩universe) + pad(strategy_scores 순).
 
     must 가 scan_cap 을 넘으면 must 전원 유지, pad 만 trim.
+    wake_syms(슬롯과 coalesce 된 트리거 심볼)는 focus 경로처럼 force_include 로 넣는다.
     """
     from ..strategy_scores import pad_score
 
@@ -225,7 +235,8 @@ def select_scan_candidates(
 
     must: list[str] = []
     seen: set[str] = set()
-    for s in list(held or []) + list(armed or []):
+    wake_set = {s for s in (wake_syms or []) if s}
+    for s in list(held or []) + list(armed or []) + list(wake_syms or []):
         if s and s not in seen:
             seen.add(s)
             must.append(s)
@@ -241,6 +252,9 @@ def select_scan_candidates(
         if it is not None:
             row = dict(it)
             row["serve_must"] = True
+            if s in wake_set:
+                # 트리거 재평가 종목은 assemble 의 buy_ineligible 탈락을 막는다(focus 와 동일).
+                row["force_include"] = True
             chosen.append(row)
             chosen_syms.add(s)
         else:
@@ -298,9 +312,11 @@ def select_candidates(items: list[dict], wake: dict | None, *,
     if t != "focus":
         if (t == "scan" and c.get("scan_enabled", True)
                 and not scan_shortlist_exempt(wake)):
+            wake_syms = filter_symbols_by_market(
+                wake_symbols(wake), markets, market_fn, wake)
             return select_scan_candidates(
                 items, held=held, armed=armed, bullish=bullish,
-                scores=scores, cfg=c), t
+                scores=scores, cfg=c, wake_syms=wake_syms), t
         return list(items), t
 
     must = []
@@ -370,6 +386,7 @@ def _should_join_reason(keeper: str, other: str, other_pr: int) -> bool:
     """coalesce 시 other reason 을 keeper 에 '+' 로 붙일지.
 
     이벤트급(≥70)은 기존과 동일. 갭반등 슬롯은 priority 65여도 풀·tier 판정용으로 보존.
+    정기 슬롯(extra 등)도 보존 — tier(scan)·결정 모델(opus 슬롯) 판정에 쓰인다.
     """
     from .features import GAP_SCAN_REASONS, wake_reason_tokens
 
@@ -377,7 +394,8 @@ def _should_join_reason(keeper: str, other: str, other_pr: int) -> bool:
         return False
     if other_pr >= 70:
         return True
-    return any(p in GAP_SCAN_REASONS for p in wake_reason_tokens(other))
+    return any(p in GAP_SCAN_REASONS or p in SLOT_REASONS
+               for p in wake_reason_tokens(other))
 
 
 def merge_wake_pending(prev: dict | None, reason: str,

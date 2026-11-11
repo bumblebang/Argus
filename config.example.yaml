@@ -304,7 +304,7 @@ agents:
     opus_reasons: ["athena_done", "gap_rebound_scan", "nxt_gap_scan"]
     opus_extra_slots:
       KR: ["08:00", "09:00"]
-      US: ["22:30"]
+      US: ["09:30"]   # extra_wakes 와 같은 시장 로컬(ET) — 정규장 개장
   claude_timeout: 600
   cursor_bridge:
     enabled: false

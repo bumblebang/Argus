@@ -378,3 +378,72 @@ def test_filter_symbols_by_market_fallback_rule():
     """market_fn 이 모르면 6자리=KR / 그 외=US 규칙."""
     assert serve.filter_symbols_by_market(
         ["005930", "TSLA"], {"US"}, lambda s: None) == ["TSLA"]
+
+
+# ── 정기 슬롯 × 트리거 coalesce (11월 미장 개장 슬롯이 2~3종으로 쪼그라든 회귀) ──
+
+def test_classify_slot_wins_over_focus_in_composite():
+    cfg = serve.serve_cfg({"serve": {"enabled": True}})
+    for r in ("wake_triggers+extra", "extra+wake_triggers", "disclosure+extra",
+              "wake_triggers+athena_done"):
+        assert serve.classify_tier({"reason": r}, cfg=cfg) == "scan"
+
+
+def test_merge_wake_preserves_extra_when_trigger_arrives_after():
+    a = serve.merge_wake_pending(None, "extra", [])
+    b = serve.merge_wake_pending(
+        a, "wake_triggers", [{"kind": "vol_spike", "symbol": "GMED"}])
+    assert "extra" in b["reason"] and "wake_triggers" in b["reason"]
+
+
+def test_merge_wake_preserves_extra_when_trigger_pending_before():
+    a = serve.merge_wake_pending(
+        None, "wake_triggers", [{"kind": "vol_spike", "symbol": "GMED"}])
+    b = serve.merge_wake_pending(a, "extra", [])
+    assert "extra" in b["reason"] and "wake_triggers" in b["reason"]
+    assert {t["symbol"] for t in b["triggers"]} == {"GMED"}
+
+
+def test_brainworker_slot_keeps_at_market_after_trigger_pending(tmp_path):
+    store = Store(tmp_path / "t.db")
+    seen = []
+    bw = BrainWorker(lambda wake=None: seen.append(wake), store=store)
+    bw.wake("wake_triggers", [{"kind": "vol_spike", "symbol": "GMED"}])
+    bw.wake("extra", [], at="09:30", market="US")
+    assert bw.run_pending() is True
+    w = seen[0]
+    assert "extra" in w["reason"] and "wake_triggers" in w["reason"]
+    assert w["at"] == "09:30" and w["market"] == "US"
+    assert {t.get("symbol") for t in w["triggers"]} == {"GMED"}
+
+
+def test_slot_coalesced_with_trigger_scans_full_shortlist_plus_trigger():
+    """23:33 개장 슬롯 + GMED vol_spike — scan shortlist 에 트리거 종목까지."""
+    items = [{"symbol": f"S{i:02d}", "market": "US"} for i in range(50)]
+    items.append({"symbol": "GMED", "market": "US"})
+    cfg = serve.serve_cfg({"serve": {
+        "enabled": True, "scan_enabled": True, "scan_cap": 10, "focus_cap": 16}})
+    wake = {"reason": "wake_triggers+extra", "at": "09:30", "market": "US",
+            "triggers": [{"kind": "vol_spike", "symbol": "GMED"}]}
+    bullish = [f"S{i:02d}" for i in range(5)]
+    out, tier = serve.select_candidates(items, wake, held=["S40"], bullish=bullish,
+                                        cfg=cfg)
+    assert tier == "scan"
+    syms = [r["symbol"] for r in out]
+    assert len(out) == 10
+    assert "GMED" in syms and "S40" in syms
+    assert set(bullish) <= set(syms)
+    gmed = next(r for r in out if r["symbol"] == "GMED")
+    assert gmed.get("force_include") is True
+
+
+def test_slot_coalesced_trigger_outside_universe_is_stub():
+    items = [{"symbol": f"S{i:02d}", "market": "US"} for i in range(20)]
+    cfg = serve.serve_cfg({"serve": {
+        "enabled": True, "scan_enabled": True, "scan_cap": 10}})
+    wake = {"reason": "wake_triggers+extra",
+            "triggers": [{"kind": "vol_spike", "symbol": "ZZZZ"}]}
+    out, tier = serve.select_candidates(items, wake, cfg=cfg)
+    assert tier == "scan"
+    z = next(r for r in out if r["symbol"] == "ZZZZ")
+    assert z.get("serve_stub") and z.get("force_include")
