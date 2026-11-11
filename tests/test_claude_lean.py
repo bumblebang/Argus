@@ -72,3 +72,36 @@ def test_claude_lean_for_shapes():
     assert L.claude_lean_for({"claude_lean": {"athena": True}}, "brain") is False
     assert L.claude_lean_for({"claude_lean": ["value_scan"]}, "value_scan") is True
     assert L.claude_lean_for({}, "athena") is False and L.claude_lean_for(None, "x") is False
+
+
+def test_effort_flag_passed_and_kept_on_fallback(monkeypatch, tmp_path):
+    calls = []
+
+    def run(args, input=None, cwd=None, **kw):
+        calls.append(list(args))
+        if len(calls) == 1:
+            return SimpleNamespace(returncode=1, stdout="", stderr="overloaded")
+        return SimpleNamespace(returncode=0, stdout='{"ok": "y"}', stderr="")
+    monkeypatch.setattr(L.subprocess, "run", run)
+    c = L.ClaudeCLIClient(command="claude", model="claude-sonnet-5-5", effort="High",
+                          fallback_model="sonnet", lean_dir=tmp_path, error_dump_path=None)
+    c.structured("S", "{}", _Out)
+    assert calls[0] == ["claude", "-p", "--model", "claude-sonnet-5-5", "--effort", "high"]
+    assert calls[1][calls[1].index("--effort") + 1] == "high"
+    assert c.effort == "high" and c.last_model == "sonnet" and c.used_fallback
+
+
+def test_effort_none_or_blank_omits_flag(monkeypatch, tmp_path):
+    cap = []
+    monkeypatch.setattr(L.subprocess, "run", _fake_run(cap))
+    for eff in (None, "", "  "):
+        c = L.ClaudeCLIClient(command="claude", model="sonnet", effort=eff, lean_dir=tmp_path)
+        c.structured("S", "{}", _Out)
+        assert "--effort" not in cap[-1]["args"] and c.effort is None
+
+
+def test_effort_typo_rejected():
+    import pytest
+    with pytest.raises(ValueError):
+        L.ClaudeCLIClient(command="claude", model="sonnet", effort="hihg")
+    assert L.normalize_effort(" MAX ") == "max"

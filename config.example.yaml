@@ -337,7 +337,11 @@ watcher:
   edgar_after_close_hours: 2
 
 athena:
-  model: "sonnet"
+  # 별칭(sonnet)은 CLI 업데이트 때 조용히 다른 모델로 바뀐다(11-01 sonnet→5.5 drift) → 정식 ID 권장.
+  model: "claude-sonnet-5-5"
+  # claude CLI --effort (low|medium|high|xhigh|max). 비우면 CLI 기본값.
+  # 11-10 평가: 5.5 기본(medium)은 거의 생각 없이 판정 → 강세 품질 저하, high 는 sonnet-5 수준.
+  effort: "high"
   max_per_run: 30
   ttl_hours: 60
   min_refresh_hours: 48

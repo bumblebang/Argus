@@ -158,6 +158,25 @@ def claude_lean_for(agents_cfg: dict | None, component: str) -> bool:
     return False
 
 
+EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
+
+
+def normalize_effort(value: Any) -> str | None:
+    """config 의 effort 값 → CLI `--effort` 인자. 비면 None(CLI 기본값).
+
+    오타는 조용히 기본값으로 떨어지면 안 된다(11-01 별칭 drift 와 같은 무증상 품질 저하) →
+    허용값 밖이면 ValueError.
+    """
+    if value is None:
+        return None
+    s = str(value).strip().lower()
+    if not s:
+        return None
+    if s not in EFFORT_LEVELS:
+        raise ValueError(f"알 수 없는 effort={value!r} (허용: {', '.join(EFFORT_LEVELS)})")
+    return s
+
+
 def _ver_key(name: str) -> list[int]:
     """'2.1.187' -> [2,1,187] (버전 내림차순 정렬용). 숫자 아닌 토큰은 0."""
     return [int(p) if p.isdigit() else 0 for p in name.split(".")]
@@ -477,7 +496,8 @@ class ClaudeCLIClient:
                  require_bridge_armed: bool = True,
                  bridge_armed_max_age_sec: float = 90.0,
                  lean: bool = False,
-                 lean_dir: str | Path = "data/llm_lean"):
+                 lean_dir: str | Path = "data/llm_lean",
+                 effort: str | None = None):
         self._command_cfg = command
         self.command = resolve_claude_command(command)
         if self.command != command:
@@ -500,6 +520,9 @@ class ClaudeCLIClient:
         self.last_quota_error: str | None = None
         self.last_quota_reset_at: float | None = None
         self.last_quota_kind: str | None = None
+        # 추론 강도(--effort). None 이면 CLI 기본값 — CLI 버전 따라 조용히 바뀔 수 있어
+        # 판정 품질이 effort 에 민감한 컴포넌트(Athena 등)는 config 로 명시한다.
+        self.effort = normalize_effort(effort)
         self.lean = bool(lean)
         self.lean_dir = Path(lean_dir)
         if self.lean and self.cwd is None:
@@ -523,6 +546,8 @@ class ClaudeCLIClient:
             a = [cmd, *self.base_args]
             if model:
                 a += ["--model", model]
+            if self.effort:
+                a += ["--effort", self.effort]
             if self.lean:
                 a += list(LEAN_ARGS)
             a += self.extra_args

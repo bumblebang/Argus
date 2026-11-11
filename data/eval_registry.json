@@ -92,6 +92,54 @@
         }
       },
       "rollout": "athena → value_scan → value_trade → brain(consistency_manager 대조 후)"
+    },
+    {
+      "id": "exp_athena_sonnet55_high_20261112",
+      "name": "athena_sonnet55_high",
+      "hypothesis": "Athena 를 claude-sonnet-5-5 + --effort high 로 고정하면, KR bullish 도시에의 20일 지수 대비 초과수익(bullish−neutral)이 변경 전 라이브 기준선(sonnet-5, −3.55%p)보다 나빠지지 않는다. 배경: 11-01 별칭 drift(sonnet→5.5, CLI 기본 effort)로 bearish 0건·강세 품질 저하.",
+      "metric": "dossier.KR.bullish_minus_neutral_excess_pp",
+      "kill_if": "메모: llm_model=claude-sonnet-5-5·llm_effort=high 도시에 한정 KR bullish 에피소드 n>=30 에서 bullish−neutral < −3.55%p 이면 kill → athena.effort 재검토(또는 claude-sonnet-5 복귀). 측정: scripts/stance_report.py + evidence_match.",
+      "kill": {
+        "metric": "dossier.KR.bullish_minus_neutral_excess_pp",
+        "op": "<",
+        "threshold": -3.55,
+        "min_n": 30
+      },
+      "min_n": 30,
+      "touches": [
+        "athena"
+      ],
+      "status": "running",
+      "created_at": 1794410523.6497798,
+      "prompt_rev": "cb15d43e3420",
+      "evidence_match": {
+        "llm_model": "claude-sonnet-5-5",
+        "llm_effort": "high"
+      },
+      "evidence_n": 54,
+      "evidence_note": "사전 표본 = 11-10 오프라인 리플레이 54건(성과 확정, 강세 16~17건 — 차이가 소수 종목에 몰려 취약). 사후 판정은 evidence_match 한정 라이브 도시에로 apply_kill_rules.",
+      "evidence": {
+        "replay": "운영 기록 프롬프트 54건, 같은 입력·경량 하네스, 모델 claude-sonnet-5-5",
+        "bullish_minus_rest_excess_pp": {
+          "medium": -8.5,
+          "high": -0.7,
+          "symmetric_prompt_medium": -9.2,
+          "sonnet5_live": -0.7
+        },
+        "output_tokens_median": {
+          "medium": 1315,
+          "high": 2460,
+          "sonnet5_live": 4400
+        },
+        "thinking_calls": {
+          "medium": "3/54",
+          "high": "53/54"
+        },
+        "stances": {
+          "medium": "강16·중38·약0",
+          "high": "강17·중36·약1"
+        }
+      }
     }
   ]
 }
