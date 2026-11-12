@@ -740,3 +740,35 @@ def test_demoted_signal_refires_after_cooldown(tmp_path, monkeypatch):
     loop.run_once()
     loop.run_once()
     assert len(wakes) == 2                        # 쿨다운 0 이면 매 틱 각성
+
+
+def test_market_state_reparsed_only_when_file_changes(tmp_path, monkeypatch):
+    """market_state.json(수 MB)은 파일이 바뀔 때만 재파싱 — 1초 틱마다 읽지 않는다."""
+    import json
+    import os
+    import src.engine.loop as L
+    p = tmp_path / "market_state.json"
+    p.write_text(json.dumps({"regime": {"KR": {"label": "bull"}}}), encoding="utf-8")
+    calls = {"n": 0}
+    real_loads = json.loads
+
+    def counting_loads(s, *a, **k):
+        calls["n"] += 1
+        return real_loads(s, *a, **k)
+    monkeypatch.setattr(L.json, "loads", counting_loads)
+    L._MS_CACHE.clear()
+
+    assert L._read_regime(p) == {"KR": "bull"}
+    assert L._read_market_state(p)["regime"]["KR"]["label"] == "bull"
+    assert L._read_regime(p) == {"KR": "bull"}
+    assert calls["n"] == 1                       # 세 번 읽어도 파싱은 1회
+
+    p.write_text(json.dumps({"regime": {"KR": {"label": "bear"}}}), encoding="utf-8")
+    os.utime(p, ns=(2_000_000_000_000_000_000, 2_000_000_000_000_000_000))
+    assert L._read_regime(p) == {"KR": "bear"}   # 변경 감지
+    assert calls["n"] == 2
+
+    p.write_text("{broken", encoding="utf-8")    # 깨진 파일은 캐시하지 않는다
+    os.utime(p, ns=(2_100_000_000_000_000_000, 2_100_000_000_000_000_000))
+    assert L._read_market_state(p) == {}
+    assert L._read_regime(tmp_path / "none.json") == {}

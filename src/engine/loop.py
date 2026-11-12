@@ -302,27 +302,46 @@ def _blank_market() -> dict:
     return {"positions": [], "candidates": [], "armed": []}
 
 
+# market_state.json 은 수 MB(뉴스 포함) — 1초 틱마다 두 번 파싱하면 틱 예산을 갉아먹는다.
+# 파일이 바뀔 때(mtime·크기)만 다시 읽는다. 반환 dict 는 공유되므로 호출측은 읽기 전용.
+_MS_CACHE: dict[str, tuple[tuple[int, int], dict]] = {}
+
+
+def _load_market_state_cached(p: Path) -> dict:
+    try:
+        st = p.stat()
+    except OSError:
+        return {}
+    sig = (st.st_mtime_ns, st.st_size)
+    key = str(p)
+    hit = _MS_CACHE.get(key)
+    if hit is not None and hit[0] == sig:
+        return hit[1]
+    try:
+        ms = json.loads(p.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}          # 쓰는 중 반쪽 파일 등 — 캐시하지 않고 다음 틱에 재시도
+    if not isinstance(ms, dict):
+        return {}
+    _MS_CACHE[key] = (sig, ms)
+    return ms
+
+
 def _read_regime(market_state_path: str | Path | None) -> dict:
     """market_state.json 에서 시장별 현재 국면 라벨만 가볍게 추출. {market: label}."""
     if not market_state_path:
         return {}
+    ms = _load_market_state_cached(Path(market_state_path))
     try:
-        p = Path(market_state_path)
-        if not p.exists():
-            return {}
-        ms = json.loads(p.read_text(encoding="utf-8"))
         return {m: (v or {}).get("label") for m, v in (ms.get("regime") or {}).items()}
-    except (OSError, ValueError):
+    except AttributeError:
         return {}
 
 
 def _read_market_state(path: str | Path | None = None) -> dict:
-    """market_state.json 전체(수급 streak 등). 틱당 1회 읽기."""
+    """market_state.json 전체(수급 streak 등). 파일이 바뀔 때만 재파싱."""
     p = Path(path) if path else ROOT / "data" / "market_state.json"
-    try:
-        return json.loads(p.read_text(encoding="utf-8")) if p.exists() else {}
-    except (OSError, ValueError):
-        return {}
+    return _load_market_state_cached(p)
 
 
 def build_watchlist(cfg, store: Store,

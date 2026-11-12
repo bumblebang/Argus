@@ -184,10 +184,9 @@ def test_ops_card_html_renders():
         "ops_reasons": ["브릿지 모드인데 미무장 — bridge.heartbeat 만료/없음 → circuit 위험"],
         "ops_actions": ["브릿지 재무장: argus bridge --serve 60"],
         "budget": {
-            "line": "세션 예산 · 추정 50% (22.0K / 44.0K, 최근 5h)",
+            "line": "주간 한도 · 브릿지 운용 · 최근 5h 출력 1.5K · 캐시 포함 22.0K · 3회",
             "quota_label": "주간 한도",
             "countdown": "2시간",
-            "session_est": {"pct": 50.0, "used": 22000, "cap": 44000, "window_sec": 18000},
         },
         "alert": {},
     })
@@ -196,3 +195,4 @@ def test_ops_card_html_renders():
     assert "다음" in html
     assert "예산" in html
     assert "주간" in html
+    assert "출력 1.5K" in html

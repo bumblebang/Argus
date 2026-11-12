@@ -3836,19 +3836,7 @@ def _ops_card_html(d: dict) -> str:
         actions = list(alert.get("actions") or [])
     budget = d.get("budget") or alert.get("budget") or {}
     budget_line = escape(str(budget.get("line") or "—"))
-    sest = budget.get("session_est") or {}
-    pct = sest.get("pct")
-    over_cap = bool(sest.get("over_cap"))
-    if pct is not None:
-        pct_col = "#3ddc84" if pct < 70 else ("#ffb454" if pct < 90 else "#ff5c63")
-        pct_txt = ">100%" if over_cap else f"{float(pct):.0f}%"
-        pct_html = (f"<span class=mono style='color:{pct_col}'>"
-                    f"추정 {pct_txt}</span>"
-                    f" <span class=muted>({escape(_fmt_tok_ops(sest.get('used')))}"
-                    f" / {escape(_fmt_tok_ops(sest.get('cap')))}"
-                    f", 최근 {int((sest.get('window_sec') or 18000) // 3600)}h)</span>")
-    else:
-        pct_html = f"<span class=mono>{budget_line}</span>"
+    pct_html = f"<span class=mono>{budget_line}</span>"
     qk = budget.get("quota_label") or budget.get("quota_kind") or ""
     cd = budget.get("countdown") or "—"
     reason_html = ("<br>".join(escape(r) for r in reasons[:3])
@@ -3864,25 +3852,11 @@ def _ops_card_html(d: dict) -> str:
         f"<div style='margin-top:8px'><span class=muted>예산</span><br>{pct_html}"
         f"{(' · ' + escape(str(qk))) if qk else ''}"
         f"{(' · 리셋까지 ' + escape(str(cd))) if budget.get('countdown') and mode != 'ok' else ''}"
-        f"<div class=muted style='font-size:11px;margin-top:4px'>"
-        f"{escape(str(budget.get('line') or ''))}</div>"
         f"</div>"
         f"<div style='margin-top:8px'><span class=muted>사유</span><br>{reason_html}</div>"
         f"<div style='margin-top:8px'><span class=muted>다음</span><br>{action_html}</div>"
         f"</div></div>"
     )
-
-
-def _fmt_tok_ops(n) -> str:
-    try:
-        n = int(n or 0)
-    except (TypeError, ValueError):
-        return "?"
-    if n >= 1_000_000:
-        return f"{n / 1_000_000:.2f}M"
-    if n >= 1_000:
-        return f"{n / 1_000:.1f}K"
-    return str(n)
 
 
 def _exec_ops_html(d: dict, *, compact: bool = False) -> str:

@@ -64,8 +64,14 @@ class TossGateway:
                  limiter: GroupRateLimiter | None = None,
                  candle_ttl_sec: float = 0.0,
                  price_guard: PriceGuard | None = None,
-                 quote_timeout_sec: float = 2.0) -> None:
+                 quote_timeout_sec: float = 2.0,
+                 snapshot_heartbeat_sec: float = 60.0) -> None:
         self.client = client
+        # 스냅샷 중복 억제: 가격이 직전 기록과 같으면 heartbeat 초가 지날 때만 다시 쓴다.
+        # 1초 틱의 과반이 직전과 같은 가격이라 그대로 쌓으면 DB 만 불어난다(소비자는 전부
+        # '최신가'·'시각 근처가' 조회라 60초 해상도로 충분). 0 이하면 예전처럼 매 틱 기록.
+        self.snapshot_heartbeat_sec = float(snapshot_heartbeat_sec)
+        self._snap_last: dict[str, tuple[float | None, float]] = {}
         self.store = store
         self.limiter = limiter
         # lastPrice 이상 틱 필터(None=끔). 감시 루프·뇌·밸류가 모두 poll_prices 를 거치므로
@@ -91,7 +97,9 @@ class TossGateway:
         ttl = float(watch.get("candle_ttl_sec", 0.0))
         pg_raw = watch.get("price_guard") or {}
         gw = cls(client, store=store, limiter=limiter, candle_ttl_sec=ttl,
-                 quote_timeout_sec=float(pg_raw.get("quote_timeout_sec", 2.0)))
+                 quote_timeout_sec=float(pg_raw.get("quote_timeout_sec", 2.0)),
+                 snapshot_heartbeat_sec=float(
+                     watch.get("snapshot_heartbeat_sec", 60.0)))
         on_event = ((lambda kind, p: store.log_event(kind, p.get("symbol"), p))
                     if store is not None else None)
         gw.price_guard = PriceGuard.from_config(
@@ -126,8 +134,26 @@ class TossGateway:
                     row["price"] = px
                     row["price_guard"] = verdict
         if record and self.store and out:
-            self.store.record_snapshots(out)
+            rows = self._snapshot_rows_to_record(out)
+            if rows:
+                self.store.record_snapshots(rows)
         return out
+
+    def _snapshot_rows_to_record(self, rows: list[dict]) -> list[dict]:
+        """직전 기록과 가격이 다르거나 heartbeat 가 지난 행만. 가드가 건드린 틱은 항상 남긴다."""
+        hb = self.snapshot_heartbeat_sec
+        if hb <= 0:
+            return rows
+        now = time.time()
+        keep: list[dict] = []
+        for row in rows:
+            sym, px = row.get("symbol"), row.get("price")
+            last = self._snap_last.get(sym)
+            if (last is None or last[0] != px or now - last[1] >= hb
+                    or "price_guard" in row):
+                keep.append(row)
+                self._snap_last[sym] = (px, now)
+        return keep
 
     def _seed_guard(self, symbols: list[str]) -> None:
         """재기동 직후 첫 틱 — 직전 스냅샷(가드 통과가)을 기준가로 심는다.
