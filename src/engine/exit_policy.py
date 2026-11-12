@@ -151,7 +151,10 @@ def close_scan_exit_trigger(pos: dict, *, market: str = "KR", now: float,
 
 def thesis_inval_trigger(pos: dict, *, price: float | None, now: float,
                          flow_streak: int | None = None) -> T.Trigger | None:
-    """thesis 무효화(price/flow/time) — 코드 감사. hits 있으면 act 청산."""
+    """thesis 무효화(price/flow/time) — 코드 감사. hits 있으면 act 트리거로 뇌를 깨운다.
+
+    코드가 직접 청산하지 않는다(_EXIT_KINDS 아님) — 논거가 깨졌는지·청산할지는 뇌가 판단.
+    """
     from ..thesis_watch import audit_position
     hits = audit_position(pos, price=price, now=now, flow_streak=flow_streak)
     if not hits:

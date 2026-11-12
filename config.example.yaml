@@ -127,6 +127,8 @@ watch:
   # snapshots(틱 가격) 보존 — 대시보드·단기·shadow 폴백. 장기 백테는 Yahoo/캔들.
   # 기본 7일(events 와 동일). 틱 밀도 높으면 DB 증가 주의. 0=prune 끔
   snapshots_retain_sec: 604800
+  # 가격이 직전 기록과 같으면 이 간격으로만 다시 기록(중복 억제). 0=매 틱 기록(예전 동작)
+  snapshot_heartbeat_sec: 60
   snapshots_prune_interval_sec: 3600   # 1시간마다 배치 삭제 시도
   snapshots_prune_batch: 200000        # 1회 호출당 배치 크기(×최대 5)
   # 관측용 events(athena_queue·athena_scan) 보존. 원장·귀속 kind 는 대상 아님.
@@ -313,10 +315,10 @@ agents:
     poll_sec: 1.0
     require_armed: true
     armed_max_age_sec: 90
-  # 클코 세션 추정 %(JSONL 합÷cap). 공식 /usage 아님. Pro~$20·5h 커뮤니티 추정치.
+  # 클코 최근 N시간 사용량(로컬 JSONL 합). 구독 한도 대비 % 는 계산하지 않는다 —
+  # 실제 cap 을 알 수 없고 캐시 읽기가 합의 대부분이라 어떤 고정 cap 도 맞지 않는다.
   claude_budget:
     enabled: true
-    session_token_cap: 44000
     session_window_sec: 18000
   val_model: "claude-opus-4-8"
 

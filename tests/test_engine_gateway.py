@@ -41,6 +41,42 @@ def test_poll_prices_records_snapshots(tmp_path):
     assert cur.fetchone()["n"] == 3
 
 
+def _snap_count(store):
+    return store.conn.execute("SELECT COUNT(*) AS n FROM snapshots").fetchone()["n"]
+
+
+def test_poll_prices_skips_unchanged_until_heartbeat(tmp_path, monkeypatch):
+    """같은 가격은 heartbeat 가 지나야 다시 기록 — 바뀐 종목만 즉시 기록."""
+    import src.engine.gateway as gwmod
+    t = {"v": 1000.0}
+    monkeypatch.setattr(gwmod.time, "time", lambda: t["v"])
+    store = Store(tmp_path / "t.db")
+    client = FakeClient()
+    g = TossGateway(client, store=store, snapshot_heartbeat_sec=60)
+    g.poll_prices(["A", "B"])
+    assert _snap_count(store) == 2
+    t["v"] += 1
+    out = g.poll_prices(["A", "B"])
+    assert len(out) == 2                      # 반환값은 그대로(기록만 생략)
+    assert _snap_count(store) == 2
+    client.get_prices = lambda syms: [
+        {"symbol": s, "lastPrice": "101" if s == "A" else "100.5"} for s in syms]
+    t["v"] += 1
+    g.poll_prices(["A", "B"])
+    assert _snap_count(store) == 3            # A 만 변동
+    t["v"] += 60
+    g.poll_prices(["A", "B"])
+    assert _snap_count(store) == 5            # heartbeat 경과 → 둘 다
+
+
+def test_poll_prices_heartbeat_zero_records_every_tick(tmp_path):
+    store = Store(tmp_path / "t.db")
+    g = TossGateway(FakeClient(), store=store, snapshot_heartbeat_sec=0)
+    g.poll_prices(["A"])
+    g.poll_prices(["A"])
+    assert _snap_count(store) == 2
+
+
 def test_poll_prices_skips_empty_symbols():
     g = TossGateway(FakeClient())
     out = g.poll_prices(["A", "", None])

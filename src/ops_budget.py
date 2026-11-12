@@ -1,7 +1,7 @@
 """클코 세션/주간 한도 — 예산 계기판.
 
 1) 소진 후 신호: mode / reset_at / quota_kind
-2) 추정 %: 로컬 JSONL 최근 N시간 토큰 ÷ session_token_cap (공식 잔량 아님)
+2) 사용량: 로컬 JSONL 최근 N시간 토큰 합(한도 대비 % 아님 — cap 을 알 수 없다)
 """
 from __future__ import annotations
 
@@ -19,8 +19,6 @@ KIND_LABEL = {
     "unknown": "한도(종류 미상)",
 }
 
-# Pro $20 · 5h 창 커뮤니티 추정치(배증 전후 바뀔 수 있음) — config 로 덮어쓰기
-DEFAULT_SESSION_TOKEN_CAP = 44_000
 DEFAULT_SESSION_WINDOW_SEC = 5 * 3600
 
 
@@ -76,24 +74,14 @@ def format_reset_clock(reset_at: float | None) -> str:
         return "—"
 
 
-def _cfg_budget(cfg: dict[str, Any] | None) -> tuple[int, float, bool]:
-    """(cap, window_sec, enabled)."""
-    cap = DEFAULT_SESSION_TOKEN_CAP
+def _cfg_budget(cfg: dict[str, Any] | None) -> tuple[float, bool]:
+    """(window_sec, enabled)."""
     window = float(DEFAULT_SESSION_WINDOW_SEC)
     enabled = True
-    if not cfg:
-        return cap, window, enabled
     agents = cfg.get("agents") if isinstance(cfg, dict) else None
-    block = {}
-    if isinstance(agents, dict):
-        block = agents.get("claude_budget") or {}
+    block = agents.get("claude_budget") if isinstance(agents, dict) else None
     if not isinstance(block, dict):
-        block = {}
-    try:
-        if block.get("session_token_cap") is not None:
-            cap = max(1, int(block["session_token_cap"]))
-    except (TypeError, ValueError):
-        pass
+        return window, enabled
     try:
         if block.get("session_window_sec") is not None:
             window = max(60.0, float(block["session_window_sec"]))
@@ -101,14 +89,19 @@ def _cfg_budget(cfg: dict[str, Any] | None) -> tuple[int, float, bool]:
         pass
     if "enabled" in block:
         enabled = bool(block.get("enabled"))
-    return cap, window, enabled
+    return window, enabled
 
 
-def estimate_session_pct(*, now: float | None = None,
-                         cfg: dict[str, Any] | None = None,
-                         usage_fn=None) -> dict[str, Any] | None:
-    """JSONL 창 합 / cap → 추정 %. enabled=false 또는 조회 실패 시 None."""
-    cap, window, enabled = _cfg_budget(cfg)
+def session_usage(*, now: float | None = None,
+                  cfg: dict[str, Any] | None = None,
+                  usage_fn=None) -> dict[str, Any] | None:
+    """최근 창의 로컬 JSONL 사용량. enabled=false 면 None.
+
+    한도 대비 % 는 내지 않는다 — 구독 cap 은 공개되지 않고, 합의 대부분이 캐시 읽기라
+    고정 cap(예전 44K)으로 나누면 한도와 무관하게 늘 '>100%' 였다. 출력 토큰과 호출 수를
+    그대로 보여 주고, 실제 소진 여부는 mode/reset_at(소진 후 신호)이 말한다.
+    """
+    window, enabled = _cfg_budget(cfg)
     if not enabled:
         return None
     ts = time.time() if now is None else float(now)
@@ -119,42 +112,19 @@ def estimate_session_pct(*, now: float | None = None,
             from .claude_local_usage import tokens_in_window
             raw = tokens_in_window(window_sec=window, now=ts)
     except Exception as e:
-        return {
-            "ok": False,
-            "error": str(e)[:120],
-            "used": 0,
-            "cap": cap,
-            "pct": None,
-            "window_sec": window,
-        }
+        return {"ok": False, "error": str(e)[:120], "window_sec": window}
     used = int(raw.get("used") or 0)
-    # 로컬 JSONL 합은 구독 잔량이 아님. cap(커뮤니티 추정) 초과해도 mode=ok 가능.
-    # 예전 min(999) 표시는 "버그처럼" 보여서, 게이지는 100% 클램프·라벨은 >100%.
-    raw_pct = round(100.0 * used / cap, 1) if cap else None
-    over_cap = bool(raw_pct is not None and raw_pct > 100.0)
-    pct = None if raw_pct is None else min(100.0, raw_pct)
-    if pct is None:
-        label = f"추정 — ({_fmt_tok(used)} / {_fmt_tok(cap)})"
-    elif over_cap:
-        label = (
-            f"추정 >100% ({_fmt_tok(used)} / {_fmt_tok(cap)}, "
-            f"최근 {int(window // 3600)}h · 근사 cap 초과)"
-        )
-    else:
-        label = (
-            f"추정 {pct:.0f}% ({_fmt_tok(used)} / {_fmt_tok(cap)}, "
-            f"최근 {int(window // 3600)}h)"
-        )
+    output = int(raw.get("output") or 0)
+    n_events = int(raw.get("n_events") or 0)
+    label = (f"최근 {int(window // 3600)}h 출력 {_fmt_tok(output)} · "
+             f"캐시 포함 {_fmt_tok(used)} · {n_events}회")
     return {
         "ok": True,
         "used": used,
-        "cap": cap,
-        "pct": pct,
-        "raw_pct": raw_pct,
-        "over_cap": over_cap,
+        "output": output,
+        "cache_read": int(raw.get("cache_read") or 0),
         "window_sec": window,
-        "n_events": int(raw.get("n_events") or 0),
-        "approx": True,
+        "n_events": n_events,
         "label": label,
     }
 
@@ -171,7 +141,7 @@ def budget_gauge(state: dict[str, Any] | None, *, now: float | None = None,
                  consecutive_failures: int | None = None,
                  cfg: dict[str, Any] | None = None,
                  usage_fn=None) -> dict[str, Any]:
-    """대시/ALERT/푸시용 스냅샷. 추정 % 는 session_est 키."""
+    """대시/ALERT/푸시용 스냅샷. 최근 창 사용량은 session_usage 키."""
     ts = time.time() if now is None else float(now)
     st = state or {}
     mode = str(st.get("mode") or "ok")
@@ -195,16 +165,13 @@ def budget_gauge(state: dict[str, Any] | None, *, now: float | None = None,
     countdown = format_countdown(reset_at_f, now=ts) if reset_at_f else "—"
     clock = format_reset_clock(reset_at_f)
 
-    session_est = estimate_session_pct(now=ts, cfg=cfg, usage_fn=usage_fn)
+    usage = session_usage(now=ts, cfg=cfg, usage_fn=usage_fn)
     est_bit = ""
-    if session_est and session_est.get("label"):
-        est_bit = f" · {session_est['label']}"
+    if usage and usage.get("label"):
+        est_bit = f" · {usage['label']}"
 
     if mode == "ok" and not kind:
-        if session_est and session_est.get("pct") is not None:
-            line = f"세션 예산{est_bit}"
-        else:
-            line = "한도 여유(추정) — 소진 전 잔량 미지"
+        line = f"한도 정상{est_bit}" if est_bit else "한도 정상 — 사용량 미집계"
         status = "ok"
     elif mode == "auth_needed":
         line = f"인증 만료 — 한도 예산과 별개{est_bit}"
@@ -230,7 +197,7 @@ def budget_gauge(state: dict[str, Any] | None, *, now: float | None = None,
         "reset_clock": clock,
         "countdown": countdown,
         "line": line,
-        "session_est": session_est,
+        "session_usage": usage,
     }
     if consecutive_failures is not None:
         out["consecutive_failures"] = int(consecutive_failures)

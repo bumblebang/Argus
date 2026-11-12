@@ -1,7 +1,7 @@
 """Claude Code 로컬 JSONL 사용량 — 토케포케 local_usage 와 동일 계약(얇은 이식).
 
 ~/.claude/projects/**/*.jsonl 의 assistant.usage 를 합산.
-구독 잔량 API 가 아니라 호출당 토큰 합(추정 % 분자).
+구독 잔량 API 가 아니라 호출당 토큰 합(대시 Ops 카드의 최근 창 사용량).
 """
 from __future__ import annotations
 
@@ -19,6 +19,8 @@ class UsageEntry:
     id: str
     when_ts: float
     total: int
+    output: int = 0
+    cache_read: int = 0
 
 
 def _home() -> Path:
@@ -113,15 +115,18 @@ def parse_claude_line(line: str) -> UsageEntry | None:
         eid = str(obj.get("uuid") or obj.get("id") or "")
     if not eid:
         return None
+    output = _int(usage.get("output_tokens"))
+    cache_read = _int(usage.get("cache_read_input_tokens"))
     total = (
         _int(usage.get("input_tokens"))
-        + _int(usage.get("output_tokens"))
+        + output
         + _int(usage.get("cache_creation_input_tokens"))
-        + _int(usage.get("cache_read_input_tokens"))
+        + cache_read
     )
     if total <= 0:
         return None
-    return UsageEntry(id=eid, when_ts=when, total=total)
+    return UsageEntry(id=eid, when_ts=when, total=total,
+                      output=output, cache_read=cache_read)
 
 
 def _dedup_keep_max(entries: Iterable[UsageEntry]) -> list[UsageEntry]:
@@ -172,6 +177,8 @@ def tokens_since(*, since_ts: float, now: float | None = None,
     used = sum(e.total for e in kept)
     return {
         "used": used,
+        "output": sum(e.output for e in kept),
+        "cache_read": sum(e.cache_read for e in kept),
         "n_events": len(kept),
         "roots": [str(r) for r in roots],
         "since_ts": since_ts,
