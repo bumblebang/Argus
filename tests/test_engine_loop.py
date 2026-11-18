@@ -90,6 +90,88 @@ def test_stop_hit_routes_to_code_exit_not_wake(tmp_path, monkeypatch):
     assert "trigger" in logged                    # wake/precision 은 없음
 
 
+def _stop_case(tmp_path, monkeypatch, quote, now=1000.0):
+    _only_kr_open(monkeypatch)
+    store = Store(tmp_path / "t.db")
+    gw = FakeGateway({"005930": 68000})           # 손절가 69000 아래(오류 틱 가정)
+    calls = []
+    def best_quote(sym):
+        calls.append(sym)
+        if isinstance(quote, Exception):
+            raise quote
+        return quote
+    gw.best_quote = best_quote
+    pos = {"symbol": "005930", "market": "KR", "qty": 10,
+           "avg_price": 70000, "stop_price": 69000, "target_price": None}
+    exits = []
+    clock = {"t": now}
+    loop = WatchLoop(gw, store, lambda: {"KR": {"positions": [pos], "candidates": []}},
+                     executor=lambda s, m, p, t: exits.append(t.kind) or True,
+                     now_fn=lambda: clock["t"])
+    return loop, store, exits, calls, clock
+
+
+def test_stop_exit_held_when_bid_clearly_above_stop(tmp_path, monkeypatch):
+    """10-07 XOM: 오류 틱이 손절선을 깼지만 매수호가는 스톱 위 → 청산 보류·재확인 대기."""
+    loop, store, exits, calls, clock = _stop_case(
+        tmp_path, monkeypatch, (71000.0, 71100.0, None))
+    res = loop.run_once()
+    assert exits == [] and res.exits == []
+    ev = store.conn.execute(
+        "SELECT payload FROM events WHERE kind='stop_unconfirmed'").fetchall()
+    assert len(ev) == 1
+    clock["t"] += 1                                 # 재확인 대기 중엔 호가 재조회 없음
+    loop.run_once()
+    assert calls == ["005930"] and exits == []
+    clock["t"] += loopmod._STOP_CONFIRM_RECHECK_SEC  # 대기 후 재조회
+    loop.run_once()
+    assert calls == ["005930", "005930"] and exits == []
+
+
+def test_stop_exit_proceeds_when_bid_confirms(tmp_path, monkeypatch):
+    loop, _, exits, _, _ = _stop_case(tmp_path, monkeypatch, (68500.0, 68600.0, None))
+    assert loop.run_once().exits == ["005930"] and exits == ["stop_hit"]
+
+
+def test_stop_exit_fail_open_without_quote(tmp_path, monkeypatch):
+    for q in (None, (None, None, None), RuntimeError("orderbook down")):
+        loop, _, exits, _, _ = _stop_case(tmp_path / str(id(q)), monkeypatch, q)
+        assert loop.run_once().exits == ["005930"] and exits == ["stop_hit"]
+
+
+def test_poll_failure_in_one_market_does_not_stop_other(tmp_path, monkeypatch):
+    _sessions(monkeypatch, {"KR": "regular", "US": "regular"})
+    store = Store(tmp_path / "t.db")
+
+    class Gw(FakeGateway):
+        def poll_prices(self, symbols, record=True):
+            if "005930" in symbols:
+                raise RuntimeError("KR prices 503")
+            return super().poll_prices(symbols, record)
+
+    gw = Gw({"AAPL": 90.0})
+    pos = {"symbol": "AAPL", "market": "US", "qty": 1,
+           "avg_price": 100.0, "stop_price": 95.0, "target_price": None}
+    exits = []
+    loop = WatchLoop(gw, store,
+                     lambda: {"KR": {"positions": [], "candidates": ["005930"]},
+                              "US": {"positions": [pos], "candidates": []}},
+                     executor=lambda s, m, p, t: exits.append(s) or True)
+    res = loop.run_once()
+    res2 = loop.run_once()
+    assert res.exits == ["AAPL"] and res.polled == 1 and res2.polled == 1
+    assert res.poll_failed == ["KR"]
+    errs = store.conn.execute(
+        "SELECT payload FROM events WHERE kind='error'").fetchall()
+    assert len(errs) == 1 and "poll_prices" in errs[0][0]   # 60초 스로틀
+    # US 폴링이 polled>0 을 채워도 heartbeat 는 ok=False(KR 시세 장애 가림 방지).
+    import json
+    loop.heartbeat_path = tmp_path / "hb.json"
+    loop._beat(res)
+    hb = json.loads(loop.heartbeat_path.read_text(encoding="utf-8"))
+    assert hb["ok"] is False and hb["poll_failed"] == ["KR"]
+
+
 def test_backing_off_exit_kind_does_not_shadow_stop_hit(tmp_path, monkeypatch):
     """앞 청산 kind(time_stop)가 백오프·거부로 False 여도 같은 틱 stop_hit 을 시도한다."""
     import time as _time
