@@ -416,6 +416,14 @@ def _is_value_position(pos: dict) -> bool:
     return str(pos.get("strategy") or "").lower() == "value"
 
 
+def _num(v: Any) -> float | None:
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return f if f == f else None   # NaN 제외
+
+
 def _rotated(lst: list, offset: int) -> list:
     """per_tick 상한 슬라이스의 기아(starvation) 방지 — 틱마다 시작점을 돌린다."""
     if len(lst) <= 1:
@@ -466,6 +474,7 @@ class TickResult:
     entries: list = field(default_factory=list)     # 코드 진입한 심볼(armed→open)
     woke: bool = False
     markets_open: list = field(default_factory=list)
+    poll_failed: list = field(default_factory=list)  # 시세 폴링 실패로 건너뛴 시장
 
 
 # 코드(빠른손)가 즉시 처리하는 청산 트리거 — 뇌를 거치지 않는다.
@@ -481,6 +490,16 @@ _EXIT_PRIORITY = {"stop_hit": 0, "trail_stop": 1, "close_scan_exit": 2,
 # 급등락·국면 반전 같은 사건형 트리거는 발생마다 기록한다.
 _TRIGGER_LOG_COOLDOWN_SEC = 60.0
 _THROTTLED_TRIGGER_KINDS = _EXIT_KINDS | {"thesis_invalidation"}
+# 스톱 청산 호가 확인: 가격 가드는 max_jump_pct(8%) 넘게 튄 틱만 의심한다. 그 아래
+# 오류 틱이 손절선을 건드리면 그대로 청산됐다(10-07 XOM 시간외 156.88 < 손절 158 →
+# 1초 뒤 실제 체결 164.48). 스톱 청산 직전 최우선 매수호가가 스톱보다 tol 넘게 위면
+# '아직 안 깨짐'으로 보고 이번엔 보류, recheck 초 뒤 다시 본다. 호가를 못 구하면
+# 진짜 급락 손절을 막지 않게 그대로 청산한다(fail-open).
+_STOP_CONFIRM_KINDS = frozenset({"stop_hit", "trail_stop"})
+_STOP_CONFIRM_TOL_PCT = 0.01
+_STOP_CONFIRM_RECHECK_SEC = 5.0
+# 시장 시세 폴링 실패 error 이벤트 기록 간격(1초 틱 × 장애 지속 스팸 방지).
+_POLL_ERROR_LOG_SEC = 60.0
 
 
 class WatchLoop:
@@ -524,6 +543,10 @@ class WatchLoop:
         self._signal_woke: dict[tuple[str, str], float] = {}
         # 트리거 이벤트 마지막 기록 시각 {(symbol, kind): ts} — 매 틱 동일 기록 스팸 방지.
         self._trigger_logged: dict[tuple[str, str], float] = {}
+        # 스톱 청산 호가 확인에서 보류된 종목 → 다음 확인 시각.
+        self._stop_hold_until: dict[str, float] = {}
+        # 시장별 시세 폴링 실패 마지막 기록 시각.
+        self._poll_err_logged: dict[str, float] = {}
         self._last_brain_wake = 0.0    # 주기 각성 타이머(개장 첫 틱에 바로 1회 발화)
         self._rr = 0                   # per_tick 상한 라운드로빈 오프셋(기아 방지)
         self._last_session: dict[str, str] = {}     # 세션 경계 리셋용: 시장→직전 틱 세션명
@@ -667,12 +690,16 @@ class WatchLoop:
             markets = list(res.markets_open or [])
             polled = int(res.polled or 0)
             should_poll = bool(should_be_open)
-            ok = (not tick_error) and (not should_poll or polled > 0)
+            poll_failed = list(res.poll_failed or [])
+            # 한 시장만 시세가 죽어도 다른 시장 폴링이 polled>0 을 채우므로 따로 본다.
+            ok = ((not tick_error) and (not poll_failed)
+                  and (not should_poll or polled > 0))
             payload = {
                 "ts": now_ts, "ticks": self._ticks,
                 "should_be_open": should_be_open,
                 "markets_open": markets, "polled": polled,
                 "ok": ok, "tick_error": bool(tick_error),
+                "poll_failed": poll_failed,
                 "code_rev": self._code_rev,
             }
             # trading_health: 시세 ok 와 별개(HALT/pause/sync/미확인 주문).
@@ -897,6 +924,42 @@ class WatchLoop:
         else:
             self.on_wake(reason, triggers)
 
+    def _stop_confirmed(self, sym: str, trig, now_ts: float) -> bool:
+        """스톱 청산 직전 호가 확인. 매수호가가 스톱보다 확실히 위면 보류(False).
+
+        보류 중엔 recheck 초 동안 호가를 다시 부르지 않는다(1초 틱마다 호가 콜 방지).
+        호가 실패·빈 호가·스톱 값 없음은 청산 진행(True) — 진짜 손절을 막지 않는다.
+        """
+        hold = self._stop_hold_until.get(sym)
+        if hold is not None and now_ts < hold:
+            return False
+        self._stop_hold_until.pop(sym, None)
+        stop = _num((getattr(trig, "payload", None) or {}).get("stop"))
+        best_quote = getattr(self.gw, "best_quote", None)
+        if not stop or stop <= 0 or best_quote is None:
+            return True
+        try:
+            q = best_quote(sym)
+        except Exception as e:
+            log.warning("스톱 확인 호가 실패 %s(청산 진행): %s", sym, e)
+            return True
+        bid = _num(q[0]) if q else None
+        if not bid or bid <= stop * (1 + _STOP_CONFIRM_TOL_PCT):
+            return True
+        self._stop_hold_until[sym] = now_ts + _STOP_CONFIRM_RECHECK_SEC
+        key = (sym, "stop_unconfirmed")
+        last = self._trigger_logged.get(key)
+        if last is None or now_ts - last >= _TRIGGER_LOG_COOLDOWN_SEC:
+            self._trigger_logged[key] = now_ts
+            payload = getattr(trig, "payload", None) or {}
+            log.warning("스톱 청산 보류 %s: 트리거가 %s · 매수호가 %s > 스톱 %s",
+                        sym, payload.get("price"), bid, stop)
+            self.store.log_event("stop_unconfirmed", sym, {
+                "kind": trig.kind, "price": payload.get("price"),
+                "stop": stop, "bid": bid,
+                "ask": _num(q[1]) if len(q) > 1 else None})
+        return False
+
     # ── 한 틱: 폴링 → 트리거 평가 → 정밀 → 로깅 ──────────────
     def run_once(self) -> TickResult:
         res = TickResult()
@@ -967,8 +1030,19 @@ class WatchLoop:
             if not symbols:
                 continue
 
-            # 감시층: /prices 배치 1콜(스냅샷 자동 기록).
-            rows = self.gw.poll_prices(symbols, record=True)
+            # 감시층: /prices 배치 1콜(스냅샷 자동 기록). 한 시장 시세 장애가 다른 시장
+            # 감시·청산까지 멈추지 않게 이 시장만 건너뛴다.
+            try:
+                rows = self.gw.poll_prices(symbols, record=True)
+            except Exception as e:
+                res.poll_failed.append(market)
+                last = self._poll_err_logged.get(market)
+                if last is None or now_ts - last >= _POLL_ERROR_LOG_SEC:
+                    self._poll_err_logged[market] = now_ts
+                    log.error("시세 폴링 실패 %s(이 시장만 건너뜀): %s", market, e)
+                    self.store.log_event("error", None, {
+                        "where": "poll_prices", "market": market, "err": str(e)})
+                continue
             res.polled += len(rows)
             price_of = {r["symbol"]: r["price"] for r in rows if r.get("symbol")}
             payload_of = {r["symbol"]: r.get("payload") for r in rows if r.get("symbol")}
@@ -1102,6 +1176,9 @@ class WatchLoop:
                     for t in exit_trigs:
                         if ready is not None and not ready(sym, t.kind):
                             continue
+                        if (t.kind in _STOP_CONFIRM_KINDS
+                                and not self._stop_confirmed(sym, t, now_ts)):
+                            break
                         try:
                             if self.executor(sym, pos_market, price, t):
                                 res.exits.append(sym)

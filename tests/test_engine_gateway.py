@@ -109,6 +109,19 @@ def test_candle_ttl_cache(monkeypatch):
     assert client.calls == 3                      # 다른 count -> 다른 키
 
 
+def test_candle_cache_evicts_expired_when_full(monkeypatch):
+    import src.engine.gateway as gwmod
+    clock = [1000.0]
+    monkeypatch.setattr(gwmod.time, "time", lambda: clock[0])
+    monkeypatch.setattr(gwmod, "_CANDLE_CACHE_MAX", 3)
+    g = TossGateway(_CandleClient(), candle_ttl_sec=10)
+    for s in ("A", "B", "C"):
+        g.candles(s, "1m", 5)
+    clock[0] = 1011.0                               # A·B·C 만료
+    g.candles("D", "1m", 5)
+    assert set(k[0] for k in g._candle_cache) == {"D"}
+
+
 def test_candle_no_cache_when_ttl_zero():
     client = _CandleClient()
     g = TossGateway(client, candle_ttl_sec=0)     # 기본=캐시 안 함

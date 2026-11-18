@@ -24,6 +24,7 @@ from .store import Store
 log = get_logger("engine.gateway")
 
 _PRICES_BATCH = 200  # /api/v1/prices 1콜 최대 종목수
+_CANDLE_CACHE_MAX = 2000  # 이 크기에 닿으면 TTL 만료 항목을 비운다
 _KST = timezone(timedelta(hours=9))
 # 가격 가드 시드 — 재기동 직후 이보다 오래된 스냅샷은 기준가로 쓰지 않는다.
 _GUARD_SEED_MAX_AGE_SEC = 86400.0
@@ -183,7 +184,13 @@ class TossGateway:
                     return hit[1]
             data = self.client.get_candles(symbol, interval=interval, count=count)
             if self.candle_ttl_sec > 0:
-                self._candle_cache[key] = (time.time(), data)
+                now = time.time()
+                # 종목·인터벌·count 조합이 계속 늘어 무한히 쌓이지 않게, 커지면 만료분을 비운다.
+                if len(self._candle_cache) >= _CANDLE_CACHE_MAX:
+                    self._candle_cache = {
+                        k: v for k, v in self._candle_cache.items()
+                        if now - v[0] < self.candle_ttl_sec}
+                self._candle_cache[key] = (now, data)
             return data
 
     def get_rankings(self, **kw: Any) -> dict:
