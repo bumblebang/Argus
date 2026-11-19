@@ -585,6 +585,35 @@ def _kr_fundamentals(api_key: str, corp_map: dict, code: str, market_cap: float 
 
 
 # ── 실행 ─────────────────────────────────────────────────────────
+def refresh_watchlist_sectors(watchlist_path: str | Path = WATCHLIST, *,
+                              ensure_fn: Callable | None = None) -> dict:
+    """워치리스트 종목 섹터를 sector_cache 에 채운다(KR=KRX 벌크, US=Finnhub 롤링 상한).
+
+    하드 게이트 섹터 맵은 유니버스 + 이 캐시다. 밸류 후보는 유니버스 밖이 대부분이라
+    캐시가 비면 전부 '미분류' 한 버킷으로 묶여 섹터와 무관하게 집중 초과로 거부된다.
+    실패는 삼킨다(스캔 결과에 영향 없음). 반환: {market: 요청 종목 수}.
+    """
+    try:
+        wl = load_watchlist(watchlist_path)
+    except Exception as e:
+        log.warning("[value] 섹터 갱신 — 워치리스트 로드 실패: %s", e)
+        return {}
+    by_mkt: dict[str, list[str]] = {}
+    for sym, ent in (wl or {}).items():
+        m = str((ent or {}).get("market") or "").upper()
+        if m in ("KR", "US"):
+            by_mkt.setdefault(m, []).append(str(sym))
+    if not by_mkt:
+        return {}
+    if ensure_fn is None:
+        from .datasources.sector_class import ensure_sectors as ensure_fn
+    try:
+        ensure_fn(by_mkt)
+    except Exception as e:
+        log.warning("[value] 섹터 갱신 실패(무시): %s", e)
+    return {m: len(v) for m, v in by_mkt.items()}
+
+
 def run_scan(cfg, llm, *, limit: int | None = None,
              fetch_ranking_fn: Callable | None = None,
              fetch_history_fn: Callable | None = None,

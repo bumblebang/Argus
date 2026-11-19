@@ -60,6 +60,49 @@ def sector_map_from_items(universe: dict | None) -> dict:
     return out
 
 
+_SECTOR_CACHE_MEMO: dict[str, tuple[tuple[int, int], dict]] = {}
+
+
+def sector_map_from_cache(cache_path: Path | None = None) -> dict:
+    """data/sector_cache.json(KRX 업종·Finnhub 실데이터) → symbol→표준 섹터.
+
+    게이트는 검사마다 맵을 다시 읽으므로 파일이 바뀔 때만(mtime·크기) 재파싱한다.
+    읽기 실패면 빈 dict — 유니버스 맵만으로 동작(기존과 동일).
+    """
+    from ..datasources.sector_class import CACHE_PATH, load_cache
+    p = Path(cache_path or CACHE_PATH)
+    try:
+        st = p.stat()
+    except OSError:
+        return {}
+    sig = (st.st_mtime_ns, st.st_size)
+    hit = _SECTOR_CACHE_MEMO.get(str(p))
+    if hit and hit[0] == sig:
+        return hit[1]
+    out: dict[str, str] = {}
+    for _market, blk in (load_cache(p) or {}).items():
+        if not isinstance(blk, dict):
+            continue
+        for sym, ent in blk.items():
+            sec = normalize_sector(ent.get("sector")) if isinstance(ent, dict) else None
+            if sym and sec:
+                out[str(sym)] = sec
+    _SECTOR_CACHE_MEMO[str(p)] = (sig, out)
+    return out
+
+
+def gate_sector_map(universe: dict | None, cache_path: Path | None = None) -> dict:
+    """게이트용 symbol→섹터 = 섹터 캐시(폴백) 위에 유니버스 섹터(우선).
+
+    유니버스 밖 종목(밸류 워치리스트·갭반등 등)이 전부 '미분류' 한 버킷으로 묶이면
+    미분류 캡(max_sector_pct×0.5)을 기존 밸류 보유가 채워, 새 밸류 매수가 섹터와
+    무관하게 '섹터 집중 초과 [미분류]'로 거부됐다(10-15~11-19 밸류 BUY 27건 중 21건).
+    """
+    out = dict(sector_map_from_cache(cache_path))
+    out.update(sector_map_from_items(universe))
+    return out
+
+
 def sector_map_from_universe(cfg: AppConfig) -> dict:
     """config.universe 의 symbol→sector 매핑(포트폴리오 감독관의 섹터 집중도용).
 

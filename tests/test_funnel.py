@@ -44,15 +44,22 @@ def test_value_funnel_merges_jsonl_and_value_done(tmp_path):
     p = tmp_path / "vf.jsonl"
     p.write_text("\n".join(json.dumps(e) for e in [
         {"market": "KR", "ts": now - 50, "selected": 10, "too_expensive": 1,
-         "margin_fail": 2, "timing_fail": 5, "gated": 2},
+         "margin_fail": 2, "timing_fail": 5, "gated": 2,
+         "cap_drops": [{"symbol": "X"}], "buy_status": {"gate_rejected": 2}},
+        {"market": "KR", "ts": now - 45, "selected": 0, "buy_status": {"gate_rejected": 1,
+                                                                        "filled": 1}},
         {"market": "KR", "ts": now - 40 * 86400, "selected": 99},   # 범위 밖
     ]) + "\nnot json\n", encoding="utf-8")
     s.log_event("value_done", None, {"summary": {"result": str(
         {"due": ["KR"], "markets": {"KR": {"candidates": 10, "gated": 2, "proposed": 1,
                                            "filled": 1, "vetoed": 0}}})}}, ts=now - 40)
     v = funnel.value_funnel(s, now - 30 * 86400, now, funnel_path=p)
-    assert v["KR"] == {"runs": 1, "selected": 10, "too_expensive": 1, "margin_fail": 2,
-                       "timing_fail": 5, "gated": 2, "proposed": 1, "filled": 1, "vetoed": 0}
+    assert v["KR"] == {"runs": 2, "selected": 10, "too_expensive": 1, "margin_fail": 2,
+                       "timing_fail": 5, "gated": 2, "cap_drops": 1, "proposed": 1,
+                       "filled": 1, "vetoed": 0,
+                       "buy_status": {"gate_rejected": 3, "filled": 1}}
+    text = funnel.format_report(funnel.brain_funnel(s, now - 86400, now), v, [], 30)
+    assert "제안 집행 결과: gate_rejected 3, filled 1" in text
 
 
 def test_cash_utilization_uses_cost_basis_and_capital_timeline(tmp_path):

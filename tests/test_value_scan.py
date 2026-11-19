@@ -736,3 +736,18 @@ class TestSchema:
         with pytest.raises(Exception):
             ValueDossier.model_validate({"stance": "bullish", "conviction": 0.5,
                                          "thesis": "t"})
+
+
+def test_refresh_watchlist_sectors_requests_by_market(tmp_path):
+    from src.value_scan import refresh_watchlist_sectors
+    wl = tmp_path / "wl.json"
+    wl.write_text(json.dumps({"030200": {"market": "KR"}, "UHS": {"market": "US"},
+                              "X": {"market": "??"}}), encoding="utf-8")
+    seen = []
+    out = refresh_watchlist_sectors(wl, ensure_fn=lambda by: seen.append(by))
+    assert out == {"KR": 1, "US": 1}
+    assert seen == [{"KR": ["030200"], "US": ["UHS"]}]
+
+    def boom(by):
+        raise RuntimeError("network")
+    assert refresh_watchlist_sectors(wl, ensure_fn=boom) == {"KR": 1, "US": 1}  # 삼킨다

@@ -24,7 +24,10 @@ SHADOW_BLOCK_STATUSES = frozenset({
 SHADOW_SOFT_STATUSES = frozenset({"armed", "gap_armed"})
 SHADOW_BOOK_STATUSES = SHADOW_BLOCK_STATUSES | SHADOW_SOFT_STATUSES
 
-_DEFAULT_HORIZON_DAYS = {"day": 1, "swing": 20, "position": 120}
+_DEFAULT_HORIZON_DAYS = {"day": 1, "close_scan": 1, "swing": 20, "position": 120}
+# 익일 청산 트랙 — config time_stop·행 meta 와 무관하게 1일로 채점한다. 예전 행은
+# meta.horizon_days=20 이 박혀 있어(close_scan 이 기본값 20 으로 떨어졌음) 덮어쓴다.
+_ONE_DAY_HORIZONS = frozenset({"day", "close_scan"})
 MIN_SAMPLE = 5
 # 히스토리 종가를 쓸 때 목표일과 실제 봉 날짜의 최대 간격(주말·연휴 여유). 이보다
 # 멀면 CSV 가 갱신 안 된 것 — 낡은 종가로 채점하지 않는다(09-27 실측 154행 중 44행이
@@ -68,7 +71,7 @@ def horizon_calendar_days(horizon: str | None,
                           cfg: dict | None = None) -> int:
     """horizon → 보유 캘린더 일수(exit_policy time_stop 과 정렬)."""
     hz = (horizon or "swing").strip().lower()
-    if hz == "day":
+    if hz in _ONE_DAY_HORIZONS:
         return 1
     block = (cfg or {}).get("exit_policy") or {}
     ts = block.get("time_stop") or {}
@@ -508,8 +511,7 @@ def score_open_shadows(store, *, now: float | None = None,
                         meta = json.loads(row["meta"])
                     except (ValueError, TypeError):
                         pass
-                hdays = int(meta.get("horizon_days") or
-                            horizon_calendar_days(row["horizon"], cfg))
+                hdays = _meta_horizon_days(meta, row["horizon"], cfg)
                 if now < entry_ts + hdays * 86400:
                     stats["pending"] += 1
                     continue
@@ -521,8 +523,7 @@ def score_open_shadows(store, *, now: float | None = None,
                 meta = json.loads(row["meta"])
             except (ValueError, TypeError):
                 pass
-        hdays = int(meta.get("horizon_days") or
-                    horizon_calendar_days(row["horizon"], cfg))
+        hdays = _meta_horizon_days(meta, row["horizon"], cfg)
         if now < entry_ts + hdays * 86400:
             stats["pending"] += 1
             continue
@@ -664,6 +665,18 @@ def _agg_rows(rows: list) -> dict:
     }
 
 
+def _meta_horizon_days(meta: dict | None, horizon: str | None,
+                       cfg: dict | None) -> int:
+    """행 meta.horizon_days 우선, 단 익일 청산 트랙(day·close_scan)은 늘 1일."""
+    if str(horizon or "").strip().lower() in _ONE_DAY_HORIZONS:
+        return 1
+    hd = (meta or {}).get("horizon_days") if isinstance(meta, dict) else None
+    try:
+        return int(hd) if hd else horizon_calendar_days(horizon, cfg)
+    except (TypeError, ValueError):
+        return horizon_calendar_days(horizon, cfg)
+
+
 def _row_horizon_days(r: dict, cfg: dict | None) -> float:
     meta = r.get("meta")
     if isinstance(meta, str):
@@ -671,11 +684,7 @@ def _row_horizon_days(r: dict, cfg: dict | None) -> float:
             meta = json.loads(meta)
         except (TypeError, ValueError):
             meta = {}
-    hd = (meta or {}).get("horizon_days") if isinstance(meta, dict) else None
-    try:
-        return float(hd) if hd else float(horizon_calendar_days(r.get("horizon"), cfg))
-    except (TypeError, ValueError):
-        return float(horizon_calendar_days(r.get("horizon"), cfg))
+    return float(_meta_horizon_days(meta, r.get("horizon"), cfg))
 
 
 def dedupe_episodes(rows: list[dict], cfg: dict | None = None) -> list[dict]:

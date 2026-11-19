@@ -183,6 +183,11 @@ def test_runner_e2e_fills_and_mirrors_to_store(tmp_path):
     assert row["target_price"] == 1300.0                        # target = fair_price_low
     # 결정 저널(tmp) 기록
     assert (tmp_path / "value_decisions.jsonl").exists()
+    # 퍼널에 BUY 집행 결과(사유 포함)가 남는다 — 체결분은 outcomes 에서 뺀다.
+    funnel = [json.loads(l) for l in
+              (tmp_path / "value_funnel.jsonl").read_text(encoding="utf-8").splitlines()]
+    kr = [f for f in funnel if f["market"] == "KR"][-1]
+    assert kr["buy_status"] == {"filled": 1} and kr["buy_outcomes"] == []
 
 
 def test_value_market_fn_corrects_wrong_llm_label(tmp_path):
