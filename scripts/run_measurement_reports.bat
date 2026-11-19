@@ -1,6 +1,6 @@
 @echo off
 chcp 65001 >nul
-REM Tier0 measurement reports (dossier / wiring / baseline).
+REM Tier0 measurement reports (dossier / wiring / baseline / funnel).
 REM Re-register: register_measurement_reports.ps1
 REM EnableDelayedExpansion: paren-block set ERR=1 이 이후 if 에 보이도록.
 setlocal EnableDelayedExpansion
@@ -34,6 +34,12 @@ if errorlevel 1 (
 "%PY%" scripts\measurement_baseline.py --out data\measurement_baseline_latest.json >> logs\measurement_reports.run.log 2>&1
 if errorlevel 1 (
   echo [measurement_baseline] FAIL>> logs\measurement_reports.run.log
+  set "ERR=1"
+)
+
+"%PY%" scripts\funnel_report.py --days 30 --out data\funnel_latest.json >> logs\measurement_reports.run.log 2>&1
+if errorlevel 1 (
+  echo [funnel_report] FAIL>> logs\measurement_reports.run.log
   set "ERR=1"
 )
 

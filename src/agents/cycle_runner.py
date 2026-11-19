@@ -151,7 +151,35 @@ class CycleRunner:
             return str(item["market"])
         acct = getattr(self.broker, "account", None)
         held = (getattr(acct, "symbol_market", None) or {}).get(symbol)
-        return str(held) if held else None
+        if held:
+            return str(held)
+        # 유니버스 밖이라도 Athena 도시에는 스캔 풀(시장별 랭킹)에서 시장을 달고 만든다.
+        store = getattr(self, "store", None)
+        if store is not None:
+            try:
+                row = store.get_fresh_dossier(symbol)
+            except Exception as e:
+                log.warning("market_of 도시에 조회 실패 %s: %s", symbol, e)
+                row = None
+            if row is not None and row["market"]:
+                return str(row["market"])
+        return None
+
+    def _market_fn_for(self, candidates: list[dict]):
+        """이번 사이클 market 권위 = market_of → 이번에 서빙한 후보의 코드 market.
+
+        갭반등 스캔·도시에 후보는 유니버스 밖이라 market_of 가 모르는데, 서빙 단계는
+        item.market(시장별 풀에서 코드가 붙인 값)으로 뇌에게 보여 준다. 집행만 엄격하면
+        뇌가 고른 매수가 market_unknown 으로 버려진다(10-22~11-19 BUY 9건).
+        LLM 라벨이 아니라 코드가 붙인 값만 쓴다.
+        """
+        served = {str(c.get("symbol")): str(c["market"]).upper()
+                  for c in candidates
+                  if c.get("symbol") and str(c.get("market") or "").upper() in ("KR", "US")}
+
+        def _fn(symbol: str) -> str | None:
+            return self.market_of(symbol) or served.get(symbol)
+        return _fn
 
     def _portfolio(self, earnings: dict | None = None,
                    live_prices: dict[str, float] | None = None) -> dict:
@@ -698,7 +726,7 @@ class CycleRunner:
                         apply_code_conviction=bool(agents_cfg.get("conviction_code", True)),
                         dossier_brief_fn=(self._dossier_brief if self.store else None),
                         features_by_sym=feat_map,
-                        market_fn=self.market_of,
+                        market_fn=self._market_fn_for(candidates),
                         sell_block_fn=self._sell_block_reason,
                         resolve_price_fn=self._resolve_price,
                         store=self.store,
