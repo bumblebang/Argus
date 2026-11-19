@@ -1104,6 +1104,18 @@ class ValueRunner:
         res["filled"] = sum(
             1 for e in cyc.executed if e.get("status") in ("filled", "partial")
             and e.get("action") == "BUY")
+        # 제안 후 미체결 사유 — proposed/filled/vetoed 만으로는 나머지(하드게이트 거부
+        # 등)가 어디서 막혔는지 안 보였다(10~11월 제안 27건 중 21건이 섹터 게이트).
+        buy_ex = [e for e in cyc.executed if e.get("action") == "BUY"]
+        status_n: dict[str, int] = {}
+        for e in buy_ex:
+            k = str(e.get("status") or "?")
+            status_n[k] = status_n.get(k, 0) + 1
+        funnel["buy_status"] = status_n
+        funnel["buy_outcomes"] = [
+            {"symbol": e.get("symbol"), "status": e.get("status"),
+             "reason": str(e.get("reason") or "")[:160]}
+            for e in buy_ex if e.get("status") not in ("filled", "partial")][:20]
         funnel["proposed"] = res["proposed"]
         funnel["filled"] = res["filled"]
         funnel["sold"] = res["sold"]

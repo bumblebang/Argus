@@ -75,7 +75,7 @@ from src.agents.pipeline import (CycleRunner, select_backend, build_live_llm,
                                  build_brain_llm_factories,
                                  synth_candles, history_candles_1y, dry_llm_factory,
                                  build_paper_core, entry_stop_target,
-                                 sector_map_from_items)
+                                 sector_map_from_items, gate_sector_map)
 from src.agents.llm import ClaudeCLIClient, claude_lean_for
 from src.agents.value_trade import ValueRunner, value_trade_cfg
 from src.broker_sync import (apply_reconcile_from_live,
@@ -760,7 +760,7 @@ def run_from_args(args) -> int:
     broker, risk = build_paper_core(
         cfg, live_client=live_client,
         account_seq=broker_cfg.get("account_seq"), store=store,
-        sector_map_fn=lambda: sector_map_from_items(provider.markets()))
+        sector_map_fn=lambda: gate_sector_map(provider.markets()))
     # 라이브 전환 시 실계좌 → 봇 원장/store 미러링(감시 루프가 broker 를 쓰기 전에 1회).
     # 페이퍼면 스킵(config 초기값 유지). 라이브 동기화 실패는 심각 → ERROR + 전역 HALT
     # (어긋난 원장으로 주문 금지). 운영자가 HALT 파일 삭제 후 재기동/재동기화.

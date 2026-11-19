@@ -106,7 +106,8 @@ def value_funnel(store, since: float, until: float | None = None,
 
     def mk(m: str) -> dict:
         return out.setdefault(m, {"runs": 0, "selected": 0, **{k: 0 for k in _VALUE_DROP_KEYS},
-                                  "gated": 0, "proposed": 0, "filled": 0, "vetoed": 0})
+                                  "gated": 0, "cap_drops": 0, "proposed": 0, "filled": 0,
+                                  "vetoed": 0, "buy_status": {}})
 
     if funnel_path is None:
         from .value_ops import FUNNEL_PATH
@@ -124,6 +125,9 @@ def value_funnel(store, since: float, until: float | None = None,
         d["runs"] += 1
         for k in ("selected", *_VALUE_DROP_KEYS, "gated"):
             d[k] += int(ev.get(k) or 0)
+        d["cap_drops"] += len(ev.get("cap_drops") or [])
+        for st, n in (ev.get("buy_status") or {}).items():
+            d["buy_status"][st] = d["buy_status"].get(st, 0) + int(n or 0)
 
     for (raw,) in _rows(store, "SELECT payload FROM events WHERE kind='value_done'"
                         " AND ts>=? AND ts<?", (since, until)):
@@ -221,10 +225,16 @@ def format_report(brain: dict, value: dict, util: list[dict], days: int) -> str:
     if not value:
         lines.append("- 기록 없음")
     for m, d in sorted(value.items()):
+        cap_note = f" (신규캡 탈락 {d['cap_drops']})" if d.get("cap_drops") else ""
         lines.append(f"- {m}: 실행 {d['runs']}회 · 선별 {d['selected']} → 비쌈 {d['too_expensive']}"
                      f" · 마진 미달 {d['margin_fail']} · 타이밍 미달 {d['timing_fail']}"
                      f" → 게이트 통과 {d['gated']} → 제안 {d['proposed']}"
+                     f"{cap_note}"
                      f" → 체결 {d['filled']} (거부 {d['vetoed']})")
+        if d.get("buy_status"):
+            bs = ", ".join(f"{k} {v}" for k, v in
+                           sorted(d["buy_status"].items(), key=lambda x: -x[1]))
+            lines.append(f"  - 제안 집행 결과: {bs}")
     lines += ["", "### 현금 활용률 (보유 원가 ÷ 자본, 일말 기준)"]
     if util:
         mkts = [k for k in util[-1] if k != "date"]

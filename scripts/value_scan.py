@@ -87,6 +87,9 @@ def main() -> int:
     summary = run_scan(cfg, llm, limit=args.limit, held_symbols=_held_symbols())
     if not args.dry:
         _log_scan_done(summary)
+        # 하드 게이트 섹터 맵 보강(유니버스 밖 밸류 후보의 '미분류' 몰림 방지).
+        from src.value_scan import refresh_watchlist_sectors
+        refresh_watchlist_sectors()
     print(json.dumps(summary, ensure_ascii=False))
     return 0
 

@@ -312,6 +312,16 @@ def test_horizon_calendar_days():
     assert horizon_calendar_days("swing", cfg) == 15
 
 
+def test_close_scan_scored_on_one_day_even_with_stale_meta():
+    """익일 청산 트랙 — 기본값 20일로 떨어져 20일 뒤 가격으로 채점하던 결함."""
+    from src.shadow_ledger import _row_horizon_days
+    assert horizon_calendar_days("close_scan") == 1
+    stale = {"horizon": "close_scan", "meta": '{"horizon_days": 20}'}
+    assert _row_horizon_days(stale, None) == 1.0
+    swing = {"horizon": "swing", "meta": '{"horizon_days": 15}'}
+    assert _row_horizon_days(swing, None) == 15.0        # 다른 트랙은 meta 우선 유지
+
+
 # ── 에피소드 단위 표본 (09-27: 154행 중 독립 표본 73) ──────────────
 
 def test_live_shadow_blocks_repeat_booking(tmp_path):
