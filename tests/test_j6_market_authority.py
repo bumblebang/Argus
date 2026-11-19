@@ -180,3 +180,37 @@ def test_unheld_symbol_market_not_rewritten(tmp_path):
     order = Order("AAPL", "US", "BUY", 1, 200)
     res = broker.execute(order, reason="entry")
     assert not res.ok and order.market == "US"
+
+
+def test_market_of_falls_back_to_fresh_dossier(tmp_path):
+    """유니버스·원장 밖 종목도 Athena 도시에가 단 시장으로 판정한다."""
+    from src.agents.cycle_runner import CycleRunner
+    from src.engine.store import Store
+
+    runner = object.__new__(CycleRunner)
+    runner.universe_fn = lambda: {}
+    runner.cfg = type("C", (), {"universe": {}})()
+    runner.broker = _broker(tmp_path)
+    runner.store = Store(tmp_path / "d.db")
+    runner.store.save_dossier("095610", "KR", thesis="t")
+    assert runner.market_of("095610") == "KR"
+    assert runner.market_of("181710") is None
+
+
+def test_cycle_market_fn_uses_served_candidate_market(tmp_path):
+    """갭반등 후보(유니버스 밖)를 뇌에게 보여 줬으면 그 코드 market 으로 집행한다.
+
+    10-22~11-19 서빙은 됐는데 집행만 market_unknown 으로 버려진 BUY 9건 회귀.
+    """
+    from src.agents.cycle_runner import CycleRunner
+
+    runner = object.__new__(CycleRunner)
+    runner.universe_fn = lambda: {}
+    runner.cfg = type("C", (), {"universe": {}})()
+    runner.broker = _broker(tmp_path)
+    runner.store = None
+    fn = runner._market_fn_for([{"symbol": "181710", "market": "KR"},
+                                {"symbol": "X", "market": "??"}])
+    assert fn("181710") == "KR"
+    assert fn("X") is None          # 코드가 붙인 KR/US 만 신뢰
+    assert fn("없는종목") is None
