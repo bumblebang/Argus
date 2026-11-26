@@ -444,6 +444,36 @@ def test_cancel_failure_abandons_after_ttl(tmp_path):
     assert not broker.execute(Order("005930", "KR", "BUY", 1, 600_000), "blocked").ok
 
 
+def test_quarantine_not_reemitted_every_sweep(tmp_path):
+    """격리 후 sweep 이 PENDING 조회로 QUARANTINED 를 덮지 않는다 — 재격리 이벤트 반복 금지.
+
+    11-26 028050: 토스 cancel-restricted 로 취소가 계속 실패하자, 매 sweep 조회가
+    상태를 PENDING 으로 덮고 취소 실패가 '신규 격리'로 처리돼 이벤트가 5분마다 쌓였다.
+    """
+    class _BadCancel(_Client):
+        def cancel_order(self, account_seq, order_id):
+            raise RuntimeError("Toss API error 422: cancel-restricted")
+
+    store = Store(tmp_path / "t.db")
+    client = _BadCancel({"status": "PENDING", "execution": {"filledQuantity": 0}})
+    broker = _broker(tmp_path, store, client, working_order_ttl_sec=0.0,
+                     working_order_abandon_ttl_sec=60.0)
+    store.upsert_working_order(order_id="X1", symbol="028050", market="KR",
+                               side="BUY", qty=6, price=56_600, status="PENDING",
+                               placed_at=time.time() - 120)
+    for _ in range(4):
+        broker.sweep_working_orders()
+    rows = store.get_working_orders()
+    assert len(rows) == 1 and rows[0]["status"] == "QUARANTINED"
+    n = store.conn.execute(
+        "SELECT COUNT(*) FROM events WHERE kind='working_order_quarantined'").fetchone()[0]
+    assert n == 1
+    # 종결 상태가 오면 격리는 해소된다.
+    broker.client = _Client({"status": "CANCELED", "execution": {"filledQuantity": 0}})
+    broker.sweep_working_orders()
+    assert store.get_working_orders(settled=False) == []
+
+
 def test_fetch_failure_abandons_after_ttl(tmp_path):
     class _Boom(_Client):
         def get_order(self, account_seq, order_id):
