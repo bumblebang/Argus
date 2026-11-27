@@ -268,7 +268,7 @@ def test_load_kr_scores_missing_file(tmp_path):
 
 def test_assess_uses_history_for_kr_rating(tmp_path, monkeypatch):
     hist = tmp_path / "fh.json"
-    hist.write_text(json.dumps({"kr": [[i, 50.0] for i in range(20)]}),
+    hist.write_text(json.dumps({"kr_daily": [[i * 86400, 50.0] for i in range(60)]}),
                     encoding="utf-8")
     _patch_sources(monkeypatch)
     out = assess(_STATE, _cfg(history_path=str(hist)))
@@ -453,7 +453,8 @@ def test_record_history_recovers_from_corrupt_file(tmp_path):
     p.write_text("{망가진", encoding="utf-8")
     fg.record_history([[100, 30.0]], 20.0, path=p, now_fn=lambda: 1000)
     d = json.loads(p.read_text(encoding="utf-8"))
-    assert d == {"us": [[100, 30.0]], "kr": [[1000, 20.0]]}
+    assert d == {"us": [[100, 30.0]], "kr": [[1000, 20.0]],
+                 "kr_daily": [[1000, 20.0]]}          # epoch 1000 = 1970-01-01(목)
 
 
 def test_record_history_is_atomic_and_leaves_no_tmp(tmp_path):
@@ -587,3 +588,61 @@ def test_athena_context_carries_sentiment():
     ctx = build_research_context("005930", "삼성전자", "KR",
                                  history_df=None, market_state=ms)
     assert ctx["sentiment"]["fear_kr"]["score"] == 20.8
+
+
+# ── 일별 등급 기준 이력(11-27: 장중 열흘치 기준 → 폭락장 반등일 extreme_greed) ──
+def test_load_kr_scores_ignores_intraday_series(tmp_path):
+    """장중 시계열 kr 은 등급 기준이 아니다 — kr_daily 만 읽는다."""
+    p = tmp_path / "fh.json"
+    p.write_text(json.dumps({"kr": [[i, 10.0] for i in range(400)]}), encoding="utf-8")
+    assert load_kr_scores(p) == []
+    p.write_text(json.dumps({"kr": [[1, 10.0]], "kr_daily": [[1, 20.0], [2, 30.0]]}),
+                 encoding="utf-8")
+    assert load_kr_scores(p) == [20.0, 30.0]
+
+
+def test_intraday_ten_days_stays_absolute(tmp_path, monkeypatch):
+    """11-27 재현: 장중 400점(열흘 폭락) 이력만 있으면 원점수 38.4 → fear(absolute)."""
+    hist = tmp_path / "fh.json"
+    hist.write_text(json.dumps({"kr": [[i, 10.0] for i in range(400)]}), encoding="utf-8")
+    kr = {"score": 38.4, "rating": "fear"}
+    apply_kr_rating(kr, load_kr_scores(hist))
+    assert kr["rating_basis"] == "absolute" and kr["rating"] == "fear"
+
+
+def test_default_min_n_requires_60_daily_points():
+    kr = {"score": 38.4}
+    apply_kr_rating(kr, [10.0] * 59)
+    assert kr["rating_basis"] == "absolute"
+    apply_kr_rating(kr, [10.0] * 60)
+    assert kr["rating_basis"] == "percentile"
+
+
+def test_record_history_kr_daily_one_point_per_kst_date(tmp_path):
+    p = tmp_path / "fh.json"
+    # KST 11-26 22시 · 11-26 23시 · 11-27 02시
+    d1_a, d1_b, d2 = 1795700000, 1795700000 + 1800, 1795700000 + 4 * 3600
+    fg.record_history(None, 20.0, path=p, now_fn=lambda: d1_a)
+    fg.record_history(None, 22.0, path=p, now_fn=lambda: d1_b)   # 같은 KST 날 → 덮어씀
+    fg.record_history(None, 30.0, path=p, now_fn=lambda: d2)
+    data = json.loads(p.read_text(encoding="utf-8"))
+    assert [v for _, v in data["kr_daily"]] == [22.0, 30.0]
+    assert len(data["kr"]) == 3                                   # 장중 시계열은 그대로
+
+
+def test_record_history_kr_daily_cap(tmp_path):
+    p = tmp_path / "fh.json"
+    mon = 1795424400          # 2026-11-23(월) 18:00 KST
+    for i in range(5):        # 월~금
+        fg.record_history(None, float(i), path=p, now_fn=lambda i=i: mon + i * 86400,
+                          daily_cap=3)
+    data = json.loads(p.read_text(encoding="utf-8"))
+    assert [v for _, v in data["kr_daily"]] == [2.0, 3.0, 4.0]
+
+
+def test_record_history_kr_daily_skips_weekend(tmp_path):
+    p = tmp_path / "fh.json"
+    sat = 1795424400 + 5 * 86400                                   # 11-28(토)
+    fg.record_history(None, 40.0, path=p, now_fn=lambda: sat)
+    data = json.loads(p.read_text(encoding="utf-8"))
+    assert data["kr_daily"] == [] and len(data["kr"]) == 1

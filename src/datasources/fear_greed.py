@@ -46,7 +46,13 @@ _KR_WEIGHTS = {"breadth": 0.5, "drawdown": 0.3, "ret_5d": 0.2}
 _KR_COMPONENTS = tuple(_KR_WEIGHTS)
 _KR_NOTE = ("브레드스·지수낙폭·5일수익률 합성. 등급은 우리 이력 대비(50=평년). "
             "VKOSPI·풋콜은 전일 KRX 부가입력(점수 가중치 아님). 성분 결측이면 과신 금지")
-_KR_RATING_MIN_N = 20     # 이보다 짧은 이력은 퍼센타일 등급을 붙이지 않는다
+# 이보다 짧은 **일별** 이력은 퍼센타일 등급을 붙이지 않는다(원점수 구간 사용).
+# 11-27 사고: 장중 25분 간격 400점(=약 9.5일)을 기준으로 삼아, 폭락만 담긴 열흘 대비
+# 반등 하루가 상위 99.9% → extreme_greed(VKOSPI 58·낙폭 −16%)로 찍혔다. 이력이
+# 한 국면에 갇히면 "50=평년"이 성립하지 않으므로 최소 약 3개월(60거래일)을 요구한다.
+_KR_RATING_MIN_N = 60
+_KR_DAILY_KEEP = 500      # 일별 이력 보존 포인트(≈2년)
+_KST_OFFSET_SEC = 9 * 3600
 
 # 대시보드 스파크라인용 시계열. market_state.sentiment(=뇌 프롬프트)에는 절대 싣지 않고
 # 별도 파일에만 쓴다 — 배열이 들어가면 LLM 컨텍스트가 노이즈로 부푼다.
@@ -84,12 +90,20 @@ def percentile_rank(score: float, hist: list[float]) -> float:
     return (less + 0.5 * eq) / n * 100.0
 
 
+def _kst_date(epoch: float) -> str:
+    return time.strftime("%Y-%m-%d", time.gmtime(float(epoch) + _KST_OFFSET_SEC))
+
+
 def load_kr_scores(path: str | Path | None = None) -> list[float]:
-    """fear_history.json 의 KR 점수만. 없거나 깨지면 []."""
+    """fear_history.json 의 KR **일별** 점수(`kr_daily`, KST 날짜당 1점). 없거나 깨지면 [].
+
+    장중 시계열 `kr`(25분 간격·400점 ≈ 열흘)은 대시보드 스파크라인 전용이다 — 등급
+    기준으로 쓰면 이력이 한 국면에 갇혀 백분위가 뒤집힌다(_KR_RATING_MIN_N 주석).
+    """
     try:
         raw = json.loads(Path(path if path is not None else HISTORY_PATH)
                          .read_text(encoding="utf-8"))
-        rows = raw.get("kr") if isinstance(raw, dict) else None
+        rows = raw.get("kr_daily") if isinstance(raw, dict) else None
         if not isinstance(rows, list):
             return []
         out = []
@@ -145,12 +159,15 @@ def _parse_history(hist: dict | None) -> list:
 
 def record_history(us_series: list | None, kr_score: float | None,
                    path: str | Path = HISTORY_PATH, min_gap_sec: float = 1500,
-                   cap: int = 400, now_fn=time.time) -> None:
+                   cap: int = 400, now_fn=time.time,
+                   daily_cap: int = _KR_DAILY_KEEP) -> None:
     """공포지수 시계열을 별도 파일에 적재(대시보드 스파크라인 전용).
 
       us : CNN 이 권위 있는 1년치 시계열을 주므로 통째로 교체(없으면 기존 유지).
       kr : 그런 소스가 없어 우리가 누적한다. 장중 5분 슬라이스가 매번 쌓지 않도록
            마지막 포인트로부터 min_gap_sec 이상 지났을 때만 append.
+      kr_daily : KR 점수를 KST 평일 날짜당 1점(그날 마지막 값으로 덮어씀) — 퍼센타일 등급의
+           기준 이력(load_kr_scores). daily_cap 포인트 보존.
 
     쓰기는 tmp+os.replace 로 원자적 — 비원자적 쓰기로 원장이 0바이트가 나 데몬이 멈춘
     전례가 있다. 이 함수도 예외를 밖으로 던지지 않는다(fail-open).
@@ -168,6 +185,7 @@ def record_history(us_series: list | None, kr_score: float | None,
             data = {}
         us = data.get("us") if isinstance(data.get("us"), list) else []
         kr = data.get("kr") if isinstance(data.get("kr"), list) else []
+        daily = data.get("kr_daily") if isinstance(data.get("kr_daily"), list) else []
         if us_series:
             us = [[int(t), round(float(s), 1)] for t, s in us_series]
         if kr_score is not None:
@@ -175,11 +193,26 @@ def record_history(us_series: list | None, kr_score: float | None,
             last = float(kr[-1][0]) if kr else None
             if last is None or (now - last) >= min_gap_sec:
                 kr.append([int(now), round(float(kr_score), 1)])
+            # 주말엔 금요일 값이 반복 계산되므로 KST 평일만(공휴일 중복은 감수).
+            if time.gmtime(now + _KST_OFFSET_SEC).tm_wday < 5:
+                pt = [int(now), round(float(kr_score), 1)]
+                try:
+                    same_day = (bool(daily)
+                                and _kst_date(daily[-1][0]) == _kst_date(now))
+                except (TypeError, ValueError, IndexError):
+                    same_day = False
+                if same_day:
+                    daily[-1] = pt
+                else:
+                    daily.append(pt)
         if cap > 0:
             us, kr = us[-cap:], kr[-cap:]
+        if daily_cap > 0:
+            daily = daily[-daily_cap:]
         p.parent.mkdir(parents=True, exist_ok=True)
         tmp = p.with_name(p.name + ".tmp")
-        tmp.write_text(json.dumps({"us": us, "kr": kr}, ensure_ascii=False),
+        tmp.write_text(json.dumps({"us": us, "kr": kr, "kr_daily": daily},
+                                  ensure_ascii=False),
                        encoding="utf-8")
         os.replace(tmp, p)
     except Exception as e:
