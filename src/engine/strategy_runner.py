@@ -8,7 +8,9 @@
 
 **신호 청산 권한은 진입 근거에 묶인다**(engine.entry_basis) — 전략 신호로 진입한
 포지션(basis=signal)과 코드 소유 당일 트랙(day)만 신호로 청산한다. close_scan 은
-익일 close_scan_exit 전용이라 배정 라벨 신호로 당일 팔지 않는다. 도시에 진입존·뇌
+익일 close_scan_exit 전용이라 배정 라벨 신호로 팔지 않고 **뇌도 깨우지 않는다**(평가
+자체를 건너뜀 — 11-25 089890: 볼린저 '중심선 복귀' 강등신호로 뇌가 당일 17:25 매도
+−0.88%, 다음날 시가 +6.1%). 손절·익일 청산(ExitExecutor)은 그대로다. 도시에 진입존·뇌
 논거·밸류로 산 포지션은 신호가 떠도 팔지 않고 `demoted` 를 돌려주고, 감시 루프가
 뇌를 깨워 논거를 재평가하게 한다(triggers.strategy_signal_trigger).
 """
@@ -24,7 +26,7 @@ from ..runner import (candles_to_df, drop_unclosed_bar, order_price,
 from ..risk_gate import Order
 from ..strategies import build_strategy, REGISTRY
 from ..strategies.base import Action, Position
-from .entry_basis import SignalExitConfig, signal_exit_allowed
+from .entry_basis import SignalExitConfig, horizon_of, signal_exit_allowed
 
 log = get_logger("engine.strategy_runner")
 
@@ -79,6 +81,11 @@ class StrategyRunner:
         name = pos.get("strategy")
         if not name or name not in REGISTRY:
             return {"action": "skip", "executed": False, "reason": "전략 미배정"}
+        # close_scan 은 오버나이트 반등 논거 — 배정 전략(볼린저 등)의 청산 신호와 무관하다.
+        # 강등 각성까지 막는다: 뇌가 깨면 '전략 신호가 꺾였다'를 근거로 당일 매도해 버린다.
+        if horizon_of(pos) == "close_scan":
+            return {"action": "skip", "executed": False,
+                    "reason": "close_scan 은 익일 close_scan_exit 전용"}
         strat = build_strategy(name, _params_of(pos))
         allowed, basis = signal_exit_allowed(pos)
         if not self.cfg.bind_to_entry_basis:

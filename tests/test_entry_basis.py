@@ -76,8 +76,12 @@ def test_signal_exit_matrix(meta, allowed):
     assert signal_exit_allowed({"meta": meta})[0] is allowed
 
 
-def test_close_scan_thesis_demotes_bollinger_same_day(tmp_path):
-    """103590 회귀: gap_rebound close_scan+thesis 를 볼린저 중심선 신호로 당일 팔지 않는다."""
+def test_close_scan_skips_bollinger_signal_without_wake(tmp_path):
+    """103590 회귀: gap_rebound close_scan+thesis 를 볼린저 중심선 신호로 당일 팔지 않는다.
+
+    089890(11-25) 회귀: 강등(뇌 각성)도 하지 않는다 — 깨어난 뇌가 '전략 신호가 꺾였다'를
+    근거로 당일 매도했다. close_scan 은 익일 close_scan_exit·손절만 따른다.
+    """
     # 종가 이미 mid 위 → bollinger_reversion SELL. 예전엔 horizon=close_scan 예외로 집행됨.
     n = 30
     closes = [70.0 + i * 0.1 for i in range(n - 1)] + [81.4]
@@ -93,11 +97,26 @@ def test_close_scan_thesis_demotes_bollinger_same_day(tmp_path):
     sr = StrategyRunner(FakeGW(candles), broker, store,
                         cfg=SignalExitConfig(min_hold_sec=0))
     r = sr.evaluate(dict(store.get_open_positions()[0]), "KR")
-    assert r["executed"] is False and r.get("demoted") is True
-    assert r["basis"] == BASIS_THESIS
+    assert r["executed"] is False and r["action"] == "skip"
+    assert not r.get("demoted")
     assert broker.position("103590").qty == 5
     kinds = {e["kind"] for e in store.conn.execute("SELECT kind FROM events")}
     assert "strategy_exit" not in kinds
+
+
+def test_close_scan_skip_does_not_fetch_candles(tmp_path):
+    """close_scan 은 캔들 조회 전에 건너뛴다(틱당 CHART 예산 보호)."""
+    class Boom:
+        def candles(self, *a, **k):
+            raise AssertionError("close_scan 은 캔들을 조회하지 않아야 한다")
+    store = Store(tmp_path / "t.db")
+    sr = StrategyRunner(Boom(), _broker(tmp_path), store,
+                        cfg=SignalExitConfig(min_hold_sec=0))
+    pos = {"symbol": "089890", "qty": 3, "avg_price": 32800,
+           "strategy": "bollinger_reversion",
+           "meta": {"entry_basis": "signal", "horizon": "close_scan",
+                    "params": {"period": 20, "num_std": 2.0}}}
+    assert sr.evaluate(pos, "KR")["action"] == "skip"
 
 
 def test_day_horizon_falls_back_to_strategy_class():
