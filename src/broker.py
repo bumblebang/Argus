@@ -67,6 +67,19 @@ def _is_blocking_working_status(status: str | None) -> bool:
     return s in ("UNKNOWN", "QUARANTINED") or s.startswith("LOCAL")
 
 
+def _keep_quarantine(prev_status, new_status: str) -> str:
+    """조회로 받은 상태를 저장할 때 격리를 유지한다.
+
+    비종결 상태(PENDING 등)로 QUARANTINED 를 덮으면 다음 취소 실패가 '신규 격리'로
+    처리돼 working_order_quarantined 이벤트가 sweep 마다(5분) 반복된다. 종결 상태만
+    격리를 해제한다.
+    """
+    if (str(prev_status or "").upper() == "QUARANTINED"
+            and new_status not in _TERMINAL):
+        return "QUARANTINED"
+    return new_status
+
+
 # KRX 단일가(동시호가) 접수 창(KST 분) → 창 끝이 체결 시각. 이 창에 낸 지정가는 체결
 # 시각 전에는 채워질 수 없다 — 60s TTL 로 취소하면 close_scan(15:20~) 매수가 영영
 # 체결되지 않는다(취소가 415 로 전부 실패하던 동안 가려져 있었다).
@@ -1110,7 +1123,8 @@ class Broker:
                         out["fetch_failed"] += 1
                     continue
                 status, filled, avg, fee = _parse_execution(info)
-                self._store_call(self.store.update_working_order, oid, status=status,
+                self._store_call(self.store.update_working_order, oid,
+                                 status=_keep_quarantine(fresh.get("status"), status),
                                  filled_qty=filled, filled_avg=avg, fee=fee)
                 if status in _TERMINAL:
                     out["settled"] += 1
@@ -1380,7 +1394,8 @@ class Broker:
             return False
         info = self._fetch_order(order_id) or {}
         status, filled, avg, fee = _parse_execution(info)
-        self._store_call(self.store.update_working_order, order_id, status=status,
+        self._store_call(self.store.update_working_order, order_id,
+                         status=_keep_quarantine(row.get("status"), status),
                          filled_qty=filled, filled_avg=avg, fee=fee)
         if status not in _TERMINAL:
             log.warning("[LIVE] 취소 미확인 id=%s status=%s — working 유지", order_id, status)
