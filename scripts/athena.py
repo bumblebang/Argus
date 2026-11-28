@@ -102,7 +102,13 @@ def main() -> int:
     else:
         market, stop_at = args.market, None      # 강제 지정 시 하드스톱 없음(수동 책임)
 
-    store = Store(cfg.raw.get("run", {}).get("db_path", "data/bot.db"))
+    db_path = cfg.raw.get("run", {}).get("db_path", "data/bot.db")
+    if args.dry:
+        # MockLLM 합성 도시에가 운영 DB 에 들어가면 뇌·하드게이트가 진짜 리서치로 읽는다.
+        from src.paths import dry_output_path
+        db_path = dry_output_path("athena_dry.db")
+        log.info("[dry] 도시에 격리 DB: %s", db_path)
+    store = Store(db_path)
     # 스윙 멤버십은 유지하고 거래대금 순으로만 재정렬(Athena 미커버 우선순위).
     sort_core_by_turnover(market)
     cfg.raw["universe"] = resolve_universe(cfg.raw, ROOT / "data")

@@ -137,6 +137,12 @@ def refresh_sessions(client, markets=("KR", "US")) -> dict:
                         entry = retry
                 except Exception as e:
                     log.warning("%s 세션표 재조회 실패: %s", m, e)
+                if "regular" not in [s["name"] for s in entry.get("sessions", [])]:
+                    # 정규장 빠진 표를 저장하면 그날 정규장 전체가 'closed' 로 판정된다
+                    # (캐시가 유효하면 is_open 폴백도 안 탄다). 저장하지 않고 폴백에 맡긴다 —
+                    # 다음 주기 갱신이 다시 받는다.
+                    log.error("%s 세션표 regular 누락 지속 — 저장 안 함(is_open 폴백 유지)", m)
+                    continue
         except Exception as e:
             log.warning("%s 세션표 조회 실패(스킵): %s", m, e)
             continue

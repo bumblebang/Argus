@@ -26,6 +26,7 @@ from ..runner import (candles_to_df, drop_unclosed_bar, order_price,
 from ..risk_gate import Order
 from ..strategies import build_strategy, REGISTRY
 from ..strategies.base import Action, Position
+from .backoff import backoff_delay
 from .entry_basis import SignalExitConfig, horizon_of, signal_exit_allowed
 
 log = get_logger("engine.strategy_runner")
@@ -135,7 +136,7 @@ class StrategyRunner:
         if not res:
             why = res.reject_reason or getattr(self.broker, "last_reject_reason", None) or "gate_rejected"
             streak += 1
-            delay = min(self.retry_base_sec * 2 ** (streak - 1), self.retry_max_sec)
+            delay = backoff_delay(self.retry_base_sec, streak, self.retry_max_sec)
             self._retry[sym] = (now + delay, streak, now)
             self.store.log_event("error", sym, {"where": "strategy_exit",
                                                 "reason": why, "retry_in_sec": delay,

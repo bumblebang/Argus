@@ -188,6 +188,10 @@ def test_unmatched_drop_emits_event_and_no_pnl(tmp_path):
     store, acct = Store(tmp_path / "t.db"), _acct(tmp_path)
     _seed(store, acct, qty=10)
 
+    # 봇 매도로 설명 안 되는 전량 소멸은 1회 보류(일시적 빈 응답이면 전 종목 유령 청산).
+    first = apply_reconcile_from_live(acct, store, _holdings([]), markets=("KR",))
+    assert first["holdings_ok"] is False and acct.position("005930").is_open
+    assert _events(store, "holdings_empty_suspect")
     res = apply_reconcile_from_live(acct, store, _holdings([]), markets=("KR",))
 
     assert res["attributed"] == {}
@@ -206,7 +210,9 @@ def test_stale_journal_sell_is_not_used_as_exit_price(tmp_path):
                              market="KR", side="SELL", qty=1, price=999_999,
                              fee=0, reason="old"))
     apply_reconcile_from_live(acct, store, _holdings([]), markets=("KR",))
+    apply_reconcile_from_live(acct, store, _holdings([]), markets=("KR",))
     assert _closed(store) == []
+    assert not acct.position("005930").is_open       # 2회 확인 후엔 반영
 
 
 def test_fill_without_price_is_not_estimated(tmp_path):
@@ -455,6 +461,7 @@ def test_pending_order_flagged_on_unattributed(tmp_path):
     store.upsert_working_order(order_id="O1", symbol="005930", market="KR",
                                side="SELL", qty=10, price=71_000,
                                status="PENDING", filled_qty=0)
+    # 미결 SELL 이 빈 보유를 설명한다 — 연속 확인 없이 바로 반영.
     apply_reconcile_from_live(acct, store, _holdings([]), markets=("KR",))
     import json
     ev = _events(store, "unattributed_delta")

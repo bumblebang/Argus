@@ -21,6 +21,7 @@ from ..strategies import build_strategy, REGISTRY
 from ..strategies.base import Action, Position
 from ..agents.conviction import size_weight, min_lot_adjust, skip_position_headroom
 from ..agents.wiring import combine_stop_target
+from .backoff import backoff_delay
 from .entry_basis import BASIS_SIGNAL, BASIS_ZONE
 
 log = get_logger("engine.execution")
@@ -133,7 +134,7 @@ class ExitExecutor:
     def _delay(self, kind: str, streak: int) -> float:
         cap = (self.urgent_retry_max_sec if kind in URGENT_EXIT_KINDS
                else self.retry_max_sec)
-        return min(self.retry_base_sec * 2 ** max(0, streak - 1), cap)
+        return backoff_delay(self.retry_base_sec, streak, cap)
 
     def ready(self, symbol: str, kind: str) -> bool:
         """이 (종목, kind) 로 지금 주문을 내도 되는가(백오프 경과)."""

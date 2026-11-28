@@ -34,6 +34,11 @@ def main() -> int:
     ap.add_argument("--dry", action="store_true")
     args = ap.parse_args()
     setup_logging("INFO")
+    global OUT_DIR
+    if args.dry:
+        # 합성 표본을 연구 데이터(krx_shadow_latest.json)에 섞지 않는다.
+        from src.paths import dry_output_path
+        OUT_DIR = dry_output_path("krx_shadow")
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     day = ymd()
     payload = {

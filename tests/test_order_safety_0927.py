@@ -307,17 +307,67 @@ def test_sweep_drops_local_row_absent_from_server(tmp_path):
     # 한참 전 주문·반대 방향 주문은 짝도 근접도 아니다
     client.orders = {"OPEN": [_order(placed - 3600, oid="OLD")],
                      "CLOSED": [_order(placed, oid="OTHER", side="BUY")]}
+    # 1차 '없음' 은 확정하지 않는다(일시적 빈 목록 응답 → 중복 주문 방지).
+    out = broker.sweep_working_orders()
+    assert out.get("local_absent") is None and out["local_orphan"] == 1
+    assert len(store.get_working_orders()) == 1
+    for k in list(broker._local_absent_seen):              # 재확인 간격 경과
+        broker._local_absent_seen[k] -= 61
     out = broker.sweep_working_orders()
     assert out.get("local_absent") == 1
     assert store.get_working_orders() == []
 
 
-def test_near_miss_order_blocks_absent_verdict(tmp_path):
-    """US 지정가 절삭(12.345→12.34) 등으로 엄격 대조가 빗나가도 근접 주문이 있으면 지우지 않는다."""
+def test_empty_list_response_never_confirms_absent(tmp_path):
+    """예외 없는 빈 응답(orders 키 없음)은 '0건' 이 아니다 — 몇 번이 와도 없음 확정 금지."""
+    client = _Client()
+    store, broker = _setup(tmp_path, client)
+    _local_row(store)
+    client.list_orders = lambda *a, **k: {}
+    for _ in range(3):
+        out = broker.sweep_working_orders()
+        for k in list(broker._local_absent_seen):
+            broker._local_absent_seen[k] -= 61
+        assert out.get("local_absent") is None
+    assert store.get_working_orders()[0]["order_id"] == "local:abc"
+
+
+def test_own_resolved_order_is_not_a_near_miss(tmp_path):
+    """직전에 귀속된 봇 자기 주문(이벤트에 order_id)은 근접 주문으로 세지 않는다."""
+    client = _Client()
+    store, broker = _setup(tmp_path, client)
+    placed = _local_row(store)
+    store.log_event("live_order", "005930", {"order_id": "MINE", "side": "SELL"})
+    client.orders = {"OPEN": [], "CLOSED": [_order(placed, oid="MINE")]}
+    out = broker.sweep_working_orders()
+    assert out.get("local_resolved") is None              # MINE 을 짝으로 잡지 않는다
+    for k in list(broker._local_absent_seen):
+        broker._local_absent_seen[k] -= 61
+    out = broker.sweep_working_orders()
+    assert out.get("local_absent") == 1                   # 영구 미확인 아님
+
+
+def test_near_miss_unique_price_only_resolves(tmp_path):
+    """US 지정가 절삭(12.345→12.34) 등 가격만 어긋난 유일 후보(시각·수량 일치)는 짝으로 채택.
+    예전엔 영구 미확인 → 그 종목 양방향 영구 차단이었다."""
     client = _Client()
     store, broker = _setup(tmp_path, client)
     placed = _local_row(store, price=70_050)
-    client.orders = {"OPEN": [_order(placed, oid="NEAR", price="70000")], "CLOSED": []}
+    near = _order(placed, oid="NEAR", price="70000", status="PENDING", filled=0)
+    client.orders = {"OPEN": [near], "CLOSED": []}
+    client.detail = near
+    out = broker.sweep_working_orders()
+    assert out.get("local_resolved") == 1
+    assert store.get_working_orders()[0]["order_id"] == "NEAR"
+
+
+def test_near_miss_ambiguous_blocks_absent_verdict(tmp_path):
+    """가격만 어긋난 후보가 둘 이상이면 모호 — 지우지도 채택하지도 않는다."""
+    client = _Client()
+    store, broker = _setup(tmp_path, client)
+    placed = _local_row(store, price=70_050)
+    client.orders = {"OPEN": [_order(placed, oid="N1", price="70000"),
+                              _order(placed, oid="N2", price="70100")], "CLOSED": []}
     out = broker.sweep_working_orders()
     assert out.get("local_absent") is None and out["local_orphan"] == 1
     assert store.get_working_orders()[0]["order_id"] == "local:abc"
