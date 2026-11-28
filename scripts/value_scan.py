@@ -84,7 +84,19 @@ def main() -> int:
                               error_dump_path="data/value_scan_cli_error.json",
                               lean=claude_lean_for(a, "value_scan"))
 
-    summary = run_scan(cfg, llm, limit=args.limit, held_symbols=_held_symbols())
+    scan_kw = {}
+    if args.dry:
+        # MockLLM 도시에를 운영 워치리스트(밸류 매수 후보 원천)에 병합하지 않는다.
+        import shutil
+        from src.paths import dry_output_path
+        from src.value_scan import WATCHLIST
+        dry_wl = dry_output_path(WATCHLIST)
+        if WATCHLIST.exists():
+            shutil.copyfile(WATCHLIST, dry_wl)
+        scan_kw["watchlist_path"] = dry_wl
+        log.info("[dry] 워치리스트 격리 경로: %s", dry_wl)
+    summary = run_scan(cfg, llm, limit=args.limit, held_symbols=_held_symbols(),
+                       **scan_kw)
     if not args.dry:
         _log_scan_done(summary)
         # 하드 게이트 섹터 맵 보강(유니버스 밖 밸류 후보의 '미분류' 몰림 방지).

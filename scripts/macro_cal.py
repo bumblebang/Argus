@@ -44,11 +44,16 @@ def main() -> int:
     for e in near:
         log.info("  임박: %s %s D%+d", e.get("label"), e.get("date"), e["dday"])
 
-    OUT.parent.mkdir(parents=True, exist_ok=True)
-    tmp = OUT.with_name(OUT.name + ".tmp")
+    out = OUT
+    if args.dry:
+        # curated 만 담은 dry 결과로 운영 매크로 캘린더(Finnhub 포함)를 덮지 않는다.
+        from src.paths import dry_output_path
+        out = dry_output_path(OUT)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    tmp = out.with_name(out.name + ".tmp")
     tmp.write_text(json.dumps(cal, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(OUT)
-    log.info("저장: %s", OUT)
+    tmp.replace(out)
+    log.info("저장: %s", out)
     return 0
 
 

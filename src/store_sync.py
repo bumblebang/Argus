@@ -122,6 +122,23 @@ def _pending_entry_plan(store, symbol: str,
     return best
 
 
+def _armed_stop_target(meta: dict, avg: float, horizon: str,
+                       params: dict | None) -> tuple[float | None, float | None]:
+    """armed 계획 → 체결 평단 기준 (손절, 목표). 즉시 체결 경로와 같은 규칙.
+
+    존 진입(entry_zone)은 즉시 체결 시 EntryExecutor 가 도시에 무효화가·목표를
+    combine_stop_target 으로 반영한다. 지연 체결 채택이 코드 기본값(entry_stop_target)만
+    쓰면 같은 계획이 체결 시점에 따라 다른 손절·목표를 받는다(예: 98/120 vs 95/110).
+    """
+    from .agents.wiring import combine_stop_target, entry_stop_target
+    zone = meta.get("entry_zone")
+    if isinstance(zone, dict):
+        stop, target, _note = combine_stop_target(
+            avg, horizon, params, zone.get("invalidation"), zone.get("target"))
+        return stop, target
+    return entry_stop_target(avg, horizon, params)
+
+
 def adopt_live_position(store, symbol: str, market: str, qty: float, avg: float,
                         *, source: str, thesis: str) -> str:
     """실계좌에서 발견한 보유를 store 에 채택. 'planned'|'promoted'|'opened' 반환.
@@ -173,7 +190,7 @@ def adopt_live_position(store, symbol: str, market: str, qty: float, avg: float,
         meta = _parse_meta(armed["meta"])
         horizon = str(meta.get("horizon") or "swing")
         params = meta.get("params") if isinstance(meta.get("params"), dict) else None
-        stop, target = entry_stop_target(float(avg), horizon, params)
+        stop, target = _armed_stop_target(meta, float(avg), horizon, params)
         aid = int(armed["id"])
         store.promote_armed(aid, float(qty), float(avg),
                             target_price=target, stop_price=stop)

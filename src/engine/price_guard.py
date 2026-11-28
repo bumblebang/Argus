@@ -35,6 +35,11 @@ QuoteFn = Callable[[str], "tuple | None"]
 
 _MAX_SUSPECT_RAWS = 16
 _QUOTE_FAIL_STREAK_TRIP = 3
+# 호가 시각이 없어 멈춤을 증명할 수 없을 때의 최종 기한(confirm_sec 배수). 이 시간 내내
+# bid/ask 가 한 번도 안 바뀌고 체결가는 2가지 이상 찍혔으면 멈춘 호가로 보고 채택한다.
+# 기한이 없으면 낡은 호가가 진짜 급락 손절을 영영 막는다. 한 값에 고정된 오류가(ROIV)는
+# 체결가 1가지라 해당 없음.
+_UNPROVEN_FROZEN_FACTOR = 5.0
 
 
 class PriceGuard:
@@ -74,6 +79,8 @@ class PriceGuard:
         self._quote_fail_until: dict[str, float] = {}
         self._quote_fail_streak = 0
         self._quote_block_until = 0.0
+        # 종목별 호가 조회 실패가 시작된 시각(성공하면 비운다) — 호가 끊김 판정.
+        self._quote_dead_since: dict[str, float] = {}
 
     @classmethod
     def from_config(cls, raw: dict | None, quote_fn: QuoteFn,
@@ -162,6 +169,7 @@ class PriceGuard:
             else:
                 self._quote_fail_streak = 0
                 self._quote_fail_until.pop(symbol, None)
+                self._quote_dead_since.pop(symbol, None)
                 info["quote_mid"] = mid
                 first_quote = self._suspect_quote.setdefault(symbol, (bid, ask))
                 quote_moved = first_quote != (bid, ask)
@@ -200,7 +208,12 @@ class PriceGuard:
                              ) -> tuple[float, str]:
         """락 안: 호가 없이 판정. 이번 의심 중 호가가 부정한 적 있으면 기각 유지."""
         rej = self._last_reject.get(symbol)
-        if rej is not None and rej[1] >= since:
+        # 호가가 실제로 confirm_sec 넘게 죽어 있으면(조회 실패 지속 = 끊김) 낡은 부정으로
+        # 기각을 유지하지 않고 아래 timeout 판정으로 넘긴다. 예산 부족으로 조회를 안 한
+        # 틱은 실패가 아니므로 기각 유지(호가 예산에 굶는 종목 보호).
+        dead = self._quote_dead_since.get(symbol)
+        quote_gone = dead is not None and now - dead >= self.confirm_sec
+        if rej is not None and rej[1] >= since and not quote_gone:
             return rej[0], "rejected"
         if stale_ref or now - since >= self.confirm_sec:
             self._accept(symbol, price, now)
@@ -216,12 +229,20 @@ class PriceGuard:
         바뀌었으면 살아 있는 호가 — 기각이 맞다. 그 외(시각이 의심 전에 멈추고 값도
         그대로)엔 의심이 confirm_sec 이상 이어지고 체결가가 2가지 이상 찍혔을 때만
         멈춘 호가로 본다. 한 값에 고정된 오류가(ROIV 29.12 30분)는 해당 없음.
+        호가 시각이 없어도 confirm_sec×_UNPROVEN_FROZEN_FACTOR 내내 값이 그대로면 채택 —
+        기한 없는 기각은 낡은 호가가 진짜 손절을 무기한 막는 구멍이다.
         """
-        if quote_at is None or quote_at >= since or quote_moved:
+        if quote_moved or distinct_raws < 2:
             return False
-        return now - since >= self.confirm_sec and distinct_raws >= 2
+        if quote_at is None:
+            # 증명 불가 — 짧은 창에선 기각 유지(흔들리는 오류가 보호), 최종 기한 뒤엔 채택.
+            return now - since >= self.confirm_sec * _UNPROVEN_FROZEN_FACTOR
+        if quote_at >= since:
+            return False
+        return now - since >= self.confirm_sec
 
     def _note_quote_failure(self, symbol: str, now: float) -> None:
+        self._quote_dead_since.setdefault(symbol, now)
         self._quote_fail_until[symbol] = now + self.quote_fail_cooldown_sec
         self._quote_fail_streak += 1
         if self._quote_fail_streak >= _QUOTE_FAIL_STREAK_TRIP:

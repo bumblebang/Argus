@@ -96,8 +96,11 @@ class KrxAlertsSource(DataSource):
 
     def fetch(self, ctx: SourceContext) -> dict:
         if ctx.dry:
+            # 운영 차단목록(krx_blocked_symbols.json)을 합성값으로 덮으면 실제 투자위험
+            # 종목 매수 차단이 풀린다 — dry 는 data/dry/ 로만 쓴다.
+            from ..paths import dry_output_path
             warnings = {"999999": ["INVESTMENT_RISK"]}
-            save_blocked_symbols({"999999"}, self.blocked_path)
+            save_blocked_symbols({"999999"}, dry_output_path(self.blocked_path))
             return {"warnings": warnings}
         client = connect(user=self.user, password=self.password,
                          spacing_sec=self.spacing)

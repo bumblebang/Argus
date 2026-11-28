@@ -108,15 +108,20 @@ def main() -> int:
                 time.sleep(0.3)
         log.info("KR 실적 캘린더 %d/%d종목", n_kr, len(kr))
 
-    OUT.parent.mkdir(parents=True, exist_ok=True)
-    OUT.write_text(json.dumps({
+    out = OUT
+    if args.dry:
+        # 빈 캘린더로 운영 파일을 덮으면 실적 임박 가드가 전부 꺼진다.
+        from src.paths import dry_output_path
+        out = dry_output_path(OUT)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps({
         "asof": datetime.now(timezone.utc).isoformat(),
         "symbols": symbols,
     }, ensure_ascii=False), encoding="utf-8")
     soon = [s for s, e in symbols.items()
             if isinstance(e.get("dday"), int) and 0 <= e["dday"] <= 3]
     log.info("실적 캘린더 %d종목(임박 %d: %s) -> %s (%.1fs)",
-             len(symbols), len(soon), ", ".join(soon) or "-", OUT, time.time() - t0)
+             len(symbols), len(soon), ", ".join(soon) or "-", out, time.time() - t0)
     return 0
 
 

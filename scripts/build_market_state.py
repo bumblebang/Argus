@@ -159,8 +159,15 @@ def main() -> int:
     else:
         log.warning("DART_API_KEY 없음 -> 국내 재무·공시 스킵")
 
-    out_path = DATA_DIR / "market_state.json"
-    state = MarketState.load(out_path) if out_path.exists() else MarketState()
+    live_path = DATA_DIR / "market_state.json"
+    # --dry 는 합성값이라 운영 파일을 덮지 않는다(뇌·감시가 읽는 국면·공포지수 오염).
+    # 직전 운영값을 바탕으로 data/dry/market_state.json 에만 쓴다.
+    if args.dry:
+        from src.paths import dry_output_path
+        out_path = dry_output_path(live_path)
+    else:
+        out_path = live_path
+    state = MarketState.load(live_path) if live_path.exists() else MarketState()
     for s in sources:
         try:
             partial = s.fetch(ctx)

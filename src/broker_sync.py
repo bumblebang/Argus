@@ -323,11 +323,16 @@ def fetch_live_account_data(client, account_seq, *, markets=("KR", "US")) -> dic
         cash[market] = c
 
     holdings, herr = _retry_fetch(
-        "보유", lambda: client.get_holdings(account_seq) or {})
+        "보유", lambda: client.get_holdings(account_seq))
+    if herr is None and not _holdings_shape_ok(holdings):
+        # 예외 없는 빈/깨진 응답(None·{}·items 없음)은 '보유 0' 이 아니라 조회 실패다.
+        # 그대로 믿으면 전 종목을 청산된 것으로 처리한다.
+        herr = ValueError(f"보유 응답 형식 이상({type(holdings).__name__}: "
+                          f"{str(holdings)[:80]!r})")
     holdings_ok = herr is None
     items: list = []
     if holdings_ok:
-        items = (holdings or {}).get("items") or []
+        items = holdings.get("items") or []
     else:
         log.error("조회: 보유 실패 — %s", herr)
         errors["holdings"] = str(herr)
@@ -335,6 +340,85 @@ def fetch_live_account_data(client, account_seq, *, markets=("KR", "US")) -> dic
     return {"cash": cash, "items": items, "holdings_ok": holdings_ok,
             "cash_ok": not failed_markets, "failed_markets": failed_markets,
             "errors": errors}
+
+
+def _holdings_shape_ok(resp) -> bool:
+    """보유 응답이 스펙 모양인가 — dict 이고 items 가 list. 빈 list 는 정상(보유 0)."""
+    return isinstance(resp, dict) and isinstance(resp.get("items"), list)
+
+
+# 원장에 보유가 있는데 실계좌 보유가 통째로 비어 오면, 이 횟수만큼 연속으로 같아야
+# 믿는다. 주기 재대사(5분) 기준 1회 보류 = 일시적 빈 응답 1건으로 전 종목 유령 청산 방지.
+_EMPTY_HOLDINGS_CONFIRM = 2
+
+
+# 저널 매도가 이 시간 안이면 '방금 판 종목'으로 본다(빈 보유의 정상 설명).
+_RECENT_EXIT_SEC = 3600.0
+
+
+def _exit_explained(account, store, symbol: str) -> bool:
+    """이 종목이 보유에서 사라진 게 봇 자기 매도로 설명되는가."""
+    if store is not None:
+        try:
+            if store.get_working_orders(symbol, side="SELL"):
+                return True
+        except Exception:
+            pass
+    now = time.time()
+    for f in reversed(getattr(account, "journal", None) or []):
+        if f.symbol != symbol or f.side != "SELL":
+            continue
+        ts = _fill_epoch(getattr(f, "ts", None))
+        return ts is None or now - ts <= _RECENT_EXIT_SEC
+    return False
+
+
+def _fill_epoch(ts) -> float | None:
+    """저널 Fill.ts(ISO 문자열 또는 epoch) → epoch. 파싱 실패는 None."""
+    if ts is None:
+        return None
+    try:
+        return float(ts)
+    except (TypeError, ValueError):
+        pass
+    try:
+        from datetime import datetime
+        return datetime.fromisoformat(str(ts)).timestamp()
+    except (TypeError, ValueError):
+        return None
+
+
+def _confirm_empty_holdings(account, store, data: dict, live_pos: dict) -> dict:
+    """원장 보유가 있는데 실계좌 보유가 통째로 비어 오면 연속 확인 전까지 실패로 본다.
+
+    반환: data 그대로, 또는 holdings_ok=False 로 바꾼 사본(호출측이 실패 경로로 처리).
+    """
+    if not data.get("holdings_ok"):
+        return data
+    held = sorted(s for s, p in account.positions.items() if p.is_open)
+    if live_pos or not held:
+        account._empty_holdings_streak = 0
+        return data
+    unexplained = [s for s in held if not _exit_explained(account, store, s)]
+    if not unexplained:
+        # 전 종목에 봇 자기 매도(미결·귀속대기 SELL 또는 방금 매도)가 있다 — 정상 전량 청산.
+        account._empty_holdings_streak = 0
+        return data
+    streak = int(getattr(account, "_empty_holdings_streak", 0) or 0) + 1
+    account._empty_holdings_streak = streak
+    if streak >= _EMPTY_HOLDINGS_CONFIRM:
+        log.warning("재대사: 실계좌 보유 0 이 %d회 연속 — 전량 청산으로 반영(원장 %s)",
+                    streak, held)
+        account._empty_holdings_streak = 0
+        return data
+    log.error("재대사: 실계좌 보유가 비어 옴(설명 안 되는 원장 보유 %s) — %d/%d 확인 전 "
+              "보유 덮기 보류", unexplained, streak, _EMPTY_HOLDINGS_CONFIRM)
+    _emit(store, "holdings_empty_suspect", None,
+          {"ledger_symbols": held, "unexplained": unexplained, "streak": streak})
+    return {**data, "holdings_ok": False, "items": [],
+            "error": "holdings empty (unconfirmed)",
+            "errors": {**dict(data.get("errors") or {}),
+                       "holdings": "빈 보유 응답 — 재확인 대기"}}
 
 
 def _health_fields(data: dict) -> dict:
@@ -801,6 +885,9 @@ def apply_reconcile_from_live(account, store, data: dict,
     items = data.get("items") or []
     live_pos, live_mkt = (
         _parse_holdings_items(items) if data.get("holdings_ok") else ({}, {}))
+    data = _confirm_empty_holdings(account, store, data, live_pos)
+    if not data.get("holdings_ok"):
+        live_pos, live_mkt = {}, {}
     new_cash = dict(data.get("cash") or {})
     # 현금 덮기 전에 입출금 보정 — SoD 델타가 입금을 이익으로 위장하지 않게.
     # 미체결 BUY 홀드 창은 제외(홀드 증감은 입출금이 아니다).
@@ -824,6 +911,7 @@ def apply_reconcile_from_live(account, store, data: dict,
     before = {sym: (float(p.qty), float(p.avg_price),
                     account.symbol_market.get(sym, "KR"))
               for sym, p in account.positions.items() if p.is_open}
+
 
     hold_syms = {str(s) for s in (defer_symbols or ())}
     merged_pos = dict(live_pos)

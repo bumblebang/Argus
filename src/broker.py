@@ -56,6 +56,18 @@ _LOCAL_LOOSE_AFTER_SEC = 900.0
 # 서버 목록 반영 지연 대비 — 이보다 어린 local 행은 '없음' 확정을 미룬다.
 _LOCAL_ABSENT_GRACE_SEC = 60.0
 _LOCAL_LIST_MAX_PAGES = 5
+# '없음' 확정은 서로 이만큼 떨어진 두 번의 조회가 모두 없음일 때만 — 일시적 빈 목록
+# 응답 1건으로 미접수를 확정하면 같은 주문을 다시 내 중복 주문이 된다.
+_LOCAL_ABSENT_CONFIRM_GAP_SEC = 60.0
+# 봇 자기 주문 식별용 — 이 이벤트들의 payload.order_id 는 이미 다른 행으로 귀속된 주문.
+_OWN_ORDER_EVENT_KINDS = ("live_order", "live_order_pending", "live_order_error",
+                          "live_order_avg_missing", "working_order_settled",
+                          "working_order_canceled", "working_order_local_resolved")
+
+
+def _orders_shape_ok(res) -> bool:
+    """주문 목록 응답이 스펙 모양인가 — dict 이고 orders 가 list. 빈 list 는 정상."""
+    return isinstance(res, dict) and isinstance(res.get("orders"), list)
 
 
 def _is_local_order_id(order_id: str | None) -> bool:
@@ -295,6 +307,12 @@ class Broker:
         self._register_failed_symbols: set[str] = set()
         # 이미 QUARANTINED 행의 quarantine_alert 이벤트 스로틀(종목:oid → last emit ts).
         self._quarantine_alert_ts: dict[str, float] = {}
+        # _cancel_and_confirm 이 확인한 취소 시점 누적 체결수량 {order_id: filled}(읽으면 비움) /
+        # 이번 해제로 취소된 BUY 의 미반영 체결분. order_id 키라 락 밖 취소와 섞이지 않는다.
+        self._cancel_fills: dict[str, float] = {}
+        # local 행 '없음' 1차 관측 시각 {order_id: ts} — 두 번째 관측에서만 확정.
+        self._local_absent_seen: dict[str, float] = {}
+        self._released_unapplied = 0.0
         # 예약이 새면 매수가 영구히 막히므로 TTL 로 강제 회수(+경보). 0 이하면 비활성.
         self.reservation_ttl_sec = float(reservation_ttl_sec)
         # 미체결 주문 방치 시간. 넘으면 취소한다. 0 이면 즉시 취소, 음수면 취소 안 함.
@@ -923,7 +941,11 @@ class Broker:
                 if str(r.get("side") or "").upper() == str(order.side).upper()]
         if not rows:
             return False
+        self._released_unapplied = 0.0
         if self._try_release_same_side_working(order, rows):
+            if (str(order.side).upper() == "BUY"
+                    and not self._shrink_buy_by_cancel_fill(order, base_kw)):
+                return True
             try:
                 if not self.store.has_working_order(order.symbol, side=order.side):
                     return False
@@ -935,8 +957,38 @@ class Broker:
         self.last_result = ExecuteResult.rejected(self.last_reject_reason, **base_kw)
         return True
 
+    def _shrink_buy_by_cancel_fill(self, order: Order, base_kw: dict) -> bool:
+        """취소한 기존 BUY 에 취소 시점 부분체결이 있었으면 새 주문 수량에서 뺀다.
+
+        그 체결분은 아직 원장에 없다(귀속 대기 → 다음 재대사). 사이징은 원장 보유로
+        했으므로 그대로 다시 내면 체결분만큼 초과매수가 된다. 남는 게 없으면 거부(False).
+        """
+        extra = float(getattr(self, "_released_unapplied", 0.0) or 0.0)
+        self._released_unapplied = 0.0
+        if extra <= 1e-9:
+            return True
+        new_qty = float(order.qty) - extra
+        if not _is_fractional_qty(float(order.qty)):
+            new_qty = float(int(new_qty)) if new_qty > 0 else 0.0
+        log.warning("[LIVE] 재발주 BUY %s — 취소 시점 체결 %s 차감: %s → %s",
+                    order.symbol, extra, order.qty, max(new_qty, 0.0))
+        self._emit("buy_shrunk_by_cancel_fill", order, {
+            "symbol": order.symbol, "requested_qty": float(order.qty),
+            "cancel_filled": extra, "qty": max(new_qty, 0.0)})
+        if new_qty <= 1e-9:
+            self.last_reject_reason = "취소 시점 부분체결로 목표 수량 충족"
+            self.last_result = ExecuteResult.rejected(self.last_reject_reason, **base_kw)
+            return False
+        order.qty = new_qty
+        base_kw["order_qty"] = float(new_qty)
+        return True
+
     def _try_release_same_side_working(self, order: Order, rows: list) -> bool:
-        """TTL 경과·공격 재지정가 working 을 execute 경로에서 즉시 취소."""
+        """TTL 경과·공격 재지정가 working 을 execute 경로에서 즉시 취소.
+
+        취소 확인된 행의 미반영 체결분(filled−applied)을 self._released_unapplied 에
+        누적한다 — BUY 재발주 수량 차감용(_shrink_buy_by_cancel_fill).
+        """
         if self.client is None or self.account_seq is None:
             return False
         now = time.time()
@@ -957,6 +1009,11 @@ class Broker:
                      row.get("price"), order.price)
             if self._cancel_and_confirm(row["order_id"], row):
                 released = True
+                filled = float(self._cancel_fills.pop(str(row["order_id"]), 0.0) or 0.0)
+                applied = float(row.get("applied_qty") or 0.0)
+                self._released_unapplied = (
+                    float(getattr(self, "_released_unapplied", 0.0) or 0.0)
+                    + max(0.0, filled - applied))
         return released
 
     def _cancel_opposing_working(self, order: Order) -> None:
@@ -993,7 +1050,9 @@ class Broker:
                 continue
             log.info("[LIVE] 청산 전 반대편 BUY 취소 id=%s %s x%s @ %s",
                      row["order_id"], row["symbol"], row["qty"], row.get("price"))
-            if not self._cancel_and_confirm(row["order_id"], row):
+            ok = self._cancel_and_confirm(row["order_id"], row)
+            self._cancel_fills.pop(str(row["order_id"]), None)
+            if not ok:
                 log.warning("[LIVE] 반대편 BUY 취소 실패 — SELL 은 계속 id=%s",
                             row["order_id"])
 
@@ -1145,7 +1204,9 @@ class Broker:
                         out["working"] += 1
                     continue
             # 취소는 락 밖 I/O
-            if self._cancel_and_confirm(oid, row):
+            canceled = self._cancel_and_confirm(oid, row)
+            self._cancel_fills.pop(str(oid), None)      # 재발주 차감용 기록 — sweep 은 불필요
+            if canceled:
                 out["canceled"] += 1
             else:
                 with self._lock:
@@ -1225,7 +1286,11 @@ class Broker:
         orders: list[dict] = []
         complete = True
         try:
-            res = lister(self.account_seq, status="OPEN", symbol=row["symbol"]) or {}
+            res = lister(self.account_seq, status="OPEN", symbol=row["symbol"])
+            if not _orders_shape_ok(res):
+                # 예외 없는 빈/깨진 응답 — 목록을 봤다고 할 수 없다('없음' 확정 금지).
+                complete = False
+                res = {}
             orders.extend(res.get("orders") or [])
             # 스펙상 OPEN 은 전량 반환(hasNext 항상 false). 어겨지면 '없음' 확정 금지.
             if res.get("hasNext"):
@@ -1234,7 +1299,10 @@ class Broker:
             for _ in range(_LOCAL_LIST_MAX_PAGES):
                 res = lister(self.account_seq, status="CLOSED", symbol=row["symbol"],
                              date_from=day_from, date_to=day_to,
-                             cursor=cursor, limit=100) or {}
+                             cursor=cursor, limit=100)
+                if not _orders_shape_ok(res):
+                    complete = False
+                    break
                 orders.extend(res.get("orders") or [])
                 cursor = res.get("nextCursor")
                 if not res.get("hasNext") or not cursor:
@@ -1249,8 +1317,13 @@ class Broker:
             known = {str(r.get("order_id")) for r in self.store.get_working_orders()}
         except Exception:
             pass
+        # 이미 다른 행으로 귀속·종결된 봇 주문(체결 후 working 에서 지워진 것)도 제외한다.
+        # 빼지 않으면 직전에 낸 같은 종목·방향 주문이 '근접 주문'으로 잡혀 영구 미확인이 된다.
+        known |= self._own_order_ids(row["symbol"],
+                                     since=placed - _LOCAL_LOOSE_BEFORE_SEC - 3600)
         amount = meta.get("order_amount")
         cands = []
+        near = []          # 시각·수량은 맞고 가격만 어긋남(호가 절삭 등)
         loose = 0
         for o in orders:
             if not isinstance(o, dict) or not o.get("orderId"):
@@ -1262,34 +1335,71 @@ class Broker:
             if str(o.get("side") or "").upper() != side:
                 continue
             ts = _parse_ts(o.get("orderedAt"))
+            # 수량(금액 주문은 금액)이 다르면 우리 주문일 수 없다 — 근접 판정에서도 뺀다.
+            if amount is not None:
+                size_ok = _same_num(o.get("orderAmount"), amount)
+            else:
+                size_ok = _same_num(o.get("quantity"), row.get("qty"))
+            if not size_ok:
+                continue
             if ts is None or (placed - _LOCAL_LOOSE_BEFORE_SEC <= ts
                               <= placed + _LOCAL_LOOSE_AFTER_SEC):
                 loose += 1
             if ts is None or not (placed - _LOCAL_MATCH_BEFORE_SEC <= ts
                                   <= placed + _LOCAL_MATCH_AFTER_SEC):
                 continue
-            if amount is not None:
-                if not _same_num(o.get("orderAmount"), amount):
-                    continue
-            else:
-                if not _same_num(o.get("quantity"), row.get("qty")):
-                    continue
-                if (str(meta.get("order_type") or "LIMIT").upper() == "LIMIT"
-                        and not _limit_price_matches(o.get("price"), row.get("price"))):
-                    continue
+            if (amount is None
+                    and str(meta.get("order_type") or "LIMIT").upper() == "LIMIT"
+                    and not _limit_price_matches(o.get("price"), row.get("price"))):
+                near.append(o)
+                continue
             cands.append(o)
+        oid = str(row.get("order_id"))
         if len(cands) == 1:
+            self._local_absent_seen.pop(oid, None)
             return "found", cands[0]
         if cands:
-            log.error("local 주문 해소 — 후보 %d건(모호) id=%s", len(cands), row.get("order_id"))
+            log.error("local 주문 해소 — 후보 %d건(모호) id=%s", len(cands), oid)
             return "unknown", None
+        if len(near) == 1 and loose == 1:
+            # 시각 창·종목·방향·수량이 맞는 유일한 미귀속 주문 — 가격만 절삭으로 어긋났다.
+            log.warning("local 주문 해소 — 가격만 다른 유일 후보 채택 id=%s → %s",
+                        oid, near[0].get("orderId"))
+            self._local_absent_seen.pop(oid, None)
+            return "found", near[0]
         if loose:
-            log.error("local 주문 해소 — 엄격 대조 0건·근접 주문 %d건(가격 절삭 등) id=%s",
-                      loose, row.get("order_id"))
+            log.error("local 주문 해소 — 엄격 대조 0건·근접 주문 %d건(모호) id=%s", loose, oid)
             return "unknown", None
         if complete and now - placed >= _LOCAL_ABSENT_GRACE_SEC:
-            return "absent", None
+            first = self._local_absent_seen.setdefault(oid, now)
+            if now - first >= _LOCAL_ABSENT_CONFIRM_GAP_SEC:
+                self._local_absent_seen.pop(oid, None)
+                return "absent", None
+            log.warning("local 주문 해소 — 목록에 없음(1차) id=%s, %.0f초 뒤 재확인",
+                        oid, _LOCAL_ABSENT_CONFIRM_GAP_SEC)
+            return "unknown", None
         return "unknown", None
+
+    def _own_order_ids(self, symbol: str, *, since: float) -> set[str]:
+        """이 종목의 봇 주문 이벤트에 찍힌 order_id(이미 귀속된 주문) 집합."""
+        out: set[str] = set()
+        recent = getattr(self.store, "recent_events", None)
+        if recent is None:
+            return out
+        for kind in _OWN_ORDER_EVENT_KINDS:
+            try:
+                rows = recent(kind, since, limit=200, symbol=symbol) or []
+            except Exception:
+                continue
+            for r in rows:
+                try:
+                    payload = r["payload"]
+                    data = json.loads(payload) if isinstance(payload, str) else (payload or {})
+                except (KeyError, IndexError, TypeError, ValueError):
+                    continue
+                if isinstance(data, dict) and data.get("order_id"):
+                    out.add(str(data["order_id"]))
+        return out
 
     def _working_row_snapshot(self, order_id: str) -> dict | None:
         """락 안: order_id 현재 행. 없으면 None."""
@@ -1394,6 +1504,8 @@ class Broker:
             return False
         info = self._fetch_order(order_id) or {}
         status, filled, avg, fee = _parse_execution(info)
+        if status in _TERMINAL:
+            self._cancel_fills[str(order_id)] = float(filled or 0.0)
         self._store_call(self.store.update_working_order, order_id,
                          status=_keep_quarantine(row.get("status"), status),
                          filled_qty=filled, filled_avg=avg, fee=fee)
@@ -1658,18 +1770,12 @@ class Broker:
             return False
 
         if order.side == "SELL":
-            sellable = None
-            try:
-                resp = self.client.get_sellable(self.account_seq, order.symbol) or {}
-                sellable = _num(_field(resp, "sellableQuantity"))
-                if sellable is None and resp:
-                    keys = list(resp.keys()) if isinstance(resp, dict) else type(resp).__name__
-                    log.warning(
-                        "[LIVE] 매도가능 응답에 sellableQuantity 없음 — 원장 수량으로 진행"
-                        "(%s keys=%s)", order.symbol, keys)
-            except Exception as e:
-                log.warning("[LIVE] 매도가능 수량 조회 실패 — 원장 수량으로 진행(%s): %s",
-                            order.symbol, e)
+            sellable = self._fetch_sellable(order.symbol)
+            if (sellable is not None and sellable <= 0
+                    and self._release_own_working_sell(order)):
+                # 우리 미체결 매도가 수량을 잡고 있었다 — 취소 확인 후 다시 본다.
+                # 여기서 그냥 반환하면 재지정가를 못 내고 TTL(300초)까지 손절이 멈춘다.
+                sellable = self._fetch_sellable(order.symbol)
             if sellable is not None:
                 if sellable <= 0:
                     log.warning("[LIVE] %s 매도가능 0 — 매도 스킵", order.symbol)
@@ -1695,6 +1801,41 @@ class Broker:
         if not self._retarget_buy_qty_to_cap(order):
             return False
         return True
+
+    def _fetch_sellable(self, symbol: str) -> float | None:
+        """실 매도가능 수량. 조회 실패·필드 없음은 None(원장 수량으로 진행)."""
+        try:
+            resp = self.client.get_sellable(self.account_seq, symbol) or {}
+        except Exception as e:
+            log.warning("[LIVE] 매도가능 수량 조회 실패 — 원장 수량으로 진행(%s): %s",
+                        symbol, e)
+            return None
+        sellable = _num(_field(resp, "sellableQuantity"))
+        if sellable is None and resp:
+            keys = list(resp.keys()) if isinstance(resp, dict) else type(resp).__name__
+            log.warning("[LIVE] 매도가능 응답에 sellableQuantity 없음 — 원장 수량으로 진행"
+                        "(%s keys=%s)", symbol, keys)
+        return sellable
+
+    def _release_own_working_sell(self, order: Order) -> bool:
+        """매도가능 0 의 원인이 우리 미체결 SELL 이면 취소(TTL 경과·더 공격적 재지정가만).
+
+        _begin_execute_locked 의 같은 방향 해제와 같은 규칙이지만, 매도가능 0 검사가
+        그보다 먼저라 여기서도 해제해야 한다. 하나라도 취소 확인되면 True.
+        """
+        if self.store is None:
+            return False
+        try:
+            rows = [r for r in (self.store.get_working_orders(
+                order.symbol, side="SELL", settled=False) or [])]
+        except Exception as e:
+            log.warning("[LIVE] 미체결 매도 조회 실패 %s: %s", order.symbol, e)
+            return False
+        if not rows:
+            return False
+        # 락 없이 — 취소·조회는 I/O 이고(sweep 도 락 밖에서 취소), 이 경로는 execute()
+        # 의 락 밖 준비 단계라 락을 잡으면 하위호환 _execute_locked 와 교착할 수 있다.
+        return self._try_release_same_side_working(order, rows)
 
     def _retarget_buy_qty_to_cap(self, order: Order) -> bool:
         """BUY notional_cap 이 있으면 현재가 기준 qty 재절사. 진행 가능하면 True.

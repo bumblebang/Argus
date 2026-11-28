@@ -475,6 +475,8 @@ class TickResult:
     woke: bool = False
     markets_open: list = field(default_factory=list)
     poll_failed: list = field(default_factory=list)  # 시세 폴링 실패로 건너뛴 시장
+    # 시세 폴링은 성공했는데 가격이 안 온 보유 종목(손절 평가 불가).
+    held_unpriced: list = field(default_factory=list)
 
 
 # 코드(빠른손)가 즉시 처리하는 청산 트리거 — 뇌를 거치지 않는다.
@@ -498,6 +500,13 @@ _THROTTLED_TRIGGER_KINDS = _EXIT_KINDS | {"thesis_invalidation"}
 _STOP_CONFIRM_KINDS = frozenset({"stop_hit", "trail_stop"})
 _STOP_CONFIRM_TOL_PCT = 0.01
 _STOP_CONFIRM_RECHECK_SEC = 5.0
+# 호가 시각이 이보다 낡으면 그 호가로는 손절을 보류하지 않는다(멈춘 호가가 손절을 막음).
+_STOP_CONFIRM_QUOTE_MAX_AGE_SEC = 60.0
+# 호가 확인 보류의 총 상한 — 연속 보류가 이 시간을 넘으면 청산한다. 매수호가가 스톱
+# 위라는 뜻이니 그 값에 팔아도 손절가보다 나쁘지 않다. 기한 없는 보류는 없다.
+_STOP_CONFIRM_MAX_HOLD_SEC = 300.0
+# 보유 종목 가격이 이 시간 넘게 안 오면 하트비트 ok=False(손절 평가가 조용히 사라짐 방지).
+_HELD_UNPRICED_ALERT_SEC = 30.0
 # 시장 시세 폴링 실패 error 이벤트 기록 간격(1초 틱 × 장애 지속 스팸 방지).
 _POLL_ERROR_LOG_SEC = 60.0
 
@@ -545,6 +554,11 @@ class WatchLoop:
         self._trigger_logged: dict[tuple[str, str], float] = {}
         # 스톱 청산 호가 확인에서 보류된 종목 → 다음 확인 시각.
         self._stop_hold_until: dict[str, float] = {}
+        # 이번 보류 구간의 첫 보류 시각(총 보류 상한용). 스톱 트리거가 사라지면 비운다.
+        self._stop_hold_since: dict[str, float] = {}
+        # 보유 종목 가격 누락 시작 시각 / 마지막 경보 기록 시각.
+        self._held_unpriced_since: dict[str, float] = {}
+        self._held_unpriced_logged: dict[str, float] = {}
         # 시장별 시세 폴링 실패 마지막 기록 시각.
         self._poll_err_logged: dict[str, float] = {}
         self._last_brain_wake = 0.0    # 주기 각성 타이머(개장 첫 틱에 바로 1회 발화)
@@ -585,7 +599,7 @@ class WatchLoop:
             )
         except Exception as e:
             log.warning("snapshots prune 실패: %s", e)
-            self.store.log_event("error", None, {"where": "prune_snapshots", "err": str(e)})
+            self._safe_event("error", None, {"where": "prune_snapshots", "err": str(e)})
             return
         deleted = int((info or {}).get("deleted") or 0)
         if deleted:
@@ -615,7 +629,7 @@ class WatchLoop:
             )
         except Exception as e:
             log.warning("events prune 실패: %s", e)
-            self.store.log_event("error", None, {"where": "prune_events", "err": str(e)})
+            self._safe_event("error", None, {"where": "prune_events", "err": str(e)})
             return
         deleted = int((info or {}).get("deleted") or 0)
         if deleted:
@@ -691,8 +705,10 @@ class WatchLoop:
             polled = int(res.polled or 0)
             should_poll = bool(should_be_open)
             poll_failed = list(res.poll_failed or [])
+            held_unpriced = list(res.held_unpriced or [])
             # 한 시장만 시세가 죽어도 다른 시장 폴링이 polled>0 을 채우므로 따로 본다.
-            ok = ((not tick_error) and (not poll_failed)
+            # 보유 종목 가격 누락도 손절 평가 공백이라 ok=False.
+            ok = ((not tick_error) and (not poll_failed) and (not held_unpriced)
                   and (not should_poll or polled > 0))
             payload = {
                 "ts": now_ts, "ticks": self._ticks,
@@ -700,6 +716,7 @@ class WatchLoop:
                 "markets_open": markets, "polled": polled,
                 "ok": ok, "tick_error": bool(tick_error),
                 "poll_failed": poll_failed,
+                "held_unpriced": held_unpriced,
                 "code_rev": self._code_rev,
             }
             # trading_health: 시세 ok 와 별개(HALT/pause/sync/미확인 주문).
@@ -930,6 +947,16 @@ class WatchLoop:
         보류 중엔 recheck 초 동안 호가를 다시 부르지 않는다(1초 틱마다 호가 콜 방지).
         호가 실패·빈 호가·스톱 값 없음은 청산 진행(True) — 진짜 손절을 막지 않는다.
         """
+        since = self._stop_hold_since.get(sym)
+        if since is not None and now_ts - since >= _STOP_CONFIRM_MAX_HOLD_SEC:
+            # 기한 없는 보류 금지 — 호가가 계속 스톱 위라도 상한이 지나면 청산.
+            self._release_stop_hold(sym)
+            log.warning("스톱 청산 보류 상한(%.0f초) 경과 %s — 청산 진행",
+                        _STOP_CONFIRM_MAX_HOLD_SEC, sym)
+            self._safe_event("stop_hold_expired", sym, {
+                "kind": getattr(trig, "kind", None),
+                "held_sec": round(now_ts - since, 1)})
+            return True
         hold = self._stop_hold_until.get(sym)
         if hold is not None and now_ts < hold:
             return False
@@ -937,15 +964,25 @@ class WatchLoop:
         stop = _num((getattr(trig, "payload", None) or {}).get("stop"))
         best_quote = getattr(self.gw, "best_quote", None)
         if not stop or stop <= 0 or best_quote is None:
+            self._release_stop_hold(sym)
             return True
         try:
             q = best_quote(sym)
         except Exception as e:
             log.warning("스톱 확인 호가 실패 %s(청산 진행): %s", sym, e)
+            self._release_stop_hold(sym)
             return True
         bid = _num(q[0]) if q else None
         if not bid or bid <= stop * (1 + _STOP_CONFIRM_TOL_PCT):
+            self._release_stop_hold(sym)
             return True
+        quote_at = _num(q[2]) if q and len(q) > 2 else None
+        if quote_at is not None and now_ts - quote_at > _STOP_CONFIRM_QUOTE_MAX_AGE_SEC:
+            # 낡은 호가는 '아직 안 깨짐'의 근거가 못 된다 — 청산 진행.
+            log.warning("스톱 확인 호가 낡음 %s(%.0f초) — 청산 진행", sym, now_ts - quote_at)
+            self._release_stop_hold(sym)
+            return True
+        self._stop_hold_since.setdefault(sym, now_ts)
         self._stop_hold_until[sym] = now_ts + _STOP_CONFIRM_RECHECK_SEC
         key = (sym, "stop_unconfirmed")
         last = self._trigger_logged.get(key)
@@ -954,11 +991,41 @@ class WatchLoop:
             payload = getattr(trig, "payload", None) or {}
             log.warning("스톱 청산 보류 %s: 트리거가 %s · 매수호가 %s > 스톱 %s",
                         sym, payload.get("price"), bid, stop)
-            self.store.log_event("stop_unconfirmed", sym, {
+            self._safe_event("stop_unconfirmed", sym, {
                 "kind": trig.kind, "price": payload.get("price"),
                 "stop": stop, "bid": bid,
                 "ask": _num(q[1]) if len(q) > 1 else None})
         return False
+
+    def _release_stop_hold(self, sym: str) -> None:
+        self._stop_hold_until.pop(sym, None)
+        self._stop_hold_since.pop(sym, None)
+
+    def _safe_event(self, kind: str, sym: str | None, payload: dict | None) -> None:
+        """이벤트 기록 — DB 실패를 삼킨다. 예외 처리·정리 경로에서 다시 던지면
+        감시 루프 프로세스가 죽는다(DB 쓰기 1회 실패 = 손절 감시 정지)."""
+        try:
+            self.store.log_event(kind, sym, payload)
+        except Exception as e:
+            log.error("이벤트 기록 실패(무시) [%s %s]: %s", kind, sym, e)
+
+    def _note_held_price(self, sym: str, price: float | None, now_ts: float,
+                         res: "TickResult") -> None:
+        """보유 종목 가격 누락 추적 — 손절 평가가 조용히 사라지지 않게."""
+        if price is not None:
+            if self._held_unpriced_since.pop(sym, None) is not None:
+                log.info("보유 종목 시세 복구 %s", sym)
+            return
+        since = self._held_unpriced_since.setdefault(sym, now_ts)
+        if now_ts - since < _HELD_UNPRICED_ALERT_SEC:
+            return
+        res.held_unpriced.append(sym)
+        last = self._held_unpriced_logged.get(sym)
+        if last is None or now_ts - last >= _POLL_ERROR_LOG_SEC:
+            self._held_unpriced_logged[sym] = now_ts
+            log.error("보유 종목 시세 누락 %s(%.0f초) — 손절 평가 불가", sym, now_ts - since)
+            self._safe_event("held_price_missing", sym,
+                             {"missing_sec": round(now_ts - since, 1)})
 
     # ── 한 틱: 폴링 → 트리거 평가 → 정밀 → 로깅 ──────────────
     def run_once(self) -> TickResult:
@@ -1072,6 +1139,8 @@ class WatchLoop:
                 if price is not None:
                     self._hist[sym].append(price)
                     live_price[sym] = price
+                if sym in positions:
+                    self._note_held_price(sym, price, now_ts, res)
 
                 # 유동성 판정: 시간외 세션에서 체결이 멈춘 종목은 뇌 신규진입 후보에서
                 # 제외(illiquid). 정규장이거나 비활성(stale_quote_sec<=0)이면 이 시장
@@ -1173,8 +1242,15 @@ class WatchLoop:
                     exit_trigs = sorted((t for t in trigs if t.kind in _EXIT_KINDS),
                                         key=lambda t: _EXIT_PRIORITY.get(t.kind, 99))
                     ready = getattr(self.executor, "ready", None)
+                    if not any(t.kind in _STOP_CONFIRM_KINDS for t in exit_trigs):
+                        self._release_stop_hold(sym)
                     for t in exit_trigs:
-                        if ready is not None and not ready(sym, t.kind):
+                        try:
+                            is_ready = ready is None or ready(sym, t.kind)
+                        except Exception as e:   # 한 종목 판정 오류가 틱 전체를 죽이지 않게
+                            log.error("청산 백오프 판정 실패 %s: %s", sym, e)
+                            is_ready = True
+                        if not is_ready:
                             continue
                         if (t.kind in _STOP_CONFIRM_KINDS
                                 and not self._stop_confirmed(sym, t, now_ts)):
@@ -1185,8 +1261,7 @@ class WatchLoop:
                                 exited = True
                         except Exception as e:
                             log.error("코드 청산 실패 %s: %s", sym, e)
-                            self.store.log_event("error", sym,
-                                                 {"where": "exit", "err": str(e)})
+                            self._safe_event("error", sym, {"where": "exit", "err": str(e)})
                         break
                 if exited:
                     continue
@@ -1393,8 +1468,8 @@ class WatchLoop:
             self._extra_grace_until = self._now() + grace
         else:
             self._extra_grace_until = 0.0
-        self.store.log_event("loop_start", None,
-                             {"markets": list(self.markets), "cfg": vars(self.cfg)})
+        self._safe_event("loop_start", None,
+                         {"markets": list(self.markets), "cfg": vars(self.cfg)})
         try:
             while True:
                 if stop_event is not None and stop_event.is_set():
@@ -1406,19 +1481,23 @@ class WatchLoop:
                     res = self.run_once()
                 except Exception as e:  # 한 틱 실패가 루프를 죽이지 않게.
                     log.exception("틱 실패: %s", e)
-                    self.store.log_event("error", None, {"where": "tick", "err": str(e)})
+                    # 예외 처리 블록에서 DB 를 다시 쓰다 실패하면 루프가 죽는다 — 삼킨다.
+                    self._safe_event("error", None, {"where": "tick", "err": str(e)})
                     res = TickResult()
                     tick_error = True
                 ticks += 1
                 self._ticks = ticks
                 self._beat(res, tick_error=tick_error)  # ok 포함 — polled=0 가짜 초록 방지
-                self._maybe_prune_snapshots()
-                self._maybe_prune_events()
+                try:
+                    self._maybe_prune_snapshots()
+                    self._maybe_prune_events()
+                except Exception as e:  # 정리 작업 실패도 감시 루프를 죽이지 않는다.
+                    log.error("prune 실패(무시): %s", e)
                 interval = (self.cfg.watch_interval_sec if res.markets_open
                             else self.cfg.idle_interval_sec)
                 self._sleep(interval)
         except KeyboardInterrupt:
             log.info("중단 요청(Ctrl-C) — 루프 종료.")
         finally:
-            self.store.log_event("loop_stop", None, {"ticks": ticks})
+            self._safe_event("loop_stop", None, {"ticks": ticks})
         return ticks

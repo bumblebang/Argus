@@ -97,12 +97,17 @@ def refresh_brief(*, force: bool = False, dry: bool = False) -> dict:
                               error_dump_path="data/public_brief_cli_error.json",
                               lean=claude_lean_for(a, "public_brief"))
 
-    brief = generate(llm, _market_state(), _dossier_stances())
+    out_path = BRIEF_PATH
+    if dry:
+        # MockLLM 브리핑이 공개 페이지에 실리지 않게 운영 캐시를 덮지 않는다.
+        from src.paths import dry_output_path
+        out_path = dry_output_path(BRIEF_PATH)
+    brief = generate(llm, _market_state(), _dossier_stances(), path=out_path)
     if brief is None:
         # 생성 실패거나 유출 가드에 걸렸다 — 캐시는 건드리지 않았다(이전 것이 남아 있으면 그게 쓰인다).
-        return {"status": "failed", "path": str(BRIEF_PATH)}
+        return {"status": "failed", "path": str(out_path)}
     return {"status": "generated", "headline": brief["headline"],
-            "watch": brief["watch"], "path": str(BRIEF_PATH)}
+            "watch": brief["watch"], "path": str(out_path)}
 
 
 def main() -> int:

@@ -275,3 +275,11 @@ def halt_pause_exists(market: str, *, root: Path | None = None,
         except OSError:
             continue
     return False
+
+
+def dry_output_path(path: str | Path) -> Path:
+    """--dry 실행의 출력 경로 — data/dry/<파일명>. 운영 파일(market_state.json·KRX
+    차단목록·value_watchlist.json 등)을 합성값으로 덮지 않게 모든 dry 쓰기를 여기로 돌린다."""
+    out = data_root() / "data" / "dry"
+    out.mkdir(parents=True, exist_ok=True)
+    return out / Path(path).name

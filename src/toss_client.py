@@ -494,7 +494,10 @@ class TossClient:
         res = self._request("order_list", params=params, account_seq=account_seq)
         if isinstance(res, dict):
             return res
-        return {"orders": res or [], "nextCursor": None, "hasNext": False}
+        if isinstance(res, list):
+            return {"orders": res, "nextCursor": None, "hasNext": False}
+        # 빈 본문(None) 등은 '주문 0건' 이 아니다 — orders 키 없이 돌려 호출측이 미확인 처리.
+        return {}
 
     def get_order(self, account_seq: int | str, order_id: str) -> dict:
         """GET /api/v1/orders/{order_id} — 단건 주문 조회(체결 대사용).

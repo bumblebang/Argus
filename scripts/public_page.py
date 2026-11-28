@@ -205,7 +205,7 @@ def _collect_positions(cur) -> tuple[list[dict], list[dict]]:
     """보유(open)·진입대기(armed) — 수량은 공개하지 않는다."""
     rows = [dict(r) for r in cur.execute(
         "select symbol,market,state,strategy,avg_price,stop_price,target_price,"
-        "meta,thesis,opened_at "
+        "meta,opened_at "
         "from positions where state in ('open','armed') order by state,symbol")]
     px = _prices(cur, [str(r["symbol"]) for r in rows])
     held, armed = [], []
@@ -222,7 +222,8 @@ def _collect_positions(cur) -> tuple[list[dict], list[dict]]:
         else:
             item["state"] = "armed"
             item.update(_armed_meta_fields(r.get("meta")))
-            item["thesis"] = r["thesis"]
+            # thesis 원문은 싣지 않는다 — 뇌 자유서술이라 어떤 문장이 섞일지 보장할 수
+            # 없다(도시에 패널과 같은 원칙). 진입대기 종목의 논거가 공개 발행되던 구멍.
             item["opened_at"] = _num(r["opened_at"])
             armed.append(item)
     return held, armed
